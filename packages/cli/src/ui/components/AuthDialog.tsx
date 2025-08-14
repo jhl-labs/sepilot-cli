@@ -58,6 +58,12 @@ export function AuthDialog({
     ) {
       return 'Existing API key detected (GEMINI_API_KEY). Select "Gemini API Key" option to use it.';
     }
+    if (
+      process.env.OPENAI_API_KEY &&
+      (!defaultAuthType || defaultAuthType === AuthType.USE_OPENAI)
+    ) {
+      return 'Existing API key detected (OPENAI_API_KEY). Select "Use OpenAI API Key" option to use it.';
+    }
     return null;
   });
   const items = [
@@ -78,6 +84,10 @@ export function AuthDialog({
       value: AuthType.USE_GEMINI,
     },
     { label: 'Vertex AI', value: AuthType.USE_VERTEX_AI },
+    {
+      label: 'Use OpenAI API Key',
+      value: AuthType.USE_OPENAI,
+    },
   ];
 
   const initialAuthIndex = items.findIndex((item) => {
@@ -90,6 +100,10 @@ export function AuthDialog({
     );
     if (defaultAuthType) {
       return item.value === defaultAuthType;
+    }
+
+    if (process.env.OPENAI_API_KEY) {
+      return item.value === AuthType.USE_OPENAI;
     }
 
     if (process.env.GEMINI_API_KEY) {

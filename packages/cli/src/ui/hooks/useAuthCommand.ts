@@ -22,9 +22,13 @@ export const useAuthCommand = (
   const [isAuthDialogOpen, setIsAuthDialogOpen] = useState(
     settings.merged.selectedAuthType === undefined,
   );
+  const [isModelSelectionOpen, setIsModelSelectionOpen] = useState(false);
+  const [pendingAuthType, setPendingAuthType] = useState<AuthType | undefined>();
+  const [pendingScope, setPendingScope] = useState<SettingScope | undefined>();
 
   const openAuthDialog = useCallback(() => {
     setIsAuthDialogOpen(true);
+    setIsModelSelectionOpen(false);
   }, []);
 
   const [isAuthenticating, setIsAuthenticating] = useState(false);
@@ -32,7 +36,7 @@ export const useAuthCommand = (
   useEffect(() => {
     const authFlow = async () => {
       const authType = settings.merged.selectedAuthType;
-      if (isAuthDialogOpen || !authType) {
+      if (isAuthDialogOpen || isModelSelectionOpen || !authType) {
         return;
       }
 
@@ -49,11 +53,20 @@ export const useAuthCommand = (
     };
 
     void authFlow();
-  }, [isAuthDialogOpen, settings, config, setAuthError, openAuthDialog]);
+  }, [isAuthDialogOpen, isModelSelectionOpen, settings, config, setAuthError, openAuthDialog]);
 
   const handleAuthSelect = useCallback(
     async (authType: AuthType | undefined, scope: SettingScope) => {
       if (authType) {
+        // For OpenAI, show model selection dialog
+        if (authType === AuthType.USE_OPENAI) {
+          setPendingAuthType(authType);
+          setPendingScope(scope);
+          setIsAuthDialogOpen(false);
+          setIsModelSelectionOpen(true);
+          return;
+        }
+
         await clearCachedCredentialFile();
 
         settings.setValue(scope, 'selectedAuthType', authType);
@@ -78,14 +91,36 @@ Logging in with Google... Please restart Gemini CLI to continue.
     [settings, setAuthError, config],
   );
 
+  const handleModelSelect = useCallback(
+    async (model: string) => {
+      if (pendingAuthType && pendingScope) {
+        await clearCachedCredentialFile();
+        
+        // Save both auth type and model
+        settings.setValue(pendingScope, 'selectedAuthType', pendingAuthType);
+        settings.setValue(pendingScope, 'openAIModel', model);
+        
+        // Update environment variable for immediate use
+        process.env.OPENAI_MODEL = model;
+      }
+      setIsModelSelectionOpen(false);
+      setPendingAuthType(undefined);
+      setPendingScope(undefined);
+      setAuthError(null);
+    },
+    [pendingAuthType, pendingScope, settings, setAuthError],
+  );
+
   const cancelAuthentication = useCallback(() => {
     setIsAuthenticating(false);
   }, []);
 
   return {
     isAuthDialogOpen,
+    isModelSelectionOpen,
     openAuthDialog,
     handleAuthSelect,
+    handleModelSelect,
     isAuthenticating,
     cancelAuthentication,
   };
