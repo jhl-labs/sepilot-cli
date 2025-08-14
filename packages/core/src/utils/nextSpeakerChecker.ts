@@ -44,6 +44,22 @@ export async function checkNextSpeaker(
   geminiClient: GeminiClient,
   abortSignal: AbortSignal,
 ): Promise<NextSpeakerResponse | null> {
+  // For OpenAI, skip the LLM-based check and use simple heuristics
+  // Check if OPENAI_API_KEY is set to determine if using OpenAI
+  const isOpenAI = !!process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== '';
+  
+  if (isOpenAI) {
+    const history = chat.getHistory();
+    // Simple heuristic for OpenAI: user should speak next after model response
+    const lastMessage = history[history.length - 1];
+    if (lastMessage && lastMessage.role === 'model') {
+      return {
+        reasoning: 'OpenAI mode: User should respond after model',
+        next_speaker: 'user',
+      };
+    }
+    return null;
+  }
   // We need to capture the curated history because there are many moments when the model will return invalid turns
   // that when passed back up to the endpoint will break subsequent calls. An example of this is when the model decides
   // to respond with an empty part collection if you were to send that message back to the server it will respond with

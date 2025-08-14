@@ -34,6 +34,7 @@ import { Footer } from './components/Footer.js';
 import { ThemeDialog } from './components/ThemeDialog.js';
 import { AuthDialog } from './components/AuthDialog.js';
 import { AuthInProgress } from './components/AuthInProgress.js';
+import { ModelSelectionDialog } from './components/ModelSelectionDialog.js';
 import { EditorSettingsDialog } from './components/EditorSettingsDialog.js';
 import { FolderTrustDialog } from './components/FolderTrustDialog.js';
 import { ShellConfirmationDialog } from './components/ShellConfirmationDialog.js';
@@ -259,8 +260,10 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
 
   const {
     isAuthDialogOpen,
+    isModelSelectionOpen,
     openAuthDialog,
     handleAuthSelect,
+    handleModelSelect,
     isAuthenticating,
     cancelAuthentication,
   } = useAuthCommand(settings, setAuthError, config);
@@ -828,6 +831,7 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
       !initialPromptSubmitted.current &&
       !isAuthenticating &&
       !isAuthDialogOpen &&
+      !isModelSelectionOpen &&
       !isThemeDialogOpen &&
       !isEditorDialogOpen &&
       !showPrivacyNotice &&
@@ -841,6 +845,7 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
     submitQuery,
     isAuthenticating,
     isAuthDialogOpen,
+    isModelSelectionOpen,
     isThemeDialogOpen,
     isEditorDialogOpen,
     showPrivacyNotice,
@@ -1034,6 +1039,14 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
                 onSelect={handleAuthSelect}
                 settings={settings}
                 initialErrorMessage={authError}
+              />
+            </Box>
+          ) : isModelSelectionOpen ? (
+            <Box flexDirection="column">
+              <ModelSelectionDialog
+                onSelect={handleModelSelect}
+                apiKey={process.env.OPENAI_API_KEY || ''}
+                baseURL={process.env.OPENAI_BASE_URL}
               />
             </Box>
           ) : isEditorDialogOpen ? (
