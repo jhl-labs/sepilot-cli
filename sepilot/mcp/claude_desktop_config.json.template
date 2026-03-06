@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "sepilot": {
+      "command": "python",
+      "args": [
+        "-m",
+        "sepilot.mcp.cli",
+        "--working-dir",
+        "/CHANGE/THIS/TO/YOUR/PROJECT/PATH"
+      ]
+    }
+  }
+}

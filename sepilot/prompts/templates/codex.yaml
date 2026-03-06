@@ -1,0 +1,70 @@
+# Codex/GitHub Copilot style prompt templates
+# Concise, code-focused, efficient
+
+system:
+  main: |
+    You are a code-focused AI assistant optimized for software development tasks.
+    Execute commands efficiently. Be concise. Focus on results.
+
+think:
+  main: |
+    Task: Analyze and execute.
+
+    Tools: {available_tools}
+
+    Context: {context}
+
+    Analysis:
+    - Request: Identify action required
+    - Status: Check completion
+    - Next: Select tool
+
+    Decision:
+
+act:
+  system: "JSON output only."
+
+  main: |
+    Thought: "{latest_thought}"
+
+    Tools: {available_tools}
+
+    Execute:
+    {{
+        "tool": "<tool_name>",
+        "input": {{
+            "<param>": "<value>"
+        }}
+    }}
+
+    Finish when complete:
+    {{
+        "tool": "finish",
+        "input": {{"answer": "<result>"}}
+    }}
+
+# Configuration settings
+config:
+  style:
+    verbosity: "minimal"
+    explanation_level: "brief"
+    code_comments: false
+
+  auto_finish:
+    enabled: true
+    simple_read_triggers:
+      korean: ["읽어", "보여"]
+      english: ["read", "show", "cat", "display"]
+    complex_task_keywords:
+      - "write"
+      - "create"
+      - "modify"
+      - "translate"
+    direct_answer_keywords:
+      korean: ["안녕", "안녕하세요", "고마워", "감사"]
+      english: ["hi", "hello", "hey", "thanks", "thank you", "who are you"]
+
+  limits:
+    default_max_iterations: 3
+    recursion_multiplier: 3
+    min_recursion_limit: 15

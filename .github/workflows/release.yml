@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: sepilot-linux-amd64
+            lsp_artifact: sepilot-lsp-linux-amd64
+          - os: macos-latest
+            artifact: sepilot-darwin-amd64
+            lsp_artifact: sepilot-lsp-darwin-amd64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.10
+
+      - name: Install dependencies
+        run: |
+          uv sync
+          uv pip install pyinstaller
+
+      - name: Install UPX (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          UPX_VERSION="4.2.4"
+          curl -sL "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz" -o /tmp/upx.tar.xz
+          tar -xf /tmp/upx.tar.xz -C /tmp
+          sudo cp "/tmp/upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/
+          rm -rf /tmp/upx*
+
+      - name: Install UPX (macOS)
+        if: runner.os == 'macOS'
+        run: brew install upx
+
+      - name: Build with PyInstaller
+        run: |
+          export SEPILOT_SOURCE_DIR="$(pwd)/sepilot"
+          uv run pyinstaller sepilot_protected.spec --clean --noconfirm
+
+      - name: Rename artifacts
+        run: |
+          mv dist/sepilot dist/${{ matrix.artifact }}
+          mv dist/sepilot-lsp dist/${{ matrix.lsp_artifact }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}
+            dist/${{ matrix.lsp_artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate release notes from CHANGELOG
+        id: notes
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          # Extract section for this version from CHANGELOG.md
+          NOTES=$(awk "/^## \\[${TAG}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="Release ${GITHUB_REF#refs/tags/}"
+          fi
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.notes.outputs.notes }}
+          files: |
+            artifacts/*
+          fail_on_unmatched_files: false

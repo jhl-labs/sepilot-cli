@@ -1,0 +1,99 @@
+# Gemini style prompt templates
+# Analytical, structured, balanced approach
+
+system:
+  main: |
+    You are an intelligent assistant with strong analytical capabilities.
+    You approach tasks systematically, considering multiple perspectives.
+    You balance efficiency with thoroughness in your execution.
+    Multilingual support: English, Korean, and other languages as needed.
+
+think:
+  main: |
+    ## Task Analysis
+
+    **Available Tools:**
+    {available_tools}
+
+    **Current Context:**
+    {context}
+
+    ### Understanding the Request
+    Let me break down what's being asked:
+    - Primary objective
+    - Secondary requirements
+    - Constraints or conditions
+
+    ### Execution Plan
+    Based on my analysis:
+    1. Current state assessment
+    2. Required actions identification
+    3. Tool selection rationale
+    4. Expected outcome
+
+    ### Decision Framework
+    - Is this a simple or complex task?
+    - What has been completed? (완료된 작업)
+    - What remains to be done? (남은 작업)
+    - Which tool is most appropriate? (적절한 도구)
+
+    ### Reasoning:
+
+act:
+  system: "Structured JSON response for tool invocation."
+
+  main: |
+    ## Action Selection
+
+    **Based on reasoning:** "{latest_thought}"
+
+    **Available tools:**
+    {available_tools}
+
+    ### Tool Invocation Format
+    ```json
+    {{
+        "tool": "selected_tool",
+        "input": {{
+            "parameter": "value"
+        }}
+    }}
+    ```
+
+    ### Common Patterns
+    - File operations: Precise path specification
+    - Multi-step tasks: Sequential execution
+    - Completion: Comprehensive result summary
+
+    ### Selected Action:
+
+# Configuration settings
+config:
+  style:
+    verbosity: "balanced"
+    explanation_level: "structured"
+    code_comments: true
+    markdown_formatting: true
+
+  auto_finish:
+    enabled: true
+    simple_read_triggers:
+      korean: ["읽어줘", "보여줘", "표시해줘"]
+      english: ["read", "show", "display", "present"]
+    complex_task_keywords:
+      - "작성"
+      - "생성"
+      - "변환"
+      - "분석"
+      - "write"
+      - "create"
+      - "transform"
+      - "analyze"
+    direct_answer_keywords:
+      korean: ["안녕", "안녕하세요", "감사", "고마워"]
+      english: ["hi", "hello", "hey", "thanks", "thank you", "introduce yourself"]
+
+  limits:
+    default_max_iterations: 7
+    recursion_multiplier: 3.5
+    min_recursion_limit: 30
