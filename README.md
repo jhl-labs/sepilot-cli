@@ -21,12 +21,16 @@
 
 Python 환경 없이 바로 사용할 수 있는 단일 실행 파일을 설치합니다.
 
-```bash
-# 최신 버전 설치
-curl -fsSL https://raw.githubusercontent.com/jhl-labs/sepilot-cli/main/install.sh | bash
+- 최신 버전 설치
 
-# 특정 버전 설치
-curl -fsSL https://raw.githubusercontent.com/jhl-labs/sepilot-cli/main/install.sh | bash -s -- --version v0.6
+```bash
+curl -fsSL https://raw.githubusercontent.com/jhl-labs/sepilot-cli/main/install.sh | bash
+```
+또는 
+
+- 특정 버전 설치
+```bash
+curl -fsSL https://raw.githubusercontent.com/jhl-labs/sepilot-cli/main/install.sh | bash -s -- --version v0.6.1
 ```
 
 `~/.local/bin/`에 `sepilot`과 `sepilot-lsp`가 설치됩니다. `~/.local/bin`이 PATH에 없다면 셸 프로필에 추가하세요:
