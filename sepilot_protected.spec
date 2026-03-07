@@ -20,6 +20,8 @@ import os
 import sys
 from pathlib import Path
 
+IS_WINDOWS = sys.platform == 'win32'
+
 # Project root
 ROOT = Path(SPECPATH)
 SOURCE_DIR = Path(os.environ.get("SEPILOT_SOURCE_DIR", str(ROOT / "sepilot")))
@@ -180,17 +182,12 @@ exe = EXE(
     name='sepilot',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,  # Strip debug symbols
-    upx=True,    # Enable UPX compression
+    strip=not IS_WINDOWS,  # Strip debug symbols (not supported on Windows)
+    upx=not IS_WINDOWS,    # UPX compression (disabled on Windows - corrupts DLLs)
     upx_exclude=[
-        # Some libraries don't work well with UPX
         'libpython*.so*',
         'libcrypto*.so*',
         'libssl*.so*',
-        # Windows DLLs
-        'python*.dll',
-        'vcruntime*.dll',
-        'ucrtbase*.dll',
     ],
     runtime_tmpdir=None,
     console=True,
@@ -245,16 +242,12 @@ exe_lsp = EXE(
     name='sepilot-lsp',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,
-    upx=True,
+    strip=not IS_WINDOWS,
+    upx=not IS_WINDOWS,
     upx_exclude=[
         'libpython*.so*',
         'libcrypto*.so*',
         'libssl*.so*',
-        # Windows DLLs
-        'python*.dll',
-        'vcruntime*.dll',
-        'ucrtbase*.dll',
     ],
     runtime_tmpdir=None,
     console=True,

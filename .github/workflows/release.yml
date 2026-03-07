@@ -55,10 +55,6 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install upx
 
-      - name: Install UPX (Windows)
-        if: runner.os == 'Windows'
-        run: choco install upx -y
-
       - name: Build with PyInstaller
         run: |
           export SEPILOT_SOURCE_DIR="$(pwd)/sepilot"
