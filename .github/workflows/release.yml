@@ -16,9 +16,15 @@ jobs:
           - os: ubuntu-latest
             artifact: sepilot-linux-amd64
             lsp_artifact: sepilot-lsp-linux-amd64
+            ext: ''
           - os: macos-latest
             artifact: sepilot-darwin-amd64
             lsp_artifact: sepilot-lsp-darwin-amd64
+            ext: ''
+          - os: windows-latest
+            artifact: sepilot-windows-amd64.exe
+            lsp_artifact: sepilot-lsp-windows-amd64.exe
+            ext: '.exe'
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -49,15 +55,21 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install upx
 
+      - name: Install UPX (Windows)
+        if: runner.os == 'Windows'
+        run: choco install upx -y
+
       - name: Build with PyInstaller
         run: |
           export SEPILOT_SOURCE_DIR="$(pwd)/sepilot"
           uv run pyinstaller sepilot_protected.spec --clean --noconfirm
+        shell: bash
 
       - name: Rename artifacts
         run: |
-          mv dist/sepilot dist/${{ matrix.artifact }}
-          mv dist/sepilot-lsp dist/${{ matrix.lsp_artifact }}
+          mv dist/sepilot${{ matrix.ext }} dist/${{ matrix.artifact }}
+          mv dist/sepilot-lsp${{ matrix.ext }} dist/${{ matrix.lsp_artifact }}
+        shell: bash
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

@@ -2,6 +2,14 @@
 
 이 프로젝트의 모든 주요 변경사항을 기록합니다. [Keep a Changelog](https://keepachangelog.com/) 형식을 따릅니다.
 
+## [0.6.0] - 2026-03-07
+
+### Added
+- Windows 빌드 지원 (GitHub Actions matrix에 windows-latest 추가)
+
+### Changed
+- Release workflow에 Linux, macOS, Windows 3개 플랫폼 빌드 통합
+
 ## [0.1.0] - 2026-03-07
 
 ### Added
