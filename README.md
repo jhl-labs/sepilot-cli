@@ -17,15 +17,32 @@
 
 ## 설치
 
-### 요구사항
+### 바이너리 설치 (권장)
 
-- Python >= 3.10
-- [uv](https://github.com/astral-sh/uv) (패키지 관리자)
+Python 환경 없이 바로 사용할 수 있는 단일 실행 파일을 설치합니다.
+
+```bash
+# 최신 버전 설치
+curl -fsSL https://raw.githubusercontent.com/jhl-labs/sepilot-cli/main/install.sh | bash
+
+# 특정 버전 설치
+curl -fsSL https://raw.githubusercontent.com/jhl-labs/sepilot-cli/main/install.sh | bash -s -- --version v0.6
+```
+
+`~/.local/bin/`에 `sepilot`과 `sepilot-lsp`가 설치됩니다. `~/.local/bin`이 PATH에 없다면 셸 프로필에 추가하세요:
+
+```bash
+export PATH="${HOME}/.local/bin:${PATH}"
+```
 
 ### 소스에서 설치
 
+개발 또는 기여 목적으로 소스에서 직접 설치할 수 있습니다.
+
+**요구사항:** Python >= 3.10, [uv](https://github.com/astral-sh/uv)
+
 ```bash
-git clone https://github.com/yourrepo/sepilot-cli.git
+git clone https://github.com/jhl-labs/sepilot-cli.git
 cd sepilot-cli
 
 # 의존성 설치
