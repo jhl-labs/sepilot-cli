@@ -319,7 +319,7 @@ class MCPClient:
                 },
                 "clientInfo": {
                     "name": "sepilot",
-                    "version": "0.1.0"
+                    "version": __import__("sepilot").__version__
                 }
             }
         )

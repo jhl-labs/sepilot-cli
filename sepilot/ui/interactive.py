@@ -115,17 +115,18 @@ from sepilot.utils.text import sanitize_text
 def _get_version_info() -> str:
     """Get version info based on dev/production mode.
 
-    Dev mode (running from git repo): returns commit hash
+    Dev mode (running from git repo): returns version + commit hash
     Production mode (installed package): returns version string
     """
+    from sepilot import __version__
+    version = f"v{__version__}"
+
     # Check if running from git repository (dev mode)
     try:
-        # Check if .git directory exists in project root
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         git_dir = os.path.join(project_root, ".git")
 
         if os.path.isdir(git_dir):
-            # Dev mode - get git commit hash
             result = subprocess.run(
                 ["git", "rev-parse", "--short", "HEAD"],
                 cwd=project_root,
@@ -135,16 +136,11 @@ def _get_version_info() -> str:
             )
             if result.returncode == 0:
                 commit_hash = result.stdout.strip()
-                return f"dev ({commit_hash})"
+                return f"{version}-dev ({commit_hash})"
     except Exception:
         pass
 
-    # Production mode - return version from package
-    try:
-        from sepilot import __version__
-        return f"v{__version__}"
-    except ImportError:
-        return "unknown"
+    return version
 
 
 def _build_shell_command(command: str) -> list[str]:

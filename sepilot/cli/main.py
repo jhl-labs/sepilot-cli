@@ -352,6 +352,7 @@ def _run_interactive_mode(
 
 
 @click.command()
+@click.version_option(version=__import__("sepilot").__version__, prog_name="SEPilot")
 @click.argument("prompt_arg", required=False, default=None)
 @click.option(
     "--prompt", "-p",

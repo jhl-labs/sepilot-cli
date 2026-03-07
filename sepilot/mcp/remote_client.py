@@ -130,7 +130,7 @@ class MCPHttpClient:
                 },
                 "clientInfo": {
                     "name": "sepilot",
-                    "version": "0.1.0",
+                    "version": __import__("sepilot").__version__,
                 },
             },
         )
@@ -352,7 +352,7 @@ class MCPSSEClient:
             {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "sepilot", "version": "0.1.0"},
+                "clientInfo": {"name": "sepilot", "version": __import__("sepilot").__version__},
             },
         )
 
