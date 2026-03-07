@@ -49,6 +49,9 @@ def handle_model_command(
         help_text = """
 [bold cyan]🤖 Model Configuration Commands[/bold cyan]
 
+[bold yellow]🚀 Quick Setup:[/bold yellow]
+  [cyan]/model setup[/cyan]                 API에서 모델 목록 조회 후 선택 (추천)
+
 [bold yellow]📊 View Configuration:[/bold yellow]
   [cyan]/model[/cyan]                       Show current configuration
   [cyan]/model show[/cyan]                  Show current configuration
@@ -126,6 +129,12 @@ def handle_model_command(
     elif command == "profile":
         return _handle_model_profile(
             input_text, parts, model_profile_manager, agent, console,
+            create_llm_func, agent_factory=agent_factory
+        )
+
+    elif command == "setup":
+        return _handle_model_setup(
+            model_profile_manager, agent, console,
             create_llm_func, agent_factory=agent_factory
         )
 
@@ -456,6 +465,148 @@ def _handle_model_profile(
     else:
         console.print(f"[yellow]⚠️  Unknown profile command: {subcommand}[/yellow]")
         console.print("[dim]Valid commands: list, save, load, delete, show, default[/dim]")
+
+    return None
+
+
+def _handle_model_setup(
+    model_profile_manager: Any,
+    agent: Any,
+    console: Console,
+    create_llm_func: Callable,
+    agent_factory: Callable | None = None
+) -> Any | None:
+    """Handle /model setup - interactive model selection via /v1/models API.
+
+    Returns:
+        A new agent instance if one was created via agent_factory, else None.
+    """
+    from sepilot.ui.setup_wizard import _fetch_models, _select_model_arrow_keys
+
+    # Get current base_url as default
+    config = model_profile_manager.get_current_config()
+    current_base_url = config.base_url or ""
+
+    # Also check agent settings and env vars for fallback
+    if not current_base_url and agent:
+        settings = getattr(agent, "settings", None)
+        if settings:
+            current_base_url = getattr(settings, "api_base_url", "") or ""
+    if not current_base_url:
+        current_base_url = (
+            os.getenv("OPENAI_API_BASE") or
+            os.getenv("LLM_BASE_URL") or
+            os.getenv("API_BASE_URL") or
+            os.getenv("OLLAMA_BASE_URL") or
+            ""
+        )
+
+    default_url = current_base_url or "http://localhost:11434"
+
+    # Step 1: API Base URL
+    console.print()
+    console.print("[bold cyan]Model Setup[/bold cyan]")
+    console.print("[dim]OpenAI 호환 API에서 모델을 선택합니다.[/dim]")
+    console.print()
+
+    try:
+        from prompt_toolkit import prompt as pt_prompt
+        from prompt_toolkit.formatted_text import HTML
+        base_url = pt_prompt(
+            HTML("<b>Base URL: </b>"),
+            default=default_url,
+        )
+    except ImportError:
+        base_url = input(f"Base URL [{default_url}]: ").strip() or default_url
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[dim]취소되었습니다.[/dim]")
+        return None
+
+    base_url = base_url.strip()
+    if not base_url:
+        base_url = default_url
+
+    # Step 2: API Key
+    current_api_key = config.api_key or ""
+    console.print()
+    try:
+        from prompt_toolkit import prompt as pt_prompt
+        from prompt_toolkit.formatted_text import HTML
+        api_key = pt_prompt(
+            HTML("<b>API Key</b> <style bg='default' fg='gray'>(Enter to skip)</style><b>: </b>"),
+            default="",
+            is_password=True,
+        )
+    except ImportError:
+        api_key = input("API Key (Enter to skip): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[dim]취소되었습니다.[/dim]")
+        return None
+
+    api_key = api_key.strip() or current_api_key or None
+
+    # Step 3: Fetch models
+    console.print()
+    console.print(f"[dim]{base_url} 에서 모델 목록을 가져오는 중...[/dim]")
+
+    try:
+        import httpx
+        models = _fetch_models(base_url, api_key)
+    except Exception as e:
+        console.print(f"[red]모델 목록 조회 실패: {e}[/red]")
+        return None
+
+    if not models:
+        console.print("[yellow]사용 가능한 모델이 없습니다.[/yellow]")
+        return None
+
+    console.print(f"[green]{len(models)}개 모델 발견[/green]")
+
+    # Step 4: Select model
+    selected_model = _select_model_arrow_keys(models, console)
+    if not selected_model:
+        console.print("\n[dim]모델 선택이 취소되었습니다.[/dim]")
+        return None
+
+    console.print(f"\n[green]선택된 모델: {selected_model}[/green]")
+
+    # Step 5: Apply config
+    model_profile_manager.set_parameter("base_url", base_url)
+    model_profile_manager.set_parameter("model", selected_model)
+    model_profile_manager.set_parameter("max_tokens", "16000")
+    model_profile_manager.set_parameter("temperature", "0.3")
+    if api_key:
+        model_profile_manager.set_parameter("api_key", api_key)
+
+    # Save profile
+    try:
+        model_profile_manager.save_profile("default-setup")
+        model_profile_manager.set_default_profile("default-setup")
+        console.print("[dim]프로필 'default-setup' 저장됨[/dim]")
+    except Exception:
+        pass
+
+    # Auto-apply to agent
+    console.print()
+    new_config = model_profile_manager.get_current_config()
+    if agent:
+        apply_ok = apply_model_config_to_agent(agent, new_config, console, create_llm_func)
+        if apply_ok:
+            console.print("[green]설정이 적용되었습니다.[/green]")
+            if hasattr(model_profile_manager, "clear_dirty_parameters"):
+                model_profile_manager.clear_dirty_parameters()
+        else:
+            console.print("[yellow]적용 실패. /model apply 로 재시도하세요.[/yellow]")
+    elif agent_factory:
+        try:
+            new_agent = agent_factory(new_config)
+            if new_agent:
+                console.print("[green]에이전트가 초기화되었습니다.[/green]")
+                if hasattr(model_profile_manager, "clear_dirty_parameters"):
+                    model_profile_manager.clear_dirty_parameters()
+                return new_agent
+        except Exception as e:
+            console.print(f"[red]에이전트 생성 실패: {e}[/red]")
 
     return None
 

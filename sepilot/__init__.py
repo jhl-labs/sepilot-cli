@@ -1,6 +1,6 @@
 """SE Pilot - Intelligent CLI Agent for Software Engineering"""
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 # Configure bundled tiktoken data for offline use.
 # tiktoken downloads encoding files on first use; by pointing

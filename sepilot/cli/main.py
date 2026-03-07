@@ -698,11 +698,18 @@ def main(
         else:
             console.print("[yellow]Warning: --stdin specified but no piped input detected[/yellow]")
 
-    # Check that prompt is provided if not in interactive mode or listing threads
+    # No prompt given → default to interactive mode
     if not prompt:
-        console.print("[bold red]Error: --prompt is required when not using --interactive or --list-threads[/bold red]")
-        console.print("[dim]Tip: Use --stdin to read from pipe, or -i for interactive mode[/dim]")
-        sys.exit(1)
+        _run_interactive_mode(
+            model=model,
+            log_dir=log_dir,
+            verbose=verbose,
+            thread_id=thread_id,
+            max_iterations=max_iterations,
+            prompt_profile=prompt_profile,
+            no_memory=no_memory
+        )
+        return
 
     # Try E2E script if available (development feature)
     if HAS_E2E:

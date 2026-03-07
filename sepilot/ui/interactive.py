@@ -108,6 +108,7 @@ from sepilot.ui.key_bindings import create_key_bindings
 from sepilot.ui.memory_manager import MemoryManager
 from sepilot.ui.output_overlays import OutputOverlayManager, TeeOutput
 from sepilot.ui.reference_expander import ReferenceExpander
+from sepilot.ui.setup_wizard import needs_setup, run_setup_wizard
 from sepilot.ui.themes import get_theme_manager, set_theme
 from sepilot.utils.text import sanitize_text
 
@@ -621,6 +622,29 @@ class InteractiveMode:
         self.running = True
         # Show welcome/help on initial launch
         self._show_welcome()
+
+        # First-run setup wizard (if no model configured)
+        if needs_setup():
+            wizard_result = run_setup_wizard(self.console)
+            if wizard_result:
+                from sepilot.config.model_profile import ModelConfig
+
+                config = ModelConfig(
+                    base_url=wizard_result.get("base_url"),
+                    model=wizard_result.get("model"),
+                    api_key=wizard_result.get("api_key"),
+                )
+                self.model_profile_manager.current_config = config
+                if self.agent:
+                    apply_ok = apply_model_config_to_agent(
+                        self.agent, config, self.console,
+                        lambda c: create_llm_from_config(c, self.agent, self.console)
+                    )
+                    if not apply_ok and self.agent_factory:
+                        new_agent = self.agent_factory(config)
+                        if new_agent:
+                            self.agent = new_agent
+                            self._context_display_manager.agent = new_agent
 
         # Auto-load default profile if set
         try:
