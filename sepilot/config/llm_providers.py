@@ -33,6 +33,20 @@ from sepilot.config.settings import Settings
 logger = logging.getLogger(__name__)
 
 
+def _ensure_versioned_base_url(base_url: str) -> str:
+    """Ensure base URL has a versioned path suffix for OpenAI compatibility.
+
+    - Already versioned (e.g. /v1, /v4, /api/paas/v4) → keep as-is
+    - No version suffix → append /v1
+    """
+    import re
+
+    stripped = base_url.rstrip("/")
+    if re.search(r"/v\d+$", stripped):
+        return stripped
+    return stripped + "/v1"
+
+
 def create_http_client(settings: Settings, async_client: bool = False) -> httpx.Client | httpx.AsyncClient:
     """Create an HTTP client with proxy and SSL configuration.
 
@@ -356,7 +370,7 @@ class LLMProviderFactory:
             }
 
             if self.settings.api_base_url:
-                llm_kwargs["openai_api_base"] = self.settings.api_base_url
+                llm_kwargs["openai_api_base"] = _ensure_versioned_base_url(self.settings.api_base_url)
 
             if custom_headers:
                 llm_kwargs["default_headers"] = custom_headers
@@ -384,9 +398,8 @@ class LLMProviderFactory:
         if not base_url:
             base_url = "http://localhost:11434"
 
-        # Ensure /v1 suffix for OpenAI compatibility
-        if not base_url.rstrip("/").endswith("/v1"):
-            base_url = base_url.rstrip("/") + "/v1"
+        # Ensure versioned path suffix for OpenAI compatibility
+        base_url = _ensure_versioned_base_url(base_url)
 
         api_key = self.settings.ollama_api_key or os.getenv("OLLAMA_API_KEY", "ollama")
 
@@ -644,9 +657,8 @@ class LLMProviderFactory:
                     f"[yellow]Unknown model '{model_name}'. Trying local Ollama at {base_url}[/yellow]"
                 )
 
-        # Ensure /v1 suffix
-        if not base_url.rstrip("/").endswith("/v1"):
-            base_url = base_url.rstrip("/") + "/v1"
+        # Ensure versioned path suffix
+        base_url = _ensure_versioned_base_url(base_url)
 
         api_key = (
             self.settings.openai_api_key
