@@ -187,6 +187,10 @@ exe = EXE(
         'libpython*.so*',
         'libcrypto*.so*',
         'libssl*.so*',
+        # Windows DLLs
+        'python*.dll',
+        'vcruntime*.dll',
+        'ucrtbase*.dll',
     ],
     runtime_tmpdir=None,
     console=True,
@@ -247,6 +251,10 @@ exe_lsp = EXE(
         'libpython*.so*',
         'libcrypto*.so*',
         'libssl*.so*',
+        # Windows DLLs
+        'python*.dll',
+        'vcruntime*.dll',
+        'ucrtbase*.dll',
     ],
     runtime_tmpdir=None,
     console=True,
