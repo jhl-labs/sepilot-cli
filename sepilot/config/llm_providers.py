@@ -616,7 +616,9 @@ class LLMProviderFactory:
             from langchain_openai import ChatOpenAI
 
             # Allow custom GitHub Models base URL via environment variable
-            base_url = os.getenv("GITHUB_MODELS_API_BASE", "https://models.inference.ai.azure.com")
+            base_url = _ensure_versioned_base_url(
+                os.getenv("GITHUB_MODELS_API_BASE", "https://models.inference.ai.azure.com")
+            )
 
             llm_kwargs = {
                 "model": model_name,

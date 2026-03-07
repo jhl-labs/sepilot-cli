@@ -919,7 +919,8 @@ class ReactAgent:
         if api_key:
             llm_params['openai_api_key'] = api_key
         if base_url:
-            llm_params['openai_api_base'] = base_url
+            from sepilot.config.llm_providers import _ensure_versioned_base_url
+            llm_params['openai_api_base'] = _ensure_versioned_base_url(base_url)
         llm_params.update(kwargs)
 
         self.llm = ChatOpenAI(**llm_params)

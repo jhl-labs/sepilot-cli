@@ -365,15 +365,15 @@ class WebFetchTool(BaseTool):
                     "temperature": 0.3,
                 }
                 if settings.api_base_url:
-                    llm_kwargs["openai_api_base"] = settings.api_base_url
+                    from sepilot.config.llm_providers import _ensure_versioned_base_url
+                    llm_kwargs["openai_api_base"] = _ensure_versioned_base_url(settings.api_base_url)
                 return ChatOpenAI(**llm_kwargs)
 
             # Ollama - use same model (no standard lightweight option)
             elif settings.ollama_base_url:
                 from langchain_openai import ChatOpenAI
-                base_url = settings.ollama_base_url
-                if not base_url.rstrip("/").endswith("/v1"):
-                    base_url = base_url.rstrip("/") + "/v1"
+                from sepilot.config.llm_providers import _ensure_versioned_base_url
+                base_url = _ensure_versioned_base_url(settings.ollama_base_url)
                 return ChatOpenAI(
                     model=model_name,
                     openai_api_key=settings.ollama_api_key or "ollama",
@@ -385,9 +385,10 @@ class WebFetchTool(BaseTool):
             # Default: OpenAI-compatible
             else:
                 from langchain_openai import ChatOpenAI
-                base_url = settings.api_base_url or "http://localhost:11434/v1"
-                if not base_url.rstrip("/").endswith("/v1"):
-                    base_url = base_url.rstrip("/") + "/v1"
+                from sepilot.config.llm_providers import _ensure_versioned_base_url
+                base_url = _ensure_versioned_base_url(
+                    settings.api_base_url or "http://localhost:11434"
+                )
                 api_key = settings.openai_api_key or settings.ollama_api_key or "ollama"
                 return ChatOpenAI(
                     model=model_name,
