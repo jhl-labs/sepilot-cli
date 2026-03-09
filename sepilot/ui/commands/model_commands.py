@@ -549,24 +549,43 @@ def _handle_model_setup(
     console.print()
     console.print(f"[dim]{base_url} 에서 모델 목록을 가져오는 중...[/dim]")
 
+    selected_model = None
     try:
         import httpx
         models = _fetch_models(base_url, api_key)
     except Exception as e:
         console.print(f"[red]모델 목록 조회 실패: {e}[/red]")
-        return None
+        models = []
 
-    if not models:
-        console.print("[yellow]사용 가능한 모델이 없습니다.[/yellow]")
-        return None
+    if models:
+        console.print(f"[green]{len(models)}개 모델 발견[/green]")
 
-    console.print(f"[green]{len(models)}개 모델 발견[/green]")
+        # Step 4: Select model
+        selected_model = _select_model_arrow_keys(models, console)
+        if not selected_model:
+            console.print("\n[dim]모델 선택이 취소되었습니다.[/dim]")
+            return None
+    else:
+        # Fallback: manual model name input
+        if not models:
+            console.print("[yellow]모델 목록을 가져올 수 없습니다. 직접 입력해주세요.[/yellow]")
+        console.print()
+        try:
+            from prompt_toolkit import prompt as pt_prompt
+            from prompt_toolkit.formatted_text import HTML
+            selected_model = pt_prompt(
+                HTML("<b>모델명 입력: </b>"),
+                default="",
+            ).strip()
+        except ImportError:
+            selected_model = input("모델명 입력: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]취소되었습니다.[/dim]")
+            return None
 
-    # Step 4: Select model
-    selected_model = _select_model_arrow_keys(models, console)
-    if not selected_model:
-        console.print("\n[dim]모델 선택이 취소되었습니다.[/dim]")
-        return None
+        if not selected_model:
+            console.print("[dim]모델명이 입력되지 않았습니다.[/dim]")
+            return None
 
     console.print(f"\n[green]선택된 모델: {selected_model}[/green]")
 
