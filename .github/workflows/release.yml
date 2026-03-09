@@ -51,6 +51,9 @@ jobs:
           uv sync
           uv pip install pyinstaller
 
+      - name: Download tiktoken data for offline use
+        run: uv run python scripts/download_tiktoken_data.py
+
       - name: Install UPX (Linux)
         if: runner.os == 'Linux'
         run: |
