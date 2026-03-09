@@ -9,14 +9,61 @@ permissions:
   contents: write
 
 jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: |
+          uv python install 3.10
+          uv sync
+          uv pip install pyinstaller
+
+      - name: Download tiktoken data for offline use
+        run: uv run python scripts/download_tiktoken_data.py
+
+      - name: Install UPX
+        run: |
+          UPX_VERSION="4.2.4"
+          curl -sL "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz" -o /tmp/upx.tar.xz
+          tar -xf /tmp/upx.tar.xz -C /tmp
+          cp "/tmp/upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/
+          rm -rf /tmp/upx*
+
+      - name: Build with PyInstaller
+        run: |
+          export SEPILOT_SOURCE_DIR="$(pwd)/sepilot"
+          uv run pyinstaller sepilot_protected.spec --clean --noconfirm
+        shell: bash
+
+      - name: Rename artifacts
+        run: |
+          mv dist/sepilot dist/sepilot-linux-amd64
+          mv dist/sepilot-lsp dist/sepilot-lsp-linux-amd64
+        shell: bash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sepilot-linux-amd64
+          path: |
+            dist/sepilot-linux-amd64
+            dist/sepilot-lsp-linux-amd64
+
   build:
     strategy:
       matrix:
         include:
-          - os: ubuntu-22.04
-            artifact: sepilot-linux-amd64
-            lsp_artifact: sepilot-lsp-linux-amd64
-            ext: ''
           - os: macos-latest
             artifact: sepilot-darwin-amd64
             lsp_artifact: sepilot-lsp-darwin-amd64
@@ -54,15 +101,6 @@ jobs:
       - name: Download tiktoken data for offline use
         run: uv run python scripts/download_tiktoken_data.py
 
-      - name: Install UPX (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          UPX_VERSION="4.2.4"
-          curl -sL "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz" -o /tmp/upx.tar.xz
-          tar -xf /tmp/upx.tar.xz -C /tmp
-          sudo cp "/tmp/upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/
-          rm -rf /tmp/upx*
-
       - name: Install UPX (macOS)
         if: runner.os == 'macOS'
         run: brew install upx
@@ -88,7 +126,7 @@ jobs:
             dist/${{ matrix.lsp_artifact }}
 
   release:
-    needs: build
+    needs: [build-linux, build]
     runs-on: ubuntu-latest
 
     steps:
