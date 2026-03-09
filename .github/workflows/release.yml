@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             artifact: sepilot-linux-amd64
             lsp_artifact: sepilot-lsp-linux-amd64
             ext: ''
