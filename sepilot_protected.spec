@@ -27,6 +27,11 @@ ROOT = Path(SPECPATH)
 SOURCE_DIR = Path(os.environ.get("SEPILOT_SOURCE_DIR", str(ROOT / "sepilot")))
 ENTRYPOINT = SOURCE_DIR / "cli" / "main.py"
 
+# Runtime hooks (executed before app entry point)
+runtime_hooks_list = [
+    str(ROOT / 'scripts' / 'pyi_rth_tiktoken.py'),
+]
+
 # Collect data files
 datas = [
     # Prompt templates
@@ -147,7 +152,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=runtime_hooks_list,
     excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -210,7 +215,7 @@ a_lsp = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=runtime_hooks_list,
     excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
