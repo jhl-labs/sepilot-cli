@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -190,11 +191,14 @@ def install_server(language: str) -> tuple[bool, str]:
     try:
         import shlex
         logger.info(f"Installing {config.name}: {config.install_command}")
+        # Windows requires shell=True to find .cmd/.bat executables (e.g. npm.cmd)
+        use_shell = sys.platform == "win32"
         result = subprocess.run(
-            shlex.split(config.install_command),
+            config.install_command if use_shell else shlex.split(config.install_command),
             capture_output=True,
             text=True,
             timeout=300,
+            shell=use_shell,
         )
 
         if result.returncode == 0:

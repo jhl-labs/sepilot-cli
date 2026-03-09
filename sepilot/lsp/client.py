@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,8 @@ class LSPClient:
             cmd = self.config.get_full_command()
             logger.info(f"Starting LSP server: {' '.join(cmd)}")
 
+            # Windows requires shell=True to find .cmd/.bat executables
+            use_shell = sys.platform == "win32"
             self._process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -81,6 +84,7 @@ class LSPClient:
                 stderr=subprocess.PIPE,
                 cwd=str(self.workspace_root),
                 env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                shell=use_shell,
             )
 
             self._running = True
