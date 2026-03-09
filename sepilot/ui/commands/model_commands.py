@@ -589,7 +589,67 @@ def _handle_model_setup(
 
     console.print(f"\n[green]선택된 모델: {selected_model}[/green]")
 
-    # Step 5: Apply config
+    # Step 5: Custom headers (optional)
+    while True:
+        console.print()
+        console.print("[bold cyan]Custom HTTP Header 설정[/bold cyan]")
+        console.print("  [dim]1) 헤더 추가[/dim]")
+        console.print("  [dim]2) 완료 (설정 적용)[/dim]")
+
+        # Show current headers if any
+        current_headers = model_profile_manager.get_current_config().custom_headers
+        if current_headers:
+            console.print()
+            for k, v in current_headers.items():
+                console.print(f"  [dim]{k}: {v}[/dim]")
+
+        console.print()
+        try:
+            from prompt_toolkit import prompt as pt_prompt
+            from prompt_toolkit.formatted_text import HTML
+            choice = pt_prompt(
+                HTML("<b>선택 (1/2): </b>"),
+                default="2",
+            ).strip()
+        except ImportError:
+            choice = input("선택 (1/2) [2]: ").strip() or "2"
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]취소되었습니다.[/dim]")
+            return None
+
+        if choice == "1":
+            try:
+                header_key = pt_prompt(
+                    HTML("<b>Header 이름: </b>"),
+                    default="",
+                ).strip()
+                if not header_key:
+                    console.print("[dim]건너뛰었습니다.[/dim]")
+                    continue
+                header_value = pt_prompt(
+                    HTML("<b>Header 값: </b>"),
+                    default="",
+                ).strip()
+                if not header_value:
+                    console.print("[dim]건너뛰었습니다.[/dim]")
+                    continue
+            except ImportError:
+                header_key = input("Header 이름: ").strip()
+                if not header_key:
+                    continue
+                header_value = input("Header 값: ").strip()
+                if not header_value:
+                    continue
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]취소되었습니다.[/dim]")
+                return None
+
+            model_profile_manager.set_custom_header(header_key, header_value)
+            console.print(f"[green]헤더 추가됨: {header_key} = {header_value}[/green]")
+        else:
+            break
+
+    # Step 6: Apply config
     model_profile_manager.set_parameter("base_url", base_url)
     model_profile_manager.set_parameter("model", selected_model)
     model_profile_manager.set_parameter("max_tokens", "16000")
