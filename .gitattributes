@@ -1,0 +1,5 @@
+# Treat tiktoken cache files as binary to prevent CRLF conversion on Windows.
+# These files contain BPE encoding data that tiktoken validates via hash check.
+# Line ending conversion corrupts the hash, causing tiktoken to delete the
+# cached file and attempt a network download.
+sepilot/data/tiktoken/* binary
