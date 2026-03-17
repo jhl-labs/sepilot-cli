@@ -5,6 +5,8 @@ Provides auto-completion for @file references with fuzzy matching.
 
 import os
 
+from sepilot.ui.command_catalog import iter_completion_commands
+
 try:
     from prompt_toolkit.completion import Completer, Completion
     HAS_PROMPT_TOOLKIT = True
@@ -23,11 +25,13 @@ class FileReferenceCompleter(Completer):
         self._cache_ttl = 5  # Refresh cache every 5 seconds
         self._gitignore_patterns = None
         self._gitignore_timestamp = 0
-        self._max_files = 10000  # Maximum number of files to cache
+        self._max_files = int(os.getenv("SEPILOT_COMPLETER_MAX_FILES", "10000"))
+        self._max_dirs = int(os.getenv("SEPILOT_COMPLETER_MAX_DIRS", "1000"))
+        self._cache_limit_notice: str | None = None
 
         # Pre-compiled common ignore directory names for fast lookup
         self._ignored_dirs = {
-            '.git', 'node_modules', '__pycache__', 'venv', 'env',
+            '.git', '.venv', 'node_modules', '__pycache__', 'venv', 'env',
             'dist', 'build', '.pytest_cache', '.mypy_cache',
             '.tox', '.eggs', 'target', 'out', '.gradle', '.idea',
             '.vscode', '.next', '.nuxt', 'coverage', '.nyc_output'
@@ -65,10 +69,6 @@ class FileReferenceCompleter(Completer):
         # Fast check: common ignored directories (set lookup is O(1))
         basename = os.path.basename(path)
         if basename in self._ignored_dirs:
-            return True
-
-        # Fast check: hidden files/directories
-        if basename.startswith('.') and basename not in {'.', '..'}:
             return True
 
         # Fast check: common patterns
@@ -137,15 +137,17 @@ class FileReferenceCompleter(Completer):
 
         files = []
         file_count = 0
+        file_limit_hit = False
         try:
             # Walk through entire directory tree
             for root, dirs, filenames in os.walk(self.working_dir):
                 # Early exit if we've collected enough files
                 if file_count >= self._max_files:
+                    file_limit_hit = True
                     break
 
                 # Fast filter: remove ignored directories using set lookup
-                dirs[:] = [d for d in dirs if d not in self._ignored_dirs and not d.startswith('.')]
+                dirs[:] = [d for d in dirs if d not in self._ignored_dirs]
 
                 # Only check gitignore for remaining directories
                 if dirs:
@@ -161,11 +163,8 @@ class FileReferenceCompleter(Completer):
                 for filename in filenames:
                     # Early exit check
                     if file_count >= self._max_files:
+                        file_limit_hit = True
                         break
-
-                    # Skip hidden files
-                    if filename.startswith('.'):
-                        continue
 
                     # Skip common ignored file extensions
                     if filename.endswith(('.pyc', '.pyo', '.so', '.dylib')):
@@ -186,13 +185,14 @@ class FileReferenceCompleter(Completer):
 
             # Add directories for navigation (limited)
             dir_count = 0
-            max_dirs = 1000  # Limit number of directories
+            dir_limit_hit = False
             for root, dirs, _ in os.walk(self.working_dir):
-                if dir_count >= max_dirs:
+                if dir_count >= self._max_dirs:
+                    dir_limit_hit = True
                     break
 
                 # Fast filter: remove ignored directories
-                dirs[:] = [d for d in dirs if d not in self._ignored_dirs and not d.startswith('.')]
+                dirs[:] = [d for d in dirs if d not in self._ignored_dirs]
 
                 if dirs:
                     filtered_dirs = []
@@ -203,7 +203,8 @@ class FileReferenceCompleter(Completer):
                     dirs[:] = filtered_dirs
 
                 for dirname in dirs:
-                    if dir_count >= max_dirs:
+                    if dir_count >= self._max_dirs:
+                        dir_limit_hit = True
                         break
 
                     rel_path = os.path.relpath(os.path.join(root, dirname), self.working_dir)
@@ -216,6 +217,19 @@ class FileReferenceCompleter(Completer):
 
         except (OSError, PermissionError):
             pass
+
+        if file_limit_hit or dir_limit_hit:
+            notices = []
+            if file_limit_hit:
+                notices.append(f"{self._max_files:,} files")
+            if dir_limit_hit:
+                notices.append(f"{self._max_dirs:,} dirs")
+            joined = ", ".join(notices)
+            self._cache_limit_notice = (
+                f"Index capped at {joined}; refine the path or raise SEPILOT_COMPLETER_MAX_*"
+            )
+        else:
+            self._cache_limit_notice = None
 
         self._file_cache = files
         self._cache_timestamp = current_time
@@ -289,7 +303,7 @@ class FileReferenceCompleter(Completer):
             for file_info in all_files:
                 path = file_info['path']
                 # Only show top-level files/dirs
-                if '/' not in path:
+                if '/' not in path and not path.startswith('.'):
                     matches.append((0, file_info))
 
             # Sort by name
@@ -307,6 +321,13 @@ class FileReferenceCompleter(Completer):
                     start_position=0,
                     display=display_text,
                     display_meta='dir' if is_dir else 'file'
+                )
+            if self._cache_limit_notice:
+                yield Completion(
+                    text="",
+                    start_position=0,
+                    display="[index limited]",
+                    display_meta=self._cache_limit_notice[:70],
                 )
             return
 
@@ -340,6 +361,14 @@ class FileReferenceCompleter(Completer):
                 start_position=start_pos,
                 display=display_text,
                 display_meta=f'dir ({score})' if is_dir else f'file ({score})'
+            )
+
+        if self._cache_limit_notice:
+            yield Completion(
+                text=partial_path,
+                start_position=-len(partial_path),
+                display='[index limited]',
+                display_meta=self._cache_limit_notice[:70],
             )
 
     def get_completions(self, document, complete_event):
@@ -510,34 +539,9 @@ class FileReferenceCompleter(Completer):
 
         partial_lower = partial.lower()
 
-        # Built-in commands
         builtin_commands = [
-            ("help", "Show help message"),
-            ("exit", "Exit interactive mode"),
-            ("quit", "Exit interactive mode"),
-            ("status", "Show session status"),
-            ("history", "Show conversation history"),
-            ("clearscreen", "Clear screen"),
-            ("clear", "Clear conversation context"),
-            ("compact", "Compact conversation context"),
-            ("context", "Show context usage"),
-            ("cost", "Show session cost"),
-            ("model", "Model configuration"),
-            ("mcp", "MCP server management"),
-            ("rag", "RAG management"),
-            ("tools", "List available tools"),
-            ("skill", "Skills system"),
-            ("skills", "Skills system"),
-            ("commands", "Custom commands"),
-            ("graph", "Visualize workflow"),
-            ("new", "Start new conversation"),
-            ("rewind", "Rewind conversation"),
-            ("undo", "Undo last exchange"),
-            ("redo", "Redo undone exchange"),
-            ("resume", "Resume previous thread"),
-            ("reset", "Reset session stats"),
-            ("yolo", "Toggle auto-approve"),
-            ("multiline", "Toggle multiline input"),
+            (entry.name.lstrip('/'), entry.description)
+            for entry in iter_completion_commands()
         ]
 
         # Get custom commands
@@ -574,5 +578,5 @@ class FileReferenceCompleter(Completer):
                 text=cmd,
                 start_position=-len(partial),
                 display=f"/{cmd}",
-                display_meta=desc[:40]
+                display_meta=desc[:50]
             )

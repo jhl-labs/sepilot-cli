@@ -10,10 +10,13 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
+from sepilot.ui.input_utils import INPUT_CANCELLED, prompt_text
+
 
 def handle_permissions(
     console: Console,
     input_text: str,
+    session: Any | None = None,
 ) -> bool:
     """Handle permission commands.
 
@@ -42,7 +45,7 @@ def handle_permissions(
     if subcommand == "list":
         return _handle_permissions_list(console, permission_manager)
     elif subcommand == "add":
-        return _handle_permissions_add(console, permission_manager, args[2:])
+        return _handle_permissions_add(console, permission_manager, args[2:], session=session)
     elif subcommand == "remove" and len(args) > 2:
         return _handle_permissions_remove(console, permission_manager, args[2])
     elif subcommand == "reset":
@@ -121,23 +124,54 @@ def _handle_permissions_list(console: Console, permission_manager) -> bool:
     return True
 
 
-def _handle_permissions_add(console: Console, permission_manager, args: list[str]) -> bool:
+def _handle_permissions_add(
+    console: Console,
+    permission_manager,
+    args: list[str],
+    session: Any | None = None,
+) -> bool:
     """Add a new permission rule."""
     from sepilot.agent.permission_rules import PermissionLevel, PermissionRule
 
     # Interactive mode if no args
     if not args or len(args) < 3:
         console.print("[bold cyan]Add Permission Rule[/bold cyan]\n")
-        console.print("Usage: /permissions add <tool> <permission> <pattern> [description]")
-        console.print()
-        console.print("Examples:")
-        console.print("  /permissions add bash_execute allow 'npm install *'")
-        console.print("  /permissions add bash_execute ask 'git push*'")
-        console.print("  /permissions add file_write deny '/etc/*'")
-        console.print()
-        console.print("Tools: bash_execute, file_write, file_edit, file_read, git, *")
-        console.print("Permissions: allow, ask, deny")
-        return True
+        tool = prompt_text(
+            "Tool (*, bash_execute, file_write, file_edit, file_read, git): ",
+            session=session,
+        )
+        if tool == INPUT_CANCELLED:
+            console.print("[dim]Cancelled[/dim]")
+            return False
+
+        permission_str = prompt_text(
+            "Permission (allow/ask/deny) [ask]: ",
+            session=session,
+            default="ask",
+        )
+        if permission_str == INPUT_CANCELLED:
+            console.print("[dim]Cancelled[/dim]")
+            return False
+
+        pattern = prompt_text(
+            "Pattern [*]: ",
+            session=session,
+            default="*",
+        )
+        if pattern == INPUT_CANCELLED:
+            console.print("[dim]Cancelled[/dim]")
+            return False
+
+        description = prompt_text(
+            "Description (optional): ",
+            session=session,
+            default="",
+        )
+        if description == INPUT_CANCELLED:
+            console.print("[dim]Cancelled[/dim]")
+            return False
+
+        args = [tool or "*", permission_str or "ask", pattern or "*", description]
 
     tool = args[0]
     permission_str = args[1].lower()

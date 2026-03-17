@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
@@ -242,6 +243,11 @@ class InteractiveMode:
             if not enable_mouse and os.getenv('SSH_CONNECTION'):
                 enable_mouse = False
 
+            # Check if vi mode should be enabled (settings or env var)
+            vi_mode_enabled = os.getenv('SEPILOT_VI_MODE', '0') in ('1', 'true', 'yes')
+            if self.agent and hasattr(self.agent, 'settings'):
+                vi_mode_enabled = vi_mode_enabled or getattr(self.agent.settings, 'vi_mode', False)
+
             # SOLID: Key bindings (Single Responsibility)
             key_bindings = create_key_bindings(
                 on_show_result=self._show_last_result,
@@ -258,11 +264,15 @@ class InteractiveMode:
                 key_bindings=key_bindings,
                 completer=self.file_completer,
                 complete_while_typing=True,
-                complete_in_thread=False,
+                complete_in_thread=True,
                 mouse_support=enable_mouse,
+                vi_mode=vi_mode_enabled,
                 style=completion_style,
                 refresh_interval=0.1,
             )
+
+            if vi_mode_enabled:
+                self.console.print("[dim]Vi mode enabled (ESC for normal mode, i for insert)[/dim]")
         else:
             self.session = None
             self.file_completer = None
@@ -312,6 +322,11 @@ class InteractiveMode:
             '/exec': self._cmd_exec_mode,
             '/auto': self._cmd_auto_mode,
             '/mode': self._cmd_mode,
+            # DevOps commands
+            '/container': self._cmd_container,
+            '/helm': self._cmd_helm,
+            '/se': self._cmd_se,
+            '/gitops': self._cmd_gitops,
         }
 
         # Special commands
@@ -323,6 +338,33 @@ class InteractiveMode:
         # MCP configuration manager (lazy initialization)
         self._mcp_config_manager = None
 
+    # -- spinner + step_logger lifecycle helpers --
+
+    def _start_progress(self, message: str = "요청을 처리하고 있어요...") -> object | None:
+        """Start spinner and step_logger. Returns indicator (or None if verbose)."""
+        if getattr(self.agent, 'verbose', False) if self.agent else False:
+            return None
+        from sepilot.ui.status_indicator import AgentStatusIndicator
+        indicator = AgentStatusIndicator(self.console)
+        if self.agent and hasattr(self.agent, 'status_indicator'):
+            self.agent.status_indicator = indicator
+        indicator.start(message)
+        from sepilot.ui.step_logger import StepLogger
+        if self.agent and hasattr(self.agent, 'step_logger'):
+            self.agent.step_logger = StepLogger(
+                Console(stderr=True), enabled=True,
+            )
+        return indicator
+
+    def _stop_progress(self, indicator: object | None) -> None:
+        """Stop spinner and clean up step_logger."""
+        if indicator:
+            indicator.stop()  # type: ignore[union-attr]
+            if self.agent and hasattr(self.agent, 'status_indicator'):
+                self.agent.status_indicator = None
+        if self.agent and hasattr(self.agent, 'step_logger'):
+            self.agent.step_logger = None
+
     def _show_last_result(self) -> None:
         """Display the last command or agent output (delegates to overlay manager)."""
         self._overlay_manager.show_last_result()
@@ -331,45 +373,28 @@ class InteractiveMode:
         """Show captured execution logs (delegates to overlay manager)."""
         self._overlay_manager.show_execution_logs()
 
-    def _show_command_palette(self) -> None:
-        """Show command palette for quick command search (OpenCode style Ctrl+K)."""
+    def _show_command_palette(self, buffer: Any | None = None) -> None:
+        """Activate slash-command search or fall back to a static command list."""
+        if buffer is not None and HAS_PROMPT_TOOLKIT:
+            buffer.reset()
+            buffer.insert_text("/")
+            buffer.start_completion(select_first=False)
+            app = get_app_or_none()
+            if app is not None:
+                app.invalidate()
+            return
+
         from sepilot.ui.command_palette import create_default_palette
 
-        # Create palette with command handlers
         command_handlers = {
-            "/help": lambda: self._handle_input("/help"),
-            "/exit": lambda: self._handle_input("/exit"),
-            "/status": lambda: self._handle_input("/status"),
-            "/history": lambda: self._handle_input("/history"),
-            "/new": lambda: self._handle_input("/new"),
-            "/resume": lambda: self._handle_input("/resume"),
-            "/rewind": lambda: self._handle_input("/rewind"),
-            "/undo": lambda: self._handle_input("/undo"),
-            "/redo": lambda: self._handle_input("/redo"),
-            "/context": lambda: self._handle_input("/context"),
-            "/compact": lambda: self._handle_input("/compact"),
-            "/clear": lambda: self._handle_input("/clear"),
-            "/cost": lambda: self._handle_input("/cost"),
-            "/model": lambda: self._handle_input("/model"),
-            "/theme": lambda: self._handle_input("/theme"),
-            "/yolo": lambda: self._handle_input("/yolo"),
-            "/tools": lambda: self._handle_input("/tools"),
-            "/mcp": lambda: self._handle_input("/mcp"),
-            "/rag": lambda: self._handle_input("/rag"),
-            "/git": lambda: self._handle_input("/git"),
-            "/graph": lambda: self._handle_input("/graph"),
-            "/clearscreen": lambda: self._handle_input("/clearscreen"),
-            "/multiline": lambda: self._handle_input("/multiline"),
-            "/session": lambda: self._handle_input("/session"),
-            "/permissions": lambda: self._handle_input("/permissions"),
-            "/license": lambda: self._handle_input("/license"),
+            name: (lambda cmd=name: self._handle_input(cmd))
+            for name in self.special_commands
         }
 
         palette = create_default_palette(command_handlers)
 
-        # Display palette in a simple way (Rich-based)
         self.console.print()
-        self.console.print("[bold cyan]Command Palette[/bold cyan] [dim](type to search, Enter to select)[/dim]")
+        self.console.print("[bold cyan]Command Palette[/bold cyan] [dim](fallback list; type a command manually)[/dim]")
         self.console.print("[dim]" + "-" * 50 + "[/dim]")
 
         # Show all commands grouped by category
@@ -385,7 +410,7 @@ class InteractiveMode:
                 self.console.print(f"  [cyan]{cmd.name:<20}[/cyan] {cmd.description}")
 
         self.console.print()
-        self.console.print("[dim]Tip: Type the command directly at the prompt[/dim]")
+        self.console.print("[dim]Tip: with prompt_toolkit, Ctrl+X Ctrl+P opens slash-command search directly[/dim]")
         self.console.print()
 
     def _get_agent_session_metrics(self) -> dict[str, Any] | None:
@@ -686,6 +711,7 @@ class InteractiveMode:
                         )
                         self.session = None
                         try:
+                            prompt_text = f"({self._get_current_mode_label()}) sepilot> "
                             user_input = input(prompt_text)
                         except (UnicodeDecodeError, UnicodeError):
                             self.console.print("[yellow]⚠️  입력 인코딩 오류 (무시됨)[/yellow]")
@@ -702,9 +728,11 @@ class InteractiveMode:
                 # Handle input
                 self._handle_input(user_input)
 
-            except (EOFError, KeyboardInterrupt):
-                # Ctrl+D or Ctrl+C
-                self.console.print("\n[yellow]Use /exit or /quit to exit[/yellow]")
+            except EOFError:
+                self.console.print("\n[yellow]Use /exit, /quit, or Ctrl+D to exit[/yellow]")
+                continue
+            except KeyboardInterrupt:
+                self.console.print("\n[yellow]Input interrupted[/yellow]")
                 continue
             except Exception as e:
                 self.console.print(f"[red]Error: {e}[/red]")
@@ -854,23 +882,26 @@ class InteractiveMode:
                 file_content = ""
                 clean_args = cmd_args
                 if "@" in cmd_args:
-                    # Parse @file references
-                    file_refs = re.findall(r'@(\S+)', cmd_args)
+                    reference_entries = [
+                        ref for ref in self._reference_expander._extract_references(cmd_args)
+                        if ref[0] == "file"
+                    ]
                     file_contents = []
-                    for ref in file_refs:
-                        filepath = os.path.expanduser(ref)
+                    for _ref_type, ref_value, _span in reference_entries:
+                        filepath = os.path.expanduser(ref_value)
                         if os.path.isfile(filepath):
                             try:
                                 with open(filepath, encoding='utf-8', errors='replace') as f:
                                     content = f.read()
-                                file_contents.append(f"--- {ref} ---\n{content}")
-                                self.console.print(f"[dim]📎 Attached: {ref}[/dim]")
+                                file_contents.append(f"--- {ref_value} ---\n{content}")
+                                self.console.print(f"[dim]📎 Attached: {ref_value}[/dim]")
                             except Exception as e:
-                                self.console.print(f"[yellow]⚠️  Could not read {ref}: {e}[/yellow]")
+                                self.console.print(f"[yellow]⚠️  Could not read {ref_value}: {e}[/yellow]")
                     if file_contents:
                         file_content = "\n\n".join(file_contents)
-                    # Remove @file references from arguments
-                    clean_args = re.sub(r'@\S+', '', cmd_args).strip()
+                        clean_args = self._reference_expander._remove_reference_spans(
+                            cmd_args, reference_entries
+                        )
 
                 # Show execution status (Claude Code style)
                 self.console.print(f"[cyan]📜 /{cmd_name} is running...[/cyan]")
@@ -888,6 +919,7 @@ class InteractiveMode:
 
                 # Execute the expanded prompt through the agent
                 if self.execute_callback:
+                    cmd_indicator = self._start_progress(f"/{cmd_name} 실행 중...")
                     try:
                         result = self.execute_callback(expanded_prompt)
                         self._overlay_manager.update_result(
@@ -897,6 +929,8 @@ class InteractiveMode:
                         self.console.print(f"[green]✅ /{cmd_name} completed[/green]")
                     except Exception as e:
                         self.console.print(f"[red]❌ /{cmd_name} failed: {e}[/red]")
+                    finally:
+                        self._stop_progress(cmd_indicator)
                 return
 
             # No command matched
@@ -973,23 +1007,9 @@ class InteractiveMode:
         self._overlay_manager.clear_logs()
 
         # Start progress indicator (only in non-verbose mode)
-        indicator = None
-        agent_verbose = getattr(self.agent, 'verbose', False) if self.agent else False
+        indicator = self._start_progress()
 
-        if not agent_verbose:
-            from sepilot.ui.status_indicator import AgentStatusIndicator
-            indicator = AgentStatusIndicator(self.console)
-            if self.agent and hasattr(self.agent, 'status_indicator'):
-                self.agent.status_indicator = indicator
-            indicator.start("요청을 처리하고 있어요...")
-
-            # Attach step logger for interactive progress display
-            from sepilot.ui.step_logger import StepLogger
-            if self.agent and hasattr(self.agent, 'step_logger'):
-                self.agent.step_logger = StepLogger(
-                    Console(stderr=True), enabled=True,
-                )
-
+        interrupted = False
         try:
             # Setup tee output (using TeeOutput from output_overlays module)
             original_stdout = sys.stdout
@@ -1044,6 +1064,16 @@ class InteractiveMode:
                         )
                     except Exception:
                         pass  # Don't fail if undo/redo recording fails
+        except KeyboardInterrupt:
+            interrupted = True
+            message = "Execution interrupted by user"
+            self.console.print(f"\n[yellow]{message}[/yellow]")
+            self._overlay_manager.update_result(
+                message,
+                f"Agent response · {datetime.now().strftime('%H:%M:%S')}"
+            )
+            if self.manual_observer:
+                self.manual_observer(user_input, message)
         except Exception as e:
             self.console.print("[bold red]Error executing command:[/bold red]")
             self.console.print(f"[red]{str(e)}[/red]")
@@ -1051,14 +1081,11 @@ class InteractiveMode:
             if self.console.is_terminal:
                 self.console.print("[dim]" + traceback.format_exc() + "[/dim]")
         finally:
-            # Always stop the progress indicator
-            if indicator:
-                indicator.stop()
-                if self.agent and hasattr(self.agent, 'status_indicator'):
-                    self.agent.status_indicator = None
-            # Clean up step logger
-            if self.agent and hasattr(self.agent, 'step_logger'):
-                self.agent.step_logger = None
+            self._stop_progress(indicator)
+
+        if interrupted:
+            self.console.print()
+            return
 
         # Auto-compact check after each command (Claude Code style)
         self._check_auto_compact()
@@ -1084,7 +1111,7 @@ class InteractiveMode:
             f"[yellow]{elapsed_str}[/yellow]"
         )
         self.console.print(banner)
-        self.console.print("[dim]Ctrl+O last output · Ctrl+L execution logs · Ctrl+K clear screen · F2 status · /help · @file attach · !<cmd> shell[/dim]")
+        self.console.print("[dim]Ctrl+O last output · Ctrl+L execution logs · Ctrl+K clear screen · Ctrl+X Ctrl+P command search · F2 status · /help · @file attach · !<cmd> shell[/dim]")
 
     def _run_shell_command(self, command: str):
         """Execute a local shell command."""
@@ -1094,45 +1121,103 @@ class InteractiveMode:
 
         self.console.print(f"[magenta]$ {command}[/magenta]")
         start = datetime.now()
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        interrupted = False
+        process: subprocess.Popen[str] | None = None
+        stdout_thread: threading.Thread | None = None
+        stderr_thread: threading.Thread | None = None
+
+        def _stream_output(stream, chunks: list[str], *, style: str | None = None) -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    if not line:
+                        break
+                    chunks.append(line)
+                    if style:
+                        self.console.print(line.rstrip("\n"), style=style)
+                    else:
+                        self.console.print(line.rstrip("\n"))
+            finally:
+                stream.close()
+
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 _build_shell_command(command),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
+                bufsize=1,
                 env=os.environ
             )
-            duration = (datetime.now() - start).total_seconds()
-            stdout = result.stdout.strip()
-            stderr = result.stderr.strip()
+            if process.stdout is None or process.stderr is None:
+                raise RuntimeError("Failed to open process streams")
 
-            if stdout:
-                self.console.print(stdout)
-            if stderr:
-                self.console.print(f"[red]{stderr}[/red]")
-            if not stdout and not stderr:
-                self.console.print("[dim]No output[/dim]")
+            stdout_thread = threading.Thread(
+                target=_stream_output,
+                args=(process.stdout, stdout_chunks),
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=_stream_output,
+                args=(process.stderr, stderr_chunks),
+                kwargs={"style": "red"},
+                daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
 
-            meta_line = f"[dim]exit {result.returncode} · {duration:.2f}s[/dim]"
-            self.console.print(meta_line)
-
-            snapshot_lines = []
-            if stdout:
-                snapshot_lines.append(stdout)
-            if stderr:
-                snapshot_lines.append(f"(stderr)\n{stderr}")
-            if not snapshot_lines:
-                snapshot_lines.append("No output")
-            snapshot_lines.append(meta_line)
-            combined_output = "\n".join(snapshot_lines)
-            self._overlay_manager.update_result(combined_output, f"Shell: {command}")
-            if self.manual_observer:
-                self.manual_observer(command, combined_output)
+            process.wait()
+        except KeyboardInterrupt:
+            interrupted = True
+            if process and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
         except Exception as exc:
             err_msg = f"Failed to run command: {exc}"
             self.console.print(f"[red]{err_msg}[/red]")
             self._overlay_manager.update_result(err_msg, f"Shell: {command}")
             if self.manual_observer:
                 self.manual_observer(command, err_msg)
+            return
+        finally:
+            if stdout_thread:
+                stdout_thread.join()
+            if stderr_thread:
+                stderr_thread.join()
+
+        duration = (datetime.now() - start).total_seconds()
+        stdout = "".join(stdout_chunks).strip()
+        stderr = "".join(stderr_chunks).strip()
+
+        if interrupted:
+            self.console.print("[yellow]Command interrupted[/yellow]")
+        elif not stdout and not stderr:
+            self.console.print("[dim]No output[/dim]")
+
+        exit_code = process.returncode if process else -1
+        meta_status = "interrupted" if interrupted else f"exit {exit_code}"
+        meta_line = f"[dim]{meta_status} · {duration:.2f}s[/dim]"
+        self.console.print(meta_line)
+
+        snapshot_lines = []
+        if stdout:
+            snapshot_lines.append(stdout)
+        if stderr:
+            snapshot_lines.append(f"(stderr)\n{stderr}")
+        if interrupted and not snapshot_lines:
+            snapshot_lines.append("Command interrupted")
+        if not interrupted and not snapshot_lines:
+            snapshot_lines.append("No output")
+        snapshot_lines.append(meta_line)
+        combined_output = "\n".join(snapshot_lines)
+        self._overlay_manager.update_result(combined_output, f"Shell: {command}")
+        if self.manual_observer:
+            self.manual_observer(command, combined_output)
 
     def _handle_memory_command(self, body: str):
         """Process # memory commands (delegates to memory manager)."""
@@ -1295,9 +1380,13 @@ class InteractiveMode:
             self.console.print("[dim]Falling back to main agent...[/dim]")
             # Fallback: use main execute_callback
             if self.execute_callback:
-                result = self.execute_callback(task_description)
-                if result:
-                    self.console.print(result)
+                fb_indicator = self._start_progress()
+                try:
+                    result = self.execute_callback(task_description)
+                    if result:
+                        self.console.print(result)
+                finally:
+                    self._stop_progress(fb_indicator)
 
         except Exception as e:
             self.console.print(f"[red]Agent invocation error: {e}[/red]")
@@ -1321,8 +1410,10 @@ class InteractiveMode:
             self.console.print(f"[bold cyan]{line}[/bold cyan]")
         self.console.print(f"[dim]Interactive mode · {version_info}[/dim]")
         self.console.print("[dim]Prompt: ask naturally, @file, !cmd, #note[/dim]")
-        self.console.print("[dim]Quick keys: Ctrl+O output · Ctrl+L logs · Ctrl+K clear · F2 status[/dim]")
+        self.console.print("[dim]Quick keys: Ctrl+O output · Ctrl+L logs · Ctrl+K clear · Ctrl+X Ctrl+P command search · F2 status[/dim]")
         self.console.print("[dim]/help for full guide · /exit to quit[/dim]")
+        self._show_welcome_skills()
+        self._show_welcome_commands()
         self.console.print()
 
     def _show_welcome_skills(self):
@@ -1612,7 +1703,8 @@ Type `/license full` or see LICENSE.md in the project directory
             self.agent,
             self.console,
             lambda config: create_llm_from_config(config, self.agent, self.console),
-            agent_factory=self.agent_factory
+            agent_factory=self.agent_factory,
+            session=self.session,
         )
         # If a new agent was created (returned from handle_model_command)
         if result is not None and result is not self.agent:
@@ -1647,7 +1739,7 @@ Type `/license full` or see LICENSE.md in the project directory
 
     def _cmd_rag(self, _input: str):
         """RAG management - delegates to rag_commands module."""
-        handle_rag_command(_input, self.console)
+        handle_rag_command(_input, self.console, session=self.session)
 
     def _cmd_tools(self, _input: str):
         """List available tools - delegates to tools_commands module."""
@@ -1686,7 +1778,7 @@ Type `/license full` or see LICENSE.md in the project directory
 
     def _cmd_permissions(self, _input: str):
         """Permission rules management - delegates to permission_commands module."""
-        handle_permissions(self.console, _input)
+        handle_permissions(self.console, _input, session=self.session)
 
     def _cmd_session(self, _input: str):
         """Session export/import - delegates to session_commands module."""
@@ -1725,7 +1817,12 @@ Type `/license full` or see LICENSE.md in the project directory
 
     def _cmd_clearcontext(self, _input: str):
         """Clear all conversation context - delegates to context_commands module."""
-        handle_clear_context(self.console, self.conversation_context, self.agent)
+        handle_clear_context(
+            self.console,
+            self.conversation_context,
+            self.agent,
+            session=self.session,
+        )
 
     def _cmd_context(self, _input: str):
         """Show context usage visualization - delegates to context_commands module.

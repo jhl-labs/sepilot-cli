@@ -6,7 +6,7 @@ only key binding creation and configuration.
 Provides:
 - Custom key bindings for prompt_toolkit
 - @ reference completion triggers
-- Shortcut keys (Ctrl+O, Ctrl+L, Ctrl+K, F1, F2)
+- Shortcut keys (Ctrl+O, Ctrl+L, Ctrl+K, Ctrl+X Ctrl+P, F1, F2)
 - Double-escape rewind trigger
 """
 
@@ -40,7 +40,7 @@ class KeyBindingsManager:
         on_show_result: Callable[[], None] | None = None,
         on_show_logs: Callable[[], None] | None = None,
         on_rewind: Callable[[str], None] | None = None,
-        on_command_palette: Callable[[], None] | None = None,
+        on_command_palette: Callable[[Any | None], None] | None = None,
     ):
         """Initialize key bindings manager.
 
@@ -48,7 +48,7 @@ class KeyBindingsManager:
             on_show_result: Callback to show last execution result (Ctrl+O)
             on_show_logs: Callback to show execution logs (Ctrl+L)
             on_rewind: Callback to trigger rewind command (Esc+Esc)
-            on_command_palette: Callback to show command palette (Ctrl+K)
+            on_command_palette: Callback to show command palette (Ctrl+X Ctrl+P)
         """
         self._on_show_result = on_show_result
         self._on_show_logs = on_show_logs
@@ -159,21 +159,25 @@ class KeyBindingsManager:
             """Submit multi-line input."""
             event.current_buffer.validate_and_handle()
 
-        # Ctrl+K: Command palette (OpenCode style)
+        # Ctrl+K: Clear screen
         @kb.add('c-k')
         def handle_ctrl_k(event: 'KeyPressEvent') -> None:
-            """Open command palette (OpenCode style)."""
-            if self._on_command_palette:
-                self._on_command_palette()
-
-        # Ctrl+Shift+K: Clear screen (moved from Ctrl+K)
-        @kb.add('c-x', 'c-k')
-        def handle_ctrl_x_k(event: 'KeyPressEvent') -> None:
             """Clear screen."""
             if os.name == 'nt':
                 subprocess.run(["cmd", "/c", "cls"], check=False)
             else:
                 subprocess.run(["clear"], check=False)
+
+        # Ctrl+X Ctrl+P: Command palette
+        @kb.add('c-x', 'c-p')
+        def handle_ctrl_x_p(event: 'KeyPressEvent') -> None:
+            """Open command palette."""
+            if self._on_command_palette:
+                self._on_command_palette(event.current_buffer)
+            else:
+                event.current_buffer.reset()
+                event.current_buffer.insert_text("/")
+                event.current_buffer.start_completion(select_first=False)
 
         # F1: Show help
         @kb.add('f1')
@@ -214,7 +218,7 @@ def create_key_bindings(
     on_show_result: Callable[[], None] | None = None,
     on_show_logs: Callable[[], None] | None = None,
     on_rewind: Callable[[str], None] | None = None,
-    on_command_palette: Callable[[], None] | None = None,
+    on_command_palette: Callable[[Any | None], None] | None = None,
 ) -> 'KeyBindings | None':
     """Factory function to create key bindings.
 
@@ -225,7 +229,7 @@ def create_key_bindings(
         on_show_result: Callback for Ctrl+O
         on_show_logs: Callback for Ctrl+L
         on_rewind: Callback for Esc+Esc
-        on_command_palette: Callback for Ctrl+K
+        on_command_palette: Callback for Ctrl+X Ctrl+P
 
     Returns:
         KeyBindings instance or None

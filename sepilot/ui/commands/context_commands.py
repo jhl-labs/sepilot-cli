@@ -9,6 +9,8 @@ from typing import Any
 
 from rich.console import Console
 
+from sepilot.ui.input_utils import prompt_confirm
+
 
 def handle_compact(
     console: Console,
@@ -106,6 +108,7 @@ def handle_clear_context(
     console: Console,
     conversation_context: list,
     agent: Any | None = None,
+    session: Any | None = None,
 ) -> bool:
     """Clear all conversation context and agent LangGraph state.
 
@@ -127,13 +130,9 @@ def handle_clear_context(
     console.print(f"[yellow]⚠️  This will clear {message_count} messages from the conversation history.[/yellow]")
     console.print("[yellow]This action cannot be undone.[/yellow]")
 
-    try:
-        confirm = input("Are you sure? (yes/no): ").strip().lower()
-        if confirm not in ['yes', 'y']:
-            console.print("[dim]Cancelled[/dim]")
-            return False
-    except (EOFError, KeyboardInterrupt):
-        console.print("\n[dim]Cancelled[/dim]")
+    confirm = prompt_confirm("Are you sure?", session=session, default=False)
+    if confirm is not True:
+        console.print("[dim]Cancelled[/dim]")
         return False
 
     # Clear local conversation context
@@ -240,6 +239,12 @@ def handle_context(
         ai_count = sum(1 for m in conversation_context if getattr(m, 'type', '') == 'ai')
         console.print(f"  [dim]Messages: {msg_count} ({human_count} user, {ai_count} assistant)[/dim]")
 
+    # Enhanced: Show top 5 messages by token usage
+    if conversation_context:
+        from sepilot.agent.context_manager import ContextManager as _CM
+        _cm = _CM(max_context_tokens=max_context)
+        _show_enhanced_context_stats(console, _cm, conversation_context, current_tokens)
+
     # Recommendations
     console.print()
     if usage_percent >= 85:
@@ -311,6 +316,65 @@ def handle_cost(
     console.print(f"  [bold green]Total:[/bold green] {total_tokens:,} tokens (~${total_cost:.4f})")
     console.print()
     console.print(f"[dim]* Prices based on {model_name} rates. Actual costs may vary.[/dim]")
+
+
+def _show_enhanced_context_stats(
+    console: Console,
+    context_manager: Any,
+    messages: list,
+    current_tokens: int,
+) -> None:
+    """Show enhanced context statistics with Rich table.
+
+    Displays:
+    - Top 5 messages by token usage
+    - Instructions/Rules token ratio
+    - Estimated remaining turns
+    """
+    from rich.table import Table
+
+    console.print()
+
+    # Top 5 messages by token usage
+    breakdown = context_manager.get_message_token_breakdown(messages)
+    top5 = breakdown[:5]
+
+    if top5:
+        table = Table(title="Top 5 Messages by Token Usage", show_header=True, header_style="bold cyan")
+        table.add_column("#", style="dim", width=4)
+        table.add_column("Role", width=10)
+        table.add_column("Tokens", justify="right", width=8)
+        table.add_column("Preview", max_width=50)
+
+        for entry in top5:
+            pct = (entry['tokens'] / current_tokens * 100) if current_tokens > 0 else 0
+            table.add_row(
+                str(entry['index']),
+                entry['role'],
+                f"{entry['tokens']:,} ({pct:.0f}%)",
+                entry['preview'][:50],
+            )
+        console.print(table)
+
+    # Instructions ratio
+    ratio_info = context_manager.get_instructions_token_ratio(messages)
+    instr_pct = ratio_info['ratio'] * 100
+    console.print(
+        f"  [cyan]Instructions/Rules:[/cyan] {ratio_info['instruction_tokens']:,} tokens "
+        f"({instr_pct:.1f}% of context)"
+    )
+
+    # Estimated remaining turns
+    remaining_turns = context_manager.estimate_remaining_turns(messages, current_tokens)
+    if remaining_turns > 20:
+        turn_color = "green"
+    elif remaining_turns > 5:
+        turn_color = "yellow"
+    else:
+        turn_color = "red"
+    console.print(
+        f"  [cyan]Estimated remaining turns:[/cyan] [{turn_color}]~{remaining_turns}[/{turn_color}]"
+    )
 
 
 def _count_tokens(messages: list) -> int:

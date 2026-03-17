@@ -12,6 +12,8 @@ from typing import Any
 from rich.console import Console
 from rich.panel import Panel
 
+from sepilot.ui.input_utils import INPUT_CANCELLED, prompt_text
+
 
 def handle_model_command(
     input_text: str,
@@ -19,7 +21,8 @@ def handle_model_command(
     agent: Any,
     console: Console,
     create_llm_func: Callable,
-    agent_factory: Callable | None = None
+    agent_factory: Callable | None = None,
+    session: Any | None = None,
 ) -> Any | None:
     """Handle /model command for model configuration.
 
@@ -64,6 +67,8 @@ def handle_model_command(
                                   /model set temperature 0.7
                                   /model set top_k 50
                                   /model set max_tokens 4096
+                                  /model set reasoning_model o3
+                                  /model set quick_model gpt-4o-mini
 
 [bold yellow]📋 Custom Headers:[/bold yellow]
   [cyan]/model header <key> <value>[/cyan]  Set a custom HTTP header
@@ -135,7 +140,7 @@ def handle_model_command(
     elif command == "setup":
         return _handle_model_setup(
             model_profile_manager, agent, console,
-            create_llm_func, agent_factory=agent_factory
+            create_llm_func, agent_factory=agent_factory, session=session
         )
 
     elif command == "apply":
@@ -218,7 +223,8 @@ def _handle_model_show(model_profile_manager: Any, agent: Any, console: Console)
 
     preferred_order = [
         "model", "base_url", "temperature", "top_p",
-        "top_k", "max_tokens", "custom_headers", "api_key"
+        "top_k", "max_tokens", "reasoning_model", "quick_model",
+        "custom_headers", "api_key"
     ]
 
     def add_row(key: str, value):
@@ -474,7 +480,8 @@ def _handle_model_setup(
     agent: Any,
     console: Console,
     create_llm_func: Callable,
-    agent_factory: Callable | None = None
+    agent_factory: Callable | None = None,
+    session: Any | None = None,
 ) -> Any | None:
     """Handle /model setup - interactive model selection via /v1/models API.
 
@@ -509,16 +516,12 @@ def _handle_model_setup(
     console.print("[dim]OpenAI 호환 API에서 모델을 선택합니다.[/dim]")
     console.print()
 
-    try:
-        from prompt_toolkit import prompt as pt_prompt
-        from prompt_toolkit.formatted_text import HTML
-        base_url = pt_prompt(
-            HTML("<b>Base URL: </b>"),
-            default=default_url,
-        )
-    except ImportError:
-        base_url = input(f"Base URL [{default_url}]: ").strip() or default_url
-    except (EOFError, KeyboardInterrupt):
+    base_url = prompt_text(
+        "Base URL: ",
+        session=session,
+        default=default_url,
+    )
+    if base_url == INPUT_CANCELLED:
         console.print("\n[dim]취소되었습니다.[/dim]")
         return None
 
@@ -529,17 +532,13 @@ def _handle_model_setup(
     # Step 2: API Key
     current_api_key = config.api_key or ""
     console.print()
-    try:
-        from prompt_toolkit import prompt as pt_prompt
-        from prompt_toolkit.formatted_text import HTML
-        api_key = pt_prompt(
-            HTML("<b>API Key</b> <style bg='default' fg='gray'>(Enter to skip)</style><b>: </b>"),
-            default="",
-            is_password=True,
-        )
-    except ImportError:
-        api_key = input("API Key (Enter to skip): ").strip()
-    except (EOFError, KeyboardInterrupt):
+    api_key = prompt_text(
+        "API Key (Enter to skip): ",
+        session=session,
+        default="",
+        is_password=True,
+    )
+    if api_key == INPUT_CANCELLED:
         console.print("\n[dim]취소되었습니다.[/dim]")
         return None
 
@@ -570,16 +569,12 @@ def _handle_model_setup(
         if not models:
             console.print("[yellow]모델 목록을 가져올 수 없습니다. 직접 입력해주세요.[/yellow]")
         console.print()
-        try:
-            from prompt_toolkit import prompt as pt_prompt
-            from prompt_toolkit.formatted_text import HTML
-            selected_model = pt_prompt(
-                HTML("<b>모델명 입력: </b>"),
-                default="",
-            ).strip()
-        except ImportError:
-            selected_model = input("모델명 입력: ").strip()
-        except (EOFError, KeyboardInterrupt):
+        selected_model = prompt_text(
+            "모델명 입력: ",
+            session=session,
+            default="",
+        )
+        if selected_model == INPUT_CANCELLED:
             console.print("\n[dim]취소되었습니다.[/dim]")
             return None
 
@@ -604,45 +599,39 @@ def _handle_model_setup(
                 console.print(f"  [dim]{k}: {v}[/dim]")
 
         console.print()
-        try:
-            from prompt_toolkit import prompt as pt_prompt
-            from prompt_toolkit.formatted_text import HTML
-            choice = pt_prompt(
-                HTML("<b>선택 (1/2): </b>"),
-                default="2",
-            ).strip()
-        except ImportError:
-            choice = input("선택 (1/2) [2]: ").strip() or "2"
-        except (EOFError, KeyboardInterrupt):
+        choice = prompt_text(
+            "선택 (1/2): ",
+            session=session,
+            default="2",
+        )
+        if choice == INPUT_CANCELLED:
             console.print("\n[dim]취소되었습니다.[/dim]")
             return None
 
         if choice == "1":
-            try:
-                header_key = pt_prompt(
-                    HTML("<b>Header 이름: </b>"),
-                    default="",
-                ).strip()
-                if not header_key:
-                    console.print("[dim]건너뛰었습니다.[/dim]")
-                    continue
-                header_value = pt_prompt(
-                    HTML("<b>Header 값: </b>"),
-                    default="",
-                ).strip()
-                if not header_value:
-                    console.print("[dim]건너뛰었습니다.[/dim]")
-                    continue
-            except ImportError:
-                header_key = input("Header 이름: ").strip()
-                if not header_key:
-                    continue
-                header_value = input("Header 값: ").strip()
-                if not header_value:
-                    continue
-            except (EOFError, KeyboardInterrupt):
+            header_key = prompt_text(
+                "Header 이름: ",
+                session=session,
+                default="",
+            )
+            if header_key == INPUT_CANCELLED:
                 console.print("\n[dim]취소되었습니다.[/dim]")
                 return None
+            if not header_key:
+                console.print("[dim]건너뛰었습니다.[/dim]")
+                continue
+
+            header_value = prompt_text(
+                "Header 값: ",
+                session=session,
+                default="",
+            )
+            if header_value == INPUT_CANCELLED:
+                console.print("\n[dim]취소되었습니다.[/dim]")
+                return None
+            if not header_value:
+                console.print("[dim]건너뛰었습니다.[/dim]")
+                continue
 
             model_profile_manager.set_custom_header(header_key, header_value)
             console.print(f"[green]헤더 추가됨: {header_key} = {header_value}[/green]")
@@ -890,6 +879,11 @@ def _build_updated_settings(agent: Any, config: Any, console: Console) -> Any:
         settings = settings.model_copy(update={key_field: config.api_key})
     if config.custom_headers:
         settings = settings.model_copy(update={"custom_headers": config.custom_headers})
+    # Propagate tier model overrides from profile
+    if getattr(config, 'reasoning_model', None):
+        settings = settings.model_copy(update={"reasoning_model": config.reasoning_model})
+    if getattr(config, 'quick_model', None):
+        settings = settings.model_copy(update={"quick_model": config.quick_model})
 
     return settings
 

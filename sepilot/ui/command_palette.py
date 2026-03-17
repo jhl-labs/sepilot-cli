@@ -1,4 +1,4 @@
-"""Command Palette - OpenCode style Ctrl+K command search.
+"""Command palette metadata and prompt_toolkit layout helpers.
 
 Provides a fuzzy search interface for quickly finding and executing commands.
 """
@@ -22,6 +22,8 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.widgets import Frame
 from rich.console import Console
 
+from sepilot.ui.command_catalog import iter_palette_commands
+
 
 @dataclass
 class PaletteCommand:
@@ -34,10 +36,10 @@ class PaletteCommand:
 
 
 class CommandPalette:
-    """OpenCode style command palette with fuzzy search.
+    """Command palette with fuzzy search.
 
     Features:
-    - Ctrl+K to open
+    - Searchable command list
     - Fuzzy search across command names and descriptions
     - Arrow keys to navigate
     - Enter to execute
@@ -279,7 +281,7 @@ class CommandPalette:
 
         palette_frame = Frame(
             body=palette_body,
-            title='Ctrl+K',
+            title='Ctrl+X Ctrl+P',
             width=60,
         )
 
@@ -309,54 +311,16 @@ def create_default_palette(command_handlers: dict[str, Callable] | None = None) 
     """
     handlers = command_handlers or {}
 
-    commands = [
-        # Help & Info
-        PaletteCommand("/help", "Show help information", "Help", handlers.get("/help"), ["?", "info"]),
-        PaletteCommand("/status", "Show session status", "Help", handlers.get("/status"), ["state", "info"]),
-        PaletteCommand("/license", "Show license information", "Help", handlers.get("/license")),
-
-        # Session Management
-        PaletteCommand("/new", "Start new conversation", "Session", handlers.get("/new"), ["fresh", "reset"]),
-        PaletteCommand("/resume", "Resume previous conversation", "Session", handlers.get("/resume"), ["continue", "load"]),
-        PaletteCommand("/session", "Session management", "Session", handlers.get("/session"), ["save", "load"]),
-
-        # History & Navigation
-        PaletteCommand("/history", "Show conversation history", "History", handlers.get("/history"), ["log", "messages"]),
-        PaletteCommand("/rewind", "Go back in conversation", "History", handlers.get("/rewind"), ["back", "undo"]),
-        PaletteCommand("/undo", "Undo last file change", "History", handlers.get("/undo"), ["rollback"]),
-        PaletteCommand("/redo", "Redo undone change", "History", handlers.get("/redo")),
-
-        # Context & Memory
-        PaletteCommand("/context", "Show context usage", "Context", handlers.get("/context"), ["tokens", "memory"]),
-        PaletteCommand("/compact", "Compact conversation context", "Context", handlers.get("/compact"), ["summarize", "compress"]),
-        PaletteCommand("/clear", "Clear conversation", "Context", handlers.get("/clear"), ["reset"]),
-        PaletteCommand("/cost", "Show session cost", "Context", handlers.get("/cost"), ["price", "tokens"]),
-
-        # Settings
-        PaletteCommand("/model", "Change AI model", "Settings", handlers.get("/model"), ["llm", "gpt", "claude"]),
-        PaletteCommand("/theme", "Change UI theme", "Settings", handlers.get("/theme"), ["colors", "style"]),
-        PaletteCommand("/yolo", "Toggle auto-approve mode", "Settings", handlers.get("/yolo"), ["auto", "approve"]),
-        PaletteCommand("/permissions", "Manage permissions", "Settings", handlers.get("/permissions"), ["security", "allow"]),
-
-        # Tools & Integration
-        PaletteCommand("/tools", "List available tools", "Tools", handlers.get("/tools"), ["commands", "functions"]),
-        PaletteCommand("/mcp", "MCP server management", "Tools", handlers.get("/mcp"), ["servers"]),
-        PaletteCommand("/rag", "RAG document management", "Tools", handlers.get("/rag"), ["documents", "knowledge"]),
-
-        # Development
-        PaletteCommand("/git", "Git operations", "Dev", handlers.get("/git"), ["commit", "push", "pull"]),
-        PaletteCommand("/graph", "Show LangGraph visualization", "Dev", handlers.get("/graph")),
-
-        # UI
-        PaletteCommand("/clearscreen", "Clear the screen", "UI", handlers.get("/clearscreen"), ["cls"]),
-        PaletteCommand("/multiline", "Toggle multiline mode", "UI", handlers.get("/multiline")),
-
-        # Exit
-        PaletteCommand("/exit", "Exit SE Pilot", "Exit", handlers.get("/exit"), ["quit", "bye"]),
-    ]
-
     palette = CommandPalette()
-    for cmd in commands:
-        palette.add_command(cmd)
+    for entry in iter_palette_commands():
+        palette.add_command(
+            PaletteCommand(
+                name=entry.name,
+                description=entry.description,
+                category=entry.category,
+                handler=handlers.get(entry.name),
+                keywords=list(entry.keywords),
+            )
+        )
 
     return palette

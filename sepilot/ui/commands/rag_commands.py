@@ -17,6 +17,8 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 
+from sepilot.ui.input_utils import prompt_confirm
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,7 +85,7 @@ def get_rag_context(query: str, console: Console, n_results: int = 5) -> str:
         return ""
 
 
-def handle_rag_command(input_text: str, console: Console) -> None:
+def handle_rag_command(input_text: str, console: Console, session=None) -> None:
     """Handle /rag command for RAG management.
 
     Args:
@@ -170,7 +172,7 @@ def handle_rag_command(input_text: str, console: Console) -> None:
             _handle_stats(rag, console)
 
         elif command == "clear":
-            _handle_clear(rag, console)
+            _handle_clear(rag, console, session=session)
 
         else:
             console.print(f"[yellow]⚠️  Unknown RAG command: '{command}'[/yellow]\n")
@@ -516,7 +518,7 @@ def _handle_stats(rag, console: Console) -> None:
     console.print()
 
 
-def _handle_clear(rag, console: Console) -> None:
+def _handle_clear(rag, console: Console, session=None) -> None:
     """Handle /rag clear command."""
     stats = rag.get_stats()
 
@@ -526,13 +528,9 @@ def _handle_clear(rag, console: Console) -> None:
 
     console.print(f"[yellow]⚠️  This will delete {stats['total_documents']} documents and {stats['total_chunks']} chunks.[/yellow]")
 
-    try:
-        confirm = input("Are you sure? (yes/no): ").strip().lower()
-        if confirm not in ['yes', 'y']:
-            console.print("[dim]Cancelled[/dim]")
-            return
-    except (EOFError, KeyboardInterrupt):
-        console.print("\n[dim]Cancelled[/dim]")
+    confirm = prompt_confirm("Are you sure?", session=session, default=False)
+    if confirm is not True:
+        console.print("[dim]Cancelled[/dim]")
         return
 
     result = rag.clear()

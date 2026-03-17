@@ -39,8 +39,12 @@ class ContextDisplayManager:
 
     # Model context windows (in tokens)
     MODEL_CONTEXT_WINDOWS = {
+        # STEP models
+        "step-3.5-flash": 32768,
+        "step-3.5": 65536,
         # OpenAI models
         "gpt-4-turbo": 128000,
+        "gpt-4o": 128000,
         "gpt-4-1106": 128000,
         "gpt-4-0125": 128000,
         "gpt-4-32k": 32768,
@@ -57,6 +61,10 @@ class ContextDisplayManager:
         "claude-3-5-sonnet": 200000,
         "claude-2": 100000,
         "claude": 100000,
+        # Other hosted models
+        "qwen3-vl-235b": 131072,
+        "qwen3-coder": 131072,
+        "glm-4.7-cloud": 131072,
         # Local models
         "ollama": 32768,
         "llama": 32768,
@@ -209,8 +217,12 @@ class ContextDisplayManager:
                     pass
 
         if self.agent and hasattr(self.agent, 'settings'):
+            context_window = getattr(self.agent.settings, 'context_window', None)
+            if isinstance(context_window, int) and context_window > 0:
+                return context_window
+
             max_tokens = getattr(self.agent.settings, 'max_tokens', None)
-            if max_tokens:
+            if isinstance(max_tokens, int) and max_tokens > 0:
                 return max_tokens
 
         return self.get_model_context_window(model_name)

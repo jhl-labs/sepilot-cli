@@ -26,7 +26,10 @@ def handle_graph_command(
         return
 
     try:
-        console.print("[bold cyan]📊 LangGraph Workflow Structure[/bold cyan]\n")
+        # Show graph mode
+        graph_mode = getattr(getattr(agent, 'settings', None), 'graph_mode', 'enhanced')
+        mode_label = "⚡ Simplified" if graph_mode == "simplify" else "🧠 Enhanced"
+        console.print(f"[bold cyan]📊 LangGraph Workflow Structure[/bold cyan] [{mode_label}]\n")
 
         # Get the compiled graph
         graph = agent.graph

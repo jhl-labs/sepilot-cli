@@ -114,6 +114,7 @@ def handle_help(console: Console, show_dynamic: bool = True) -> None:
 - `Ctrl+D` - Exit interactive mode
 - `Ctrl+O` - Show last execution result
 - `Ctrl+K` - Clear screen
+- `Ctrl+X Ctrl+P` - Open slash-command search
 - `ESC` - Cancel file completion menu (Claude Code style!)
 - `ESC+ESC` - Quick rewind (double-tap within 0.5s)
 - `F1` - Show this help message

@@ -36,6 +36,8 @@ class ReferenceExpander:
     # Default limits for content inclusion
     DEFAULT_MAX_CHARS_PER_ITEM = 200000
     DEFAULT_MAX_TOTAL_CHARS = 400000
+    _REFERENCE_TOKEN_RE = re.compile(r'(?<![\w@])@([^\s]+)')
+    _TRAILING_REF_PUNCTUATION = ".,;!?)]}"
 
     def __init__(
         self,
@@ -73,60 +75,7 @@ class ReferenceExpander:
             - ("git", "diff" or "HEAD~1" etc.)
             - ("agent", "explore" or "coder" etc.)
         """
-        references: list[tuple[str, str]] = []
-
-        # @agent:explore, @agent:coder, etc.
-        agent_pattern = r'@agent:([a-zA-Z_][a-zA-Z0-9_]*)'
-        for match in re.finditer(agent_pattern, text):
-            references.append(("agent", match.group(1)))
-
-        # @url:https://... or @url:http://...
-        url_pattern = r'@url:(https?://[^\s]+)'
-        for match in re.finditer(url_pattern, text):
-            references.append(("url", match.group(1)))
-
-        # @git:diff, @git:HEAD~1, @git:abc123, etc.
-        git_pattern = r'@git:([^\s]+)'
-        for match in re.finditer(git_pattern, text):
-            references.append(("git", match.group(1)))
-
-        # @folder/ (trailing slash indicates directory)
-        folder_pattern = r'@([\w\-_/\.]+)/'
-        for match in re.finditer(folder_pattern, text):
-            path = match.group(1)
-            if not path.startswith(('url:', 'git:')):
-                references.append(("folder", path))
-
-        # @**/*.py or @src/**/*.ts (glob patterns)
-        glob_pattern = r'@(\*\*?[^\s]+|\S+\*\S*)'
-        for match in re.finditer(glob_pattern, text):
-            pattern = match.group(1)
-            if '*' in pattern and not pattern.startswith(('url:', 'git:')):
-                references.append(("glob", pattern))
-
-        # @file.py (regular files)
-        file_pattern = r'@([\w\-_/\.]+)'
-        for match in re.finditer(file_pattern, text):
-            path = match.group(1)
-            if (path.startswith(('url:', 'git:', 'agent:')) or
-                '*' in path or
-                any(ref[1] == path for ref in references)):
-                continue
-            # Skip if this is part of an @agent:name reference
-            match_start = match.start()
-            if match_start > 0 and text[match_start - 1:match_start] != '@':
-                # Check if this is part of @agent:name where 'agent' was extracted
-                if path == 'agent':
-                    continue
-            match_end = match.end()
-            if match_end < len(text) and text[match_end] == '/':
-                continue
-            if match_end < len(text) and text[match_end] == ':':
-                # This is a prefix like @git: or @url: or @agent:
-                continue
-            references.append(("file", path))
-
-        return references
+        return [(ref_type, ref_value) for ref_type, ref_value, _span in self._extract_references(text)]
 
     def parse_file_references(self, text: str) -> list[str]:
         """Parse @file references only (legacy compatibility).
@@ -202,13 +151,13 @@ class ReferenceExpander:
         Returns:
             Expanded prompt with all referenced contents
         """
-        references = self.parse_references(user_input)
+        references_with_spans = self._extract_references(user_input)
+        references = [(ref_type, ref_value) for ref_type, ref_value, _span in references_with_spans]
 
         if not references:
             return user_input
 
-        # Remove @ references from the original input
-        cleaned_input = re.sub(r'@(url:|git:)?[\w\-_/\.\*:]+/?', '', user_input).strip()
+        cleaned_input = self._remove_reference_spans(user_input, references_with_spans)
 
         # Build the expanded prompt
         expanded_parts: list[str] = []
@@ -238,9 +187,94 @@ class ReferenceExpander:
         # Combine: referenced contents + user instruction
         if expanded_parts:
             context = "\n\n".join(expanded_parts)
-            return f"{context}\n\n{cleaned_input}"
+            return f"{context}\n\n{cleaned_input}" if cleaned_input else context
 
         return user_input
+
+    def _extract_references(self, text: str) -> list[tuple[str, str, tuple[int, int]]]:
+        """Extract references with their exact spans in the original text."""
+        references: list[tuple[str, str, tuple[int, int]]] = []
+        seen: set[tuple[str, str]] = set()
+
+        for match in self._REFERENCE_TOKEN_RE.finditer(text):
+            raw_token = match.group(1)
+            token = raw_token.rstrip(self._TRAILING_REF_PUNCTUATION)
+            if not token:
+                continue
+
+            reference = self._classify_reference_token(token)
+            if reference is None:
+                continue
+
+            ref_type, ref_value = reference
+            dedupe_key = (ref_type, ref_value)
+            if dedupe_key in seen:
+                continue
+
+            span_end = match.start() + 1 + len(token)
+            references.append((ref_type, ref_value, (match.start(), span_end)))
+            seen.add(dedupe_key)
+
+        return references
+
+    def _classify_reference_token(self, token: str) -> tuple[str, str] | None:
+        """Classify a parsed @token into a reference type."""
+        if token.startswith("agent:"):
+            agent_name = token[6:]
+            if re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*', agent_name):
+                return ("agent", agent_name)
+            return None
+
+        if token.startswith("url:"):
+            url = token[4:]
+            if re.match(r'https?://\S+$', url):
+                return ("url", url)
+            return None
+
+        if token.startswith("git:"):
+            git_ref = token[4:]
+            if git_ref:
+                return ("git", git_ref)
+            return None
+
+        if token.endswith('/'):
+            folder = token[:-1]
+            if folder:
+                return ("folder", folder)
+            return None
+
+        if '*' in token:
+            return ("glob", token)
+
+        if ':' in token:
+            return None
+
+        is_path_like = any(char in token for char in ('/', '.', '_', '-'))
+        if not is_path_like and not os.path.exists(token):
+            return None
+
+        return ("file", token)
+
+    @staticmethod
+    def _remove_reference_spans(
+        text: str,
+        references: list[tuple[str, str, tuple[int, int]]],
+    ) -> str:
+        """Remove parsed references without stripping unrelated text like emails."""
+        if not references:
+            return text
+
+        parts: list[str] = []
+        last_end = 0
+        for _ref_type, _ref_value, (start, end) in references:
+            parts.append(text[last_end:start])
+            last_end = end
+        parts.append(text[last_end:])
+
+        cleaned = ''.join(parts)
+        cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        return cleaned.strip()
 
     def _expand_single_reference(
         self, ref_type: str, ref_value: str, max_chars: int
@@ -628,7 +662,14 @@ class ReferenceExpander:
         Returns:
             File content or None
         """
-        encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'cp949', 'euc-kr']
+        with open(abs_path, 'rb') as f:
+            sample = f.read(8192)
+
+        if self._looks_binary_bytes(sample):
+            self.console.print(f"[yellow]⚠️  Skipping binary file: {display_path}[/yellow]")
+            return None
+
+        encodings_to_try = ['utf-8', 'utf-8-sig', 'cp949', 'euc-kr']
 
         for enc in encodings_to_try:
             try:
@@ -646,6 +687,19 @@ class ReferenceExpander:
         except Exception as e:
             self.console.print(f"[red]❌ Cannot read {display_path}: {e}[/red]")
             return None
+
+    @staticmethod
+    def _looks_binary_bytes(sample: bytes) -> bool:
+        """Best-effort binary detection to avoid dumping raw bytes into context."""
+        if not sample:
+            return False
+
+        if b'\x00' in sample:
+            return True
+
+        text_bytes = bytes({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)))
+        non_text = sample.translate(None, text_bytes)
+        return (len(non_text) / len(sample)) > 0.30
 
 
 # Convenience instance for simple usage
