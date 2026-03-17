@@ -262,12 +262,11 @@ jobs:
         run: |
           mkdir -p results
           cat > "results/${{ matrix.distro }}.txt" <<'RESULT_EOF'
-          distro=${{ matrix.distro }}
-          glibc=${{ matrix.glibc }}
-          binary=${{ matrix.binary }}
-          version=${{ steps.version.outputs.status }}
-          help=${{ steps.help.outputs.status }}
-          version_output=${{ steps.version.outputs.output }}
+          distro="${{ matrix.distro }}"
+          glibc="${{ matrix.glibc }}"
+          binary="${{ matrix.binary }}"
+          version="${{ steps.version.outputs.status }}"
+          help="${{ steps.help.outputs.status }}"
           RESULT_EOF
 
       - name: Upload result
