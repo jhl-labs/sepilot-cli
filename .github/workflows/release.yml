@@ -81,8 +81,14 @@ jobs:
               export PATH="$HOME/.cargo/bin:$PATH"
 
               uv python install 3.10
-              # onnxruntime 1.23+ has no manylinux2014 wheel — exclude it
-              uv sync --no-install-package onnxruntime
+              # Several packages lack manylinux2014 wheels — exclude them.
+              # They are optional at runtime (RAG, benchmarks) and guarded by try/except.
+              uv sync \
+                --no-install-package onnxruntime \
+                --no-install-package pyarrow \
+                --no-install-package datasets \
+                --no-install-package swebench \
+                --no-install-package chromadb
               uv pip install pyinstaller
 
               # Use --no-sync to prevent uv run from re-triggering dependency resolution
