@@ -2,6 +2,19 @@
 
 이 프로젝트의 모든 주요 변경사항을 기록합니다. [Keep a Changelog](https://keepachangelog.com/) 형식을 따릅니다.
 
+## [0.8.1] - 2026-03-17
+
+### Added
+- **Karpathy 코딩 가이드라인 스킬**: LLM 코딩 실수를 줄이기 위한 행동 가이드라인 자동 주입
+- **Investigation 플랜 템플릿**: 진단/조사/장애 분석 등 비코드 태스크를 위한 계층적 플래너 전략 추가 (`diagnose`, `investigate`)
+
+### Changed
+- 계층적 플래너 프롬프트를 "coding agent"에서 "software engineering agent"로 확장하여 인프라/운영 태스크 지원 개선
+- `/clear` 명령 시 plan 관련 상태(`plan_steps`, `triage_decision` 등)도 함께 리셋하도록 개선
+
+### Fixed
+- Rich markup injection 방지: 에러 메시지에 `rich.markup.escape` 적용 (CLI 3곳)
+
 ## [0.8.0] - 2026-03-17
 
 ### Added
