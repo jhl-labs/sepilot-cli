@@ -21,15 +21,26 @@ def set_current_settings(settings) -> None:
     _current_settings = settings
 
 
-def _create_subagent_llm():
+def _create_subagent_llm(role: str | None = None):
     """Create LLM for SubAgent using LLM Provider Factory.
 
     Uses propagated settings from the main agent when available,
     falling back to default Settings() if not set.
 
+    Role-based model routing:
+    - pm, architect, researcher → reasoning_model (if configured)
+    - tester, security_reviewer → verifier_model (if configured)
+    - Others → main model
+
+    Args:
+        role: SubAgent role for tier-based model selection
+
     Returns:
         LLM instance or None if creation fails
     """
+    REASONING_ROLES = {"pm", "architect", "researcher"}
+    VERIFIER_ROLES = {"tester", "security_reviewer"}
+
     try:
         from sepilot.config.llm_providers import LLMProviderFactory, LLMProviderError
         from sepilot.config.settings import Settings
@@ -39,7 +50,14 @@ def _create_subagent_llm():
         settings = settings.model_copy(update={"temperature": 0.0})
 
         factory = LLMProviderFactory(settings)
-        return factory.create_llm()
+
+        # Role-based model selection
+        if role in REASONING_ROLES and getattr(settings, 'reasoning_model', None):
+            return factory.create_llm(settings.reasoning_model)
+        elif role in VERIFIER_ROLES and getattr(settings, 'verifier_model', None):
+            return factory.create_llm(settings.verifier_model)
+        else:
+            return factory.create_llm()
 
     except LLMProviderError as e:
         logger.warning(f"LLM provider error: {e}")
@@ -49,6 +67,16 @@ def _create_subagent_llm():
     except Exception as e:
         logger.warning(f"Failed to initialize SubAgent LLM: {e}")
         return None
+
+
+def _get_worktree_manager():
+    """Get or create a WorktreeManager instance.
+
+    Returns:
+        WorktreeManager instance
+    """
+    from sepilot.agent.subagent.worktree_manager import WorktreeManager
+    return WorktreeManager()
 
 
 @tool
@@ -62,6 +90,7 @@ def subagent_execute(
     """Execute a complex task using SubAgent system.
 
     SubAgent 시스템을 사용하여 복잡한 작업을 여러 하위 작업으로 분해하고 병렬 실행합니다.
+    각 서브에이전트는 git worktree로 격리된 작업 디렉토리에서 실행됩니다.
 
     Args:
         main_task: 실행할 메인 작업 설명
@@ -100,7 +129,7 @@ def subagent_execute(
         return _run_async(_async_team_execute(main_task, max_parallel))
 
     async def _async_execute():
-        """Internal async implementation."""
+        """Internal async implementation with worktree isolation."""
         from sepilot.agent.subagent import SubAgentOrchestrator
         from sepilot.agent.subagent.specialized_agents import (
             AnalyzerSubAgent,
@@ -112,80 +141,101 @@ def subagent_execute(
 
         logger.info(f"SubAgent executing: {main_task}")
 
-        # Get LLM using shared initialization logic
-        llm = _create_subagent_llm()
-        if llm is None:
-            logger.warning("Failed to initialize LLM, SubAgent will run without LLM")
+        # Create worktree for isolated execution
+        wm = _get_worktree_manager()
+        worktree = await wm.create_worktree(task_id=f"subagent-{os.getpid()}")
+        logger.info(f"Created worktree for subagent: {worktree.path}")
 
-        # Create Orchestrator
-        orchestrator = SubAgentOrchestrator(
-            llm=llm,
-            max_parallel=max_parallel
-        )
+        try:
+            # Create tier LLMs once, reuse across agents with the same tier
+            main_llm = _create_subagent_llm()
+            if main_llm is None:
+                logger.warning("Failed to initialize LLM, SubAgent will run without LLM")
+            reasoning_llm = _create_subagent_llm(role="researcher") or main_llm
+            verifier_llm = _create_subagent_llm(role="tester") or main_llm
 
-        # Get all tools
-        from sepilot.tools.langchain_tools import get_all_tools
-        all_tools = get_all_tools()
+            # Create Orchestrator
+            orchestrator = SubAgentOrchestrator(
+                llm=main_llm,
+                max_parallel=max_parallel
+            )
 
-        # Tool filtering function
-        def filter_tools(tool_names: list[str]):
-            return [t for t in all_tools if hasattr(t, 'name') and t.name in tool_names]
+            # Get all tools
+            from sepilot.tools.langchain_tools import get_all_tools
+            all_tools = get_all_tools()
 
-        # Register specialized SubAgents
-        orchestrator.register_subagent(AnalyzerSubAgent(
-            agent_id="analyzer_1",
-            tools=filter_tools(["code_analyze", "file_read", "codebase"]),
-            llm=llm
-        ))
+            # Tool filtering function
+            def filter_tools(tool_names: list[str]):
+                return [t for t in all_tools if hasattr(t, 'name') and t.name in tool_names]
 
-        orchestrator.register_subagent(CodeGenSubAgent(
-            agent_id="codegen_1",
-            tools=filter_tools(["file_write", "file_edit", "code_analyze", "file_read"]),
-            llm=llm
-        ))
+            # Register specialized SubAgents (role-based model routing)
+            orchestrator.register_subagent(AnalyzerSubAgent(
+                agent_id="analyzer_1",
+                tools=filter_tools(["code_analyze", "file_read", "codebase"]),
+                llm=reasoning_llm
+            ))
 
-        orchestrator.register_subagent(TestingSubAgent(
-            agent_id="testing_1",
-            tools=filter_tools(["bash_execute", "file_write", "file_read"]),
-            llm=llm
-        ))
+            orchestrator.register_subagent(CodeGenSubAgent(
+                agent_id="codegen_1",
+                tools=filter_tools(["file_write", "file_edit", "code_analyze", "file_read"]),
+                llm=main_llm
+            ))
 
-        orchestrator.register_subagent(DocumentationSubAgent(
-            agent_id="documentation_1",
-            tools=filter_tools(["file_write", "code_analyze", "file_read"]),
-            llm=llm
-        ))
+            orchestrator.register_subagent(TestingSubAgent(
+                agent_id="testing_1",
+                tools=filter_tools(["bash_execute", "file_write", "file_read"]),
+                llm=verifier_llm
+            ))
 
-        orchestrator.register_subagent(RefactoringSubAgent(
-            agent_id="refactoring_1",
-            tools=filter_tools(["code_analyze", "file_edit", "file_read"]),
-            llm=llm
-        ))
+            orchestrator.register_subagent(DocumentationSubAgent(
+                agent_id="documentation_1",
+                tools=filter_tools(["file_write", "code_analyze", "file_read"]),
+                llm=main_llm
+            ))
 
-        # Decompose task
-        subtasks = await orchestrator.decompose_task(main_task)
-        logger.info(f"Decomposed into {len(subtasks)} subtasks")
+            orchestrator.register_subagent(RefactoringSubAgent(
+                agent_id="refactoring_1",
+                tools=filter_tools(["code_analyze", "file_edit", "file_read"]),
+                llm=main_llm
+            ))
 
-        # Create execution plan
-        execution_plan = orchestrator.create_execution_plan(
-            subtasks,
-            strategy=decomposition_strategy
-        )
-        logger.info(f"Created execution plan with {execution_plan.total_phases} phases")
+            # Inject worktree path into task context
+            worktree_context = {"worktree_path": str(worktree.path)}
 
-        # Execute
-        results = await orchestrator.execute_plan(execution_plan)
+            # Decompose task
+            subtasks = await orchestrator.decompose_task(main_task, context=worktree_context)
+            logger.info(f"Decomposed into {len(subtasks)} subtasks")
 
-        # Aggregate results
-        aggregated = await orchestrator.aggregate_results(
-            main_task=main_task,
-            results=results,
-            aggregation_strategy=aggregation_strategy
-        )
+            # Create execution plan
+            execution_plan = orchestrator.create_execution_plan(
+                subtasks,
+                strategy=decomposition_strategy
+            )
+            logger.info(f"Created execution plan with {execution_plan.total_phases} phases")
 
-        # Summary
-        return f"""
+            # Save original cwd and switch to worktree
+            original_cwd = os.getcwd()
+            os.chdir(str(worktree.path))
+
+            try:
+                # Execute
+                results = await orchestrator.execute_plan(execution_plan)
+            finally:
+                # Restore original cwd
+                os.chdir(original_cwd)
+
+            # Aggregate results
+            aggregated = await orchestrator.aggregate_results(
+                main_task=main_task,
+                results=results,
+                aggregation_strategy=aggregation_strategy
+            )
+
+            # Summary
+            return f"""
 🎯 SubAgent 실행 완료
+
+📂 Worktree: {worktree.path} (branch: {worktree.branch})
 
 📊 실행 통계:
 - 전체 작업: {len(results)}개
@@ -197,6 +247,20 @@ def subagent_execute(
 📝 결과:
 {aggregated.final_output}
 """
+        finally:
+            # Post-execution: check for changes and cleanup if none
+            has_changes = await wm.has_changes(worktree)
+            if has_changes:
+                logger.info(
+                    f"Worktree {worktree.worktree_id} has changes, "
+                    f"keeping branch: {worktree.branch}"
+                )
+            else:
+                cleanup_result = await wm.cleanup_worktree(worktree)
+                logger.info(
+                    f"Worktree {worktree.worktree_id} had no changes, "
+                    f"cleaned up: {cleanup_result['cleaned_up']}"
+                )
 
     return _run_async(_async_execute())
 
@@ -224,7 +288,7 @@ def _run_async(coro) -> str:
 
 
 async def _async_team_execute(main_task: str, max_parallel: int = 3) -> str:
-    """팀 모드 비동기 실행 구현"""
+    """팀 모드 비동기 실행 구현 (worktree 격리 포함)"""
     from sepilot.agent.subagent.team_agents import (
         ArchitectAgent,
         DebuggerAgent,
@@ -240,100 +304,119 @@ async def _async_team_execute(main_task: str, max_parallel: int = 3) -> str:
 
     logger.info(f"Team mode executing: {main_task}")
 
-    # LLM 생성
-    llm = _create_subagent_llm()
-    if llm is None:
-        logger.warning("Failed to initialize LLM, team will run without LLM")
+    # Create worktree for isolated team execution
+    wm = _get_worktree_manager()
+    worktree = await wm.create_worktree(task_id=f"team-{os.getpid()}")
+    logger.info(f"Created worktree for team execution: {worktree.path}")
 
-    # 도구 필터링
-    from sepilot.tools.langchain_tools import get_all_tools
-    all_tools = get_all_tools()
+    try:
+        # 도구 필터링
+        from sepilot.tools.langchain_tools import get_all_tools
+        all_tools = get_all_tools()
 
-    def filter_tools(tool_names: list[str]):
-        return [t for t in all_tools if hasattr(t, 'name') and t.name in tool_names]
+        def filter_tools(tool_names: list[str]):
+            return [t for t in all_tools if hasattr(t, 'name') and t.name in tool_names]
 
-    # TeamOrchestrator 생성
-    orchestrator = TeamOrchestrator(llm=llm, max_parallel=max_parallel)
+        # Create tier LLMs once, reuse across roles with the same tier
+        main_llm = _create_subagent_llm()
+        reasoning_llm = _create_subagent_llm(role="pm") or main_llm  # reasoning tier
+        verifier_llm = _create_subagent_llm(role="tester") or main_llm  # verifier tier
 
-    # 8개 팀 에이전트 등록
-    orchestrator.register_agent(
-        TeamRole.PM,
-        PMAgent(agent_id="pm_1", llm=llm),
-    )
-    orchestrator.register_agent(
-        TeamRole.DEVELOPER,
-        DeveloperAgent(
-            agent_id="developer_1",
-            tools=filter_tools(["file_write", "file_edit", "file_read", "code_analyze", "bash_execute"]),
-            llm=llm,
-        ),
-    )
-    orchestrator.register_agent(
-        TeamRole.TESTER,
-        TesterAgent(
-            agent_id="tester_1",
-            tools=filter_tools(["file_write", "file_read", "bash_execute"]),
-            llm=llm,
-        ),
-    )
-    orchestrator.register_agent(
-        TeamRole.DEBUGGER,
-        DebuggerAgent(
-            agent_id="debugger_1",
-            tools=filter_tools(["file_read", "bash_execute", "code_analyze", "search_content"]),
-            llm=llm,
-        ),
-    )
-    orchestrator.register_agent(
-        TeamRole.RESEARCHER,
-        ResearcherAgent(
-            agent_id="researcher_1",
-            tools=filter_tools(["file_read", "find_file", "search_content", "codebase", "web_search"]),
-            llm=llm,
-        ),
-    )
-    orchestrator.register_agent(
-        TeamRole.ARCHITECT,
-        ArchitectAgent(
-            agent_id="architect_1",
-            tools=filter_tools(["file_read", "code_analyze", "codebase", "search_content", "get_structure"]),
-            llm=llm,
-        ),
-    )
-    orchestrator.register_agent(
-        TeamRole.SECURITY_REVIEWER,
-        SecurityReviewerAgent(
-            agent_id="security_reviewer_1",
-            tools=filter_tools(["file_read", "search_content", "code_analyze"]),
-            llm=llm,
-        ),
-    )
-    orchestrator.register_agent(
-        TeamRole.DEVOPS,
-        DevOpsAgent(
-            agent_id="devops_1",
-            tools=filter_tools(["file_read", "bash_execute", "find_file"]),
-            llm=llm,
-        ),
-    )
+        # TeamOrchestrator 생성
+        orchestrator = TeamOrchestrator(llm=main_llm, max_parallel=max_parallel)
 
-    # 팀 작업 실행
-    result = await orchestrator.execute_team_task(main_task)
+        # 8개 팀 에이전트 등록 (역할별 tier LLM 할당)
+        # reasoning tier: pm, architect, researcher
+        # verifier tier: tester, security_reviewer
+        # main tier: developer, debugger, devops
+        orchestrator.register_agent(
+            TeamRole.PM,
+            PMAgent(agent_id="pm_1", llm=reasoning_llm),
+        )
+        orchestrator.register_agent(
+            TeamRole.DEVELOPER,
+            DeveloperAgent(
+                agent_id="developer_1",
+                tools=filter_tools(["file_write", "file_edit", "file_read", "code_analyze", "bash_execute"]),
+                llm=main_llm,
+            ),
+        )
+        orchestrator.register_agent(
+            TeamRole.TESTER,
+            TesterAgent(
+                agent_id="tester_1",
+                tools=filter_tools(["file_write", "file_read", "bash_execute"]),
+                llm=verifier_llm,
+            ),
+        )
+        orchestrator.register_agent(
+            TeamRole.DEBUGGER,
+            DebuggerAgent(
+                agent_id="debugger_1",
+                tools=filter_tools(["file_read", "bash_execute", "code_analyze", "search_content"]),
+                llm=main_llm,
+            ),
+        )
+        orchestrator.register_agent(
+            TeamRole.RESEARCHER,
+            ResearcherAgent(
+                agent_id="researcher_1",
+                tools=filter_tools(["file_read", "find_file", "search_content", "codebase", "web_search"]),
+                llm=reasoning_llm,
+            ),
+        )
+        orchestrator.register_agent(
+            TeamRole.ARCHITECT,
+            ArchitectAgent(
+                agent_id="architect_1",
+                tools=filter_tools(["file_read", "code_analyze", "codebase", "search_content", "get_structure"]),
+                llm=reasoning_llm,
+            ),
+        )
+        orchestrator.register_agent(
+            TeamRole.SECURITY_REVIEWER,
+            SecurityReviewerAgent(
+                agent_id="security_reviewer_1",
+                tools=filter_tools(["file_read", "search_content", "code_analyze"]),
+                llm=verifier_llm,
+            ),
+        )
+        orchestrator.register_agent(
+            TeamRole.DEVOPS,
+            DevOpsAgent(
+                agent_id="devops_1",
+                tools=filter_tools(["file_read", "bash_execute", "find_file"]),
+                llm=main_llm,
+            ),
+        )
 
-    # 결과 포맷팅
-    stats = result["stats"]
-    gate_results = result.get("gate_results", [])
+        # Save original cwd and switch to worktree
+        original_cwd = os.getcwd()
+        os.chdir(str(worktree.path))
 
-    gate_summary = ""
-    for gate in gate_results:
-        status = "PASSED" if gate.passed else "FAILED"
-        gate_summary += f"\n  - {gate.phase.value}: {status}"
-        if gate.issues:
-            for issue in gate.issues:
-                gate_summary += f"\n    - {issue}"
+        try:
+            # 팀 작업 실행
+            result = await orchestrator.execute_team_task(main_task)
+        finally:
+            # Restore original cwd
+            os.chdir(original_cwd)
 
-    return f"""
+        # 결과 포맷팅
+        stats = result["stats"]
+        gate_results = result.get("gate_results", [])
+
+        gate_summary = ""
+        for gate in gate_results:
+            status = "PASSED" if gate.passed else "FAILED"
+            gate_summary += f"\n  - {gate.phase.value}: {status}"
+            if gate.issues:
+                for issue in gate.issues:
+                    gate_summary += f"\n    - {issue}"
+
+        return f"""
 🎯 Team 실행 완료
+
+📂 Worktree: {worktree.path} (branch: {worktree.branch})
 
 📊 실행 통계:
 - 전체 작업: {stats['total']}개
@@ -346,6 +429,20 @@ async def _async_team_execute(main_task: str, max_parallel: int = 3) -> str:
 📝 결과:
 {result['output']}
 """
+    finally:
+        # Post-execution: check for changes and cleanup if none
+        has_changes = await wm.has_changes(worktree)
+        if has_changes:
+            logger.info(
+                f"Team worktree {worktree.worktree_id} has changes, "
+                f"keeping branch: {worktree.branch}"
+            )
+        else:
+            cleanup_result = await wm.cleanup_worktree(worktree)
+            logger.info(
+                f"Team worktree {worktree.worktree_id} had no changes, "
+                f"cleaned up: {cleanup_result['cleaned_up']}"
+            )
 
 
 __all__ = ['subagent_execute', 'set_current_settings']

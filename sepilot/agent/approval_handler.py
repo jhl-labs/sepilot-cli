@@ -7,8 +7,12 @@ Integrates with PermissionManager for pattern-based permission rules.
 """
 
 import asyncio
+import json
+import logging
 import os
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +31,48 @@ try:
 except ImportError:
     HAS_PROMPT_TOOLKIT = False
 
+_audit_logger = logging.getLogger(__name__)
+
+INPUT_CANCELLED = "__INPUT_CANCELLED__"
+INPUT_NO_INPUT = "__NO_INPUT__"
+
+
+class AuditLogger:
+    """Append-only JSONL audit logger for tool approval decisions.
+
+    Logs every approve/deny/auto decision to ~/.sepilot/audit.jsonl.
+    Logging failures are silently suppressed to never block approval flow.
+    """
+
+    def __init__(self, path: Path | None = None, session_id: str | None = None):
+        self._path = path or (Path.home() / ".sepilot" / "audit.jsonl")
+        self.session_id = session_id or uuid.uuid4().hex[:12]
+
+    def log(
+        self,
+        tool: str,
+        action: str,
+        risk_level: str = "",
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Write a single audit entry. Never raises."""
+        try:
+            entry: dict[str, Any] = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "tool": tool,
+                "action": action,
+                "risk_level": risk_level,
+                "session_id": self.session_id,
+            }
+            if extra:
+                entry.update(extra)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            # Audit logging must never block the approval flow
+            _audit_logger.debug("Audit log write failed: %s", exc)
+
 
 class ApprovalHandler:
     """Handles human-in-the-loop approval for sensitive tool executions.
@@ -44,6 +90,7 @@ class ApprovalHandler:
         sensitive_tools: set[str] | None = None,
         auto_approve: bool = False,
         permission_manager: PermissionManager | None = None,
+        audit_logger: AuditLogger | None = None,
     ):
         """Initialize approval handler.
 
@@ -52,6 +99,7 @@ class ApprovalHandler:
             sensitive_tools: Set of tool names requiring approval
             auto_approve: If True, auto-approve all tool executions
             permission_manager: Permission manager for pattern-based rules
+            audit_logger: Optional audit logger for recording decisions
         """
         # Always keep a Rich console so approval UI can render syntax highlight
         # even when the main agent runs in non-verbose mode.
@@ -65,6 +113,7 @@ class ApprovalHandler:
         self.auto_approve = auto_approve
         self.auto_approve_session = False  # Session-wide auto-approve
         self.permission_manager = permission_manager or get_permission_manager()
+        self.audit_logger = audit_logger or AuditLogger()
 
     def handle_interrupt_events(self, interrupts: list) -> Any:
         """Handle LangGraph interrupt tuples by prompting the user.
@@ -104,6 +153,13 @@ class ApprovalHandler:
         # Fallback for other interrupt types
         return payload
 
+    def _audit_tool_calls(self, tool_calls: list, action: str) -> None:
+        """Log audit entries for a batch of tool calls."""
+        for tc in tool_calls:
+            tool_name = tc.get("name", "unknown")
+            risk = tc.get("risk_level", "")
+            self.audit_logger.log(tool=tool_name, action=action, risk_level=risk)
+
     def _handle_tool_approval(self, payload: dict) -> dict:
         """Handle tool approval request with pattern-based permission rules.
 
@@ -134,6 +190,7 @@ class ApprovalHandler:
                         f"[bold red]차단됨: {tool_name}[/bold red]\n"
                         f"[red]사유: {reason}[/red]"
                     )
+                self._audit_tool_calls(tool_calls, "deny")
                 return {
                     "type": "deny",
                     "decision": "deny",
@@ -154,6 +211,7 @@ class ApprovalHandler:
                     self.console.print(
                         f"[dim green]✓ 자동 허용: {tool_name}[/dim green]"
                     )
+            self._audit_tool_calls(tool_calls, "auto")
             return {"type": "accept", "decision": "approve"}
 
         # Auto-approve ASK-level calls when explicitly enabled.
@@ -162,6 +220,7 @@ class ApprovalHandler:
             if self.console and tool_calls:
                 tool_list = ", ".join({tc.get("name", "unknown") for tc in tool_calls})
                 self.console.print(f"[dim cyan]🔓 자동 승인 모드: {tool_list}[/dim cyan]")
+            self._audit_tool_calls(tool_calls, "auto")
             return {"type": "accept", "decision": "approve"}
 
         # ASK: Show tool calls and prompt user
@@ -180,6 +239,7 @@ class ApprovalHandler:
         if not sys.stdin.isatty():
             if self.console:
                 self.console.print("[dim]TTY가 아니므로 자동으로 승인합니다.[/dim]")
+            self._audit_tool_calls(tool_calls, "auto")
             return {"type": "accept", "decision": "approve"}
 
         # Check session-wide auto-approve
@@ -188,9 +248,15 @@ class ApprovalHandler:
                 self.console.print(
                     "[dim cyan]✓ 세션 자동 승인 모드 활성화됨 - 자동으로 승인합니다.[/dim cyan]"
                 )
+            self._audit_tool_calls(tool_calls, "auto")
             return {"type": "accept", "decision": "approve"}
 
-        return self._get_user_approval()
+        result = self._get_user_approval()
+        # Log the user's interactive decision
+        decision = result.get("decision", "deny")
+        action = "approve" if decision == "approve" else "deny"
+        self._audit_tool_calls(tool_calls, action)
+        return result
 
     def _display_tool_calls(
         self,
@@ -238,25 +304,46 @@ class ApprovalHandler:
                 args.get("notebook_path")
             )
 
+            # Assess risk for color coding
+            risk_info = self.assess_tool_risk(tool_name, args)
+            risk_level = tc.get("risk_level") or risk_info.get("level", "low")
+            risk_reasons = tc.get("risk_reasons") or risk_info.get("reasons", [])
+
+            # Risk-based color scheme
+            risk_colors = {
+                "high": ("bold red", "red", "HIGH"),
+                "medium": ("bold yellow", "yellow", "MED"),
+                "low": ("bold green", "green", "LOW"),
+            }
+            risk_style, risk_border, risk_label = risk_colors.get(
+                str(risk_level).lower(), ("bold green", "green", "LOW")
+            )
+
             meta = Table.grid(padding=(0, 1))
             meta.add_column(style="bold cyan", no_wrap=True)
             meta.add_column(style="white")
             meta.add_row("tool", tool_name)
 
+            # Show risk level with color badge
+            risk_display = Text()
+            risk_display.append(f" {risk_label} ", style=f"bold white on {risk_border}")
+            if isinstance(risk_reasons, list) and risk_reasons:
+                reason_preview = "; ".join(str(item) for item in risk_reasons[:3])
+                if len(reason_preview) > 120:
+                    reason_preview = reason_preview[:120] + "..."
+                risk_display.append(f" {reason_preview}", style="dim")
+            meta.add_row("risk", risk_display)
+
+            # Show key arguments in a compact summary
+            arg_summary_parts = []
             for key in ("file_path", "path", "cwd", "timeout", "replace_all"):
                 if key in args and args.get(key) is not None:
                     value = str(args[key])
                     if len(value) > 120:
                         value = value[:120] + "..."
                     meta.add_row(key, value)
-            if tc.get("risk_level"):
-                meta.add_row("risk", str(tc.get("risk_level")))
-            risk_reasons = tc.get("risk_reasons")
-            if isinstance(risk_reasons, list) and risk_reasons:
-                reason_preview = "; ".join(str(item) for item in risk_reasons[:3])
-                if len(reason_preview) > 160:
-                    reason_preview = reason_preview[:160] + "..."
-                meta.add_row("risk_reasons", reason_preview)
+                    if key in ("file_path", "path"):
+                        arg_summary_parts.append(value)
 
             # Show git tool intent explicitly for safer approval decisions.
             if tool_name == "git":
@@ -273,9 +360,10 @@ class ApprovalHandler:
                     cmd = cmd[:120] + "..."
                 meta.add_row("command", cmd)
 
+            # Build section with risk-colored border
             section: list[Any] = [
-                Rule(f" request {idx}/{len(tool_calls)} ", style="dim"),
-                Text(f"🛠 {tool_name}", style="bold cyan"),
+                Rule(f" [{risk_label}] request {idx}/{len(tool_calls)} ", style=risk_border),
+                Text(f"  {tool_name}", style=risk_style),
                 meta,
             ]
 
@@ -295,10 +383,25 @@ class ApprovalHandler:
             tool_blocks.extend(section)
 
         self.console.print()
-        self.console.print(Text("🧭 Human-in-the-loop · Tool approval required", style="bold yellow"))
-        self.console.print(Rule(style="yellow"))
+        # Header with risk-aware styling
+        max_risk = "low"
+        for tc in tool_calls:
+            tc_risk = tc.get("risk_level") or self.assess_tool_risk(
+                tc.get("name", ""), tc.get("args", {})
+            ).get("level", "low")
+            levels = ["low", "medium", "high"]
+            if levels.index(str(tc_risk).lower()) > levels.index(max_risk):
+                max_risk = str(tc_risk).lower()
+
+        header_colors = {"high": "bold red", "medium": "bold yellow", "low": "bold green"}
+        border_colors = {"high": "red", "medium": "yellow", "low": "green"}
+        header_style = header_colors.get(max_risk, "bold yellow")
+        border_style = border_colors.get(max_risk, "yellow")
+
+        self.console.print(Text("  도구 실행 승인 요청", style=header_style))
+        self.console.print(Rule(style=border_style))
         self.console.print(Group(*(preface_blocks + tool_blocks)))
-        self.console.print(Rule(style="yellow"))
+        self.console.print(Rule(style=border_style))
 
     def _sanitize_approval_rationale(self, text: str) -> str:
         """Drop internal system/meta notes from approval rationale text."""
@@ -498,16 +601,23 @@ class ApprovalHandler:
         Returns:
             Decision dictionary
         """
-        prompt_text = "도구 실행을 승인할까요? (y)es / (n)o / (m)essage / (a)lways > "
+        prompt_text = "승인? (y)승인 (n)거부 (m)피드백 (a)세션 자동승인 > "
 
         while True:
             choice = self._safe_input(prompt_text).lower()
 
-            if choice == "__no_input__":
+            if choice == INPUT_NO_INPUT.lower():
                 return {
                     "type": "deny",
                     "decision": "deny",
                     "reason": "승인 입력을 받지 못해 자동 거부됨",
+                }
+
+            if choice == INPUT_CANCELLED.lower():
+                return {
+                    "type": "deny",
+                    "decision": "deny",
+                    "reason": "사용자가 승인 프롬프트를 취소함",
                 }
 
             if choice in ("", "y", "yes"):
@@ -601,9 +711,9 @@ class ApprovalHandler:
                 print(f"⚠️  입력 인코딩 오류 (무시됨): {e}")
             return ""
         except EOFError:
-            return ""
+            return INPUT_NO_INPUT
         except KeyboardInterrupt:
-            return ""
+            return INPUT_CANCELLED
 
     def assess_tool_risk(
         self, tool_name: str, args: dict[str, Any]

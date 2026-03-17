@@ -496,6 +496,7 @@ def create_enhanced_tool_node(agent: 'ReactAgent') -> callable:
         # Update status indicator for tool execution.
         # For long-running shell tools (e.g., pyinstaller), spinner frames and
         # streaming logs can interleave and produce garbled lines.
+        stopped_for_streaming = False
         if hasattr(agent, 'status_indicator') and agent.status_indicator and tool_calls:
             tool_names_for_status = [tc.get('name', 'unknown') for tc in tool_calls]
             has_streaming_shell = any(
@@ -504,10 +505,39 @@ def create_enhanced_tool_node(agent: 'ReactAgent') -> callable:
             )
             if has_streaming_shell:
                 agent.status_indicator.stop()
+                stopped_for_streaming = True
             elif num_tools == 1:
                 agent.status_indicator.update_for_tool(tool_names_for_status[0])
             else:
                 agent.status_indicator.update(f"Executing {num_tools} tools...")
+
+        # Pre-tool hooks: execute before tool invocation
+        if hasattr(agent, 'hook_manager') and agent.hook_manager and tool_calls:
+            for tc in tool_calls:
+                tc_name = tc.get('name', '')
+                try:
+                    hook_results = agent.hook_manager.execute_hook(
+                        "pre_tool", tool_name=tc_name,
+                        context={"tool_args": tc.get('args', {})}
+                    )
+                    for hr in hook_results:
+                        if hr.blocked:
+                            if agent.console:
+                                agent.console.print(
+                                    f"[red]🚫 Hook blocked tool '{tc_name}': {hr.error}[/red]"
+                                )
+                            # Restart spinner if it was stopped for streaming
+                            if stopped_for_streaming and hasattr(agent, 'status_indicator') and agent.status_indicator:
+                                agent.status_indicator.start("도구 실행 결과를 분석하고 있어요...", reset_metrics=False)
+                            return merge_updates(state_updates, {
+                                "messages": [ToolMessage(
+                                    content=f"Blocked by hook: {hr.error}",
+                                    tool_call_id=tc.get("id", ""),
+                                )]
+                            })
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).debug(f"Pre-tool hook error: {e}")
 
         # Print execution info - highlight parallel execution (Claude Code pattern)
         if agent.console and tool_calls:
@@ -756,10 +786,17 @@ def create_enhanced_tool_node(agent: 'ReactAgent') -> callable:
                     tool_result,
                     error,
                 )
+                # Pass result preview for inline display
+                result_text = ""
+                if tool_result:
+                    result_text = str(tool_result)[:600]
+                elif error:
+                    result_text = str(error)[:300]
                 agent.step_logger.log_tool_result(
                     tool_name,
                     success=ok,
                     decision_hint=decision_hint,
+                    result_preview=result_text,
                 )
 
         # Print completion status
@@ -868,6 +905,22 @@ def create_enhanced_tool_node(agent: 'ReactAgent') -> callable:
                         f"[bold red]⚠️ Syntax errors in {len(syntax_errors)} file(s) — "
                         f"LLM will be notified[/bold red]"
                     )
+
+        # Post-tool hooks: execute after tool invocation
+        if hasattr(agent, 'hook_manager') and agent.hook_manager and tool_calls:
+            for tc in tool_calls:
+                tc_name = tc.get('name', '')
+                try:
+                    agent.hook_manager.execute_hook(
+                        "post_tool", tool_name=tc_name,
+                        context={"tool_args": tc.get('args', {})}
+                    )
+                except Exception:
+                    pass  # Post hooks are fire-and-forget
+
+        # Restart spinner if it was stopped for streaming shell tools
+        if stopped_for_streaming and hasattr(agent, 'status_indicator') and agent.status_indicator:
+            agent.status_indicator.start("도구 실행 결과를 분석하고 있어요...", reset_metrics=False)
 
         return merge_updates(state_updates, result)
 

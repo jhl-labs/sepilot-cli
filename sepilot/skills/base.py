@@ -29,6 +29,14 @@ class SkillMetadata:
     triggers: list[str] = field(default_factory=list)  # Keywords that trigger this skill
     category: str = "general"
     priority: int = 0  # Higher priority = matched first when multiple skills match
+    # Extended fields for markdown skills (SKILL.md)
+    allowed_tools: list[str] = field(default_factory=list)
+    model_override: str | None = None
+    context_mode: str = "inline"  # "inline" or "fork"
+    agent_type: str | None = None
+    user_invocable: bool = True
+    disable_model_invocation: bool = False
+    argument_hint: str = ""
 
 
 class BaseSkill(ABC):

@@ -38,6 +38,9 @@ GLOBAL_INSTRUCTIONS_FILE = "SEPILOT.md"
 PROJECT_SEPILOT_DIR = ".sepilot"
 PROJECT_CONTEXT_FILE = "context.md"
 
+# Supported instruction file names (checked in order)
+INSTRUCTION_FILENAMES = ["SEPILOT.md", "AGENT.md", "CLAUDE.md"]
+
 
 def ensure_global_sepilot_dir() -> Path:
     """Ensure ~/.sepilot directory exists with proper structure."""
@@ -47,6 +50,9 @@ def ensure_global_sepilot_dir() -> Path:
     # Create subdirectories
     (global_dir / "memories").mkdir(exist_ok=True)
     (global_dir / "sessions").mkdir(exist_ok=True)
+    (global_dir / "skills").mkdir(exist_ok=True)
+    (global_dir / "rules").mkdir(exist_ok=True)
+    (global_dir / "commands").mkdir(exist_ok=True)
 
     # Create default SEPILOT.md if not exists
     instructions_file = global_dir / GLOBAL_INSTRUCTIONS_FILE
@@ -55,6 +61,10 @@ def ensure_global_sepilot_dir() -> Path:
             "# SE Pilot Global Instructions\n\n"
             "Add your personal preferences and instructions here.\n"
             "These will be applied to all projects.\n\n"
+            "## Supported file names:\n"
+            "- SEPILOT.md (primary)\n"
+            "- AGENT.md (alternative)\n"
+            "- CLAUDE.md (Claude Code compatible)\n\n"
             "## Example:\n"
             "- 대답은 항상 한국어로 해\n"
             "- Always commit changes with descriptive messages\n",
@@ -65,23 +75,79 @@ def ensure_global_sepilot_dir() -> Path:
 
 
 def get_global_instructions() -> str:
-    """Get global user instructions from ~/.sepilot/SEPILOT.md."""
+    """Get global user instructions from ~/.sepilot/.
+
+    Checks for SEPILOT.md, AGENT.md, CLAUDE.md in order.
+    Also checks ~/.claude/ for Claude Code compatibility.
+    """
     ensure_global_sepilot_dir()
-    instructions_file = GLOBAL_SEPILOT_DIR / GLOBAL_INSTRUCTIONS_FILE
-    if instructions_file.exists():
-        return instructions_file.read_text(encoding="utf-8")
+
+    # Check ~/.sepilot/ first
+    for filename in INSTRUCTION_FILENAMES:
+        instructions_file = GLOBAL_SEPILOT_DIR / filename
+        if instructions_file.exists():
+            return instructions_file.read_text(encoding="utf-8")
+
+    # Check ~/.claude/ for Claude Code compatibility
+    claude_dir = Path.home() / ".claude"
+    if claude_dir.exists():
+        for filename in INSTRUCTION_FILENAMES:
+            instructions_file = claude_dir / filename
+            if instructions_file.exists():
+                return instructions_file.read_text(encoding="utf-8")
+
     return ""
 
 
 def get_project_context(project_path: Path | None = None) -> str:
-    """Get project-specific context from .sepilot/context.md."""
+    """Get project-specific context from .sepilot/context.md.
+
+    Also checks .claude/ and .agent/ directories,
+    and looks for AGENT.md/CLAUDE.md at project root.
+    """
     if project_path is None:
         project_path = Path.cwd()
 
-    context_file = project_path / PROJECT_SEPILOT_DIR / PROJECT_CONTEXT_FILE
-    if context_file.exists():
-        return context_file.read_text(encoding="utf-8")
+    # Check config directories
+    for config_dir in [PROJECT_SEPILOT_DIR, ".claude", ".agent"]:
+        context_file = project_path / config_dir / PROJECT_CONTEXT_FILE
+        if context_file.exists():
+            return context_file.read_text(encoding="utf-8")
+
+    # Check project root for instruction files
+    for filename in INSTRUCTION_FILENAMES:
+        root_file = project_path / filename
+        if root_file.exists():
+            return root_file.read_text(encoding="utf-8")
+
     return ""
+
+
+def get_all_instructions(
+    project_path: Path | None = None,
+    active_files: list[str] | None = None
+) -> str:
+    """Get all instructions using the full InstructionsLoader.
+
+    This is the recommended function for loading instructions.
+    Falls back to simple loading if InstructionsLoader is not available.
+    """
+    try:
+        from sepilot.agent.instructions_loader import load_all_instructions
+        return load_all_instructions(
+            working_dir=project_path,
+            active_files=active_files,
+        )
+    except ImportError:
+        # Fallback to simple loading
+        parts = []
+        global_inst = get_global_instructions()
+        if global_inst:
+            parts.append(global_inst)
+        project_ctx = get_project_context(project_path)
+        if project_ctx:
+            parts.append(project_ctx)
+        return "\n\n---\n\n".join(parts)
 
 
 def save_project_context(context: str, project_path: Path | None = None) -> None:

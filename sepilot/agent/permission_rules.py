@@ -248,14 +248,17 @@ class PermissionManager:
         self,
         config_path: Path | None = None,
         project_path: Path | None = None,
+        auto_persist: bool = True,
     ):
         """Initialize permission manager
 
         Args:
             config_path: Path to user config file
             project_path: Path to project root for project-specific rules
+            auto_persist: If True, automatically save rules on add/remove
         """
         self.rule_set = PermissionRuleSet()
+        self._auto_persist = auto_persist
 
         # Load user rules
         if config_path is None:
@@ -326,6 +329,18 @@ class PermissionManager:
 
         return permission, reasons.get(permission, "")
 
+    def _auto_save(self) -> None:
+        """Persist rules to disk if auto_persist is enabled.
+
+        Failures are logged but never raised to avoid breaking callers.
+        """
+        if not self._auto_persist:
+            return
+        try:
+            self.save_rules()
+        except Exception as exc:
+            logger.warning("Auto-persist failed (non-fatal): %s", exc)
+
     def add_allow_rule(
         self, tool: str, pattern: str, description: str = ""
     ) -> None:
@@ -342,6 +357,7 @@ class PermissionManager:
             permission=PermissionLevel.ALLOW,
             description=description,
         ))
+        self._auto_save()
 
     def add_ask_rule(
         self, tool: str, pattern: str, description: str = ""
@@ -359,6 +375,7 @@ class PermissionManager:
             permission=PermissionLevel.ASK,
             description=description,
         ))
+        self._auto_save()
 
     def add_deny_rule(
         self, tool: str, pattern: str, description: str = ""
@@ -377,6 +394,26 @@ class PermissionManager:
             description=description,
             priority=500,  # High priority for custom deny rules
         ))
+        self._auto_save()
+
+    def remove_rule(self, tool: str, pattern: str) -> bool:
+        """Remove a user rule by tool name and pattern.
+
+        Built-in dangerous rules (priority >= 1000) cannot be removed.
+
+        Args:
+            tool: Tool name
+            pattern: Pattern string
+
+        Returns:
+            True if a rule was removed
+        """
+        for i, rule in enumerate(self.rule_set.rules):
+            if rule.tool == tool and rule.pattern == pattern and rule.priority < 1000:
+                del self.rule_set.rules[i]
+                self._auto_save()
+                return True
+        return False
 
     def save_rules(self) -> None:
         """Save current rules to config file"""

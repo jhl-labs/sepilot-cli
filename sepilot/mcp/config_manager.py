@@ -1,29 +1,46 @@
 """MCP Configuration Manager
 
 Manages MCP server configurations and persists them to disk.
+
+Enhanced with Claude Code-style features:
+- .mcp.json project file support
+- Environment variable expansion (${VAR:-default})
+- Scope hierarchy (local > project > user)
+- Multiple config directory support (.sepilot/, .claude/)
 """
 
 import json
+import logging
 import os
+import re
+import shutil
 import tempfile
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class MCPAccessControl:
     """Access control configuration for an MCP server"""
 
-    # Allow list - agents explicitly allowed (highest priority)
+    # Allow list - agents explicitly allowed (highest priority, stored lowercase)
     allow: list[str] = field(default_factory=list)
 
-    # Deny list - agents explicitly denied (second priority)
+    # Deny list - agents explicitly denied (second priority, stored lowercase)
     deny: list[str] = field(default_factory=list)
 
     # Default behavior when agent is not in allow or deny list
     default_allow: bool = True
+
+    def __post_init__(self):
+        """Normalize allow/deny lists to lowercase"""
+        self.allow = [a.lower() for a in self.allow]
+        self.deny = [d.lower() for d in self.deny]
 
     def can_access(self, agent_name: str) -> bool:
         """Check if an agent can access this MCP server
@@ -143,6 +160,8 @@ class MCPServerConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> 'MCPServerConfig':
         """Create from dictionary"""
+        # Copy to avoid mutating the input dict
+        data = dict(data)
         # Extract access_control and create MCPAccessControl object
         ac_data = data.pop('access_control', {})
         access_control = MCPAccessControl(**ac_data)
@@ -150,12 +169,86 @@ class MCPServerConfig:
         # Create MCPServerConfig with remaining data
         return cls(access_control=access_control, **data)
 
+    @classmethod
+    def from_mcp_json(cls, name: str, data: dict[str, Any]) -> 'MCPServerConfig':
+        """Create from .mcp.json format (Claude Code compatible).
+
+        .mcp.json format:
+        {
+            "mcpServers": {
+                "server-name": {
+                    "type": "http",
+                    "url": "https://...",
+                    "headers": {"Authorization": "Bearer ${TOKEN}"},
+                    "command": "...",
+                    "args": [],
+                    "env": {}
+                }
+            }
+        }
+        """
+        transport = data.get("type", "stdio")
+        url = data.get("url")
+        command = data.get("command")
+        args = data.get("args", [])
+        env = data.get("env", {})
+        headers = data.get("headers", {})
+
+        # Expand environment variables in values
+        env = {k: _expand_env_vars(v) for k, v in env.items()}
+        if url:
+            url = _expand_env_vars(url)
+        if command:
+            command = _expand_env_vars(command)
+        args = [_expand_env_vars(a) for a in args]
+        if headers:
+            headers = {k: _expand_env_vars(v) for k, v in headers.items()}
+
+        return cls(
+            name=name,
+            command=command,
+            args=args,
+            env=env,
+            url=url,
+            transport=transport,
+            description=data.get("description", ""),
+            oauth={"headers": headers} if headers else None,
+        )
+
+
+def _expand_env_vars(value: str) -> str:
+    """Expand ${VAR:-default} patterns in config values.
+
+    Supports:
+    - ${VAR} - simple env var
+    - ${VAR:-default} - env var with default value
+    - $VAR - simple env var (no braces)
+    """
+    def replacer_braced(match: re.Match) -> str:
+        var_name = match.group(1)
+        default = match.group(3) if match.group(3) is not None else ""
+        return os.environ.get(var_name, default)
+
+    def replacer_simple(match: re.Match) -> str:
+        var_name = match.group(1)
+        return os.environ.get(var_name, match.group(0))
+
+    # ${VAR:-default} pattern first (more specific)
+    result = re.sub(r'\$\{(\w+)(:-([^}]*))?\}', replacer_braced, value)
+    # $VAR pattern (only if not already handled by braced pattern)
+    result = re.sub(r'\$(\w+)', replacer_simple, result)
+    return result
+
 
 class MCPConfigManager:
     """Manager for MCP server configurations
 
     Handles loading, saving, and managing MCP server configurations.
-    Configurations are stored in ~/.sepilot/mcp_config.json
+
+    Configuration sources (higher priority first):
+    1. .mcp.json (project-local, Claude Code compatible)
+    2. .sepilot/mcp_config.json (project-local)
+    3. ~/.sepilot/mcp_config.json (user-global)
     """
 
     def __init__(self, config_path: Path | None = None):
@@ -171,40 +264,54 @@ class MCPConfigManager:
 
         self.config_path = Path(config_path)
         self.servers: dict[str, MCPServerConfig] = {}
+        self._lock = threading.RLock()
 
         # Load existing configuration
         self.load()
 
     def load(self):
-        """Load configuration from disk"""
-        if not self.config_path.exists():
-            # Create default configuration
-            self._create_default_config()
-            return
+        """Load configuration from all sources.
 
+        Load order (later sources override earlier):
+        1. User-global config (~/.sepilot/mcp_config.json)
+        2. Project .mcp.json (Claude Code compatible)
+        """
+        # Step 1: Load from user config file
+        if not self.config_path.exists():
+            self._create_default_config()
+        else:
+            self._load_from_file(self.config_path)
+
+        # Step 2: Load from .mcp.json (project-local, higher priority)
+        self._load_project_mcp_json()
+
+    def _load_from_file(self, filepath: Path):
+        """Load servers from a sepilot mcp_config.json file."""
         try:
-            with open(self.config_path, encoding='utf-8') as f:
+            with open(filepath, encoding='utf-8') as f:
                 data = json.load(f)
 
-            # Load servers
-            self.servers = {}
             for name, server_data in data.get('servers', {}).items():
                 self.servers[name] = MCPServerConfig.from_dict(server_data)
 
         except Exception as e:
             # Backup corrupted config before overwriting
-            backup_path = self.config_path.with_suffix('.bak')
+            backup_path = filepath.with_suffix('.bak')
             try:
-                import shutil
-                shutil.copy2(self.config_path, backup_path)
-                print(f"Warning: MCP config corrupted, backed up to {backup_path}")
+                shutil.copy2(filepath, backup_path)
+                logger.warning(f"MCP config corrupted, backed up to {backup_path}")
             except Exception:
                 pass
-            print(f"Warning: Failed to load MCP config: {e}")
+            logger.warning(f"Failed to load MCP config: {e}")
             self._create_default_config()
 
     def save(self):
         """Save configuration to disk using atomic write to prevent corruption"""
+        with self._lock:
+            self._save_unlocked()
+
+    def _save_unlocked(self):
+        """Internal save without lock (caller must hold self._lock)"""
         try:
             data = {
                 'servers': {
@@ -219,7 +326,6 @@ class MCPConfigManager:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Atomic write: write to temp file, then rename
-            import tempfile
             tmp_fd, tmp_path = tempfile.mkstemp(
                 dir=self.config_path.parent,
                 suffix='.tmp',
@@ -241,6 +347,118 @@ class MCPConfigManager:
 
         except Exception as e:
             raise RuntimeError(f"Failed to save MCP config: {e}") from e
+
+    # Known fields for .mcp.json server entries
+    _KNOWN_SERVER_FIELDS = {
+        "type", "command", "args", "env", "url", "headers",
+        "description", "oauth", "enabled", "transport",
+    }
+
+    @staticmethod
+    def _validate_server_entry(name: str, data: dict, source: str) -> list[str]:
+        """Validate a single MCP server entry from .mcp.json.
+
+        Returns a list of warning messages (empty means valid).
+        Validation is advisory only -- the server will still be loaded.
+        """
+        warnings: list[str] = []
+
+        # Must have command (stdio) or url (remote)
+        has_command = bool(data.get("command"))
+        has_url = bool(data.get("url"))
+        if not has_command and not has_url:
+            warnings.append(
+                f"[{source}] server '{name}': "
+                "'command' 또는 'url' 필드가 필요합니다"
+            )
+
+        # Type checks
+        if "args" in data and not isinstance(data["args"], list):
+            warnings.append(
+                f"[{source}] server '{name}': "
+                f"'args' 필드는 list 타입이어야 합니다 "
+                f"(현재: {type(data['args']).__name__})"
+            )
+        if "env" in data and not isinstance(data["env"], dict):
+            warnings.append(
+                f"[{source}] server '{name}': "
+                f"'env' 필드는 dict 타입이어야 합니다 "
+                f"(현재: {type(data['env']).__name__})"
+            )
+        if "headers" in data and not isinstance(data["headers"], dict):
+            warnings.append(
+                f"[{source}] server '{name}': "
+                f"'headers' 필드는 dict 타입이어야 합니다 "
+                f"(현재: {type(data['headers']).__name__})"
+            )
+
+        # Warn on unknown fields
+        unknown = set(data.keys()) - MCPConfigManager._KNOWN_SERVER_FIELDS
+        if unknown:
+            warnings.append(
+                f"[{source}] server '{name}': "
+                f"알 수 없는 필드: {', '.join(sorted(unknown))}"
+            )
+
+        return warnings
+
+    def _load_project_mcp_json(self):
+        """Load .mcp.json from project root (Claude Code compatible).
+
+        .mcp.json format:
+        {
+            "mcpServers": {
+                "github": {
+                    "type": "http",
+                    "url": "https://api.githubcopilot.com/mcp/",
+                    "headers": {"Authorization": "Bearer ${TOKEN}"}
+                }
+            }
+        }
+
+        Project-level servers override user-level servers with same name.
+        Schema validation warnings are logged but never block server loading.
+        """
+        # Search in multiple locations
+        search_paths = [
+            Path.cwd() / ".mcp.json",
+            Path.cwd() / ".sepilot" / ".mcp.json",
+            Path.cwd() / ".claude" / ".mcp.json",
+        ]
+
+        for mcp_json_path in search_paths:
+            if mcp_json_path.exists():
+                try:
+                    with open(mcp_json_path, encoding='utf-8') as f:
+                        data = json.load(f)
+
+                    mcp_servers = data.get("mcpServers", {})
+                    for name, server_data in mcp_servers.items():
+                        # Schema validation (advisory only)
+                        validation_warnings = self._validate_server_entry(
+                            name, server_data, str(mcp_json_path)
+                        )
+                        for warning_msg in validation_warnings:
+                            logger.warning(warning_msg)
+
+                        # Project servers override user servers
+                        server = MCPServerConfig.from_mcp_json(name, server_data)
+                        self.servers[name] = server
+
+                    if mcp_servers:
+                        logger.info(
+                            f"Loaded {len(mcp_servers)} MCP servers from "
+                            f"{mcp_json_path}"
+                        )
+
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        f"Invalid .mcp.json at {mcp_json_path}: {e}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to load .mcp.json from {mcp_json_path}: {e}"
+                    )
 
     def _create_default_config(self):
         """Create default configuration with example servers"""
@@ -282,6 +500,9 @@ class MCPConfigManager:
             raise ValueError(f"Server '{name}' already exists")
 
         # Validate configuration
+        valid_transports = ("stdio", "http", "sse")
+        if transport not in valid_transports:
+            raise ValueError(f"Invalid transport '{transport}'. Must be one of: {valid_transports}")
         if transport == "stdio" and not command:
             raise ValueError("Local (stdio) servers require a command")
         if transport in ("http", "sse") and not url:

@@ -115,7 +115,11 @@ from sepilot.agent.file_detector import FilePathDetector, create_file_detector
 from sepilot.agent.hierarchical_planner import HierarchicalPlanner, create_hierarchical_planner
 
 # Advanced agent patterns
+from sepilot.agent.hooks import HookManager, get_hook_manager
+from sepilot.agent.instructions_loader import load_all_instructions
 from sepilot.agent.memory_bank import MemoryBank, create_memory_bank
+from sepilot.agent.rules_loader import get_rules_loader
+from sepilot.agent.subagent.worktree_manager import WorktreeManager
 from sepilot.tools.codebase_tools import CodebaseExplorer
 
 # Pattern nodes for LangGraph visualization
@@ -303,11 +307,15 @@ class ReactAgent:
             self.is_thinking_model = False
             self.triage_llm = None
             self.verifier_llm = None
+            self.reasoning_llm = None
+            self.quick_llm = None
         else:
             self.llm = self._initialize_llm()
-            # Initialize tier-specific LLMs for classification tasks (cheaper models)
-            self.triage_llm = self.llm  # Default: use main LLM
-            self.verifier_llm = self.llm  # Default: use main LLM
+            # Initialize tier-specific LLMs (defaults to main LLM)
+            self.triage_llm = self.llm
+            self.verifier_llm = self.llm
+            self.reasoning_llm = self.llm
+            self.quick_llm = self.llm
             self._init_tier_llms()
             self._bind_tools_to_llm()
 
@@ -316,6 +324,12 @@ class ReactAgent:
             set_current_settings(self.settings)
 
         self.iteration_count = 0
+
+        # Progress tracking for checklist (persisted across conversation turns)
+        self._progress_plan_steps: list[str] = []
+        self._progress_planning_notes: list[str] = []
+        self._progress_current_step: int = 0
+        self._progress_current_task: dict[str, Any] | None = None
 
         # Agent Mode system (PLAN/CODE/EXEC)
         self.mode_engine = ModeTransitionEngine()
@@ -451,8 +465,11 @@ class ReactAgent:
         self.a2a_connector: A2AConnector | None = None
         self.handoff_manager: SessionHandoffManager | None = None
 
-        # Initialize Advanced Agent Patterns
-        self._init_agent_patterns()
+        # Initialize Advanced Agent Patterns (skip for simplified graph mode)
+        if getattr(self.settings, 'graph_mode', 'enhanced') == 'simplify':
+            self._init_stub_patterns()
+        else:
+            self._init_agent_patterns()
 
         # Build the graph with checkpointer
         self.graph = self._build_graph()
@@ -501,7 +518,7 @@ class ReactAgent:
 
         # Hierarchical Planner - multi-level task decomposition
         self.hierarchical_planner: HierarchicalPlanner = create_hierarchical_planner(
-            llm=self.llm,
+            llm=self.reasoning_llm,
             console=self.console,
             verbose=self.verbose
         )
@@ -514,7 +531,7 @@ class ReactAgent:
 
         # Debate Orchestrator - multi-perspective analysis
         self.debate_orchestrator: DebateOrchestrator = create_debate_orchestrator(
-            llm=self.llm,
+            llm=self.reasoning_llm,
             console=self.console,
             verbose=self.verbose
         )
@@ -536,11 +553,45 @@ class ReactAgent:
             logger=self.logger
         )
 
+        # Hook Manager - pre/post tool execution hooks
+        self.hook_manager: HookManager = get_hook_manager()
+
+        # Rules Loader - path-based conditional rules
+        self.rules_loader = get_rules_loader(project_root=Path(os.getcwd()))
+
+        # Worktree Manager - git worktree isolation for subagents
+        self.worktree_manager: WorktreeManager = WorktreeManager(
+            repo_root=Path(os.getcwd())
+        )
+
         if self.console and self.verbose:
             self.console.print(
                 "[dim cyan]🧠 Advanced agent patterns initialized: "
-                "Memory, Backtracking, Hierarchical Planning, Tool Learning, Debate, Exploration[/dim cyan]"
+                "Memory, Backtracking, Hierarchical Planning, Tool Learning, Debate, Exploration, Hooks, Rules[/dim cyan]"
             )
+
+    def _init_stub_patterns(self) -> None:
+        """Stub pattern attributes for simplified graph mode.
+
+        Sets None placeholders so attribute access in update_llm() and other
+        methods doesn't crash, but avoids heavy initialization overhead.
+        """
+        self.memory_bank = None
+        self.backtracking = None
+        self.hierarchical_planner = None
+        self.tool_learning = None
+        self.debate_orchestrator = None
+        self.pattern_orchestrator = None
+        self.file_detector = None
+        self.codebase_explorer = None
+        self._reflection_node = None
+        # Hooks and rules are lightweight - always initialize
+        self.hook_manager: HookManager = get_hook_manager()
+        self.rules_loader = get_rules_loader(project_root=Path(os.getcwd()))
+        # Worktree Manager is lightweight - always initialize
+        self.worktree_manager: WorktreeManager = WorktreeManager(
+            repo_root=Path(os.getcwd())
+        )
 
     def update_llm(self, new_llm, updated_settings: Settings | None = None) -> None:
         """Propagate LLM update to ALL dependent systems.
@@ -558,19 +609,27 @@ class ReactAgent:
         self._bind_tools_to_llm()
         self._mode_llm_cache.clear()  # Invalidate mode-filtered LLM cache
 
-        # Tier LLMs (triage/verifier use main LLM unless separately configured)
+        # Reset all tier LLMs to main, then re-initialize from settings
         self.triage_llm = new_llm
         self.verifier_llm = new_llm
+        self.reasoning_llm = new_llm
+        self.quick_llm = new_llm
 
-        # Hierarchical Planner
+        # Update settings if provided (before _init_tier_llms so it reads new config)
+        if updated_settings:
+            self.settings = updated_settings
+
+        # Re-initialize tier LLMs from settings (restores separate models if configured)
+        self._init_tier_llms()
+
+        # Propagate reasoning_llm to planning/debate/reflection components
         if hasattr(self, 'hierarchical_planner') and self.hierarchical_planner:
-            self.hierarchical_planner.llm = new_llm
+            self.hierarchical_planner.llm = self.reasoning_llm
 
-        # Debate Orchestrator (proposer, critic, resolver)
         if hasattr(self, 'debate_orchestrator') and self.debate_orchestrator:
-            self.debate_orchestrator.proposer.llm = new_llm
-            self.debate_orchestrator.critic.llm = new_llm
-            self.debate_orchestrator.resolver.llm = new_llm
+            self.debate_orchestrator.proposer.llm = self.reasoning_llm
+            self.debate_orchestrator.critic.llm = self.reasoning_llm
+            self.debate_orchestrator.resolver.llm = self.reasoning_llm
 
         # Pattern Orchestrator
         if hasattr(self, 'pattern_orchestrator') and self.pattern_orchestrator:
@@ -578,11 +637,7 @@ class ReactAgent:
 
         # Reflection Node (created during graph build)
         if hasattr(self, '_reflection_node') and self._reflection_node:
-            self._reflection_node.llm = new_llm
-
-        # Update settings if provided
-        if updated_settings:
-            self.settings = updated_settings
+            self._reflection_node.llm = self.reasoning_llm
 
         # Propagate settings to SubAgent tools
         from sepilot.tools.langchain_tools.subagent_tools import set_current_settings
@@ -689,10 +744,7 @@ class ReactAgent:
         max_interrupts = getattr(self.settings, 'max_interrupts', 50)  # type: int
         interrupt_count = 0
         next_input: Any = initial_input
-        progress_plan_steps: list[str] = []
-        progress_planning_notes: list[str] = []
-        progress_current_step: int = 0
-        progress_current_task: dict[str, Any] | None = None
+        # Progress tracking uses instance variables (persisted across conversation turns)
 
         while True:
             # Use stream() with default mode (updates) to detect interrupts
@@ -713,26 +765,26 @@ class ReactAgent:
                             payload = chunk.get(key)
                             if isinstance(payload, dict):
                                 if isinstance(payload.get("plan_steps"), list):
-                                    progress_plan_steps = payload.get("plan_steps", [])
+                                    self._progress_plan_steps = payload.get("plan_steps", [])
                                 if isinstance(payload.get("planning_notes"), list):
-                                    progress_planning_notes = payload.get("planning_notes", [])
+                                    self._progress_planning_notes = payload.get("planning_notes", [])
                                 if payload.get("current_plan_step") is not None:
                                     try:
-                                        progress_current_step = int(payload.get("current_plan_step"))
+                                        self._progress_current_step = int(payload.get("current_plan_step"))
                                     except (TypeError, ValueError):
                                         pass
                                 if isinstance(payload.get("current_task"), dict):
-                                    progress_current_task = payload.get("current_task")
+                                    self._progress_current_task = payload.get("current_task")
 
                             self.step_logger.log_plan(
-                                progress_plan_steps,
-                                progress_planning_notes,
+                                self._progress_plan_steps,
+                                self._progress_planning_notes,
                             )
                             self.step_logger.log_plan_progress(
-                                progress_plan_steps,
-                                progress_current_step,
-                                progress_current_task,
-                                progress_planning_notes,
+                                self._progress_plan_steps,
+                                self._progress_current_step,
+                                self._progress_current_task,
+                                self._progress_planning_notes,
                             )
 
                 # Update monitor with node execution (if monitor is available)
@@ -794,7 +846,7 @@ class ReactAgent:
 
                     # Resume indicator after interrupt
                     if self.status_indicator:
-                        self.status_indicator.start("Resuming...")
+                        self.status_indicator.start("Resuming...", reset_metrics=False)
 
                     # Resume with Command - enhanced with state update
                     # Track approval in state for better context
@@ -848,17 +900,29 @@ class ReactAgent:
             for idx, note in enumerate(verification_notes[-5:], 1):
                 self.console.print(f"[cyan]{idx}. {note}[/cyan]")
 
+    # Regex patterns for thinking/reasoning models that can't use bind_tools.
+    # Uses word-boundary-aware matching to avoid false positives (e.g., 'modelo3' won't match 'o3').
+    _THINKING_MODEL_RE = re.compile(
+        r'deepseek-r1|'
+        r'\bqwq\b|'
+        r'qwen-think|'
+        r'\bo1-|'
+        r'\bo3\b|'          # matches 'o3', 'o3-mini' (word boundary before, boundary/hyphen after)
+        r'\bo3-|'
+        r'\breasoning\b|'
+        r'deepseek.*think',
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _check_thinking_model(llm) -> bool:
+        """Check if a given LLM is a thinking/reasoning model that can't bind_tools."""
+        model_name = str(getattr(llm, 'model_name', None) or getattr(llm, 'model', '') or '').lower()
+        return bool(ReactAgent._THINKING_MODEL_RE.search(model_name))
+
     def _bind_tools_to_llm(self):
         """Bind LangChain tools to LLM and detect thinking models."""
-        model_name = str(self.settings.model).lower()
-        self.is_thinking_model = any([
-            'deepseek-r1' in model_name,
-            'qwq' in model_name,
-            'qwen-think' in model_name,
-            'o1-' in model_name,
-            'reasoning' in model_name,
-            'think' in model_name and 'deepseek' in model_name
-        ])
+        self.is_thinking_model = self._check_thinking_model(self.llm)
 
         if self.is_thinking_model:
             if self.console:
@@ -869,32 +933,49 @@ class ReactAgent:
         else:
             self.llm_with_tools = self.llm.bind_tools(self.langchain_tools)
 
-    def _get_mode_filtered_llm(self, mode: AgentMode):
+    def _get_mode_filtered_llm(self, mode: AgentMode, task_type: str | None = None):
         """Get LLM bound with mode-filtered tools. Results are cached per mode.
 
         Args:
             mode: Current agent mode
+            task_type: Optional task type for tier routing ("reasoning", "quick")
 
         Returns:
             LLM instance with mode-appropriate tools bound
         """
-        if mode == AgentMode.AUTO:
+        # Select base LLM based on task_type or mode
+        if task_type == "reasoning":
+            base_llm = self.reasoning_llm
+        elif task_type == "quick":
+            base_llm = self.quick_llm
+        elif mode == AgentMode.PLAN:
+            base_llm = self.reasoning_llm
+        else:
+            base_llm = self.llm
+
+        # Fast path: AUTO mode with default LLM
+        if mode == AgentMode.AUTO and base_llm is self.llm:
             return self.llm_with_tools
 
         # Thinking models can't bind_tools — rely on runtime filtering in tool_executor
-        if self.is_thinking_model:
-            return self.llm_with_tools
+        if self._check_thinking_model(base_llm):
+            return base_llm
 
         prompt_profile = getattr(self, "prompt_profile", "default")
-        cache_key = f"{mode.value}_{prompt_profile}"
+        cache_key = f"{mode.value}_{task_type or 'default'}_{prompt_profile}_{id(base_llm)}"
         if cache_key in self._mode_llm_cache:
             return self._mode_llm_cache[cache_key]
 
         filtered_tools = get_mode_filtered_tools(self.langchain_tools, mode, prompt_profile)
         if not filtered_tools:
-            return self.llm_with_tools
+            # No tool filtering needed — bind all tools if not the main LLM
+            if base_llm is self.llm:
+                return self.llm_with_tools
+            bound = base_llm.bind_tools(self.langchain_tools)
+            self._mode_llm_cache[cache_key] = bound
+            return bound
 
-        bound = self.llm.bind_tools(filtered_tools)
+        bound = base_llm.bind_tools(filtered_tools)
         self._mode_llm_cache[cache_key] = bound
         return bound
 
@@ -982,9 +1063,130 @@ class ReactAgent:
                 )
                 self.verifier_llm = self.llm
 
+        if getattr(self.settings, 'reasoning_model', None):
+            try:
+                self.reasoning_llm = factory.create_llm(self.settings.reasoning_model)
+                if self.console and self.verbose:
+                    self.console.print(
+                        f"[dim cyan]🧠 Reasoning model: {self.settings.reasoning_model}[/dim cyan]"
+                    )
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Tier LLM init failed for reasoning model '{self.settings.reasoning_model}': {e}. Using main LLM."
+                )
+                self.reasoning_llm = self.llm
+
+        if getattr(self.settings, 'quick_model', None):
+            try:
+                self.quick_llm = factory.create_llm(self.settings.quick_model)
+                if self.console and self.verbose:
+                    self.console.print(
+                        f"[dim cyan]⚡ Quick model: {self.settings.quick_model}[/dim cyan]"
+                    )
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Tier LLM init failed for quick model '{self.settings.quick_model}': {e}. Using main LLM."
+                )
+                self.quick_llm = self.llm
+
     def _build_graph(self) -> StateGraph:
-        """Build LangGraph workflow (Enhanced State only)."""
+        """Build LangGraph workflow based on graph_mode setting."""
+        if getattr(self.settings, 'graph_mode', 'enhanced') == 'simplify':
+            return self._build_simplified_graph()
         return self._build_enhanced_graph()
+
+    def _build_simplified_graph(self) -> StateGraph:
+        """Minimal agent loop (Claude Code style) — 9 nodes.
+
+        Designed for slow-inference / rate-limited environments.
+        Skips: orchestrator, memory, planner, tool_recommender, tool_recorder,
+               reflection, backtrack, debate, codebase_exploration.
+
+        Graph structure:
+            triage
+              ├─→ direct_response → END
+              └─→ iteration_guard → context_manager → agent
+                                                        │
+                              ┌─────────────────────────┴──────────┐
+                              ↓                                    ↓
+                          approval → tools → verifier         verifier
+                              │                │                   │
+                              └────────────────┴───────────────────↓
+                                                iteration_guard ←→ reporter → END
+        """
+        workflow = StateGraph(EnhancedAgentState)
+
+        # Tool node (reuse existing enhanced tool executor)
+        enhanced_tool_node = create_enhanced_tool_node(self)
+
+        # ===== 9 nodes only =====
+        workflow.add_node("triage", self._triage_node)
+        workflow.add_node("direct_response", self._direct_response_node)
+        workflow.add_node("iteration_guard", self._iteration_guard_node)
+        workflow.add_node("context_manager", self._context_manager_node)
+        workflow.add_node("agent", self._agent_node)
+        workflow.add_node("approval", self._approval_node)
+        workflow.add_node("tools", enhanced_tool_node)
+        workflow.add_node("verifier", self._verification_node)
+        workflow.add_node("reporter", self._reporting_node)
+
+        # ===== Edges =====
+        workflow.set_entry_point("triage")
+
+        # Triage: 2-way split (no orchestrator distinction)
+        workflow.add_conditional_edges(
+            "triage",
+            self._triage_next_step_simplified,
+            {"direct": "direct_response", "execute": "iteration_guard"}
+        )
+        workflow.add_edge("direct_response", END)
+
+        # Iteration guard: stop → reporter directly (no memory_writer)
+        workflow.add_conditional_edges(
+            "iteration_guard",
+            self._guard_decision,
+            {"continue": "context_manager", "stop": "reporter"}
+        )
+
+        # Core loop: no tool_recommender
+        workflow.add_edge("context_manager", "agent")
+
+        # Agent routing (reuse existing)
+        workflow.add_conditional_edges(
+            "agent",
+            self._agent_next_step,
+            {"tools": "approval", "finalize": "verifier"}
+        )
+
+        # Approval routing (reuse existing)
+        workflow.add_conditional_edges(
+            "approval",
+            self._approval_next_step,
+            {"run_tools": "tools", "retry": "iteration_guard"}
+        )
+
+        # Tools → verifier (no tool_recorder)
+        workflow.add_edge("tools", "verifier")
+
+        # Verifier: simplified — no reflection/backtrack/debate pipeline
+        workflow.add_conditional_edges(
+            "verifier",
+            self._verification_next_step_simplified,
+            {"continue": "iteration_guard", "report": "reporter"}
+        )
+
+        # Exit
+        workflow.add_edge("reporter", END)
+
+        if self.console and self.verbose:
+            self.console.print(
+                "[dim cyan]⚡ Simplified graph mode: 9 nodes "
+                "(triage → agent → tools loop)[/dim cyan]"
+            )
+
+        return workflow.compile(checkpointer=self.checkpointer)
 
     def _build_enhanced_graph(self) -> StateGraph:
         """Full agent pipeline with all pattern nodes for visualization.
@@ -1045,7 +1247,7 @@ class ReactAgent:
 
         # Create reflection node (store for LLM propagation)
         self._reflection_node = create_reflection_node(
-            llm=self.llm,
+            llm=self.reasoning_llm,
             console=self.console,
             verbose=self.verbose,
             logger=self.logger
@@ -1358,6 +1560,13 @@ class ReactAgent:
         else:
             return "complex"
 
+    def _triage_next_step_simplified(self, state: EnhancedAgentState) -> Literal["direct", "execute"]:
+        """Simplified triage: direct response or execute (no orchestrator distinction)."""
+        decision = state.get("triage_decision") or "use_tools"
+        if decision == "direct_response":
+            return "direct"
+        return "execute"
+
     def _extract_at_file_references(self, text: str) -> list[tuple[str, str]]:
         """Extract @file references and read their contents.
 
@@ -1574,7 +1783,7 @@ class ReactAgent:
         messages_with_context = [direct_response_specialist_msg] + messages
 
         try:
-            response = self.llm.invoke(messages_with_context)
+            response = self.quick_llm.invoke(messages_with_context)
 
             # Extract and track token usage (works for both regular and thinking models)
             tokens_used = self._track_token_usage(response, source="direct_response")
@@ -2009,17 +2218,20 @@ class ReactAgent:
             updates["messages"] = self._compute_message_diff(messages, pruned_messages)
             messages = pruned_messages
 
-        # Step 2: Full compaction if still over threshold
+        # Step 2: Predictive compaction - pre-identify candidates at 75%
+        if context_manager.should_prepare_compaction(current_tokens):
+            context_manager.identify_compaction_candidates(messages)
+
+        # Step 3: Full compaction if still over threshold (use incremental first)
         if context_manager.should_compact(current_tokens):
             if self.console:
                 self.console.print("[yellow]⚠️  Context usage high, auto-compacting...[/yellow]")
 
-            # Summarize using LLM
+            # Use incremental compaction (summarizes oldest 50% by relevance)
             try:
-                compacted_messages = context_manager.summarize_messages(
+                compacted_messages = context_manager.compact_incremental(
                     messages,
-                    self.llm,
-                    keep_recent=10
+                    llm=self.quick_llm,
                 )
                 updates["messages"] = self._compute_message_diff(messages, compacted_messages)
                 updates["_last_compaction_iter"] = current_iter  # Set cooldown
@@ -2028,7 +2240,7 @@ class ReactAgent:
                     self.console.print(f"[green]✅ Context compacted: {len(messages)} → {len(compacted_messages)} messages[/green]")
 
             except Exception:
-                # If summarization fails, use simple compaction
+                # If incremental fails, use simple compaction
                 if self.console:
                     self.console.print("[yellow]Summarization failed, using simple compaction[/yellow]")
 
@@ -3002,6 +3214,12 @@ class ReactAgent:
             return "continue"
         return "report"
 
+    def _verification_next_step_simplified(self, state: EnhancedAgentState) -> Literal["continue", "report"]:
+        """Simplified verifier routing: continue loop or report (no reflection pipeline)."""
+        if state.get("needs_additional_iteration"):
+            return "continue"
+        return "report"
+
     def _reflection_next_step(
         self, state: EnhancedAgentState
     ) -> Literal["revise_plan", "refine_strategy", "proceed", "escalate"]:
@@ -3926,7 +4144,7 @@ class ReactAgent:
                     console=self.console, show_panel=False
                 )
                 handler.start()
-                for chunk in self.llm.stream(messages):
+                for chunk in self.quick_llm.stream(messages):
                     token = chunk.content if hasattr(chunk, 'content') else str(chunk)
                     if token:
                         handler.update(token)
@@ -3936,7 +4154,7 @@ class ReactAgent:
                 return None  # 이미 콘솔에 출력됨 → 이중 출력 방지
             else:
                 # 비-인터렉티브: 동기 호출 후 결과 반환
-                response = self.llm.invoke(messages)
+                response = self.quick_llm.invoke(messages)
                 result = response.content if hasattr(response, 'content') else str(response)
                 self.logger.log_result(result)
                 return result
@@ -3989,7 +4207,26 @@ class ReactAgent:
 
         # Create initial message stack
         import uuid as _uuid
-        system_msg = SystemMessage(content=self.prompt_template.get_system_prompt())
+        base_system_prompt = self.prompt_template.get_system_prompt()
+
+        # Inject user/project instructions (SEPILOT.md, CLAUDE.md, AGENT.md)
+        try:
+            user_instructions = load_all_instructions()
+            if user_instructions:
+                base_system_prompt += f"\n\n# User/Project Instructions\n\n{user_instructions}"
+        except Exception as e:
+            logger.debug(f"Failed to load instructions: {e}")
+
+        # Inject active rules based on files mentioned in prompt
+        try:
+            if self.rules_loader:
+                rules_text = self.rules_loader.get_rules_text()
+                if rules_text:
+                    base_system_prompt += f"\n\n# Active Rules\n\n{rules_text}"
+        except Exception as e:
+            logger.debug(f"Failed to load rules: {e}")
+
+        system_msg = SystemMessage(content=base_system_prompt)
         human_msg = HumanMessage(content=prompt, id=f"exec_{_uuid.uuid4().hex[:12]}")
         message_stack: list[BaseMessage] = [system_msg]
         if context_messages:
@@ -4029,13 +4266,15 @@ class ReactAgent:
 
         try:
             # Run the graph with LangGraph checkpoint configuration
-            # Each iteration cycle goes through multiple nodes (planner, guard, agent, tools, verifier)
-            # So recursion_limit needs to be much higher than max_iterations
+            # Each iteration cycle goes through multiple nodes.
+            # Enhanced: ~15 nodes/iter, Simplified: ~7 nodes/iter
+            is_simplified = getattr(self.settings, 'graph_mode', 'enhanced') == 'simplify'
+            recursion_multiplier = 8 if is_simplified else 15
             config = {
                 "configurable": {
                     "thread_id": self.thread_id
                 },
-                "recursion_limit": self.settings.max_iterations * 15
+                "recursion_limit": self.settings.max_iterations * recursion_multiplier
             }
 
             final_state = self._invoke_with_interrupts(initial_state, config)

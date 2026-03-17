@@ -40,6 +40,7 @@ from .team_models import (
     TeamTaskAssignment,
 )
 from .team_orchestrator import TeamOrchestrator
+from .worktree_manager import WorktreeManager, Worktree
 
 __all__ = [
     # Models
@@ -79,4 +80,7 @@ __all__ = [
     "DevOpsAgent",
     # Team Orchestrator
     "TeamOrchestrator",
+    # Worktree Manager
+    "WorktreeManager",
+    "Worktree",
 ]

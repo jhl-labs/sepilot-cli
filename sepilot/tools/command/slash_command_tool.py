@@ -19,45 +19,78 @@ class SlashCommandTool(BaseTool):
 
     def __init__(self, logger=None):
         super().__init__(logger)
-        self.commands_dir = Path.home() / ".sepilot" / "commands"
-        self.commands_dir.mkdir(parents=True, exist_ok=True)
+        self.commands_dirs = self._get_command_directories()
         self._load_commands()
 
+    def _get_command_directories(self) -> list[Path]:
+        """Get all command directories to search.
+
+        Search order (later = higher priority):
+        1. ~/.sepilot/commands/ (user global)
+        2. ~/.claude/commands/ (Claude Code compat)
+        3. .sepilot/commands/ (project local)
+        4. .claude/commands/ (project local, Claude Code compat)
+        """
+        dirs = []
+        # User-level (trusted - can execute scripts)
+        self._trusted_dirs = set()
+        for user_config in [Path.home() / ".sepilot", Path.home() / ".claude"]:
+            cmd_dir = user_config / "commands"
+            cmd_dir.mkdir(parents=True, exist_ok=True)
+            dirs.append(cmd_dir)
+            self._trusted_dirs.add(str(cmd_dir.resolve()))
+        # Project-level (untrusted - text/prompt only, no script execution)
+        for project_config in [".sepilot", ".claude"]:
+            cmd_dir = Path.cwd() / project_config / "commands"
+            if cmd_dir.is_dir():
+                dirs.append(cmd_dir)
+        return dirs
+
+    def _is_trusted_source(self, cmd_file: Path) -> bool:
+        """Check if a command file is from a trusted directory."""
+        resolved = str(cmd_file.resolve().parent)
+        return any(resolved.startswith(td) for td in self._trusted_dirs)
+
     def _load_commands(self):
-        """Load available slash commands"""
+        """Load available slash commands from all directories"""
         self.commands = {}
 
-        # Load from commands directory
-        for cmd_file in self.commands_dir.glob("*.md"):
-            cmd_name = cmd_file.stem
-            try:
-                content = cmd_file.read_text(encoding='utf-8')
-                # Parse command metadata from frontmatter if present
-                if content.startswith('---'):
-                    parts = content.split('---', 2)
-                    if len(parts) >= 3:
-                        import yaml
-                        metadata = yaml.safe_load(parts[1])
-                        self.commands[cmd_name] = {
-                            'description': metadata.get('description', ''),
-                            'content': parts[2].strip(),
-                            'file': str(cmd_file)
-                        }
+        for commands_dir in self.commands_dirs:
+            if not commands_dir.exists():
+                continue
+            for cmd_file in commands_dir.glob("*.md"):
+                cmd_name = cmd_file.stem
+                try:
+                    content = cmd_file.read_text(encoding='utf-8')
+                    # Parse command metadata from frontmatter if present
+                    if content.startswith('---'):
+                        parts = content.split('---', 2)
+                        if len(parts) >= 3:
+                            import yaml
+                            metadata = yaml.safe_load(parts[1])
+                            self.commands[cmd_name] = {
+                                'description': metadata.get('description', ''),
+                                'content': parts[2].strip(),
+                                'file': str(cmd_file),
+                                'trusted': self._is_trusted_source(cmd_file),
+                            }
+                        else:
+                            self.commands[cmd_name] = {
+                                'description': '',
+                                'content': content,
+                                'file': str(cmd_file),
+                                'trusted': self._is_trusted_source(cmd_file),
+                            }
                     else:
                         self.commands[cmd_name] = {
                             'description': '',
                             'content': content,
-                            'file': str(cmd_file)
+                            'file': str(cmd_file),
+                            'trusted': self._is_trusted_source(cmd_file),
                         }
-                else:
-                    self.commands[cmd_name] = {
-                        'description': '',
-                        'content': content,
-                        'file': str(cmd_file)
-                    }
-            except Exception as e:
-                if self.logger:
-                    self.logger.log(f"Error loading command {cmd_name}: {e}")
+                except Exception as e:
+                    if self.logger:
+                        self.logger.log(f"Error loading command {cmd_name}: {e}")
 
     def execute(self, command: str) -> str:
         """Execute a slash command"""
@@ -112,9 +145,17 @@ class SlashCommandTool(BaseTool):
 
             # Check if it's a script command
             if content.startswith('#!/'):
-                # Execute as script
-                script_result = self._execute_script(content, args)
-                result.append(script_result)
+                # Security: only execute scripts from trusted directories
+                if not cmd_info.get('trusted', False):
+                    result.append(
+                        "⚠️ Script execution blocked: project-level commands "
+                        "cannot execute scripts for security reasons.\n"
+                        "Move this command to ~/.sepilot/commands/ to enable "
+                        "script execution."
+                    )
+                else:
+                    script_result = self._execute_script(content, args)
+                    result.append(script_result)
             else:
                 # Return processed content
                 result.append(content)
@@ -129,6 +170,10 @@ class SlashCommandTool(BaseTool):
 
     def _execute_script(self, content: str, args: str) -> str:
         """Execute content as a script"""
+        import shlex
+        import tempfile
+
+        script_path = None
         try:
             # Determine interpreter from shebang
             first_line = content.split('\n')[0]
@@ -140,7 +185,6 @@ class SlashCommandTool(BaseTool):
                 interpreter = '/bin/bash'
 
             # Create temporary script file
-            import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
                 f.write(content)
                 script_path = f.name
@@ -148,16 +192,16 @@ class SlashCommandTool(BaseTool):
             # Make executable
             Path(script_path).chmod(0o755)
 
+            # Use shlex.split for proper argument handling
+            arg_list = shlex.split(args) if args else []
+
             # Execute script
             result = subprocess.run(
-                [interpreter, script_path] + args.split(),
+                [interpreter, script_path] + arg_list,
                 capture_output=True,
                 text=True,
                 timeout=30
             )
-
-            # Clean up
-            Path(script_path).unlink()
 
             if result.returncode == 0:
                 return result.stdout
@@ -168,6 +212,9 @@ class SlashCommandTool(BaseTool):
             return "Script execution timed out after 30 seconds"
         except Exception as e:
             return f"Script execution error: {str(e)}"
+        finally:
+            if script_path:
+                Path(script_path).unlink(missing_ok=True)
 
     def _list_available_commands(self) -> str:
         """List available slash commands"""

@@ -1,4 +1,10 @@
-"""Skill Manager for SEPilot Skills System"""
+"""Skill Manager for SEPilot Skills System
+
+Enhanced with Claude Code-style features:
+- SKILL.md markdown-based skill loading
+- Multi-directory discovery (user, project, nested)
+- Claude Code compatible paths (.claude/skills/)
+"""
 
 import asyncio
 import importlib
@@ -30,23 +36,39 @@ class SkillManager:
         """Get directories to search for user/project skills (not builtin)
 
         Builtin skills are loaded via package import in _load_builtin_skills()
+        Python (.py) skills: only from trusted user directory (~/.sepilot/skills/)
+        Markdown (.md/SKILL.md) skills: from both user and project directories
         """
         dirs = []
 
-        # User skills (~/.sepilot/skills/)
-        user_dir = Path.home() / ".sepilot" / "skills"
-        if user_dir.exists():
-            dirs.append(user_dir)
+        # User skills (~/.sepilot/skills/ and ~/.claude/skills/)
+        for user_config in [Path.home() / ".sepilot", Path.home() / ".claude"]:
+            user_dir = user_config / "skills"
+            if user_dir.exists():
+                dirs.append(user_dir)
 
-        # Project skills (.sepilot/skills/) - skip for security
-        # Loading arbitrary .py files from cloned repositories is dangerous
-        # as they execute arbitrary code. Only load from trusted user directory.
-        project_dir = Path.cwd() / ".sepilot" / "skills"
-        if project_dir.exists():
-            logger.warning(
-                f"Skipping project-local skills directory ({project_dir}) "
-                "for security. Use ~/.sepilot/skills/ for custom skills."
-            )
+        return dirs
+
+    def _get_markdown_skill_directories(self) -> list[tuple[Path, str]]:
+        """Get directories for markdown-based SKILL.md discovery.
+
+        Returns list of (directory, source_type) tuples.
+        Markdown skills are safe to load from project directories
+        since they don't execute arbitrary code.
+        """
+        dirs: list[tuple[Path, str]] = []
+
+        # User-level (higher priority)
+        for user_config in [Path.home() / ".sepilot", Path.home() / ".claude"]:
+            skills_dir = user_config / "skills"
+            if skills_dir.is_dir():
+                dirs.append((skills_dir, "user"))
+
+        # Project-level (safe: only .md files, no code execution)
+        for config_dir in [".sepilot", ".claude", ".agent"]:
+            proj_skills = Path.cwd() / config_dir / "skills"
+            if proj_skills.is_dir():
+                dirs.append((proj_skills, "project"))
 
         return dirs
 
@@ -113,11 +135,50 @@ class SkillManager:
                         self._skills[metadata.name] = skill
                         logger.info(f"Loaded skill: {metadata.name}")
 
+            # Load markdown-based skills (SKILL.md)
+            self._load_markdown_skills()
+
             # Load built-in skills from the builtin subpackage
             self._load_builtin_skills()
 
             self._loaded = True
             logger.info(f"Discovered {len(self._skills)} skills")
+
+    def _load_markdown_skills(self):
+        """Load markdown-based skills (SKILL.md format).
+
+        Discovers SKILL.md files from user and project directories.
+        Markdown skills are safe for project dirs (no code execution).
+        """
+        try:
+            from .markdown_skill import MarkdownSkill
+
+            for skills_dir, source in self._get_markdown_skill_directories():
+                # Pattern 1: skills/skill-name/SKILL.md
+                if skills_dir.is_dir():
+                    for item in sorted(skills_dir.iterdir()):
+                        if item.is_dir():
+                            skill_file = item / "SKILL.md"
+                            if skill_file.exists():
+                                skill = MarkdownSkill.from_file(skill_file, source=source)
+                                if skill:
+                                    name = skill.get_metadata().name
+                                    if name not in self._skills:
+                                        self._skills[name] = skill
+                                        logger.info(f"Loaded markdown skill: {name} ({source})")
+
+                    # Pattern 2: skills/*.md (flat files)
+                    for md_file in sorted(skills_dir.glob("*.md")):
+                        if md_file.name.lower() in ("readme.md", "skill.md"):
+                            continue
+                        skill = MarkdownSkill.from_file(md_file, source=source)
+                        if skill:
+                            name = skill.get_metadata().name
+                            if name not in self._skills:
+                                self._skills[name] = skill
+                                logger.debug(f"Loaded markdown skill: {name} ({source})")
+        except ImportError:
+            logger.debug("markdown_skill module not available")
 
     def _load_builtin_skills(self):
         """Load built-in skills from the builtin subpackage"""
