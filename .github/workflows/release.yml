@@ -102,12 +102,11 @@ jobs:
 
               export SEPILOT_SOURCE_DIR="$(pwd)/sepilot"
               uv run --no-sync pyinstaller sepilot_protected.spec --clean --noconfirm
-            '
 
-      - name: Rename artifacts
-        run: |
-          mv dist/sepilot dist/sepilot-linux-amd64-legacy
-          mv dist/sepilot-lsp dist/sepilot-lsp-linux-amd64-legacy
+              # Rename inside container (files are owned by root)
+              mv dist/sepilot dist/sepilot-linux-amd64-legacy
+              mv dist/sepilot-lsp dist/sepilot-lsp-linux-amd64-legacy
+            '
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
