@@ -75,7 +75,7 @@ jobs:
               curl -LsSf https://astral.sh/uv/install.sh | sh
               export PATH="$HOME/.local/bin:$PATH"
               uv python install 3.10
-              uv sync
+              uv sync --no-install-package onnxruntime
               uv pip install pyinstaller
               uv run python scripts/download_tiktoken_data.py
               UPX_VERSION="4.2.4"
