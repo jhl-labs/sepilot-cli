@@ -72,19 +72,30 @@ jobs:
           docker run --rm -v "${{ github.workspace }}:/work" -w /work \
             quay.io/pypa/manylinux2014_x86_64 \
             bash -c '
+              set -e
               curl -LsSf https://astral.sh/uv/install.sh | sh
               export PATH="$HOME/.local/bin:$PATH"
+
+              # Install Rust (needed to build tiktoken from source on manylinux2014)
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+              export PATH="$HOME/.cargo/bin:$PATH"
+
               uv python install 3.10
+              # onnxruntime 1.23+ has no manylinux2014 wheel — exclude it
               uv sync --no-install-package onnxruntime
               uv pip install pyinstaller
-              uv run python scripts/download_tiktoken_data.py
+
+              # Use --no-sync to prevent uv run from re-triggering dependency resolution
+              uv run --no-sync python scripts/download_tiktoken_data.py
+
               UPX_VERSION="4.2.4"
               curl -sL "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz" -o /tmp/upx.tar.xz
               tar -xf /tmp/upx.tar.xz -C /tmp
               cp "/tmp/upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/
               rm -rf /tmp/upx*
+
               export SEPILOT_SOURCE_DIR="$(pwd)/sepilot"
-              uv run pyinstaller sepilot_protected.spec --clean --noconfirm
+              uv run --no-sync pyinstaller sepilot_protected.spec --clean --noconfirm
             '
 
       - name: Rename artifacts
