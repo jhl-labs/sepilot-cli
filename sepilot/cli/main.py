@@ -291,7 +291,8 @@ def _run_interactive_mode(
             try:
                 result = agent.execute(user_input, context_messages=context_snapshot)
             except Exception as e:
-                console.print(f"[red]Error: {e}[/red]")
+                from rich.markup import escape
+                console.print(f"[red]Error: {escape(str(e))}[/red]")
                 if verbose:
                     import traceback
                     console.print(traceback.format_exc())
@@ -344,7 +345,8 @@ def _run_interactive_mode(
         console.print("\n[yellow]⚠️  Interrupted by user[/yellow]")
         sys.exit(0)
     except Exception as e:
-        console.print(f"\n[bold red]❌ Error: {e}[/bold red]")
+        from rich.markup import escape
+        console.print(f"\n[bold red]❌ Error: {escape(str(e))}[/bold red]")
         if verbose:
             import traceback
             console.print(traceback.format_exc())
@@ -907,7 +909,8 @@ def main(
         sys.exit(1)
 
     except Exception as e:
-        console.print(f"\n[bold red]❌ Error: {e}[/bold red]")
+        from rich.markup import escape
+        console.print(f"\n[bold red]❌ Error: {escape(str(e))}[/bold red]")
         if verbose:
             import traceback
             console.print(traceback.format_exc())

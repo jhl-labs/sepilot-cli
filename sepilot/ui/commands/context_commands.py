@@ -138,16 +138,24 @@ def handle_clear_context(
     # Clear local conversation context
     conversation_context.clear()
 
-    # Also clear agent's LangGraph checkpoint messages
-    if agent and hasattr(agent, 'get_conversation_messages') and hasattr(agent, 'rewind_messages'):
-        try:
-            messages = agent.get_conversation_messages()
-            if messages:
-                human_count = sum(1 for m in messages if getattr(m, 'type', '') == 'human')
-                if human_count > 0:
-                    agent.rewind_messages(human_count)
-        except Exception:
-            pass  # Best-effort: local context is already cleared
+    # Also clear agent's LangGraph checkpoint messages and plan state
+    if agent:
+        if hasattr(agent, 'get_conversation_messages') and hasattr(agent, 'rewind_messages'):
+            try:
+                messages = agent.get_conversation_messages()
+                if messages:
+                    human_count = sum(1 for m in messages if getattr(m, 'type', '') == 'human')
+                    if human_count > 0:
+                        agent.rewind_messages(human_count)
+            except Exception:
+                pass  # Best-effort: local context is already cleared
+
+        # Reset plan-related state so stale plans don't persist
+        if hasattr(agent, 'reset_plan_state'):
+            try:
+                agent.reset_plan_state()
+            except Exception:
+                pass
 
     console.print(f"[green]✅ Cleared {message_count} messages from conversation history[/green]")
     console.print("[dim]Starting fresh conversation...[/dim]")

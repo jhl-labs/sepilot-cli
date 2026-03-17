@@ -3849,6 +3849,31 @@ class ReactAgent:
                 "",
             ])
 
+        # Inject Karpathy coding guidelines for code-related tasks
+        # Two sources: keyword-based TaskAnalyzer (task_type_detected)
+        #              + LLM-based triage (current_strategy)
+        task_type_detected = state.get("task_type_detected", "")
+        current_strategy = state.get("current_strategy")
+        strategy_value = (
+            current_strategy.value
+            if hasattr(current_strategy, "value")
+            else str(current_strategy or "")
+        )
+        from sepilot.skills.builtin.karpathy_guidelines import (
+            KARPATHY_CODE_TASK_TYPES,
+            KARPATHY_CODE_STRATEGIES,
+            KARPATHY_GUIDELINES_PROMPT,
+        )
+        if (
+            task_type_detected in KARPATHY_CODE_TASK_TYPES
+            or strategy_value in KARPATHY_CODE_STRATEGIES
+        ):
+            sections.extend([
+                "═══ CODING GUIDELINES ═══",
+                KARPATHY_GUIDELINES_PROMPT,
+                "",
+            ])
+
         sections.extend([
             "═══ RULES ═══",
             (
@@ -4494,6 +4519,41 @@ class ReactAgent:
         self.thread_id = new_thread_id
         self.config = {"configurable": {"thread_id": new_thread_id}}
         return new_thread_id
+
+    def reset_plan_state(self) -> None:
+        """Reset plan-related state fields in LangGraph checkpoint.
+
+        Called by /clear to ensure stale plan steps don't persist
+        after conversation history is cleared.
+        """
+        try:
+            config = {"configurable": {"thread_id": self.thread_id}}
+            self.graph.update_state(config, {
+                "plan_created": False,
+                "plan_steps": [],
+                "current_plan_step": 0,
+                "planning_notes": [],
+                "plan_execution_pending": False,
+                "hierarchical_plan": {},
+                "triage_decision": None,
+                "triage_reason": None,
+                "exploration_context": "",
+                "exploration_results": {},
+            })
+        except Exception:
+            pass  # Best-effort: state may not exist yet
+
+        # Also reset UI-side progress tracking
+        self._progress_plan_steps = []
+        self._progress_current_step = 0
+        self._progress_planning_notes = []
+        self._progress_current_task = None
+
+        # Reset step_logger cached signatures so new plans render correctly
+        if self.step_logger:
+            self.step_logger._last_plan_signature = None
+            self.step_logger._last_plan_progress_signature = None
+            self.step_logger._checklist_lines_rendered = 0
 
     def rewind_messages(self, count: int = 1) -> dict[str, Any]:
         """Rewind conversation messages - delegates to ThreadManager."""

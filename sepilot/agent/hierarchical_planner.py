@@ -175,9 +175,11 @@ class HierarchicalPlanner:
     """
 
     # Full 3-level decomposition (complex tasks only)
-    FULL_DECOMPOSITION_PROMPT = """You are a HIERARCHICAL TASK PLANNER for a coding agent.
+    FULL_DECOMPOSITION_PROMPT = """You are a HIERARCHICAL TASK PLANNER for a software engineering agent.
 
 Your task: Decompose a COMPLEX task into a 3-level hierarchy.
+The task may involve code changes, debugging, infrastructure/cluster operations, diagnostics, or analysis.
+Match the plan to the ACTUAL nature of the task — do NOT default to code implementation steps.
 
 ## Levels:
 1. STRATEGIC (1-3 goals): High-level objectives
@@ -189,7 +191,7 @@ find_file, file_read, file_edit, file_write, bash_execute, web_search
 
 ## Output Format (JSON):
 {
-    "strategic_goals": [{"id": "S1", "description": "...", "strategy": "explore|implement|debug|refactor", "complexity": 1-5}],
+    "strategic_goals": [{"id": "S1", "description": "...", "strategy": "explore|implement|debug|refactor|diagnose|investigate", "complexity": 1-5}],
     "tactical_tasks": [{"id": "T1", "parent": "S1", "description": "...", "strategy": "...", "complexity": 1-5, "dependencies": []}],
     "operational_actions": [{"id": "O1", "parent": "T1", "description": "...", "tools": ["tool1"], "files": ["path"], "dependencies": []}]
 }
@@ -197,9 +199,11 @@ find_file, file_read, file_edit, file_write, bash_execute, web_search
 Be specific, consider dependencies, estimate complexity realistically."""
 
     # 2-level decomposition (medium tasks)
-    TACTICAL_DECOMPOSITION_PROMPT = """You are a TASK PLANNER for a coding agent.
+    TACTICAL_DECOMPOSITION_PROMPT = """You are a TASK PLANNER for a software engineering agent.
 
 Your task: Decompose a task into 2 levels (NO strategic level needed).
+The task may involve code changes, debugging, infrastructure/cluster operations, diagnostics, or analysis.
+Match the plan to the ACTUAL nature of the task — do NOT default to code implementation steps.
 
 ## Levels:
 1. TACTICAL (1-3 tasks): Approach steps
@@ -210,7 +214,7 @@ find_file, file_read, file_edit, file_write, bash_execute
 
 ## Output Format (JSON):
 {
-    "tactical_tasks": [{"id": "T1", "description": "...", "strategy": "explore|implement|debug|refactor", "complexity": 1-3}],
+    "tactical_tasks": [{"id": "T1", "description": "...", "strategy": "explore|implement|debug|refactor|diagnose|investigate", "complexity": 1-3}],
     "operational_actions": [{"id": "O1", "parent": "T1", "description": "...", "tools": ["tool1"], "files": ["path"]}]
 }
 
@@ -277,7 +281,7 @@ Keep it simple and actionable."""
             ],
         },
         "code_review": {
-            "keywords": ["review", "check", "analyze", "검토", "리뷰", "분석"],
+            "keywords": ["review", "check", "analyze", "검토", "리뷰"],
             "tactical_tasks": [
                 {"id": "T1", "description": "Read and understand the code", "strategy": "explore", "complexity": 2},
                 {"id": "T2", "description": "Analyze code quality and issues", "strategy": "explore", "complexity": 2},
@@ -285,6 +289,23 @@ Keep it simple and actionable."""
             "operational_actions": [
                 {"id": "O1", "parent": "T1", "description": "Read target files", "tools": ["file_read"]},
                 {"id": "O2", "parent": "T2", "description": "Search for patterns and issues", "tools": ["search_content"]},
+            ],
+        },
+        "investigation": {
+            "keywords": [
+                "diagnose", "investigate", "troubleshoot", "debug", "why",
+                "진단", "파악", "조사", "장애", "문제", "원인", "분석",
+                "상태", "확인", "점검", "health", "status",
+            ],
+            "tactical_tasks": [
+                {"id": "T1", "description": "Gather current status and symptoms", "strategy": "diagnose", "complexity": 2},
+                {"id": "T2", "description": "Investigate root cause", "strategy": "investigate", "complexity": 3},
+                {"id": "T3", "description": "Summarize findings and recommend actions", "strategy": "explore", "complexity": 1},
+            ],
+            "operational_actions": [
+                {"id": "O1", "parent": "T1", "description": "Check system status and collect logs", "tools": ["bash_execute"]},
+                {"id": "O2", "parent": "T2", "description": "Analyze logs and configuration", "tools": ["bash_execute", "file_read"]},
+                {"id": "O3", "parent": "T3", "description": "Compile diagnosis report", "tools": ["bash_execute"]},
             ],
         },
     }

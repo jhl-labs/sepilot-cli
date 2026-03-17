@@ -19,6 +19,7 @@ _BUILTIN_SKILLS: list[tuple[str, str]] = [
     (".frontend_design", "FrontendDesignSkill"),
     (".fastapi_design", "FastAPIDesignSkill"),
     (".project_intro", "ProjectIntroSkill"),
+    (".karpathy_guidelines", "KarpathyGuidelinesSkill"),
 ]
 
 
