@@ -226,19 +226,23 @@ jobs:
           name: ${{ matrix.binary }}
           path: bin
 
+      - name: Pull Docker image
+        run: docker pull ${{ matrix.image }}
+
       - name: Run --version test
         id: version
         run: |
           chmod +x bin/${{ matrix.binary }}
+          # Capture only stdout; stderr (docker warnings) goes to runner log
           VERSION=$(docker run --rm \
             -v "$PWD/bin/${{ matrix.binary }}:/sepilot:ro" \
-            ${{ matrix.image }} /sepilot --version 2>&1) || true
-          echo "output=$VERSION" >> "$GITHUB_OUTPUT"
-          if echo "$VERSION" | grep -q "^SEPilot, version"; then
+            ${{ matrix.image }} /sepilot --version 2>/dev/null) || true
+          echo "output=${VERSION}" >> "$GITHUB_OUTPUT"
+          if echo "$VERSION" | grep -q "SEPilot, version"; then
             echo "status=pass" >> "$GITHUB_OUTPUT"
           else
             echo "status=fail" >> "$GITHUB_OUTPUT"
-            echo "::error::--version failed on ${{ matrix.distro }}: $VERSION"
+            echo "::error::--version failed on ${{ matrix.distro }}: ${VERSION}"
           fi
 
       - name: Run --help test
@@ -246,7 +250,7 @@ jobs:
         run: |
           OUTPUT=$(docker run --rm \
             -v "$PWD/bin/${{ matrix.binary }}:/sepilot:ro" \
-            ${{ matrix.image }} /sepilot --help 2>&1) || true
+            ${{ matrix.image }} /sepilot --help 2>/dev/null) || true
           if echo "$OUTPUT" | grep -q "Usage:"; then
             echo "status=pass" >> "$GITHUB_OUTPUT"
           else
@@ -257,14 +261,14 @@ jobs:
       - name: Write result
         run: |
           mkdir -p results
-          cat > results/${{ matrix.distro }}.txt <<EOF
+          cat > "results/${{ matrix.distro }}.txt" <<'RESULT_EOF'
           distro=${{ matrix.distro }}
           glibc=${{ matrix.glibc }}
           binary=${{ matrix.binary }}
           version=${{ steps.version.outputs.status }}
           help=${{ steps.help.outputs.status }}
           version_output=${{ steps.version.outputs.output }}
-          EOF
+          RESULT_EOF
 
       - name: Upload result
         uses: actions/upload-artifact@v4
