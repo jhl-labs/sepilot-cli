@@ -10,9 +10,16 @@ permissions:
 
 jobs:
   build-linux:
+    strategy:
+      matrix:
+        include:
+          - image: quay.io/pypa/manylinux2014_x86_64
+            artifact_suffix: linux-amd64-ubuntu2004
+          - image: quay.io/pypa/manylinux_2_28_x86_64
+            artifact_suffix: linux-amd64
     runs-on: ubuntu-22.04
     container:
-      image: quay.io/pypa/manylinux_2_28_x86_64
+      image: ${{ matrix.image }}
 
     steps:
       - name: Checkout
@@ -48,17 +55,17 @@ jobs:
 
       - name: Rename artifacts
         run: |
-          mv dist/sepilot dist/sepilot-linux-amd64
-          mv dist/sepilot-lsp dist/sepilot-lsp-linux-amd64
+          mv dist/sepilot dist/sepilot-${{ matrix.artifact_suffix }}
+          mv dist/sepilot-lsp dist/sepilot-lsp-${{ matrix.artifact_suffix }}
         shell: bash
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sepilot-linux-amd64
+          name: sepilot-${{ matrix.artifact_suffix }}
           path: |
-            dist/sepilot-linux-amd64
-            dist/sepilot-lsp-linux-amd64
+            dist/sepilot-${{ matrix.artifact_suffix }}
+            dist/sepilot-lsp-${{ matrix.artifact_suffix }}
 
   build:
     strategy:
