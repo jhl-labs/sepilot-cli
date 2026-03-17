@@ -14,6 +14,11 @@
 
 ### Fixed
 - Rich markup injection 방지: 에러 메시지에 `rich.markup.escape` 적용 (CLI 3곳)
+- Legacy 빌드(manylinux2014) CI 수정: Rust 설치, 미지원 패키지 제외, 컨테이너 내 rename
+
+### CI
+- **Linux 호환성 테스트 자동화**: 릴리즈 시 6개 OS(CentOS 7 ~ Ubuntu 24.04)에서 바이너리 검증
+- 릴리즈 노트에 호환성 테스트 결과 자동 첨부
 
 ## [0.8.0] - 2026-03-17
 

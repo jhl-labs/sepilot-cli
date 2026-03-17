@@ -181,8 +181,153 @@ jobs:
             dist/${{ matrix.artifact }}
             dist/${{ matrix.lsp_artifact }}
 
+  # ---------------------------------------------------------------------------
+  # Compatibility test: run built binaries on multiple Linux distros via Docker
+  # ---------------------------------------------------------------------------
+  compat-test:
+    needs: [build-linux, build-linux-legacy]
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Legacy binary targets (GLIBC < 2.28)
+          - image: centos:7
+            distro: CentOS 7
+            glibc: "2.17"
+            binary: sepilot-linux-amd64-legacy
+          - image: ubuntu:18.04
+            distro: Ubuntu 18.04
+            glibc: "2.27"
+            binary: sepilot-linux-amd64-legacy
+          # Regular binary targets (GLIBC >= 2.28)
+          - image: debian:10
+            distro: Debian 10
+            glibc: "2.28"
+            binary: sepilot-linux-amd64
+          - image: ubuntu:20.04
+            distro: Ubuntu 20.04
+            glibc: "2.31"
+            binary: sepilot-linux-amd64
+          - image: ubuntu:22.04
+            distro: Ubuntu 22.04
+            glibc: "2.35"
+            binary: sepilot-linux-amd64
+          - image: ubuntu:24.04
+            distro: Ubuntu 24.04
+            glibc: "2.39"
+            binary: sepilot-linux-amd64
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: bin
+
+      - name: Run --version test
+        id: version
+        run: |
+          chmod +x bin/${{ matrix.binary }}
+          VERSION=$(docker run --rm \
+            -v "$PWD/bin/${{ matrix.binary }}:/sepilot:ro" \
+            ${{ matrix.image }} /sepilot --version 2>&1) || true
+          echo "output=$VERSION" >> "$GITHUB_OUTPUT"
+          if echo "$VERSION" | grep -q "^SEPilot, version"; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            echo "::error::--version failed on ${{ matrix.distro }}: $VERSION"
+          fi
+
+      - name: Run --help test
+        id: help
+        run: |
+          OUTPUT=$(docker run --rm \
+            -v "$PWD/bin/${{ matrix.binary }}:/sepilot:ro" \
+            ${{ matrix.image }} /sepilot --help 2>&1) || true
+          if echo "$OUTPUT" | grep -q "Usage:"; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            echo "::error::--help failed on ${{ matrix.distro }}"
+          fi
+
+      - name: Write result
+        run: |
+          mkdir -p results
+          cat > results/${{ matrix.distro }}.txt <<EOF
+          distro=${{ matrix.distro }}
+          glibc=${{ matrix.glibc }}
+          binary=${{ matrix.binary }}
+          version=${{ steps.version.outputs.status }}
+          help=${{ steps.help.outputs.status }}
+          version_output=${{ steps.version.outputs.output }}
+          EOF
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-result-${{ matrix.distro }}
+          path: results/
+
+  # ---------------------------------------------------------------------------
+  # Aggregate compatibility results into a markdown table
+  # ---------------------------------------------------------------------------
+  compat-summary:
+    needs: [compat-test]
+    runs-on: ubuntu-latest
+
+    outputs:
+      table: ${{ steps.summary.outputs.table }}
+
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: compat-result-*
+          path: results
+          merge-multiple: true
+
+      - name: Generate summary table
+        id: summary
+        run: |
+          TABLE="| OS | GLIBC | Binary | --version | --help |"
+          TABLE="$TABLE
+          |---|---|---|---|---|"
+
+          for f in results/*.txt; do
+            eval "$(cat "$f" | sed 's/^ *//')"
+
+            v_icon="✅"; [ "$version" = "pass" ] || v_icon="❌"
+            h_icon="✅"; [ "$help" = "pass" ] || h_icon="❌"
+
+            case "$binary" in
+              *legacy*) bin_label="legacy" ;;
+              *)        bin_label="regular" ;;
+            esac
+
+            TABLE="$TABLE
+          | $distro | $glibc | $bin_label | $v_icon | $h_icon |"
+          done
+
+          {
+            echo "table<<EOF"
+            echo "$TABLE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Also write to job summary
+          echo "## Linux Compatibility Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "$TABLE" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Create GitHub Release with compatibility report in release notes
+  # ---------------------------------------------------------------------------
   release:
-    needs: [build-linux, build-linux-legacy, build]
+    needs: [build-linux, build-linux-legacy, build, compat-summary]
     runs-on: ubuntu-latest
 
     steps:
@@ -193,6 +338,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: sepilot-*
           merge-multiple: true
 
       - name: Generate release notes from CHANGELOG
@@ -204,9 +350,20 @@ jobs:
           if [ -z "$NOTES" ]; then
             NOTES="Release ${GITHUB_REF#refs/tags/}"
           fi
+
+          COMPAT_TABLE="${{ needs.compat-summary.outputs.table }}"
+
+          BODY="${NOTES}
+
+          ---
+
+          ### 🐧 Linux Compatibility Test
+
+          ${COMPAT_TABLE}"
+
           {
             echo "notes<<EOF"
-            echo "$NOTES"
+            echo "$BODY"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
