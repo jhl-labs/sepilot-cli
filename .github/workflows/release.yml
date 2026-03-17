@@ -10,16 +10,9 @@ permissions:
 
 jobs:
   build-linux:
-    strategy:
-      matrix:
-        include:
-          - image: quay.io/pypa/manylinux2014_x86_64
-            artifact_suffix: linux-amd64-ubuntu2004
-          - image: quay.io/pypa/manylinux_2_28_x86_64
-            artifact_suffix: linux-amd64
     runs-on: ubuntu-22.04
     container:
-      image: ${{ matrix.image }}
+      image: quay.io/pypa/manylinux_2_28_x86_64
 
     steps:
       - name: Checkout
@@ -55,17 +48,57 @@ jobs:
 
       - name: Rename artifacts
         run: |
-          mv dist/sepilot dist/sepilot-${{ matrix.artifact_suffix }}
-          mv dist/sepilot-lsp dist/sepilot-lsp-${{ matrix.artifact_suffix }}
+          mv dist/sepilot dist/sepilot-linux-amd64
+          mv dist/sepilot-lsp dist/sepilot-lsp-linux-amd64
         shell: bash
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sepilot-${{ matrix.artifact_suffix }}
+          name: sepilot-linux-amd64
           path: |
-            dist/sepilot-${{ matrix.artifact_suffix }}
-            dist/sepilot-lsp-${{ matrix.artifact_suffix }}
+            dist/sepilot-linux-amd64
+            dist/sepilot-lsp-linux-amd64
+
+  build-linux-legacy:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build in manylinux2014 container
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/work" -w /work \
+            quay.io/pypa/manylinux2014_x86_64 \
+            bash -c '
+              curl -LsSf https://astral.sh/uv/install.sh | sh
+              export PATH="$HOME/.local/bin:$PATH"
+              uv python install 3.10
+              uv sync
+              uv pip install pyinstaller
+              uv run python scripts/download_tiktoken_data.py
+              UPX_VERSION="4.2.4"
+              curl -sL "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz" -o /tmp/upx.tar.xz
+              tar -xf /tmp/upx.tar.xz -C /tmp
+              cp "/tmp/upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/
+              rm -rf /tmp/upx*
+              export SEPILOT_SOURCE_DIR="$(pwd)/sepilot"
+              uv run pyinstaller sepilot_protected.spec --clean --noconfirm
+            '
+
+      - name: Rename artifacts
+        run: |
+          mv dist/sepilot dist/sepilot-linux-amd64-legacy
+          mv dist/sepilot-lsp dist/sepilot-lsp-linux-amd64-legacy
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sepilot-linux-amd64-legacy
+          path: |
+            dist/sepilot-linux-amd64-legacy
+            dist/sepilot-lsp-linux-amd64-legacy
 
   build:
     strategy:
@@ -133,7 +166,7 @@ jobs:
             dist/${{ matrix.lsp_artifact }}
 
   release:
-    needs: [build-linux, build]
+    needs: [build-linux, build-linux-legacy, build]
     runs-on: ubuntu-latest
 
     steps:
