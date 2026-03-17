@@ -1,12 +1,12 @@
 """SE Pilot - Intelligent CLI Agent for Software Engineering"""
 
-__version__ = "0.7.4"
+__version__ = "0.8.0"
 
 # Configure bundled tiktoken data for offline use.
 # tiktoken downloads encoding files on first use; by pointing
 # TIKTOKEN_CACHE_DIR at our bundled copy the download is skipped entirely.
-# PyInstaller bundles data files under sys._MEIPASS, so we check both paths.
 import os as _os
+# PyInstaller bundles data files under sys._MEIPASS, so we check both paths.
 import sys as _sys
 
 _base_dir = getattr(_sys, '_MEIPASS', _os.path.dirname(__file__))

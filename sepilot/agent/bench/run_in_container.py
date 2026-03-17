@@ -145,6 +145,17 @@ def run_agent(problem_statement: str) -> str:
     if api_key:
         settings.openai_api_key = api_key
 
+    # 멀티모델 tier 설정 (환경변수에서 자동 로드됨, 명시적 확인)
+    for attr, env_key in [
+        ("triage_model", "SEPILOT_TRIAGE_MODEL"),
+        ("verifier_model", "SEPILOT_VERIFIER_MODEL"),
+        ("reasoning_model", "SEPILOT_REASONING_MODEL"),
+        ("quick_model", "SEPILOT_QUICK_MODEL"),
+    ]:
+        val = os.environ.get(env_key)
+        if val:
+            setattr(settings, attr, val)
+
     logger = FileLogger(log_dir=os.path.join(tempfile.gettempdir(), "sepilot-logs"))
 
     agent = ReactAgent(

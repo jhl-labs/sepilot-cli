@@ -77,6 +77,7 @@ class LSPClient:
 
             # Windows requires shell=True to find .cmd/.bat executables
             use_shell = sys.platform == "win32"
+
             self._process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,

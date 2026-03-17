@@ -347,11 +347,13 @@ class InferenceRunner:
         """컨테이너에 전달할 환경변수 구성."""
         env_vars = {}
 
-        # LLM API 설정
+        # LLM API 설정 + 멀티모델 tier 환경변수
         for key in [
             "OPENAI_API_BASE_URL", "OPENAI_API_KEY", "DEFAULT_MODEL",
             "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
             "LLM_BASE_URL", "API_BASE_URL", "OLLAMA_BASE_URL",
+            "SEPILOT_TRIAGE_MODEL", "SEPILOT_VERIFIER_MODEL",
+            "SEPILOT_REASONING_MODEL", "SEPILOT_QUICK_MODEL",
         ]:
             val = os.getenv(key)
             if val:
