@@ -23,6 +23,12 @@ class Settings(BaseModel):
     use_enhanced_state: bool = Field(default=True)  # Use enhanced state management
     enable_streaming: bool = Field(default=True, description="Enable token-by-token streaming output")
 
+    # Graph mode: 'enhanced' (full 17-node pipeline) or 'simplify' (minimal Claude Code-style loop)
+    graph_mode: str = Field(
+        default_factory=lambda: os.getenv("SEPILOT_GRAPH_MODE", "enhanced"),
+        description="Graph mode: 'enhanced' (full pipeline) or 'simplify' (minimal agent loop)"
+    )
+
     # Human-in-the-loop settings
     max_interrupts: int = Field(default=20, description="Maximum number of user approval prompts before stopping")
     sensitive_tools: set = Field(
@@ -30,9 +36,25 @@ class Settings(BaseModel):
         description="Tools requiring user approval in enhanced mode"
     )
 
-    # Model tier routing: use cheaper models for classification tasks
-    triage_model: str | None = Field(default=None, description="Cheaper model for triage/classification (e.g., gpt-4o-mini)")
-    verifier_model: str | None = Field(default=None, description="Cheaper model for verification/completion checks (e.g., gpt-4o-mini)")
+    # Model tier routing: use cheaper/specialized models for specific tasks
+    # Note: Settings extends BaseModel (not BaseSettings), so env_prefix doesn't auto-map.
+    # Each field uses explicit default_factory=os.getenv() for environment variable support.
+    triage_model: str | None = Field(
+        default_factory=lambda: os.getenv("SEPILOT_TRIAGE_MODEL"),
+        description="Cheaper model for triage/classification (e.g., gpt-4o-mini)"
+    )
+    verifier_model: str | None = Field(
+        default_factory=lambda: os.getenv("SEPILOT_VERIFIER_MODEL"),
+        description="Cheaper model for verification/completion checks (e.g., gpt-4o-mini)"
+    )
+    reasoning_model: str | None = Field(
+        default_factory=lambda: os.getenv("SEPILOT_REASONING_MODEL"),
+        description="Large model for planning/reflection/debate (e.g., o3, claude-opus). Falls back to main model."
+    )
+    quick_model: str | None = Field(
+        default_factory=lambda: os.getenv("SEPILOT_QUICK_MODEL"),
+        description="Fast cheap model for direct responses (e.g., gpt-4o-mini, haiku). Falls back to main model."
+    )
 
     # Performance optimization settings (centralized cache configuration)
     tool_cache_size: int = Field(default=100, description="Maximum number of cached tool results")
@@ -113,6 +135,12 @@ class Settings(BaseModel):
 
     # Theme configuration
     theme: str = Field(default="default", description="UI theme (default, dark, light, monokai)")
+
+    # Vi mode (Vim key bindings in prompt)
+    vi_mode: bool = Field(
+        default_factory=lambda: os.getenv("SEPILOT_VI_MODE", "0") in ("1", "true", "yes"),
+        description="Enable vi/vim key bindings in interactive prompt"
+    )
 
     # Permission rules file
     permission_rules_file: str | None = Field(

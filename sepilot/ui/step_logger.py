@@ -191,8 +191,9 @@ class StepLogger:
             text += f" ({short} 기준으로 진행 중)"
         self._print_message(text, min_interval=0.0)
 
-    def log_tool_result(self, tool_name: str, *, success: bool, decision_hint: str = "") -> None:
-        """Log a compact post-tool outcome with inferred decision."""
+    def log_tool_result(self, tool_name: str, *, success: bool, decision_hint: str = "",
+                        result_preview: str = "") -> None:
+        """Log a compact post-tool outcome with inferred decision and inline preview."""
         if not self.enabled:
             return
         if self._checklist_lines_rendered > 0:
@@ -211,6 +212,45 @@ class StepLogger:
         self._last_tool_result_key = key
         self._last_tool_result_at = now
         self._print_message(msg, min_interval=0.0)
+
+        # Show inline result preview for important tools
+        if result_preview and tool_name in (
+            "bash_execute", "file_edit", "file_write", "git", "search_content"
+        ):
+            self._print_tool_result_inline(tool_name, result_preview, success)
+
+    def _print_tool_result_inline(self, tool_name: str, preview: str, success: bool) -> None:
+        """Display a compact inline preview of tool execution results."""
+        preview = preview.strip()
+        if not preview:
+            return
+
+        # Truncate to reasonable size
+        max_lines = 8
+        max_chars = 500
+        lines = preview.split("\n")
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines.append(f"  ... ({len(preview.split(chr(10))) - max_lines} more lines)")
+        truncated = "\n".join(lines)
+        if len(truncated) > max_chars:
+            truncated = truncated[:max_chars] + "..."
+
+        # Color based on success/tool type
+        style_color = "green" if success else "red"
+        tool_labels = {
+            "bash_execute": "shell",
+            "file_edit": "edit",
+            "file_write": "write",
+            "git": "git",
+            "search_content": "search",
+        }
+        label = tool_labels.get(tool_name, tool_name)
+
+        self._console.print(
+            f"[dim {style_color}]  [{label}] {truncated}[/dim {style_color}]",
+            highlight=False,
+        )
 
     def log_mode(self, old_mode: str, new_mode: str) -> None:
         """Log a mode transition (e.g. ``PLAN → CODE``)."""

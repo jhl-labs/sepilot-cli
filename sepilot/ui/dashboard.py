@@ -179,9 +179,41 @@ if HAS_TEXTUAL:
             logs.clear()
 
         def action_save_logs(self) -> None:
-            """Save logs to file"""
-            # TODO: Implement log saving
-            self.add_log("[yellow]Log saving not yet implemented[/yellow]")
+            """Save logs to JSONL file in ~/.sepilot/logs/"""
+            import json
+            from pathlib import Path
+
+            log_dir = Path.home() / ".sepilot" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file = log_dir / f"dashboard_{self.session_id}_{timestamp}.jsonl"
+
+            try:
+                logs_widget = self.query_one("#logs", RichLog)
+                # RichLog stores lines internally; extract via _lines if available,
+                # otherwise fall back to exporting plain text via renderables.
+                lines = []
+                if hasattr(logs_widget, "lines"):
+                    for line in logs_widget.lines:
+                        lines.append(str(line))
+                elif hasattr(logs_widget, "_lines"):
+                    for line in logs_widget._lines:
+                        lines.append(str(line))
+
+                with open(log_file, "w", encoding="utf-8") as f:
+                    for i, line in enumerate(lines):
+                        entry = {
+                            "session_id": self.session_id,
+                            "line_number": i + 1,
+                            "content": line,
+                            "saved_at": datetime.now().isoformat(),
+                        }
+                        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+                self.add_log(f"[green]로그가 저장되었습니다: {log_file}[/green]")
+            except Exception as e:
+                self.add_log(f"[red]로그 저장 실패: {e}[/red]")
 
         def update_status(
             self,

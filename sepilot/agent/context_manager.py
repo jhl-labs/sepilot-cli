@@ -7,6 +7,7 @@ This module provides:
 - Intelligent semantic-based context management
 """
 
+import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -17,6 +18,8 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 
 from sepilot.config.constants import CONTEXT_PRUNE_SUMMARY_MAX_CHARS
+
+logger = logging.getLogger(__name__)
 
 # Module-level tiktoken encoding cache (avoid re-creating per call)
 _tiktoken_encoding = None
@@ -140,6 +143,7 @@ class ContextManager:
         max_context_tokens: int = 96000,
         warning_threshold: float = 0.8,
         compact_threshold: float = 0.92,
+        predictive_threshold: float = 0.75,
         min_messages_to_keep: int = 15,
     ):
         """Initialize context manager.
@@ -148,12 +152,18 @@ class ContextManager:
             max_context_tokens: Maximum tokens allowed in context
             warning_threshold: Percentage at which to warn user
             compact_threshold: Percentage at which to auto-compact
+            predictive_threshold: Percentage at which to pre-identify compaction candidates
             min_messages_to_keep: Minimum messages to keep after compaction
         """
         self.max_context_tokens = max_context_tokens
         self.warning_threshold = warning_threshold
         self.compact_threshold = compact_threshold
+        self.predictive_threshold = predictive_threshold
         self.min_messages_to_keep = min_messages_to_keep
+        # Pre-identified compaction candidates (populated at predictive_threshold)
+        self._compaction_candidates: list[int] = []
+        # Incremental compaction round tracker
+        self._incremental_round: int = 0
 
     def should_warn(self, current_tokens: int) -> bool:
         """Check if we should warn about context size."""
@@ -164,6 +174,289 @@ class ContextManager:
         """Check if we should auto-compact context."""
         usage = current_tokens / self.max_context_tokens
         return usage >= self.compact_threshold
+
+    def should_prepare_compaction(self, current_tokens: int) -> bool:
+        """Check if we should pre-identify compaction candidates (predictive).
+
+        At predictive_threshold (default 75%), identify messages that would be
+        summarized when actual compaction triggers, so compaction is faster.
+        """
+        usage = current_tokens / self.max_context_tokens
+        return usage >= self.predictive_threshold and usage < self.compact_threshold
+
+    def identify_compaction_candidates(
+        self,
+        messages: list[BaseMessage],
+    ) -> list[int]:
+        """Pre-identify messages that are candidates for summarization.
+
+        Categorizes messages by relevance and marks LOW/MINIMAL ones
+        for immediate summarization and MEDIUM ones for later rounds.
+
+        Args:
+            messages: Current message list
+
+        Returns:
+            List of message indices that are compaction candidates
+        """
+        candidates: list[int] = []
+        total = len(messages)
+        if total == 0:
+            return candidates
+
+        for i, msg in enumerate(messages):
+            if isinstance(msg, SystemMessage):
+                continue
+            relevance = self._assess_message_relevance(msg, i, total)
+            if relevance in (ContextRelevance.LOW, ContextRelevance.MINIMAL):
+                candidates.append(i)
+            elif relevance == ContextRelevance.MEDIUM and self._incremental_round >= 2:
+                # MEDIUM messages become candidates from round 2 onwards
+                candidates.append(i)
+
+        self._compaction_candidates = candidates
+        return candidates
+
+    def _assess_message_relevance(
+        self,
+        message: BaseMessage,
+        position: int,
+        total_messages: int,
+    ) -> ContextRelevance:
+        """Assess the relevance of a single message for compaction decisions.
+
+        Args:
+            message: The message to assess
+            position: Position index in the message list
+            total_messages: Total number of messages
+
+        Returns:
+            ContextRelevance level
+        """
+        if isinstance(message, SystemMessage):
+            return ContextRelevance.CRITICAL
+
+        recency = position / total_messages if total_messages > 0 else 0
+
+        # Recent messages (last 20%) are HIGH
+        if recency > 0.8:
+            return ContextRelevance.HIGH
+
+        content = str(getattr(message, 'content', '') or '')
+
+        # Error-related content is important
+        if 'error' in content.lower() or 'exception' in content.lower():
+            return ContextRelevance.HIGH
+
+        # Human messages in the recent half are at least MEDIUM
+        if isinstance(message, HumanMessage):
+            return ContextRelevance.HIGH if recency > 0.5 else ContextRelevance.MEDIUM
+
+        # AI messages with tool calls must stay paired
+        if isinstance(message, AIMessage) and hasattr(message, 'tool_calls') and message.tool_calls:
+            return ContextRelevance.HIGH
+
+        # Tool messages
+        if isinstance(message, ToolMessage):
+            if 'Error' in content or 'error' in content.lower():
+                return ContextRelevance.HIGH
+            elif len(content) > 1000:
+                return ContextRelevance.MEDIUM
+            else:
+                return ContextRelevance.LOW
+
+        # Position-based fallback
+        if recency > 0.5:
+            return ContextRelevance.MEDIUM
+        elif recency > 0.2:
+            return ContextRelevance.LOW
+        else:
+            return ContextRelevance.MINIMAL
+
+    def compact_incremental(
+        self,
+        messages: list[BaseMessage],
+        llm: Any = None,
+        focus_instruction: str | None = None,
+    ) -> list[BaseMessage]:
+        """Incrementally compact messages by summarizing oldest low-relevance ones.
+
+        Unlike full compact(), this preserves recent messages entirely and only
+        summarizes the oldest 50% of non-system messages, filtering by relevance:
+        - CRITICAL/HIGH: Never summarized
+        - MEDIUM: Summarized from round 2+
+        - LOW/MINIMAL: Always summarized
+
+        Args:
+            messages: Current message list
+            llm: Optional LLM for summarization (falls back to simple compaction)
+            focus_instruction: Optional focus topic for summarization
+
+        Returns:
+            Compacted message list with summary replacing old messages
+        """
+        self._incremental_round += 1
+
+        if len(messages) <= self.min_messages_to_keep:
+            return messages
+
+        system_messages = [m for m in messages if isinstance(m, SystemMessage)]
+        non_system = [m for m in messages if not isinstance(m, SystemMessage)]
+
+        if len(non_system) <= self.min_messages_to_keep:
+            return messages
+
+        # Determine split point: oldest 50% are candidates
+        split_idx = len(non_system) // 2
+        older_half = non_system[:split_idx]
+        recent_half = non_system[split_idx:]
+
+        # Filter older messages by relevance
+        to_summarize: list[BaseMessage] = []
+        to_keep: list[BaseMessage] = []
+
+        for i, msg in enumerate(older_half):
+            relevance = self._assess_message_relevance(msg, i, len(non_system))
+            if relevance in (ContextRelevance.CRITICAL, ContextRelevance.HIGH):
+                to_keep.append(msg)
+            elif relevance == ContextRelevance.MEDIUM and self._incremental_round < 2:
+                to_keep.append(msg)
+            else:
+                to_summarize.append(msg)
+
+        if not to_summarize:
+            return messages  # Nothing to summarize
+
+        # Create summary
+        if llm:
+            try:
+                conversation_text = self._format_messages_for_summary(to_summarize)
+
+                focus_part = ""
+                if focus_instruction:
+                    focus_part = f"\n\n특히 다음 주제에 집중하여 요약해주세요: {focus_instruction}"
+
+                summary_prompt = f"""다음은 이전 대화의 일부입니다. 핵심 내용을 간결하게 요약해주세요:
+
+{conversation_text}
+
+요약 시 다음을 포함해주세요:
+- 수행된 주요 작업과 결과
+- 중요한 결정사항
+- 아직 관련 있는 컨텍스트{focus_part}
+
+간결하고 명확하게 요약해주세요."""
+
+                summary_response = llm.invoke([HumanMessage(content=summary_prompt)])
+                summary_content = summary_response.content if hasattr(summary_response, 'content') else str(summary_response)
+
+                summary_message = SystemMessage(
+                    content=f"[점진적 대화 요약 - {len(to_summarize)}개 메시지, 라운드 {self._incremental_round}]\n{summary_content}"
+                )
+
+                return system_messages + [summary_message] + to_keep + recent_half
+
+            except Exception as e:
+                logger.warning("Incremental summarization failed: %s", e)
+                # Fall through to safe compaction
+
+        # Safe fallback: keep recent messages (same as legacy compact_messages)
+        # Never silently drop message content
+        keep_recent = max(self.min_messages_to_keep, len(recent_half))
+        recent_kept = non_system[-keep_recent:]
+        return system_messages + recent_kept
+
+    def get_message_token_breakdown(
+        self,
+        messages: list[BaseMessage],
+    ) -> list[dict[str, Any]]:
+        """Get per-message token breakdown sorted by token count (descending).
+
+        Args:
+            messages: Message list to analyze
+
+        Returns:
+            List of dicts with 'index', 'role', 'tokens', 'preview' keys
+        """
+        breakdown = []
+        for i, msg in enumerate(messages):
+            tokens = self._count_message_tokens(msg)
+            content = str(getattr(msg, 'content', '') or '')
+            role = type(msg).__name__.replace('Message', '')
+
+            breakdown.append({
+                'index': i,
+                'role': role,
+                'tokens': tokens,
+                'preview': content[:80].replace('\n', ' '),
+            })
+
+        breakdown.sort(key=lambda x: x['tokens'], reverse=True)
+        return breakdown
+
+    def get_instructions_token_ratio(
+        self,
+        messages: list[BaseMessage],
+    ) -> dict[str, Any]:
+        """Calculate the token ratio of system/instruction messages vs total.
+
+        Args:
+            messages: Message list
+
+        Returns:
+            Dict with 'instruction_tokens', 'total_tokens', 'ratio'
+        """
+        instruction_tokens = 0
+        total_tokens = 0
+
+        for msg in messages:
+            tokens = self._count_message_tokens(msg)
+            total_tokens += tokens
+            if isinstance(msg, SystemMessage):
+                instruction_tokens += tokens
+
+        ratio = instruction_tokens / total_tokens if total_tokens > 0 else 0.0
+        return {
+            'instruction_tokens': instruction_tokens,
+            'total_tokens': total_tokens,
+            'ratio': ratio,
+        }
+
+    def estimate_remaining_turns(
+        self,
+        messages: list[BaseMessage],
+        current_tokens: int,
+    ) -> int:
+        """Estimate how many more conversation turns fit in the context window.
+
+        Based on average tokens per turn (human + AI message pair).
+
+        Args:
+            messages: Current messages
+            current_tokens: Current total tokens
+
+        Returns:
+            Estimated number of remaining turns (human+AI pairs)
+        """
+        remaining = self.max_context_tokens - current_tokens
+        if remaining <= 0:
+            return 0
+
+        # Count turns (human messages)
+        human_count = sum(1 for m in messages if isinstance(m, HumanMessage))
+        non_system_tokens = sum(
+            self._count_message_tokens(m)
+            for m in messages
+            if not isinstance(m, SystemMessage)
+        )
+
+        if human_count == 0:
+            # No history yet, assume ~2000 tokens per turn
+            avg_tokens_per_turn = 2000
+        else:
+            avg_tokens_per_turn = max(non_system_tokens // human_count, 500)
+
+        return max(remaining // avg_tokens_per_turn, 0)
 
     def _count_tokens(self, text: str) -> int:
         """Count tokens in text using tiktoken or fallback estimation.

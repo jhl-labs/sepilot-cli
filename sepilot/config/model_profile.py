@@ -25,6 +25,10 @@ class ModelConfig:
     top_p: float | None = None
     max_tokens: int | None = None
 
+    # Tier model overrides
+    reasoning_model: str | None = None
+    quick_model: str | None = None
+
     # Custom headers
     custom_headers: dict[str, str] = field(default_factory=dict)
 

@@ -84,18 +84,25 @@ class AgentStatusIndicator:
 
     # -- lifecycle --
 
-    def start(self, message: str = "요청을 처리하고 있어요...") -> None:
-        """Start the spinner with an initial message."""
+    def start(self, message: str = "요청을 처리하고 있어요...", *, reset_metrics: bool = True) -> None:
+        """Start the spinner with an initial message.
+
+        Args:
+            message: Status text to display.
+            reset_metrics: If True (default), clear accumulated token metrics.
+                Set to False when resuming after a temporary pause (e.g. bash streaming).
+        """
         with self._lock:
             if self._active:
                 return
-            self._started_at = time.monotonic()
-            self._latest_context_tokens = None
-            self._latest_token_rate = None
-            self._last_tokens_for_rate = None
-            self._last_rate_update_at = None
+            if reset_metrics:
+                self._started_at = time.monotonic()
+                self._latest_context_tokens = None
+                self._latest_token_rate = None
+                self._last_tokens_for_rate = None
+                self._last_rate_update_at = None
             self._status = self._console.status(
-                f"[bold cyan]{message}[/bold cyan]",
+                f"[bold cyan]{message}{self._format_metrics_suffix()}[/bold cyan]",
                 spinner="dots",
             )
             self._status.start()
@@ -144,7 +151,7 @@ class AgentStatusIndicator:
 
             inst_rate = delta_tokens / delta_t
             # Guard unrealistic spikes from bursty state updates.
-            inst_rate = max(0.0, min(inst_rate, 2000.0))
+            inst_rate = max(0.0, min(inst_rate, 500.0))
 
             if self._latest_token_rate is None:
                 self._latest_token_rate = inst_rate
