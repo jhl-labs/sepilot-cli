@@ -2,6 +2,30 @@
 
 이 프로젝트의 모든 주요 변경사항을 기록합니다. [Keep a Changelog](https://keepachangelog.com/) 형식을 따릅니다.
 
+## [0.9.0] - 2026-03-30
+
+### Added
+- **멀티 에이전트 시스템** (`agent/multi/`): PM, Ralph Loop, Team, Inbox 기반 협업 에이전트 아키텍처
+- **Tmux 서브에이전트**: tmux 세션 기반 격리 실행 지원 (`subagent/tmux_subagent.py`)
+- **실행 컨텍스트 모듈** (`execution_context.py`): 현재 실행 경계 추적
+- **CLI 에이전트 LLM 설정** (`config/cli_agent_llm.py`): CLI 전용 LLM 프로바이더 구성
+- **DevOps 스킬 5종**: container, helm, gitops, k8s-health, se-helper를 Skills 시스템으로 이전
+- **PromptSkill 기반 스킬 리팩토링**: fastapi_design, frontend_design을 마크다운 프롬프트로 분리
+- **에이전트/성능 관리 명령어**: `/agent`, `/performance` 명령어 추가
+
+### Changed
+- `base_agent.py` 대규모 개선: 멀티 에이전트, tmux, 실행 컨텍스트 통합
+- `instructions_loader.py` 리팩토링: 프로젝트/규칙/사용자 규칙 소스 분리 파라미터 추가
+- `context_manager.py` 개선: predictive threshold, incremental compact 지원
+- `subagent/` 모듈 전면 확장: team orchestrator, specialized agents 강화
+- Builtin 스킬을 자동 디스커버리 방식으로 전환 (수동 등록 제거)
+- `session_commands.py`, `undo_redo_commands.py` 등 UI 명령어 모듈 개선
+
+### Removed
+- `k8s_agent.py`: 전용 에이전트 제거 (Skills 시스템으로 대체)
+- `devops_commands.py`, `k8s_commands.py`: 슬래시 명령어 제거 (Skills로 이전)
+- `sepilot.web` 잔여 참조 (`estimate_cost`) 정리
+
 ## [0.8.1] - 2026-03-17
 
 ### Added
