@@ -20,7 +20,7 @@ class LanguageHandler(Protocol):
     language: Language
 
     def extract_ast(
-        self, file_path: str, content: str, tree: "tree_sitter.Tree"
+        self, file_path: str, content: str, tree: tree_sitter.Tree
     ) -> UnifiedAST:
         """Extract unified AST from tree-sitter parse tree."""
         ...

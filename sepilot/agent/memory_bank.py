@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from sepilot.agent.enhanced_state import AgentStrategy, EnhancedAgentState
-
+from sepilot.agent.execution_context import get_current_user_query
 
 # ═══════════════════════════════════════════════════════════════════
 # Claude Code Style: File-based Configuration
@@ -137,6 +137,9 @@ def get_all_instructions(
         return load_all_instructions(
             working_dir=project_path,
             active_files=active_files,
+            include_project_sources=True,
+            include_project_rules=True,
+            include_user_rules=True,
         )
     except ImportError:
         # Fallback to simple loading
@@ -440,12 +443,7 @@ class MemoryBank:
         if not messages:
             return None
 
-        # Get original task from first human message
-        task_description = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                task_description = getattr(msg, "content", "")[:500]
-                break
+        task_description = get_current_user_query(state)[:500]
 
         if not task_description:
             return None
@@ -607,13 +605,7 @@ class MemoryBank:
         Returns:
             List of relevant memories
         """
-        # Extract task from state
-        messages = state.get("messages", [])
-        task = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                task = getattr(msg, "content", "")
-                break
+        task = get_current_user_query(state)
 
         if not task:
             return []
@@ -944,12 +936,9 @@ class SessionManager:
         tool_history = state.get("tool_call_history", [])
         file_changes = state.get("file_changes", [])
 
-        # Get task from first human message if not provided
+        # Get task from the current execution prompt if not provided
         if not task_summary:
-            for msg in messages:
-                if hasattr(msg, "type") and msg.type == "human":
-                    task_summary = getattr(msg, "content", "")[:200]
-                    break
+            task_summary = get_current_user_query(state)[:200]
 
         return SessionData(
             session_id=session_id,

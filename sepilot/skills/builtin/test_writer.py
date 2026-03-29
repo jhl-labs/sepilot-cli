@@ -1,28 +1,19 @@
-"""Test Writer Skill - Automated test generation assistance"""
+"""Test Writer Skill"""
 
-from ..base import BaseSkill, SkillMetadata, SkillResult
+from ..base import PromptSkill
 
 
-class TestWriterSkill(BaseSkill):
-    """Skill for generating high-quality tests"""
-
-    def get_metadata(self) -> SkillMetadata:
-        return SkillMetadata(
-            name="test-writer",
-            description="Generate comprehensive tests with best practices",
-            version="1.0.0",
-            author="SEPilot",
-            triggers=[
-                "write test", "add test", "create test", "unit test",
-                "test case", "test code", "pytest", "unittest",
-                "need test", "missing test", "test coverage"
-            ],
-            category="testing"
-        )
-
-    def execute(self, input_text: str, context: dict) -> SkillResult:
-        """Execute test writer skill"""
-        test_prompt = """## Test Writing Guidelines
+class TestWriterSkill(PromptSkill):
+    name = "test-writer"
+    description = "Generate comprehensive tests with best practices"
+    triggers = [
+        "write test", "add test", "create test", "unit test",
+        "test case", "test code", "pytest", "unittest",
+        "need test", "missing test", "test coverage",
+    ]
+    category = "testing"
+    prompt = """\
+## Test Writing Guidelines
 
 When writing tests, follow these best practices:
 
@@ -103,10 +94,4 @@ class TestMyFunction(unittest.TestCase):
 - Error handling paths
 - Integration points
 
-Generate comprehensive, maintainable tests that catch real bugs.
-"""
-        return SkillResult(
-            success=True,
-            message="Test writer skill activated - following testing best practices",
-            prompt_injection=test_prompt
-        )
+Generate comprehensive, maintainable tests that catch real bugs."""

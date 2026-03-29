@@ -16,7 +16,7 @@ from pathlib import Path
 import docker
 from rich.console import Console
 
-from sepilot.agent.bench.models import SWEInstance, BenchResult, Prediction
+from sepilot.agent.bench.models import BenchResult, Prediction, SWEInstance
 
 
 class InferenceRunner:
@@ -196,6 +196,9 @@ class InferenceRunner:
             # 4. agent가 bash_execute로 `python script.py` 실행 시
             #    → PATH 상 testbed Python이 먼저 → 프로젝트 패키지 정상 import ✅
             team_flag = "--team-mode " if self.team_mode else ""
+            _model_lower = env_vars.get("DEFAULT_MODEL", "").lower()
+            is_cli_agent = _model_lower.startswith("cli:") or _model_lower.startswith("tmux:")
+
             bootstrap_cmd = (
                 # [1] base conda Python(3.11+)으로 에이전트 전용 venv 생성
                 f"python -m venv {self.CONTAINER_AGENT_VENV} 2>/dev/null && "
@@ -207,6 +210,18 @@ class InferenceRunner:
                 "/opt/miniconda3/envs/testbed/bin/pip install --quiet pytest 2>&1 | tail -2; "
                 # [2] PATH 앞에 testbed bin 추가 (이 시점부터 `python` = testbed Python)
                 "export PATH=/opt/miniconda3/envs/testbed/bin:$PATH && "
+            )
+
+            # CLI 에이전트: PATH는 볼륨 마운트 후 동적으로 결정 (아래 참조)
+            _cli_path_prefix = ""
+            if is_cli_agent:
+                bootstrap_cmd += (
+                    # ripgrep 설치 (opencode가 자체 ripgrep 대신 시스템 rg 사용하도록)
+                    "apt-get update -qq && apt-get install -y -qq ripgrep >/dev/null 2>&1; "
+                    "{_CLI_PATH_PLACEHOLDER}"
+                )
+
+            bootstrap_cmd += (
                 "cd /testbed && "
                 # [3] agent는 agent venv Python으로 명시적 실행
                 "PYTHONPATH=/sepilot "
@@ -217,15 +232,87 @@ class InferenceRunner:
                 f"{team_flag}"
             )
 
+            # Volume mounts
+            volumes = {
+                str(self.project_dir): {"bind": "/sepilot", "mode": "ro"},
+                str(problem_file): {"bind": self.CONTAINER_PROBLEM_FILE, "mode": "ro"},
+                str(self.OUTPUT_DIR): {"bind": self.CONTAINER_OUTPUT_DIR, "mode": "rw"},
+            }
+
+            # CLI 에이전트: 호스트 node.js + CLI 바이너리를 컨테이너에 마운트
+            # 전략: 심볼릭 링크 보존을 위해 호스트 경로를 동일 경로로 마운트
+            if is_cli_agent:
+                import shutil
+                from pathlib import Path
+
+                # node.js 런타임 (codex, opencode 등이 여기에 설치됨)
+                node_bin = shutil.which("node")
+                if node_bin:
+                    node_dir = str(Path(node_bin).resolve().parent.parent)
+                    volumes[node_dir] = {"bind": "/host-node", "mode": "ro"}
+
+                # CLI 바이너리: 심볼릭 링크 경로 + 실제 바이너리 경로 모두 마운트
+                # (claude는 ~/.local/bin → ~/.local/share/claude/... 심볼릭 링크)
+                host_dirs_to_mount: set[str] = set()
+                for cli_name in ("claude", "codex", "opencode", "gemini"):
+                    cli_path = shutil.which(cli_name)
+                    if not cli_path:
+                        continue
+                    p = Path(cli_path)
+                    # 심볼릭 링크 경로의 디렉토리
+                    host_dirs_to_mount.add(str(p.parent))
+                    # 실제 바이너리 경로의 디렉토리 (심볼릭 대상)
+                    if p.is_symlink():
+                        real = p.resolve()
+                        host_dirs_to_mount.add(str(real.parent))
+                        # symlink target 상위 디렉토리도 (claude는 versions/ 구조)
+                        host_dirs_to_mount.add(str(real.parent.parent))
+
+                # 호스트 경로를 동일 컨테이너 경로로 마운트 (심볼릭 링크 보존)
+                extra_paths = []
+                for host_dir in sorted(host_dirs_to_mount):
+                    if host_dir not in volumes:
+                        volumes[host_dir] = {"bind": host_dir, "mode": "ro"}
+                        extra_paths.append(host_dir)
+
+                # PATH 업데이트: node + 모든 CLI 디렉토리
+                path_entries = "/host-node/bin:" + ":".join(sorted(host_dirs_to_mount))
+                bootstrap_cmd = bootstrap_cmd.replace(
+                    "{_CLI_PATH_PLACEHOLDER}",
+                    f"export PATH={path_entries}:$PATH && ",
+                )
+
+                # CLI 인증 디렉토리/파일 마운트 (각 CLI의 인증 토큰/설정)
+                home = Path.home()
+                # CLI 인증/설정 마운트 (mode: ro=읽기전용, rw=읽기쓰기)
+                cli_auth_mounts = [
+                    (".claude", "ro"),
+                    (".claude.json", "ro"),
+                    (".codex", "ro"),
+                    (".opencode", "ro"),
+                    (".config/opencode", "ro"),
+                    (".local/share/opencode", "rw"),  # opencode DB + auth.json (쓰기 필요)
+                    (".cache/opencode", "ro"),         # opencode models.json
+                ]
+                for auth_item, mount_mode in cli_auth_mounts:
+                    auth_path = home / auth_item
+                    if auth_path.exists() and str(auth_path) not in volumes:
+                        volumes[str(auth_path)] = {"bind": str(auth_path), "mode": mount_mode}
+
+                # HOME을 호스트와 동일하게 설정 (인증 파일 경로 일치를 위해)
+                env_vars["HOME"] = str(home)
+
+                # API 키 환경변수 전달 (claude 등에 필요)
+                for key in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+                    val = os.environ.get(key)
+                    if val:
+                        env_vars[key] = val
+
             container = client.containers.run(
                 image=image_key,
                 name=container_name,
                 command=["bash", "-c", bootstrap_cmd],
-                volumes={
-                    str(self.project_dir): {"bind": "/sepilot", "mode": "ro"},
-                    str(problem_file): {"bind": self.CONTAINER_PROBLEM_FILE, "mode": "ro"},
-                    str(self.OUTPUT_DIR): {"bind": self.CONTAINER_OUTPUT_DIR, "mode": "rw"},
-                },
+                volumes=volumes,
                 environment=env_vars,
                 network_mode="host",
                 working_dir="/testbed",
@@ -233,14 +320,14 @@ class InferenceRunner:
             )
 
             # 컨테이너 실행 대기
-            timed_out = False
+            _timed_out = False
             try:
                 exit_result = container.wait(timeout=timeout)
                 exit_code = exit_result.get("StatusCode", -1)
             except Exception as wait_err:
                 logs.append(f"Container wait error (timeout): {wait_err}")
                 exit_code = -1
-                timed_out = True
+                _timed_out = True
                 # SIGTERM 먼저 → 시그널 핸들러가 result.json 작성할 시간 확보
                 try:
                     container.kill(signal="SIGTERM")
@@ -471,7 +558,7 @@ class InferenceRunner:
         # 방법 1: 컨테이너를 잠시 재시작하여 git diff 실행
         try:
             container.start()
-            exec_result = container.exec_run(
+            _exec_result = container.exec_run(
                 ["bash", "-c", f"cd /testbed && git diff HEAD > {self.CONTAINER_PATCH_FILE}"],
                 workdir="/testbed",
             )
@@ -547,7 +634,7 @@ class EvaluationRunner:
         # predictions 에서 instance_ids 추출 (지정되지 않은 경우)
         if instance_ids is None:
             instance_ids = []
-            with open(predictions_path, "r", encoding="utf-8") as f:
+            with open(predictions_path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line:
@@ -663,28 +750,39 @@ run_evaluation(
         result_file = self._find_result_file(run_id)
 
         if result_file and result_file.exists():
-            with open(result_file, "r", encoding="utf-8") as f:
+            with open(result_file, encoding="utf-8") as f:
                 raw_results = json.load(f)
 
-            # swebench 보고서 형식: resolved_ids / unresolved_ids 리스트
-            resolved_ids = set(raw_results.get("resolved_ids", []))
-
-            if resolved_ids or "resolved_ids" in raw_results:
-                # 신규 형식 (resolved_ids 리스트)
+            if not isinstance(raw_results, dict):
+                self.console.print(
+                    "[yellow]Malformed evaluation result file: expected object, "
+                    f"got {type(raw_results).__name__}. Treating all instances as unresolved.[/yellow]"
+                )
                 for instance_id in instance_ids:
                     results[instance_id] = {
-                        "resolved": instance_id in resolved_ids,
+                        "resolved": False,
                         "raw": raw_results,
                     }
             else:
-                # 레거시 형식 (instance_id → {resolved: bool})
-                for instance_id in instance_ids:
-                    if instance_id in raw_results:
-                        entry = raw_results[instance_id]
-                        resolved = entry.get("resolved", False) if isinstance(entry, dict) else False
-                        results[instance_id] = {"resolved": resolved, "raw": entry}
-                    else:
-                        results[instance_id] = {"resolved": False, "raw": {}}
+                # swebench 보고서 형식: resolved_ids / unresolved_ids 리스트
+                resolved_ids = set(raw_results.get("resolved_ids", []))
+
+                if resolved_ids or "resolved_ids" in raw_results:
+                    # 신규 형식 (resolved_ids 리스트)
+                    for instance_id in instance_ids:
+                        results[instance_id] = {
+                            "resolved": instance_id in resolved_ids,
+                            "raw": raw_results,
+                        }
+                else:
+                    # 레거시 형식 (instance_id → {resolved: bool})
+                    for instance_id in instance_ids:
+                        if instance_id in raw_results:
+                            entry = raw_results[instance_id]
+                            resolved = entry.get("resolved", False) if isinstance(entry, dict) else False
+                            results[instance_id] = {"resolved": resolved, "raw": entry}
+                        else:
+                            results[instance_id] = {"resolved": False, "raw": {}}
 
             # 결과 파일을 EVAL_RESULTS_DIR에 보관
             dest = self.EVAL_RESULTS_DIR / result_file.name

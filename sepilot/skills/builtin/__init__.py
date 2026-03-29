@@ -1,7 +1,9 @@
-"""Built-in skills for SEPilot"""
+"""Built-in skills for SEPilot — auto-discovered from this package."""
 
 import importlib
+import inspect
 import logging
+import pkgutil
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -9,34 +11,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Registry of builtin skill modules and their class names
-_BUILTIN_SKILLS: list[tuple[str, str]] = [
-    (".code_review", "CodeReviewSkill"),
-    (".explain_code", "ExplainCodeSkill"),
-    (".git_helper", "GitHelperSkill"),
-    (".debug_helper", "DebugHelperSkill"),
-    (".test_writer", "TestWriterSkill"),
-    (".frontend_design", "FrontendDesignSkill"),
-    (".fastapi_design", "FastAPIDesignSkill"),
-    (".project_intro", "ProjectIntroSkill"),
-    (".karpathy_guidelines", "KarpathyGuidelinesSkill"),
-]
-
 
 def get_builtin_skills() -> list["BaseSkill"]:
-    """Get all built-in skill instances.
+    """Discover and instantiate all BaseSkill subclasses in this package."""
+    from ..base import BaseSkill
 
-    Loads skills dynamically from the registry, gracefully handling
-    import failures for individual skills.
-    """
-    skills = []
+    skills: list[BaseSkill] = []
 
-    for module_name, class_name in _BUILTIN_SKILLS:
+    for _finder, modname, ispkg in pkgutil.iter_modules(__path__):
+        if ispkg:
+            continue
         try:
-            module = importlib.import_module(module_name, package=__package__)
-            skill_class = getattr(module, class_name)
-            skills.append(skill_class())
-        except (ImportError, AttributeError) as e:
-            logger.debug(f"Failed to load builtin skill {class_name}: {e}")
+            module = importlib.import_module(f".{modname}", __package__)
+        except Exception as e:
+            logger.debug("Failed to import builtin skill module %s: %s", modname, e)
+            continue
+
+        for _name, obj in inspect.getmembers(module, inspect.isclass):
+            if issubclass(obj, BaseSkill) and obj is not BaseSkill and obj.__module__ == module.__name__:
+                try:
+                    skills.append(obj())
+                except Exception as e:
+                    logger.debug("Failed to instantiate %s: %s", _name, e)
 
     return skills

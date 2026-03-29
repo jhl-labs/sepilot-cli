@@ -268,7 +268,7 @@ class OAuthHandler:
 
         # Open browser
         logger.info("Opening browser for OAuth authentication...")
-        print(f"\n🔐 Opening browser for authentication...")
+        print("\n🔐 Opening browser for authentication...")
         print(f"   If browser doesn't open, visit: {auth_url}\n")
         webbrowser.open(auth_url)
 

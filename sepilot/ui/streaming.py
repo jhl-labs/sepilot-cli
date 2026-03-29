@@ -36,12 +36,12 @@ class StreamingHandler:
         self.current_text = ""
         self.live: Live | None = None
         self.start_time: float = 0
-        self.token_count: int = 0
+        self.chunk_count: int = 0
 
     def start(self):
         """Start streaming output"""
         self.current_text = ""
-        self.token_count = 0
+        self.chunk_count = 0
         self.start_time = time.time()
 
         if self.show_panel:
@@ -55,13 +55,13 @@ class StreamingHandler:
 
     def update(self, token: str):
         """
-        Add a new token to the output
+        Add a new streaming chunk to the output
 
         Args:
-            token: New token from LLM
+            token: New chunk from LLM (may contain multiple tokens)
         """
         self.current_text += token
-        self.token_count += 1
+        self.chunk_count += 1
 
         if self.live:
             self.live.update(self._render_panel())
@@ -81,13 +81,13 @@ class StreamingHandler:
 
         # Calculate stats
         elapsed = time.time() - self.start_time
-        tokens_per_sec = self.token_count / elapsed if elapsed > 0 else 0
+        chunks_per_sec = self.chunk_count / elapsed if elapsed > 0 else 0
 
         # Show stats in dim
         if self.console and elapsed > 0:
             self.console.print(
-                f"[dim]Streamed {self.token_count} tokens in {elapsed:.1f}s "
-                f"({tokens_per_sec:.1f} tokens/sec)[/dim]"
+                f"[dim]Streamed {self.chunk_count} chunks in {elapsed:.1f}s "
+                f"({chunks_per_sec:.1f} chunks/sec)[/dim]"
             )
 
     def get_text(self) -> str:
@@ -135,28 +135,28 @@ class CallbackStreamingHandler:
 
         self.current_text = ""
         self.start_time: float = 0
-        self.token_count: int = 0
+        self.chunk_count: int = 0
 
     def start(self):
         """Start streaming"""
         self.current_text = ""
-        self.token_count = 0
+        self.chunk_count = 0
         self.start_time = time.time()
         self.on_start()
 
     def update(self, token: str):
-        """Add token"""
+        """Add chunk"""
         self.current_text += token
-        self.token_count += 1
+        self.chunk_count += 1
         self.on_token(token)
 
     def finish(self):
         """Finish streaming"""
         elapsed = time.time() - self.start_time
         stats = {
-            'token_count': self.token_count,
+            'chunk_count': self.chunk_count,
             'elapsed_seconds': elapsed,
-            'tokens_per_second': self.token_count / elapsed if elapsed > 0 else 0
+            'chunks_per_second': self.chunk_count / elapsed if elapsed > 0 else 0
         }
         self.on_finish(self.current_text, stats)
 

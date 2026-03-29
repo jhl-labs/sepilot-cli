@@ -6,12 +6,12 @@ import hashlib
 import json
 import logging
 import sqlite3
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Generator
 
-from .models import CallEdge, Dependency, IndexedFile, IndexedSymbol, IndexStatus, ProjectIndex
+from .models import CallEdge, Dependency, IndexedFile, IndexedSymbol, IndexStatus
 
 logger = logging.getLogger(__name__)
 

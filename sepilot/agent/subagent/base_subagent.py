@@ -137,7 +137,29 @@ class BaseSubAgent(ABC):
         messages.append(HumanMessage(content=prompt))
 
         response = await self.llm.ainvoke(messages)
-        return response.content
+        return self._normalize_llm_content(response.content)
+
+    def _normalize_llm_content(self, content: Any) -> str:
+        """Normalize LangChain message content into a plain text string."""
+        if isinstance(content, str):
+            return content
+        if content is None:
+            return ""
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                part = self._normalize_llm_content(item).strip()
+                if part:
+                    parts.append(part)
+            return "\n".join(parts)
+        if isinstance(content, dict):
+            for key in ("text", "content"):
+                value = content.get(key)
+                normalized = self._normalize_llm_content(value).strip()
+                if normalized:
+                    return normalized
+            return ""
+        return str(content)
 
     def get_tool(self, tool_name: str) -> Any | None:
         """도구 이름으로 도구 가져오기

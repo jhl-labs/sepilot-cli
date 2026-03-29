@@ -27,6 +27,7 @@ class Worktree:
     worktree_id: str
     path: Path
     branch: str
+    base_commit: str = ""
     created_at: datetime = field(default_factory=datetime.now)
     task_id: str = ""
     has_changes: bool = False
@@ -36,6 +37,7 @@ class Worktree:
             "worktree_id": self.worktree_id,
             "path": str(self.path),
             "branch": self.branch,
+            "base_commit": self.base_commit,
             "task_id": self.task_id,
             "created_at": self.created_at.isoformat(),
             "has_changes": self.has_changes,
@@ -114,6 +116,13 @@ class WorktreeManager:
             worktree_id = uuid.uuid4().hex[:8]
             branch_name = f"worktree-agent-{worktree_id}"
 
+            returncode, base_commit, stderr = await self._run_git(
+                "rev-parse", "--verify", f"{base_branch}^{{commit}}"
+            )
+            if returncode != 0:
+                raise RuntimeError(f"Failed to resolve base branch: {stderr}")
+            resolved_base_commit = base_commit.splitlines()[-1].strip()
+
             # Create worktree directory
             worktree_base = self.repo_root / self.WORKTREE_BASE_DIR
             worktree_base.mkdir(parents=True, exist_ok=True)
@@ -122,7 +131,7 @@ class WorktreeManager:
             # Create git worktree with new branch
             returncode, stdout, stderr = await self._run_git(
                 "worktree", "add", "-b", branch_name,
-                str(worktree_path), base_branch
+                str(worktree_path), resolved_base_commit
             )
 
             if returncode != 0:
@@ -134,6 +143,7 @@ class WorktreeManager:
                 worktree_id=worktree_id,
                 path=worktree_path,
                 branch=branch_name,
+                base_commit=resolved_base_commit,
                 task_id=task_id,
             )
 
@@ -155,13 +165,17 @@ class WorktreeManager:
             worktree.has_changes = True
             return True
 
-        # Check if branch has commits ahead of base
-        returncode, stdout, _ = await self._run_git(
-            "log", "--oneline", "HEAD...HEAD~1",
-            cwd=worktree.path
-        )
+        if worktree.base_commit:
+            returncode, stdout, _ = await self._run_git(
+                "rev-list", "--count", f"{worktree.base_commit}..HEAD",
+                cwd=worktree.path
+            )
+            if returncode == 0:
+                has = int(stdout.strip() or "0") > 0
+                worktree.has_changes = has
+                return has
 
-        has = bool(stdout.strip())
+        has = False
         worktree.has_changes = has
         return has
 
@@ -285,6 +299,28 @@ class WorktreeManager:
             "message": "",
         }
 
+        # 현재 위치 저장 (merge 후 복원). detached HEAD면 commit으로 복원해야 한다.
+        returncode, original_branch, _ = await self._run_git(
+            "symbolic-ref", "-q", "--short", "HEAD"
+        )
+        original_ref = original_branch.strip() if returncode == 0 else None
+        restore_detached = False
+        if original_ref is None:
+            returncode, original_commit, _ = await self._run_git(
+                "rev-parse", "--verify", "HEAD"
+            )
+            if returncode == 0:
+                original_ref = original_commit.splitlines()[-1].strip()
+                restore_detached = True
+
+        # checkout 전 target branch를 commit-ish로 검증해 옵션 주입을 막는다.
+        returncode, _, stderr = await self._run_git(
+            "rev-parse", "--verify", f"{target_branch}^{{commit}}"
+        )
+        if returncode != 0:
+            result["message"] = f"Failed to resolve {target_branch}: {stderr}"
+            return result
+
         # Checkout target branch before merging
         returncode, _, stderr = await self._run_git(
             "checkout", target_branch
@@ -298,7 +334,16 @@ class WorktreeManager:
             "merge", worktree.branch, "--no-edit",
         )
 
-        if returncode != 0:
+        merge_success = returncode == 0
+
+        # 원래 위치로 복원 (merge 성공/실패 무관)
+        if original_ref and (restore_detached or original_ref != target_branch):
+            if restore_detached:
+                await self._run_git("checkout", "--detach", original_ref)
+            else:
+                await self._run_git("checkout", original_ref)
+
+        if not merge_success:
             result["message"] = f"Merge failed: {stderr}"
             return result
 

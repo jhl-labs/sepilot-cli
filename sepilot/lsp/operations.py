@@ -11,14 +11,12 @@ from sepilot.tools.code_analysis.language_detector import get_language_detector
 
 from .client import LSPClient
 from .models import (
-    CallHierarchyItem,
     Diagnostic,
     DocumentSymbol,
     HoverInfo,
     Location,
     SymbolInformation,
 )
-from .servers import LSPServerConfig
 
 logger = logging.getLogger(__name__)
 

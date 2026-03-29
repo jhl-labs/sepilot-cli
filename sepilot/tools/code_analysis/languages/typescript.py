@@ -7,14 +7,12 @@ from typing import TYPE_CHECKING
 from ..unified_ast import (
     ClassSymbol,
     FunctionSymbol,
-    ImportInfo,
     Language,
     Location,
     Parameter,
     SymbolKind,
     UnifiedAST,
     VariableSymbol,
-    Visibility,
 )
 from .javascript import JavaScriptHandler
 
@@ -31,7 +29,7 @@ class TypeScriptHandler(JavaScriptHandler):
     language = Language.TYPESCRIPT
 
     def extract_ast(
-        self, file_path: str, content: str, tree: "tree_sitter.Tree"
+        self, file_path: str, content: str, tree: tree_sitter.Tree
     ) -> UnifiedAST:
         """Extract unified AST from TypeScript parse tree."""
         # Get base JavaScript AST
@@ -49,7 +47,7 @@ class TypeScriptHandler(JavaScriptHandler):
         return ast
 
     def _extract_interfaces(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract interface definitions."""
         for node in self._find_nodes(root, ["interface_declaration"]):
@@ -110,7 +108,7 @@ class TypeScriptHandler(JavaScriptHandler):
             )
 
     def _parse_interface_member(
-        self, node: "tree_sitter.Node", content: str, file_path: str
+        self, node: tree_sitter.Node, content: str, file_path: str
     ) -> FunctionSymbol | None:
         """Parse an interface method or property signature."""
         name_node = node.child_by_field_name("name")
@@ -145,7 +143,7 @@ class TypeScriptHandler(JavaScriptHandler):
         )
 
     def _parse_ts_parameters(
-        self, params_node: "tree_sitter.Node", content: str
+        self, params_node: tree_sitter.Node, content: str
     ) -> list[Parameter]:
         """Parse TypeScript function parameters with types."""
         params = []
@@ -196,7 +194,7 @@ class TypeScriptHandler(JavaScriptHandler):
         return params
 
     def _extract_type_aliases(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract type alias definitions."""
         for node in self._find_nodes(root, ["type_alias_declaration"]):
@@ -225,7 +223,7 @@ class TypeScriptHandler(JavaScriptHandler):
             )
 
     def _extract_enums(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract enum definitions."""
         for node in self._find_nodes(root, ["enum_declaration"]):
@@ -276,7 +274,7 @@ class TypeScriptHandler(JavaScriptHandler):
             )
 
     def _enhance_with_types(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str
     ) -> None:
         """Enhance AST with TypeScript type information."""
         # Enhance function return types
@@ -306,7 +304,7 @@ class TypeScriptHandler(JavaScriptHandler):
                             break
 
     def _matches_function(
-        self, node: "tree_sitter.Node", name: str, content: str
+        self, node: tree_sitter.Node, name: str, content: str
     ) -> bool:
         """Check if a node matches a function by name."""
         name_node = node.child_by_field_name("name")
@@ -315,7 +313,7 @@ class TypeScriptHandler(JavaScriptHandler):
         return False
 
     def _matches_method(
-        self, node: "tree_sitter.Node", name: str, content: str
+        self, node: tree_sitter.Node, name: str, content: str
     ) -> bool:
         """Check if a node matches a method by name."""
         name_node = node.child_by_field_name("name")

@@ -1,24 +1,15 @@
-"""Explain Code Skill - Code explanation and documentation"""
+"""Explain Code Skill"""
 
-from ..base import BaseSkill, SkillMetadata, SkillResult
+from ..base import PromptSkill
 
 
-class ExplainCodeSkill(BaseSkill):
-    """Skill for explaining code"""
-
-    def get_metadata(self) -> SkillMetadata:
-        return SkillMetadata(
-            name="explain-code",
-            description="Explain code with detailed breakdown and documentation",
-            version="1.0.0",
-            author="SEPilot",
-            triggers=["explain code", "what does this do", "explain this", "how does this work"],
-            category="documentation"
-        )
-
-    def execute(self, input_text: str, context: dict) -> SkillResult:
-        """Execute explain code skill"""
-        explain_prompt = """## Code Explanation Guidelines
+class ExplainCodeSkill(PromptSkill):
+    name = "explain-code"
+    description = "Explain code with detailed breakdown and documentation"
+    triggers = ["explain code", "what does this do", "explain this", "how does this work"]
+    category = "documentation"
+    prompt = """\
+## Code Explanation Guidelines
 
 **IMPORTANT: This is a READ-ONLY task. Do NOT modify, edit, or fix any code. Only explain it.**
 
@@ -47,10 +38,4 @@ When explaining the code, provide:
 
 Use clear, simple language suitable for someone learning this codebase.
 
-**REMINDER: Do NOT use file_edit, file_write, or any modification tools. Only read and explain.**
-"""
-        return SkillResult(
-            success=True,
-            message="Explain code skill activated",
-            prompt_injection=explain_prompt
-        )
+**REMINDER: Do NOT use file_edit, file_write, or any modification tools. Only read and explain.**"""

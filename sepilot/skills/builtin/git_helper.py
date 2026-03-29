@@ -1,24 +1,15 @@
-"""Git Helper Skill - Git operations assistance"""
+"""Git Helper Skill"""
 
-from ..base import BaseSkill, SkillMetadata, SkillResult
+from ..base import PromptSkill
 
 
-class GitHelperSkill(BaseSkill):
-    """Skill for git operations assistance"""
-
-    def get_metadata(self) -> SkillMetadata:
-        return SkillMetadata(
-            name="git-helper",
-            description="Assist with git operations, commit messages, and branch management",
-            version="1.0.0",
-            author="SEPilot",
-            triggers=["git commit", "commit message", "git help", "merge conflict"],
-            category="version-control"
-        )
-
-    def execute(self, input_text: str, context: dict) -> SkillResult:
-        """Execute git helper skill"""
-        git_prompt = """## Git Helper Guidelines
+class GitHelperSkill(PromptSkill):
+    name = "git-helper"
+    description = "Assist with git operations, commit messages, and branch management"
+    triggers = ["git commit", "commit message", "git help", "merge conflict"]
+    category = "version-control"
+    prompt = """\
+## Git Helper Guidelines
 
 **IMPORTANT: For destructive operations (force push, reset --hard, rebase), always explain the impact and ask for confirmation first.**
 
@@ -47,10 +38,4 @@ When assisting with git operations:
 
 Always check `git status` before operations and provide safe commands.
 
-**REMINDER: Explain what each git command will do before executing. Never run destructive commands without user confirmation.**
-"""
-        return SkillResult(
-            success=True,
-            message="Git helper skill activated",
-            prompt_injection=git_prompt
-        )
+**REMINDER: Explain what each git command will do before executing. Never run destructive commands without user confirmation.**"""

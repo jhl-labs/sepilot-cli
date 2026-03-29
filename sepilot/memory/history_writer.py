@@ -10,9 +10,9 @@ This module provides:
 import json
 import os
 import sys
+from collections.abc import Generator
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Generator, Iterator
+from typing import Any
 
 # Platform-compatible file locking
 if sys.platform == "win32":
@@ -96,7 +96,7 @@ class HistoryWriter:
             return
 
         try:
-            with open(self.session_file, 'r', encoding='utf-8') as f:
+            with open(self.session_file, encoding='utf-8') as f:
                 # Read last line
                 lines = f.readlines()
                 if lines:
@@ -369,7 +369,7 @@ class HistoryReader:
             return events
 
         try:
-            with open(session_file, 'r', encoding='utf-8') as f:
+            with open(session_file, encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     if line:
@@ -398,7 +398,7 @@ class HistoryReader:
             return
 
         try:
-            with open(session_file, 'r', encoding='utf-8') as f:
+            with open(session_file, encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     if line:

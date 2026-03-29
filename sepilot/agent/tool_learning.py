@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from sepilot.agent.enhanced_state import AgentStrategy, EnhancedAgentState
+from sepilot.agent.execution_context import get_current_user_query
 
 
 @dataclass
@@ -606,12 +607,7 @@ class ToolLearningNode:
             State updates with tool recommendations
         """
         # Get task context
-        messages = state.get("messages", [])
-        task_description = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                task_description = getattr(msg, "content", "")
-                break
+        task_description = get_current_user_query(state)
 
         # Get current context
         strategy = state.get("current_strategy")

@@ -4,6 +4,7 @@
 """
 
 import logging
+import re
 
 from langchain_core.language_models import BaseChatModel
 
@@ -11,6 +12,11 @@ from .base_subagent import BaseSubAgent
 from .models import SubAgentTask
 
 logger = logging.getLogger(__name__)
+
+_DANGEROUS_TEST_COMMAND_RE = re.compile(
+    r"(rm\s+-rf\s+/|mkfs|dd\s+if=|shutdown|reboot|:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;|chmod\s+-R\s+777\s+/)",
+    re.IGNORECASE,
+)
 
 
 class AnalyzerSubAgent(BaseSubAgent):
@@ -250,6 +256,13 @@ class TestingSubAgent(BaseSubAgent):
 
         if bash_tool and "test_command" in task.context:
             test_command = task.context["test_command"]
+
+            if not isinstance(test_command, str) or not test_command.strip():
+                return "❌ test_command는 비어 있지 않은 문자열이어야 합니다."
+
+            # 위험 명령 차단
+            if _DANGEROUS_TEST_COMMAND_RE.search(test_command):
+                return f"❌ 위험 명령 차단됨: {test_command}"
 
             try:
                 result = bash_tool.invoke({"command": test_command})

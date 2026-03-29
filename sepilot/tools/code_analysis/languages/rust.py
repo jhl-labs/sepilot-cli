@@ -27,7 +27,7 @@ class RustHandler:
     language = Language.RUST
 
     def extract_ast(
-        self, file_path: str, content: str, tree: "tree_sitter.Tree"
+        self, file_path: str, content: str, tree: tree_sitter.Tree
     ) -> UnifiedAST:
         """Extract unified AST from Rust parse tree."""
         ast = UnifiedAST(file_path=file_path, language=Language.RUST)
@@ -43,12 +43,12 @@ class RustHandler:
 
         return ast
 
-    def _get_node_text(self, node: "tree_sitter.Node", content: str) -> str:
+    def _get_node_text(self, node: tree_sitter.Node, content: str) -> str:
         """Get text content of a node."""
         return content[node.start_byte : node.end_byte]
 
     def _extract_imports(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str
     ) -> None:
         """Extract use statements."""
         for node in self._find_nodes(root, ["use_declaration"]):
@@ -61,7 +61,7 @@ class RustHandler:
                     ast.imports.append(ImportInfo(module=module, import_type="use"))
 
     def _parse_use_tree(
-        self, ast: UnifiedAST, node: "tree_sitter.Node", content: str, prefix: str
+        self, ast: UnifiedAST, node: tree_sitter.Node, content: str, prefix: str
     ) -> None:
         """Recursively parse use tree."""
         if node.type == "use_tree":
@@ -103,7 +103,7 @@ class RustHandler:
             ast.imports.append(ImportInfo(module=full_module, import_type="use"))
 
     def _extract_functions(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract function definitions."""
         for node in self._find_nodes(root, ["function_item"]):
@@ -116,7 +116,7 @@ class RustHandler:
                 ast.functions.append(func)
 
     def _parse_function(
-        self, node: "tree_sitter.Node", content: str, file_path: str
+        self, node: tree_sitter.Node, content: str, file_path: str
     ) -> FunctionSymbol | None:
         """Parse a function definition."""
         name_node = node.child_by_field_name("name")
@@ -189,7 +189,7 @@ class RustHandler:
         )
 
     def _parse_parameters(
-        self, params_node: "tree_sitter.Node", content: str
+        self, params_node: tree_sitter.Node, content: str
     ) -> list[Parameter]:
         """Parse function parameters."""
         params = []
@@ -216,7 +216,7 @@ class RustHandler:
         return params
 
     def _extract_structs(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract struct definitions."""
         for node in self._find_nodes(root, ["struct_item"]):
@@ -301,7 +301,7 @@ class RustHandler:
             )
 
     def _extract_traits(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract trait definitions."""
         for node in self._find_nodes(root, ["trait_item"]):
@@ -367,13 +367,13 @@ class RustHandler:
                 )
             )
 
-    def _has_body(self, func_node: "tree_sitter.Node") -> bool:
+    def _has_body(self, func_node: tree_sitter.Node) -> bool:
         """Check if a function has a body (not just a signature)."""
         body = func_node.child_by_field_name("body")
         return body is not None
 
     def _extract_enums(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract enum definitions."""
         for node in self._find_nodes(root, ["enum_item"]):
@@ -440,7 +440,7 @@ class RustHandler:
             )
 
     def _extract_impls(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract impl blocks and attach methods to structs."""
         for node in self._find_nodes(root, ["impl_item"]):
@@ -475,7 +475,7 @@ class RustHandler:
                             ast.functions.append(method)
 
     def _extract_variables(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract module-level constants and statics."""
         # Constants
@@ -560,7 +560,7 @@ class RustHandler:
             )
 
     def _extract_modules(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str
     ) -> None:
         """Extract module declarations."""
         for node in self._find_nodes(root, ["mod_item"]):
@@ -570,7 +570,7 @@ class RustHandler:
                 ast.metadata.setdefault("modules", []).append(module_name)
 
     def _get_doc_comment(
-        self, node: "tree_sitter.Node", content: str
+        self, node: tree_sitter.Node, content: str
     ) -> str | None:
         """Extract doc comments (/// or //!) preceding a node."""
         # Look at previous siblings for line comments
@@ -580,9 +580,7 @@ class RustHandler:
         doc_lines = []
         for i in range(start_line - 1, -1, -1):
             line = lines[i].strip()
-            if line.startswith("///"):
-                doc_lines.insert(0, line[3:].strip())
-            elif line.startswith("//!"):
+            if line.startswith("///") or line.startswith("//!"):
                 doc_lines.insert(0, line[3:].strip())
             elif line.startswith("//"):
                 continue  # Skip regular comments
@@ -593,7 +591,7 @@ class RustHandler:
 
         return "\n".join(doc_lines) if doc_lines else None
 
-    def _extract_calls(self, node: "tree_sitter.Node", content: str) -> list[str]:
+    def _extract_calls(self, node: tree_sitter.Node, content: str) -> list[str]:
         """Extract function calls."""
         calls = []
         for call_node in self._find_nodes(node, ["call_expression"]):
@@ -612,7 +610,7 @@ class RustHandler:
                         calls.append(self._get_node_text(field, content))
         return list(set(calls))
 
-    def _calculate_complexity(self, node: "tree_sitter.Node") -> int:
+    def _calculate_complexity(self, node: tree_sitter.Node) -> int:
         """Calculate cyclomatic complexity."""
         complexity = 1
         branch_nodes = [
@@ -635,8 +633,8 @@ class RustHandler:
         return complexity
 
     def _find_nodes(
-        self, node: "tree_sitter.Node", types: list[str]
-    ) -> list["tree_sitter.Node"]:
+        self, node: tree_sitter.Node, types: list[str]
+    ) -> list[tree_sitter.Node]:
         """Find all nodes of given types recursively."""
         results = []
         if node.type in types:

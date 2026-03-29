@@ -4,7 +4,6 @@ This module follows the Single Responsibility Principle (SRP) by handling
 only permission-related commands.
 """
 
-from pathlib import Path
 from typing import Any
 
 from rich.console import Console
@@ -252,7 +251,7 @@ def _handle_permissions_test(console: Console, permission_manager, tool: str, co
     """Test if a command would be allowed."""
     permission, reason = permission_manager.check_permission(tool, {"command": command})
 
-    console.print(f"[bold cyan]Permission Test[/bold cyan]\n")
+    console.print("[bold cyan]Permission Test[/bold cyan]\n")
     console.print(f"Tool: {tool}")
     console.print(f"Command: {command}")
     console.print()

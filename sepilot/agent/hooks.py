@@ -502,7 +502,7 @@ class HookManager:
         except socket.gaierror:
             return f"DNS resolution failed: {hostname}"
 
-        for family, _type, _proto, _canonname, sockaddr in addrinfos:
+        for _family, _type, _proto, _canonname, sockaddr in addrinfos:
             ip = ipaddress.ip_address(sockaddr[0])
             for network in _SSRF_BLOCKED_NETWORKS:
                 if ip in network:
@@ -538,8 +538,8 @@ class HookManager:
             )
 
         try:
-            import urllib.request
             import urllib.error
+            import urllib.request
 
             payload = json.dumps({
                 "hook_event_name": hook.event,

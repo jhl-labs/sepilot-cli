@@ -36,8 +36,8 @@ def get_rag_context(query: str, console: Console, n_results: int = 5) -> str:
     try:
         # 빠른 사전 검증: documents.json이 없거나 비어있으면 즉시 반환
         # chromadb import + vectorstore init을 완전히 건너뜀
-        from pathlib import Path
         import json as _json
+        from pathlib import Path
 
         docs_file = Path.home() / ".sepilot" / "rag" / "documents.json"
         if not docs_file.exists():

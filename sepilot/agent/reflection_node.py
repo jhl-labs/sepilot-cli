@@ -18,9 +18,12 @@ from typing import Any
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from sepilot.config.constants import MAX_REFLECTION_ITERATIONS as _MAX_REFLECTION_ITERATIONS
-
 from sepilot.agent.enhanced_state import AgentMode, AgentStrategy, EnhancedAgentState
+from sepilot.agent.execution_context import (
+    get_current_execution_messages,
+    get_current_user_query,
+)
+from sepilot.config.constants import MAX_REFLECTION_ITERATIONS as _MAX_REFLECTION_ITERATIONS
 
 
 class ReflectionDecision(str, Enum):
@@ -205,9 +208,9 @@ class FailurePatternDetector:
                 })
 
         # Pattern 6: Circular reasoning (similar AI responses)
-        messages = state.get("messages", [])
+        current_messages = get_current_execution_messages(state)
         ai_responses = [
-            msg.content[:200] for msg in messages
+            msg.content[:200] for msg in current_messages
             if isinstance(msg, AIMessage) and not getattr(msg, 'tool_calls', None)
         ]
         if len(ai_responses) >= 3:
@@ -223,11 +226,7 @@ class FailurePatternDetector:
         # Pattern 7: Wrong file target - editing files not mentioned in request
         if file_changes and len(tool_history) >= 2:
             # Get user request to check file relevance
-            user_request = ""
-            for msg in messages:
-                if isinstance(msg, HumanMessage):
-                    user_request = getattr(msg, "content", "").lower()
-                    break
+            user_request = get_current_user_query(state).lower()
             if user_request:
                 edit_tools = [tc for tc in tool_history if tc.tool_name in ("file_edit", "file_write")]
                 if edit_tools:
@@ -337,16 +336,12 @@ Analyze the execution and respond in this JSON format:
         iteration_count = state.get("iteration_count", 0)
 
         # Get original task
-        messages = state.get("messages", [])
-        original_task = ""
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                original_task = getattr(msg, "content", "")
-                break
+        current_messages = get_current_execution_messages(state)
+        original_task = get_current_user_query(state)
 
         # Get recent agent responses
         recent_responses = []
-        for msg in messages[-10:]:
+        for msg in current_messages[-10:]:
             if isinstance(msg, AIMessage):
                 content = getattr(msg, "content", "")
                 if content:

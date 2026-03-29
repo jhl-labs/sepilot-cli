@@ -17,8 +17,8 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import ToolMessage
-from langgraph.types import interrupt
 from langgraph.prebuilt import ToolNode
+from langgraph.types import interrupt
 
 from sepilot.agent import state_helpers, tool_tracker
 from sepilot.agent.agent_utils import (
@@ -606,14 +606,14 @@ def create_enhanced_tool_node(agent: 'ReactAgent') -> callable:
 
                 # Execute with exponential backoff retry
                 max_tool_retries = 2  # Maximum retry attempts for tool execution
-                last_exception = None
+                _last_exception = None
 
                 for attempt in range(1, max_tool_retries + 2):
                     try:
                         result = tool_node.invoke(temp_state)
                         break  # Success, exit retry loop
                     except Exception as e:
-                        last_exception = e
+                        _last_exception = e
                         error_context = ErrorRecoveryStrategy.create_error_context(e, attempt)
 
                         # Check if we should retry
@@ -873,7 +873,7 @@ def create_enhanced_tool_node(agent: 'ReactAgent') -> callable:
             for py_file in changed_py:
                 try:
                     abs_path = py_file if os.path.isabs(py_file) else os.path.join(workspace_path, py_file)
-                    with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                    with open(abs_path, encoding="utf-8", errors="replace") as fh:
                         source = fh.read()
                     compile(source, py_file, "exec")
                 except SyntaxError as e:

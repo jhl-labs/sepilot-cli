@@ -16,6 +16,11 @@ from typing import Any
 
 from rich.console import Console
 
+from sepilot.agent.execution_context import (
+    is_user_turn_boundary_message,
+    is_user_visible_conversation_message,
+)
+
 
 @dataclass
 class ContextUsageInfo:
@@ -176,7 +181,9 @@ class ContextDisplayManager:
         # Get model name
         model_name = "gpt-4-turbo-preview"
         if self.agent and hasattr(self.agent, 'settings'):
-            model_name = getattr(self.agent.settings, 'model', model_name)
+            agent_model = getattr(self.agent.settings, 'model', model_name)
+            if isinstance(agent_model, str) and agent_model:
+                model_name = agent_model
 
         # Get max tokens from environment or model default
         max_tokens = self._get_max_tokens(model_name)
@@ -231,12 +238,8 @@ class ContextDisplayManager:
         """Calculate current token usage from various sources."""
         tokens_used = 0
 
-        # Priority 1: From conversation_context
-        if self.conversation_context:
-            tokens_used = self.count_messages_tokens(self.conversation_context, model_name)
-
-        # Priority 2: From agent state
-        if tokens_used == 0 and self.agent and hasattr(self.agent, 'graph'):
+        # Priority 1: From agent state (source of truth for memory-backed sessions)
+        if self.agent and hasattr(self.agent, 'graph'):
             try:
                 thread_config = getattr(self.agent, "thread_config", None)
                 if thread_config:
@@ -247,7 +250,32 @@ class ContextDisplayManager:
             except Exception:
                 pass
 
+        # Priority 2: From local conversation context
+        if tokens_used == 0 and self.conversation_context:
+            tokens_used = self.count_messages_tokens(self.conversation_context, model_name)
+
         return tokens_used
+
+    def _get_context_messages_for_display(self) -> list:
+        """Return the best available message list for UI rendering."""
+        if self.agent and getattr(self.agent, "enable_memory", False) is True:
+            try:
+                if hasattr(self.agent, "get_conversation_messages"):
+                    messages = self.agent.get_conversation_messages()
+                    if messages:
+                        return list(messages)
+            except Exception:
+                pass
+
+        return list(self.conversation_context)
+
+    def _get_user_visible_messages_for_summary(self) -> list:
+        """Return only user-visible conversation turns for compact UI summaries."""
+        return [
+            msg
+            for msg in self._get_context_messages_for_display()
+            if is_user_visible_conversation_message(msg)
+        ]
 
     def format_context_usage(self, compact: bool = False) -> str:
         """Format context usage for display.
@@ -314,10 +342,11 @@ class ContextDisplayManager:
         self.console.print(f"  [{color}]{usage.tokens_used:,}[/{color}] / {usage.max_tokens:,} tokens ({usage.usage_percent:.1f}%)")
 
         # Show breakdown
-        if self.conversation_context:
-            msg_count = len(self.conversation_context)
-            human_count = sum(1 for m in self.conversation_context if getattr(m, 'type', '') == 'human')
-            ai_count = sum(1 for m in self.conversation_context if getattr(m, 'type', '') == 'ai')
+        display_messages = self._get_user_visible_messages_for_summary()
+        if display_messages:
+            msg_count = len(display_messages)
+            human_count = sum(1 for m in display_messages if is_user_turn_boundary_message(m))
+            ai_count = sum(1 for m in display_messages if getattr(m, 'type', '') == 'ai')
             self.console.print(f"  [dim]Messages: {msg_count} ({human_count} user, {ai_count} assistant)[/dim]")
 
         # Recommendations
@@ -341,7 +370,12 @@ class ContextDisplayManager:
         if os.getenv('SEPILOT_AUTO_COMPACT', '1') == '0':
             return False
 
-        if not self.conversation_context:
+        has_thread_state = bool(
+            self.agent
+            and getattr(self.agent, "enable_memory", False) is True
+            and getattr(self.agent, "thread_config", None)
+        )
+        if not self.conversation_context and not has_thread_state:
             return False
 
         # Get thresholds
@@ -383,10 +417,40 @@ class ContextDisplayManager:
         )
 
         tokens_before = usage.tokens_used
-        message_count_before = len(self.conversation_context)
+        message_count_before = len(self._get_context_messages_for_display())
         target_tokens = int(usage.max_tokens * target_ratio)
 
         self.console.print(f"[dim]목표: {target_tokens:,} 토큰 ({target_ratio*100:.0f}%)[/dim]")
+
+        if (
+            self.agent
+            and getattr(self.agent, "enable_memory", False) is True
+            and hasattr(self.agent, "compact_conversation_context")
+        ):
+            result = self.agent.compact_conversation_context(keep_recent=10, target_tokens=target_tokens)
+            if not result.get("success"):
+                return False
+
+            if hasattr(self.agent, "get_conversation_messages"):
+                try:
+                    self.conversation_context.clear()
+                    for msg in self.agent.get_conversation_messages():
+                        if is_user_visible_conversation_message(msg):
+                            self.conversation_context.append(msg)
+                except Exception:
+                    pass
+
+            refreshed_usage = self.get_context_usage_info()
+            message_count_after = len(self._get_context_messages_for_display())
+            tokens_after = refreshed_usage.tokens_used
+            method = "요약" if result.get("method") == "summarized" else "압축"
+            tokens_saved = tokens_before - tokens_after
+            self.console.print(f"[green]✅ 자동 {method} 완료![/green]")
+            self.console.print(f"   [dim]메시지: {message_count_before} → {message_count_after}[/dim]")
+            self.console.print(f"   [dim]토큰: {tokens_before:,} → {tokens_after:,} ({tokens_saved:,} 절약)[/dim]")
+            self.console.print(f"   [dim]사용량: {usage.usage_percent:.1f}% → {refreshed_usage.usage_percent:.1f}%[/dim]")
+            self.console.print()
+            return True
 
         context_manager = ContextManager(max_context_tokens=usage.max_tokens)
 
@@ -434,7 +498,8 @@ class ContextDisplayManager:
         self.console.print(f"[dim]Context window: {usage.max_tokens:,} tokens[/dim]")
         self.console.print()
 
-        if not self.conversation_context:
+        display_messages = self._get_context_messages_for_display()
+        if not display_messages:
             self.console.print("[yellow]No messages in context[/yellow]")
             return
 
@@ -449,10 +514,11 @@ class ContextDisplayManager:
 
         total_tokens = 0
         user_tokens = 0
+        agent_prompt_tokens = 0
         assistant_tokens = 0
         tool_tokens = 0
 
-        for i, msg in enumerate(self.conversation_context, 1):
+        for i, msg in enumerate(display_messages, 1):
             msg_type = getattr(msg, 'type', 'unknown')
             content = str(getattr(msg, 'content', ''))
             tokens = self.count_tokens(content, usage.model_name)
@@ -460,9 +526,12 @@ class ContextDisplayManager:
             percent = (tokens / usage.max_tokens * 100) if usage.max_tokens > 0 else 0
 
             # Track by type
-            if msg_type == 'human':
+            if msg_type == 'human' and is_user_turn_boundary_message(msg):
                 user_tokens += tokens
                 type_display = "[cyan]User[/cyan]"
+            elif msg_type == 'human':
+                agent_prompt_tokens += tokens
+                type_display = "[magenta]Agent Prompt[/magenta]"
             elif msg_type == 'ai':
                 assistant_tokens += tokens
                 type_display = "[green]Assistant[/green]"
@@ -492,6 +561,8 @@ class ContextDisplayManager:
         self.console.print("[bold]Token Distribution:[/bold]")
         total = max(total_tokens, 1)
         self.console.print(f"  [cyan]User:[/cyan] {user_tokens:,} ({user_tokens/total*100:.1f}%)")
+        if agent_prompt_tokens > 0:
+            self.console.print(f"  [magenta]Agent Prompt:[/magenta] {agent_prompt_tokens:,} ({agent_prompt_tokens/total*100:.1f}%)")
         self.console.print(f"  [green]Assistant:[/green] {assistant_tokens:,} ({assistant_tokens/total*100:.1f}%)")
         if tool_tokens > 0:
             self.console.print(f"  [yellow]Tool:[/yellow] {tool_tokens:,} ({tool_tokens/total*100:.1f}%)")
@@ -524,53 +595,3 @@ class ContextDisplayManager:
                 "/compact로 압축하거나 계속 진행하세요[/yellow]"
             )
             self.console.print("[dim]   92% 도달 시 자동 압축됩니다. /context로 상세 보기[/dim]")
-
-
-# Cost estimation
-PRICING_PER_MILLION = {
-    "gpt-4-turbo": {"input": 10.0, "output": 30.0},
-    "gpt-4o": {"input": 2.5, "output": 10.0},
-    "gpt-4o-mini": {"input": 0.15, "output": 0.6},
-    "claude-3-opus": {"input": 15.0, "output": 75.0},
-    "claude-3-sonnet": {"input": 3.0, "output": 15.0},
-    "claude-3-haiku": {"input": 0.25, "output": 1.25},
-    "claude-3-5-sonnet": {"input": 3.0, "output": 15.0},
-    "default": {"input": 3.0, "output": 15.0},
-}
-
-
-def estimate_cost(
-    total_tokens: int,
-    model_name: str,
-    input_ratio: float = 0.6,
-) -> dict[str, float]:
-    """Estimate cost for token usage.
-
-    Args:
-        total_tokens: Total tokens used
-        model_name: Model name for pricing
-        input_ratio: Ratio of input to total tokens
-
-    Returns:
-        Dictionary with input_cost, output_cost, total_cost
-    """
-    input_tokens = int(total_tokens * input_ratio)
-    output_tokens = total_tokens - input_tokens
-
-    # Find matching pricing
-    model_pricing = PRICING_PER_MILLION["default"]
-    for key in PRICING_PER_MILLION:
-        if key in model_name.lower():
-            model_pricing = PRICING_PER_MILLION[key]
-            break
-
-    input_cost = (input_tokens / 1_000_000) * model_pricing["input"]
-    output_cost = (output_tokens / 1_000_000) * model_pricing["output"]
-
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "input_cost": input_cost,
-        "output_cost": output_cost,
-        "total_cost": input_cost + output_cost,
-    }

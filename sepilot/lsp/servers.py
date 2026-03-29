@@ -198,7 +198,7 @@ def install_server(language: str) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=300,
-            shell=use_shell,
+            shell=use_shell,  # nosec B602 - Windows .cmd/.bat compatibility
         )
 
         if result.returncode == 0:

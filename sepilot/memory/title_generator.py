@@ -103,10 +103,7 @@ Title:"""
             return generate_title_fallback(messages)
 
         # Extract title from response
-        if hasattr(response, 'content'):
-            title = response.content.strip()
-        else:
-            title = str(response).strip()
+        title = response.content.strip() if hasattr(response, 'content') else str(response).strip()
 
         # Clean up
         title = title.strip('"\'')

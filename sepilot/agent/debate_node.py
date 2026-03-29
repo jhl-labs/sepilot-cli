@@ -26,6 +26,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from sepilot.agent.enhanced_state import EnhancedAgentState
+from sepilot.agent.execution_context import get_current_user_query
 
 
 def _extract_json_block(content: str) -> str:
@@ -527,12 +528,7 @@ class DebateNode:
             True if debate should be conducted
         """
         # Get task description
-        messages = state.get("messages", [])
-        task = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                task = getattr(msg, "content", "").lower()
-                break
+        task = get_current_user_query(state).lower()
 
         # Check for trigger keywords
         return any(kw in task for kw in self.trigger_keywords)
@@ -550,12 +546,7 @@ class DebateNode:
             return {}
 
         # Get context
-        messages = state.get("messages", [])
-        task = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                task = getattr(msg, "content", "")
-                break
+        task = get_current_user_query(state)
 
         # Get relevant code context
         file_changes = state.get("file_changes", [])

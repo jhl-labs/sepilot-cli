@@ -23,6 +23,7 @@ from typing import Any
 from langchain_core.language_models import BaseChatModel
 
 from sepilot.agent.enhanced_state import EnhancedAgentState
+from sepilot.agent.execution_context import get_current_user_query
 
 
 class TaskType(str, Enum):
@@ -370,12 +371,7 @@ class AdaptiveOrchestrator:
             OrchestrationPlan with selected patterns
         """
         # Extract task description
-        messages = state.get("messages", [])
-        task_description = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                task_description = getattr(msg, "content", "")
-                break
+        task_description = get_current_user_query(state)
 
         # Analyze task
         task_type, complexity = self.task_analyzer.analyze(task_description)

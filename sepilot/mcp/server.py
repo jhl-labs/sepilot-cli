@@ -431,8 +431,8 @@ class SEPilotMCPServer:
 
             result = tool_map[name].invoke(arguments)
             return str(result)
-        except ImportError:
-            raise ValueError(f"Unknown tool: {name}")
+        except ImportError as e:
+            raise ValueError(f"Unknown tool: {name}") from e
         except Exception as e:
             raise RuntimeError(f"Tool execution failed: {str(e)}") from e
 

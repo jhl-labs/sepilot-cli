@@ -7,6 +7,9 @@ This module provides project-wide indexing capabilities including:
 - File watching for incremental updates
 """
 
+from sepilot.indexer.call_graph import CallGraph
+from sepilot.indexer.dependency_graph import DependencyGraph
+from sepilot.indexer.indexer import ProjectIndexer, get_project_indexer
 from sepilot.indexer.models import (
     CallEdge,
     Dependency,
@@ -14,11 +17,8 @@ from sepilot.indexer.models import (
     IndexedSymbol,
     SymbolReference,
 )
-from sepilot.indexer.symbol_table import SymbolTable
-from sepilot.indexer.dependency_graph import DependencyGraph
-from sepilot.indexer.call_graph import CallGraph
-from sepilot.indexer.indexer import ProjectIndexer, get_project_indexer
 from sepilot.indexer.storage import IndexStorage
+from sepilot.indexer.symbol_table import SymbolTable
 
 __all__ = [
     # Models

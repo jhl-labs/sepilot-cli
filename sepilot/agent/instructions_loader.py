@@ -17,11 +17,9 @@ Supported instruction file names (checked in order):
 """
 
 import logging
-import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any
 
 from sepilot.utils.markdown import glob_match as _glob_match
 from sepilot.utils.markdown import parse_frontmatter as _parse_frontmatter
@@ -86,7 +84,7 @@ def _expand_dynamic_commands(content: str, source_path: Path) -> str:
         cmd = match.group(1)
         try:
             result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True,
+                cmd, shell=True, capture_output=True, text=True,  # nosec B602 - trusted content only
                 timeout=10, cwd=str(Path.cwd())
             )
             if result.returncode == 0:
@@ -127,19 +125,28 @@ class InstructionsLoader:
     def load_all(
         self,
         working_dir: Path | None = None,
-        active_files: list[str] | None = None
+        active_files: list[str] | None = None,
+        include_project_sources: bool = False,
+        include_project_rules: bool = False,
+        include_user_rules: bool = True,
     ) -> str:
         """Load all instructions from all sources.
 
         Args:
             working_dir: Override working directory
             active_files: List of currently active file paths (for rules filtering)
+            include_project_sources: Include project-local instruction files and context
+            include_project_rules: Include project-local conditional rules
+            include_user_rules: Include user-level conditional rules
 
         Returns:
             Combined instruction text
         """
         cwd = working_dir or self.working_dir
-        cache_key = f"{cwd}:{','.join(active_files or [])}"
+        cache_key = (
+            f"{cwd}:{','.join(active_files or [])}:"
+            f"{int(include_project_sources)}:{int(include_project_rules)}:{int(include_user_rules)}"
+        )
 
         if cache_key == self._cache_key and self._cache:
             return self._cache.get("result", "")
@@ -151,18 +158,24 @@ class InstructionsLoader:
         if global_instructions:
             sections.append(f"# Global Instructions\n\n{global_instructions}")
 
-        # 2. Directory chain instructions (parent dirs -> project root)
-        chain_instructions = self._load_directory_chain(cwd)
-        if chain_instructions:
-            sections.append(chain_instructions)
+        if include_project_sources:
+            # 2. Directory chain instructions (parent dirs -> project root)
+            chain_instructions = self._load_directory_chain(cwd)
+            if chain_instructions:
+                sections.append(chain_instructions)
 
-        # 3. Project config directory context
-        project_context = self._load_project_context(cwd)
-        if project_context:
-            sections.append(f"# Project Context\n\n{project_context}")
+            # 3. Project config directory context
+            project_context = self._load_project_context(cwd)
+            if project_context:
+                sections.append(f"# Project Context\n\n{project_context}")
 
         # 4. Conditional rules
-        rules = self._load_conditional_rules(cwd, active_files)
+        rules = self._load_conditional_rules(
+            cwd,
+            active_files,
+            include_project_rules=include_project_rules,
+            include_user_rules=include_user_rules,
+        )
         if rules:
             sections.append(f"# Active Rules\n\n{rules}")
 
@@ -284,7 +297,9 @@ class InstructionsLoader:
     def _load_conditional_rules(
         self,
         cwd: Path,
-        active_files: list[str] | None = None
+        active_files: list[str] | None = None,
+        include_project_rules: bool = False,
+        include_user_rules: bool = True,
     ) -> str:
         """Load conditional rules from .sepilot/rules/ directory.
 
@@ -304,21 +319,23 @@ class InstructionsLoader:
         git_root = _get_git_root(cwd) or cwd
         rules_sections: list[str] = []
 
-        # Check project-level rules
-        for config_dir_name in CONFIG_DIRS:
-            rules_dir = git_root / config_dir_name / "rules"
-            if rules_dir.is_dir():
-                self._load_rules_from_dir(
-                    rules_dir, git_root, active_files, rules_sections
-                )
+        if include_project_rules:
+            # Check project-level rules
+            for config_dir_name in CONFIG_DIRS:
+                rules_dir = git_root / config_dir_name / "rules"
+                if rules_dir.is_dir():
+                    self._load_rules_from_dir(
+                        rules_dir, git_root, active_files, rules_sections
+                    )
 
-        # Check user-level rules
-        for user_config in [Path.home() / ".sepilot", Path.home() / ".claude"]:
-            user_rules_dir = user_config / "rules"
-            if user_rules_dir.is_dir():
-                self._load_rules_from_dir(
-                    user_rules_dir, git_root, active_files, rules_sections
-                )
+        if include_user_rules:
+            # Check user-level rules
+            for user_config in [Path.home() / ".sepilot", Path.home() / ".claude"]:
+                user_rules_dir = user_config / "rules"
+                if user_rules_dir.is_dir():
+                    self._load_rules_from_dir(
+                        user_rules_dir, git_root, active_files, rules_sections
+                    )
 
         return "\n\n".join(rules_sections)
 
@@ -389,7 +406,13 @@ class InstructionsLoader:
         self._cache.clear()
         self._cache_key = ""
 
-    def get_instruction_sources(self, cwd: Path | None = None) -> list[dict[str, str]]:
+    def get_instruction_sources(
+        self,
+        cwd: Path | None = None,
+        include_project_sources: bool = False,
+        include_project_rules: bool = False,
+        include_user_rules: bool = True,
+    ) -> list[dict[str, str]]:
         """Get list of instruction sources that would be loaded.
 
         Useful for debugging and UI display.
@@ -415,35 +438,47 @@ class InstructionsLoader:
                 continue
             break
 
-        # Directory chain
         git_root = _get_git_root(cwd) or Path(cwd.anchor)
-        current = cwd.resolve()
-        stop = git_root.resolve()
 
-        while current >= stop:
-            for filename in INSTRUCTION_FILENAMES:
-                filepath = current / filename
-                if filepath.exists():
-                    sources.append({
-                        "path": str(filepath),
-                        "type": "directory_chain",
-                        "status": "active"
-                    })
+        if include_project_sources:
+            current = cwd.resolve()
+            stop = git_root.resolve()
+
+            while current >= stop:
+                for filename in INSTRUCTION_FILENAMES:
+                    filepath = current / filename
+                    if filepath.exists():
+                        sources.append({
+                            "path": str(filepath),
+                            "type": "directory_chain",
+                            "status": "active"
+                        })
+                        break
+                current = current.parent
+                if current == current.parent:
                     break
-            current = current.parent
-            if current == current.parent:
-                break
 
-        # Rules
-        for config_dir_name in CONFIG_DIRS:
-            rules_dir = git_root / config_dir_name / "rules"
-            if rules_dir.is_dir():
-                for rule_file in sorted(rules_dir.rglob("*.md")):
-                    sources.append({
-                        "path": str(rule_file),
-                        "type": "rule",
-                        "status": "active"
-                    })
+        if include_project_rules:
+            for config_dir_name in CONFIG_DIRS:
+                rules_dir = git_root / config_dir_name / "rules"
+                if rules_dir.is_dir():
+                    for rule_file in sorted(rules_dir.rglob("*.md")):
+                        sources.append({
+                            "path": str(rule_file),
+                            "type": "rule",
+                            "status": "active"
+                        })
+
+        if include_user_rules:
+            for user_config in [Path.home() / ".sepilot", Path.home() / ".claude"]:
+                user_rules_dir = user_config / "rules"
+                if user_rules_dir.is_dir():
+                    for rule_file in sorted(user_rules_dir.rglob("*.md")):
+                        sources.append({
+                            "path": str(rule_file),
+                            "type": "rule",
+                            "status": "active"
+                        })
 
         return sources
 
@@ -463,7 +498,10 @@ def get_instructions_loader() -> InstructionsLoader:
 
 def load_all_instructions(
     working_dir: Path | None = None,
-    active_files: list[str] | None = None
+    active_files: list[str] | None = None,
+    include_project_sources: bool = False,
+    include_project_rules: bool = False,
+    include_user_rules: bool = True,
 ) -> str:
     """Load all instructions from all sources.
 
@@ -472,9 +510,18 @@ def load_all_instructions(
     Args:
         working_dir: Override working directory
         active_files: Currently active file paths for rules filtering
+        include_project_sources: Include project-local instruction files and context
+        include_project_rules: Include project-local conditional rules
+        include_user_rules: Include user-level conditional rules
 
     Returns:
         Combined instruction text
     """
     loader = get_instructions_loader()
-    return loader.load_all(working_dir=working_dir, active_files=active_files)
+    return loader.load_all(
+        working_dir=working_dir,
+        active_files=active_files,
+        include_project_sources=include_project_sources,
+        include_project_rules=include_project_rules,
+        include_user_rules=include_user_rules,
+    )

@@ -127,7 +127,7 @@ class TaskExecutor:
     def submit(
         self,
         name: str,
-        coro: Coroutine[Any, Any, T],
+        coro: Coroutine[Any, Any, T] | RetryableTask,
         description: str = "",
         priority: TaskPriority = TaskPriority.NORMAL,
         timeout: float | None = None,
@@ -175,7 +175,7 @@ class TaskExecutor:
     async def _create_wrapper(
         self,
         task_id: str,
-        coro: Coroutine[Any, Any, T]
+        coro: Coroutine[Any, Any, T] | RetryableTask
     ) -> ExecutionResult:
         """Wrap coroutine with semaphore, retry, timeout handling."""
         task_info = self.registry.get(task_id)
@@ -232,7 +232,7 @@ class TaskExecutor:
     async def _execute_with_retry(
         self,
         task_id: str,
-        coro: Coroutine[Any, Any, T]
+        coro: Coroutine[Any, Any, T] | RetryableTask
     ) -> ExecutionResult:
         """Execute with retry logic."""
         task_info = self.registry.get(task_id)
@@ -246,12 +246,14 @@ class TaskExecutor:
         start_time = datetime.now()
         last_error = None
         last_traceback = None
+        is_retryable = isinstance(coro, RetryableTask)
 
         for attempt in range(task_info.max_retries + 1):
             try:
+                current_coro = coro.create_coroutine() if is_retryable else coro
                 # Execute with timeout
                 result = await asyncio.wait_for(
-                    coro,
+                    current_coro,
                     timeout=task_info.timeout_seconds
                 )
 
@@ -297,15 +299,17 @@ class TaskExecutor:
 
             # Retry if possible
             if attempt < task_info.max_retries:
+                if not is_retryable:
+                    last_error = (
+                        f"{last_error} "
+                        "(retry requires wrapping the coroutine in RetryableTask)"
+                    )
+                    break
                 delay = self.config.retry_policy.get_delay(attempt)
                 logger.info(f"Retrying task {task_id} in {delay:.1f}s")
-                self.registry.retry(task_id)
+                self.registry.begin_retry(task_id)
                 self._notify_progress(task_id)
                 await asyncio.sleep(delay)
-
-                # Need to recreate coroutine for retry
-                # This is a limitation - coro can only be awaited once
-                # Caller should provide a factory function for retryable tasks
 
         # All retries exhausted
         duration = (datetime.now() - start_time).total_seconds()
@@ -321,7 +325,7 @@ class TaskExecutor:
             success=False,
             error=last_error,
             traceback=last_traceback,
-            retry_count=task_info.max_retries,
+            retry_count=task_info.retry_count,
             duration_seconds=duration
         )
         self._results[task_id] = exec_result
@@ -348,8 +352,8 @@ class TaskExecutor:
 
         for name, coro_factory, kwargs in tasks:
             kwargs = kwargs or {}
-            coro = coro_factory()
-            task_id = self.submit(name, coro, **kwargs)
+            retryable = coro_factory if isinstance(coro_factory, RetryableTask) else RetryableTask(coro_factory)
+            task_id = self.submit(name, retryable, **kwargs)
             task_ids.append(task_id)
 
         if wait:

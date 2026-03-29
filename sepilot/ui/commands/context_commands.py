@@ -9,7 +9,32 @@ from typing import Any
 
 from rich.console import Console
 
+from sepilot.agent.execution_context import (
+    is_user_turn_boundary_message,
+    is_user_visible_conversation_message,
+)
 from sepilot.ui.input_utils import prompt_confirm
+
+
+def _agent_uses_memory(agent: Any | None) -> bool:
+    """Return True only for real memory-enabled agents, not loose mocks."""
+    return bool(agent is not None and getattr(agent, "enable_memory", False) is True)
+
+
+def _sync_conversation_context_from_agent(agent: Any, conversation_context: list) -> None:
+    """Refresh local conversation context from the active agent thread."""
+    if not agent or not hasattr(agent, "get_conversation_messages"):
+        return
+
+    try:
+        messages = agent.get_conversation_messages()
+    except Exception:
+        return
+
+    conversation_context.clear()
+    for msg in messages:
+        if is_user_visible_conversation_message(msg):
+            conversation_context.append(msg)
 
 
 def handle_compact(
@@ -31,7 +56,12 @@ def handle_compact(
     """
     from sepilot.agent.context_manager import ContextManager
 
-    if not conversation_context:
+    has_agent_thread = bool(
+        agent
+        and _agent_uses_memory(agent)
+        and hasattr(agent, "get_conversation_messages")
+    )
+    if not conversation_context and not has_agent_thread:
         console.print("[yellow]No conversation context to compact[/yellow]")
         return False
 
@@ -48,6 +78,24 @@ def handle_compact(
         console.print(f"[cyan]📦 Compacting with focus: [bold]{focus_instruction}[/bold][/cyan]")
     else:
         console.print("[cyan]📦 Compacting conversation context...[/cyan]")
+
+    if _agent_uses_memory(agent) and hasattr(agent, "compact_conversation_context"):
+        result = agent.compact_conversation_context(
+            keep_recent=10,
+            focus_instruction=focus_instruction,
+        )
+        if not result.get("success"):
+            console.print(f"[yellow]{result.get('error', 'Context compaction failed')}[/yellow]")
+            return False
+
+        _sync_conversation_context_from_agent(agent, conversation_context)
+        console.print("[green]✅ Context compacted successfully![/green]")
+        console.print(
+            f"  Messages: {result.get('messages_before', 0)} → {result.get('messages_after', 0)}"
+        )
+        if focus_instruction:
+            console.print(f"  Focus: {focus_instruction}")
+        return True
 
     # Get current stats
     tokens_before = _count_tokens(conversation_context)
@@ -120,11 +168,21 @@ def handle_clear_context(
     Returns:
         True if cleared
     """
-    if not conversation_context:
+    has_agent_thread = bool(
+        agent
+        and _agent_uses_memory(agent)
+        and hasattr(agent, "get_conversation_messages")
+    )
+    if not conversation_context and not has_agent_thread:
         console.print("[yellow]Conversation context is already empty[/yellow]")
         return False
 
     message_count = len(conversation_context)
+    if message_count == 0 and has_agent_thread:
+        try:
+            message_count = len(agent.get_conversation_messages())
+        except Exception:
+            message_count = 0
 
     # Ask for confirmation
     console.print(f"[yellow]⚠️  This will clear {message_count} messages from the conversation history.[/yellow]")
@@ -140,7 +198,12 @@ def handle_clear_context(
 
     # Also clear agent's LangGraph checkpoint messages and plan state
     if agent:
-        if hasattr(agent, 'get_conversation_messages') and hasattr(agent, 'rewind_messages'):
+        if _agent_uses_memory(agent) and hasattr(agent, "clear_conversation_messages"):
+            try:
+                agent.clear_conversation_messages()
+            except Exception:
+                pass  # Best-effort: local context is already cleared
+        elif hasattr(agent, 'get_conversation_messages') and hasattr(agent, 'rewind_messages'):
             try:
                 messages = agent.get_conversation_messages()
                 if messages:
@@ -196,22 +259,18 @@ def handle_context(
         display_manager.display_detailed_breakdown()
         return
 
-    # Get max context window
-    max_context = int(os.getenv('MAX_TOKENS', '96000'))
+    from sepilot.ui.context_display import ContextDisplayManager
 
-    # Calculate current token usage
-    current_tokens = _count_tokens(conversation_context)
-
-    # Also check agent state
-    if current_tokens == 0 and agent and hasattr(agent, 'get_conversation_messages'):
-        try:
-            messages = agent.get_conversation_messages()
-            current_tokens = _count_tokens(messages)
-        except Exception:
-            pass
-
-    # Calculate percentage
-    usage_percent = (current_tokens / max_context) * 100 if max_context > 0 else 0
+    display_manager = ContextDisplayManager(
+        console=console,
+        agent=agent,
+        conversation_context=conversation_context,
+    )
+    usage = display_manager.get_context_usage_info()
+    display_messages = display_manager._get_user_visible_messages_for_summary()
+    max_context = usage.max_tokens
+    current_tokens = usage.tokens_used
+    usage_percent = usage.usage_percent
 
     # Create visual grid (40 cells)
     grid_size = 40
@@ -241,17 +300,17 @@ def handle_context(
     console.print(f"  [{color}]{current_tokens:,}[/{color}] / {max_context:,} tokens ({usage_percent:.1f}%)")
 
     # Show breakdown
-    if conversation_context:
-        msg_count = len(conversation_context)
-        human_count = sum(1 for m in conversation_context if getattr(m, 'type', '') == 'human')
-        ai_count = sum(1 for m in conversation_context if getattr(m, 'type', '') == 'ai')
+    if display_messages:
+        msg_count = len(display_messages)
+        human_count = sum(1 for m in display_messages if is_user_turn_boundary_message(m))
+        ai_count = sum(1 for m in display_messages if getattr(m, 'type', '') in ('ai', 'assistant'))
         console.print(f"  [dim]Messages: {msg_count} ({human_count} user, {ai_count} assistant)[/dim]")
 
     # Enhanced: Show top 5 messages by token usage
-    if conversation_context:
-        from sepilot.agent.context_manager import ContextManager as _CM
-        _cm = _CM(max_context_tokens=max_context)
-        _show_enhanced_context_stats(console, _cm, conversation_context, current_tokens)
+    if display_messages:
+        from sepilot.agent.context_manager import ContextManager as _ContextManager
+        _cm = _ContextManager(max_context_tokens=max_context)
+        _show_enhanced_context_stats(console, _cm, display_messages, current_tokens)
 
     # Recommendations
     console.print()

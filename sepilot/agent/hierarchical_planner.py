@@ -26,6 +26,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from sepilot.agent.enhanced_state import AgentStrategy, EnhancedAgentState
+from sepilot.agent.execution_context import get_current_user_query
 
 
 class PlanDepth(str, Enum):
@@ -481,7 +482,7 @@ Keep it simple and actionable."""
 
             return plan
 
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError:
             # JSON parsing failed - try simpler depth first
             if depth == PlanDepth.FULL:
                 if self.console:
@@ -812,12 +813,7 @@ class HierarchicalPlanningNode:
             State updates with hierarchical plan
         """
         # Get task from messages
-        messages = state.get("messages", [])
-        task_description = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                task_description = getattr(msg, "content", "")
-                break
+        task_description = get_current_user_query(state)
 
         if not task_description:
             return {}

@@ -12,7 +12,6 @@ Permission levels:
 import fnmatch
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path

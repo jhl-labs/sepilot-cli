@@ -15,7 +15,15 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from sepilot.config.constants import CONTEXT_PRUNE_SUMMARY_MAX_CHARS
 
@@ -317,9 +325,7 @@ class ContextManager:
 
         for i, msg in enumerate(older_half):
             relevance = self._assess_message_relevance(msg, i, len(non_system))
-            if relevance in (ContextRelevance.CRITICAL, ContextRelevance.HIGH):
-                to_keep.append(msg)
-            elif relevance == ContextRelevance.MEDIUM and self._incremental_round < 2:
+            if relevance in (ContextRelevance.CRITICAL, ContextRelevance.HIGH) or relevance == ContextRelevance.MEDIUM and self._incremental_round < 2:
                 to_keep.append(msg)
             else:
                 to_summarize.append(msg)
@@ -541,7 +547,9 @@ class ContextManager:
                 break
 
         kept_reversed.reverse()
-        return system_messages + kept_reversed
+        start_index = max(0, len(non_system_messages) - len(kept_reversed))
+        recent_messages = self._select_recent_messages(non_system_messages, start_index)
+        return system_messages + recent_messages
 
     def summarize_to_token_limit(
         self,
@@ -596,9 +604,9 @@ class ContextManager:
             else:
                 break
 
-        # Messages to summarize (everything not in recent)
-        recent_set = {id(m) for m in recent_messages}
-        to_summarize = [m for m in non_system_messages if id(m) not in recent_set]
+        start_index = max(0, len(non_system_messages) - len(recent_messages))
+        recent_messages = self._select_recent_messages(non_system_messages, start_index)
+        to_summarize = non_system_messages[:max(0, len(non_system_messages) - len(recent_messages))]
 
         if not to_summarize:
             # Nothing to summarize
@@ -702,6 +710,46 @@ class ContextManager:
 
         return result if changed else messages
 
+    def _align_recent_window_start(
+        self,
+        messages: list[BaseMessage],
+        start_index: int,
+    ) -> int:
+        """Backtrack the retained suffix so tool interaction blocks stay intact."""
+        start = max(0, start_index)
+
+        while start > 0:
+            current = messages[start]
+            previous = messages[start - 1]
+
+            if isinstance(current, ToolMessage):
+                start -= 1
+                continue
+
+            if isinstance(current, AIMessage) and isinstance(previous, ToolMessage):
+                start -= 1
+                continue
+
+            if (
+                isinstance(current, AIMessage)
+                and isinstance(previous, AIMessage)
+                and getattr(previous, "tool_calls", None)
+            ):
+                start -= 1
+                continue
+
+            break
+
+        return start
+
+    def _select_recent_messages(
+        self,
+        messages: list[BaseMessage],
+        start_index: int,
+    ) -> list[BaseMessage]:
+        """Select a recent suffix while preserving tool call / tool result adjacency."""
+        return messages[self._align_recent_window_start(messages, start_index):]
+
     def compact_messages(
         self,
         messages: list[BaseMessage],
@@ -725,7 +773,8 @@ class ContextManager:
         system_messages = [m for m in messages if isinstance(m, SystemMessage)]
         non_system_messages = [m for m in messages if not isinstance(m, SystemMessage)]
 
-        recent_messages = non_system_messages[-keep_recent:]
+        start_index = max(0, len(non_system_messages) - keep_recent)
+        recent_messages = self._select_recent_messages(non_system_messages, start_index)
 
         return system_messages + recent_messages
 
@@ -759,8 +808,9 @@ class ContextManager:
         if len(non_system_messages) <= keep_recent:
             return messages
 
-        to_summarize = non_system_messages[:-keep_recent]
-        recent_messages = non_system_messages[-keep_recent:]
+        start_index = max(0, len(non_system_messages) - keep_recent)
+        recent_messages = self._select_recent_messages(non_system_messages, start_index)
+        to_summarize = non_system_messages[:max(0, len(non_system_messages) - len(recent_messages))]
 
         conversation_text = self._format_messages_for_summary(to_summarize)
 
@@ -934,18 +984,7 @@ class IntelligentContextManager(ContextManager):
         self.compaction_count += 1
         self.tokens_saved += self._estimate_tokens(messages) - self._estimate_tokens(new_messages)
 
-        # Use RemoveMessage for add_messages reducer compatibility
-        msg_ops: list[BaseMessage] = []
-        new_ids = {id(m) for m in new_messages}
-        for msg in messages:
-            msg_id = getattr(msg, 'id', None)
-            if id(msg) not in new_ids and msg_id:
-                msg_ops.append(RemoveMessage(id=msg_id))
-        old_ids = {id(m) for m in messages}
-        for msg in new_messages:
-            if id(msg) not in old_ids:
-                msg_ops.append(msg)
-
+        msg_ops: list[BaseMessage] = [RemoveMessage(id=REMOVE_ALL_MESSAGES, content=""), *new_messages]
         return {"messages": msg_ops, "context_compacted": True}
 
     def _emergency_compact(self, state: Any) -> dict[str, Any]:
@@ -977,20 +1016,8 @@ class IntelligentContextManager(ContextManager):
         self.compaction_count += 1
         self.tokens_saved += self._estimate_tokens(messages) - self._estimate_tokens(new_messages)
 
-        # Use RemoveMessage for add_messages reducer compatibility
-        msg_ops: list[BaseMessage] = []
-        new_ids = {id(m) for m in new_messages}
-        for msg in messages:
-            msg_id = getattr(msg, 'id', None)
-            if id(msg) not in new_ids and msg_id:
-                msg_ops.append(RemoveMessage(id=msg_id))
-        old_ids = {id(m) for m in messages}
-        for msg in new_messages:
-            if id(msg) not in old_ids:
-                msg_ops.append(msg)
-
         return {
-            "messages": msg_ops,
+            "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES, content=""), *new_messages],
             "emergency_compaction": True,
             "original_count": len(messages),
             "new_count": len(new_messages)
@@ -1532,7 +1559,7 @@ class SmartContextSelector:
 
             file_path = item.get("file_path", "unknown")
             reason = item.get("reason", "")
-            source = item.get("source", "")
+            _source = item.get("source", "")
 
             part = f"\n## {file_path}\n"
             if reason:

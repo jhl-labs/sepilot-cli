@@ -42,6 +42,8 @@ _PLAN_TOOLS = frozenset({
     "add_plan_step", "get_plan_status",
     "plan", "todo_manage", "ask_user", "slash_command", "skill",
     "think",
+    # tmux read-only
+    "tmux_status", "tmux_read",
 })
 
 _SWE_PLAN_TOOLS = _PLAN_TOOLS | frozenset({
@@ -56,11 +58,15 @@ MODE_TOOLS: dict[str, frozenset[str] | None] = {
         # Bash / execution
         "bash_execute", "bash_background", "bash_output",
         "kill_shell", "list_shells", "git",
+        # tmux agent sessions
+        "tmux_create_session", "tmux_send", "tmux_destroy", "tmux_orchestrate",
     }),
     "exec": _PLAN_TOOLS | frozenset({
         # Bash / execution (no file_edit/file_write)
         "bash_execute", "bash_background", "bash_output",
         "kill_shell", "list_shells", "git",
+        # tmux agent sessions
+        "tmux_create_session", "tmux_send", "tmux_destroy", "tmux_orchestrate",
     }),
     "auto": None,  # None = no filter, all tools available
 }

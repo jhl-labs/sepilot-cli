@@ -9,7 +9,14 @@ from datetime import datetime
 from typing import Any
 
 from langchain_core.messages import RemoveMessage
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from rich.console import Console
+
+from sepilot.agent.execution_context import (
+    get_message_content,
+    is_user_turn_boundary_message,
+    is_user_visible_conversation_message,
+)
 
 
 class ThreadManager:
@@ -72,7 +79,8 @@ class ThreadManager:
 
             if state and state.values:
                 messages = state.values.get("messages", [])
-                return f"Session has {len(messages)} messages"
+                visible_messages = [msg for msg in messages if is_user_visible_conversation_message(msg)]
+                return f"Session has {len(visible_messages)} messages"
             return "No messages in current session"
         except Exception as e:
             return f"Error retrieving session: {str(e)}"
@@ -213,23 +221,24 @@ class ThreadManager:
                 channel_values = latest_checkpoint.checkpoint.get('channel_values', {})
                 messages = channel_values.get('messages', [])
 
-                thread_info["message_count"] = len(messages)
+                visible_messages = [
+                    msg for msg in messages if is_user_visible_conversation_message(msg)
+                ]
+                thread_info["message_count"] = len(visible_messages)
 
-                if messages:
+                if visible_messages:
                     # First user message = conversation topic
-                    for msg in messages:
-                        msg_type = msg.type if hasattr(msg, 'type') else (msg.get('type') if isinstance(msg, dict) else '')
-                        if msg_type == 'human':
-                            content = self._extract_message_content(msg)
-                            content = content.replace('\n', ' ').strip()
+                    for msg in visible_messages:
+                        if is_user_turn_boundary_message(msg):
+                            content = get_message_content(msg).replace('\n', ' ').strip()
                             if len(content) > 80:
                                 content = content[:77] + "..."
                             thread_info["first_message_preview"] = content
                             break
 
                     # Last message preview
-                    last_msg = messages[-1]
-                    content = self._extract_message_content(last_msg)
+                    last_msg = visible_messages[-1]
+                    content = get_message_content(last_msg)
                     if len(content) > 100:
                         content = content[:100] + "..."
                     thread_info["last_message_preview"] = content
@@ -405,7 +414,9 @@ class ThreadManager:
 
             if state:
                 messages = state.values.get("messages", []) if state.values else []
-                stats["message_count"] = len(messages)
+                stats["message_count"] = sum(
+                    1 for msg in messages if is_user_visible_conversation_message(msg)
+                )
 
             return stats
         except Exception as e:
@@ -464,16 +475,9 @@ class ThreadManager:
                 messages, count
             )
 
-            # Use RemoveMessage for add_messages reducer compatibility
-            messages_to_remove = messages[len(messages_to_keep):]
-            remove_ops = []
-            for msg in messages_to_remove:
-                msg_id = getattr(msg, 'id', None)
-                if msg_id:
-                    remove_ops.append(RemoveMessage(id=msg_id))
-
-            if remove_ops:
-                self.graph.update_state(config, {"messages": remove_ops})
+            # Replace the thread message list exactly so no stale tail survives.
+            replacement_ops = [RemoveMessage(id=REMOVE_ALL_MESSAGES, content=""), *messages_to_keep]
+            self.graph.update_state(config, {"messages": replacement_ops})
 
             return {
                 "success": True,
@@ -511,8 +515,8 @@ class ThreadManager:
             msg = messages[i]
             msg_type = getattr(msg, 'type', None)
 
-            # Count human messages as the start of a pair
-            if msg_type == 'human':
+            # Count only real user turn boundaries, not internal control prompts.
+            if msg_type == 'human' and is_user_turn_boundary_message(msg):
                 pairs_found += 1
 
             removed_count += 1

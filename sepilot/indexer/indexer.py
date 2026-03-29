@@ -6,10 +6,10 @@ import hashlib
 import logging
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 from sepilot.tools.code_analysis.language_detector import get_language_detector
 from sepilot.tools.code_analysis.tree_sitter_parser import get_tree_sitter_parser

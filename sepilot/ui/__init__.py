@@ -12,7 +12,7 @@ This module provides enhanced UI/UX components following SOLID principles:
 """
 
 from .completer import FileReferenceCompleter
-from .context_display import ContextDisplayManager, ContextUsageInfo, estimate_cost
+from .context_display import ContextDisplayManager, ContextUsageInfo
 from .dashboard import DashboardManager, create_dashboard, is_dashboard_available
 from .interactive import InteractiveMode
 from .key_bindings import KeyBindingsManager, create_key_bindings
@@ -24,12 +24,12 @@ from .output_overlays import (
     get_overlay_manager,
 )
 from .progress_display import ProgressDisplay, StatusPanel
-from .status_indicator import AgentStatusIndicator
 from .reference_expander import (
     ReferenceExpander,
     expand_file_references,
     get_expander,
 )
+from .status_indicator import AgentStatusIndicator
 from .streaming import (
     CallbackStreamingHandler,
     StreamingHandler,
@@ -62,7 +62,6 @@ __all__ = [
     # Context display (SOLID: Single Responsibility)
     "ContextDisplayManager",
     "ContextUsageInfo",
-    "estimate_cost",
     # Memory management (SOLID: Single Responsibility)
     "MemoryManager",
     "MemoryEntry",

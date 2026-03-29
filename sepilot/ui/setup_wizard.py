@@ -232,11 +232,7 @@ def needs_setup() -> bool:
         "SEPILOT_MODEL",
         "DEFAULT_MODEL",
     ]
-    for key in env_keys:
-        if os.getenv(key):
-            return False
-
-    return True
+    return not any(os.getenv(key) for key in env_keys)
 
 
 def run_setup_wizard(console: Console) -> dict[str, str | None] | None:

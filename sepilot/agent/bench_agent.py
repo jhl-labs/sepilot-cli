@@ -12,10 +12,10 @@ from pathlib import Path
 from rich.console import Console
 
 from sepilot.agent.bench.dataset_loader import DatasetLoader
-from sepilot.agent.bench.datasets import get_dataset_config, PREDEFINED_DATASETS, get_preset_config
+from sepilot.agent.bench.datasets import get_dataset_config
 from sepilot.agent.bench.evaluator import Evaluator
-from sepilot.agent.bench.instance_runner import InferenceRunner, EvaluationRunner
-from sepilot.agent.bench.models import SWEInstance, BenchResult
+from sepilot.agent.bench.instance_runner import EvaluationRunner, InferenceRunner
+from sepilot.agent.bench.models import BenchResult, SWEInstance
 
 
 class BenchAgent:
@@ -161,7 +161,13 @@ class BenchAgent:
             # BenchResult에 resolved 상태 업데이트
             for br in self.last_run_results:
                 if br.instance_id in results:
-                    br.resolved = results[br.instance_id].get("resolved", False)
+                    entry = results[br.instance_id]
+                    if isinstance(entry, dict):
+                        br.resolved = entry.get("resolved", False)
+                    elif isinstance(entry, bool):
+                        br.resolved = entry
+                    else:
+                        continue
                     if br.resolved:
                         br.test_result = "passed"
                     else:
@@ -236,7 +242,7 @@ class BenchAgent:
         errors = sum(1 for r in self.last_run_results if r.status == "error")
         total_time = sum(r.duration_seconds for r in self.last_run_results)
 
-        self.console.print(f"\n[bold]Inference Summary:[/bold]")
+        self.console.print("\n[bold]Inference Summary:[/bold]")
         self.console.print(f"  Total instances: {total}")
         self.console.print(f"  [green]With patch: {with_patch}[/green]")
         self.console.print(f"  [yellow]No patch: {total - with_patch - errors}[/yellow]")

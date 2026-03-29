@@ -10,16 +10,39 @@ Both commands use Git for file state management when available.
 import json
 import os
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
-
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
+
+from sepilot.agent.execution_context import (
+    is_user_visible_conversation_message,
+)
+
+
+def _agent_uses_memory(agent: Any | None) -> bool:
+    """Return True only for real memory-enabled agents, not loose mocks."""
+    return bool(agent is not None and getattr(agent, "enable_memory", False) is True)
+
+
+def _sync_conversation_context_from_agent(agent: Any, conversation_context: list) -> None:
+    """Refresh the local conversation context from the active agent thread."""
+    if not hasattr(agent, "get_conversation_messages"):
+        return
+
+    try:
+        messages = agent.get_conversation_messages()
+    except Exception:
+        return
+
+    conversation_context.clear()
+    for msg in messages:
+        if is_user_visible_conversation_message(msg):
+            conversation_context.append(msg)
 
 
 @dataclass
@@ -585,8 +608,9 @@ def handle_undo(
     if entry and agent and hasattr(agent, 'rewind_messages'):
         agent.rewind_messages(1)
 
-        # Also update conversation_context
-        if len(conversation_context) >= 2:
+        if _agent_uses_memory(agent):
+            _sync_conversation_context_from_agent(agent, conversation_context)
+        elif len(conversation_context) >= 2:
             conversation_context.pop()  # Remove assistant message
             conversation_context.pop()  # Remove user message
 
@@ -657,10 +681,18 @@ def handle_redo(
         console.print(f"[red]Redo failed: {result.get('error')}[/red]")
         return result
 
-    # Restore messages to conversation context using proper LangChain message types
+    restored_messages = []
     if entry:
-        conversation_context.append(HumanMessage(content=entry.user_message))
-        conversation_context.append(AIMessage(content=entry.assistant_response))
+        restored_messages = [
+            HumanMessage(content=entry.user_message),
+            AIMessage(content=entry.assistant_response),
+        ]
+
+    if restored_messages and _agent_uses_memory(agent) and hasattr(agent, "append_conversation_messages"):
+        agent.append_conversation_messages(restored_messages)
+        _sync_conversation_context_from_agent(agent, conversation_context)
+    elif restored_messages:
+        conversation_context.extend(restored_messages)
 
     # Display results
     console.print()

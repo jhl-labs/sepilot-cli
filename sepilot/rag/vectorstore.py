@@ -115,7 +115,7 @@ class VectorStore:
         documents = []
         metadatas = []
 
-        for chunk, chunk_id in zip(chunks, all_chunk_ids):
+        for chunk, chunk_id in zip(chunks, all_chunk_ids, strict=False):
             if chunk_id in existing_ids:
                 logger.debug(f"Chunk already exists: {chunk_id}")
                 continue

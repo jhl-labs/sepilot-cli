@@ -15,7 +15,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any
 
 import httpx
 
@@ -436,9 +436,9 @@ class MCPSSEClient:
         try:
             response = await asyncio.wait_for(future, timeout=self.timeout)
             return response
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             self._pending_requests.pop(request_id, None)
-            raise MCPRemoteError(f"Request timed out: {method}")
+            raise MCPRemoteError(f"Request timed out: {method}") from e
 
     async def list_tools(self) -> list[dict[str, Any]]:
         """List available tools"""

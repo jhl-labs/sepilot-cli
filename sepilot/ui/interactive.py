@@ -62,33 +62,8 @@ from sepilot.ui.commands.core_commands import (
     handle_history,
 )
 from sepilot.ui.commands.custom_commands import handle_custom_commands_command
-from sepilot.ui.commands.devops_commands import (
-    handle_container_command,
-    handle_gitops_command,
-    handle_helm_command,
-    handle_se_command,
-)
 from sepilot.ui.commands.graph_commands import handle_graph_command
-from sepilot.ui.commands.k8s_commands import handle_k8s_health_command
 from sepilot.ui.commands.mcp_commands import handle_mcp_command
-from sepilot.ui.commands.model_commands import (
-    apply_model_config_to_agent,
-    create_llm_from_config,
-    handle_model_command,
-)
-from sepilot.ui.commands.rag_commands import get_rag_context, handle_rag_command
-from sepilot.ui.commands.security_commands import handle_security_command
-from sepilot.ui.commands.skill_commands import handle_skill_command
-from sepilot.ui.commands.tools_commands import handle_tools_command
-from sepilot.ui.commands.theme_commands import handle_theme
-from sepilot.ui.commands.stats_commands import handle_stats
-from sepilot.ui.commands.permission_commands import handle_permissions
-from sepilot.ui.commands.session_commands import (
-    handle_new,
-    handle_resume,
-    handle_rewind,
-    handle_session,
-)
 from sepilot.ui.commands.mode_commands import (
     handle_auto_mode,
     handle_code_mode,
@@ -96,6 +71,24 @@ from sepilot.ui.commands.mode_commands import (
     handle_mode_command,
     handle_plan_mode,
 )
+from sepilot.ui.commands.model_commands import (
+    apply_model_config_to_agent,
+    create_llm_from_config,
+    handle_model_command,
+)
+from sepilot.ui.commands.permission_commands import handle_permissions
+from sepilot.ui.commands.rag_commands import get_rag_context, handle_rag_command
+from sepilot.ui.commands.security_commands import handle_security_command
+from sepilot.ui.commands.session_commands import (
+    handle_new,
+    handle_resume,
+    handle_rewind,
+    handle_session,
+)
+from sepilot.ui.commands.skill_commands import handle_skill_command
+from sepilot.ui.commands.stats_commands import handle_stats
+from sepilot.ui.commands.theme_commands import handle_theme
+from sepilot.ui.commands.tools_commands import handle_tools_command
 from sepilot.ui.commands.undo_redo_commands import (
     get_undo_redo_manager,
     handle_redo,
@@ -110,7 +103,6 @@ from sepilot.ui.memory_manager import MemoryManager
 from sepilot.ui.output_overlays import OutputOverlayManager, TeeOutput
 from sepilot.ui.reference_expander import ReferenceExpander
 from sepilot.ui.setup_wizard import needs_setup, run_setup_wizard
-from sepilot.ui.themes import get_theme_manager, set_theme
 from sepilot.utils.text import sanitize_text
 
 
@@ -189,6 +181,8 @@ class InteractiveMode:
         self.agent = agent
         self.agent_factory = agent_factory
         self.conversation_context = conversation_context if conversation_context is not None else []
+        self._agent_team = None
+        self._ralph_loop = None
 
         # Session state
         self.session_start = datetime.now()
@@ -311,9 +305,10 @@ class InteractiveMode:
             '/skill': self._cmd_skill,  # Skills system (Claude Code style)
             '/skills': self._cmd_skill,  # Alias for /skill
             '/commands': self._cmd_commands,  # Custom commands (Claude Code style)
-            '/k8s-health': self._cmd_k8s_health,  # Kubernetes health checks
             '/theme': self._cmd_theme,  # Theme management
             '/stats': self._cmd_stats,  # Usage statistics and cost tracking
+            '/performance': self._cmd_performance,  # LLM speed metrics
+            '/perf': self._cmd_performance,  # Alias
             '/permissions': self._cmd_permissions,  # Permission rules management
             '/session': self._cmd_session,  # Session export/import
             # Agent mode commands (PLAN/CODE/EXEC)
@@ -322,11 +317,7 @@ class InteractiveMode:
             '/exec': self._cmd_exec_mode,
             '/auto': self._cmd_auto_mode,
             '/mode': self._cmd_mode,
-            # DevOps commands
-            '/container': self._cmd_container,
-            '/helm': self._cmd_helm,
-            '/se': self._cmd_se,
-            '/gitops': self._cmd_gitops,
+            '/agent': self._cmd_agent,
         }
 
         # Special commands
@@ -637,10 +628,7 @@ class InteractiveMode:
         if any(marker in text for marker in blocked_contains):
             return False
 
-        if text.count("\n") > 20 and len(text) > 2000:
-            return False
-
-        return True
+        return not (text.count("\n") > 20 and len(text) > 2000)
 
     def start(self):
         """Start the interactive REPL"""
@@ -1344,6 +1332,14 @@ class InteractiveMode:
             self.console.print("[dim]Executing agent task...[/dim]")
 
             # Run async task
+            previous_loop = None
+            had_previous_loop = False
+            try:
+                previous_loop = asyncio.get_event_loop()
+                had_previous_loop = True
+            except RuntimeError:
+                previous_loop = None
+
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
@@ -1352,10 +1348,14 @@ class InteractiveMode:
                 )
             finally:
                 loop.close()
+                if had_previous_loop and previous_loop is not None:
+                    asyncio.set_event_loop(previous_loop)
+                else:
+                    asyncio.set_event_loop(None)
 
             # Process results
             if results:
-                for task_id, result in results.items():
+                for _task_id, result in results.items():
                     if result.is_success():
                         self.console.print()
                         self.console.print(f"[bold green]✅ @agent:{agent_name} completed[/bold green]")
@@ -1477,6 +1477,7 @@ class InteractiveMode:
             history_file=self.history_file,
             conversation_context=self.conversation_context,
             input_text=_input,
+            agent=self.agent,
         )
 
     def _cmd_status(self, _input: str):
@@ -1595,7 +1596,7 @@ Type `/license full` or see LICENSE.md in the project directory
             /undo         - Undo last exchange
             /undo --list  - Show undo stack
         """
-        result = handle_undo(
+        _result = handle_undo(
             self.console,
             self.agent,
             self.conversation_context,
@@ -1612,7 +1613,7 @@ Type `/license full` or see LICENSE.md in the project directory
             /redo         - Redo last undone exchange
             /redo --list  - Show redo stack
         """
-        result = handle_redo(
+        _result = handle_redo(
             self.console,
             self.agent,
             self.conversation_context,
@@ -1679,22 +1680,6 @@ Type `/license full` or see LICENSE.md in the project directory
         self.console.print(f"  [cyan]Total tokens:[/cyan] {old_tokens:,}")
         self.console.print("\n[green]✓ Session statistics have been reset[/green]")
 
-    def _cmd_container(self, _input: str):
-        """Container and Docker commands - delegates to devops_commands module."""
-        handle_container_command(_input, self.agent, self.console)
-
-    def _cmd_helm(self, _input: str):
-        """Helm Chart generation - delegates to devops_commands module."""
-        handle_helm_command(_input, self.agent, self.console)
-
-    def _cmd_se(self, _input: str):
-        """Software Engineering commands - delegates to devops_commands module."""
-        handle_se_command(_input, self.agent, self.console)
-
-    def _cmd_gitops(self, _input: str):
-        """GitOps/ArgoCD commands - delegates to devops_commands module."""
-        handle_gitops_command(_input, self.agent, self.console)
-
     def _cmd_model(self, _input: str):
         """Model configuration commands - delegates to model_commands module."""
         result = handle_model_command(
@@ -1711,6 +1696,78 @@ Type `/license full` or see LICENSE.md in the project directory
             self.agent = result
             # Update stale agent reference in context display manager
             self._context_display_manager.agent = result
+
+    def _cmd_agent(self, _input: str):
+        """Agent orchestration commands - delegates to agent_commands module."""
+        from sepilot.ui.commands.agent_commands import handle_agent_command
+        llm = self.agent.llm if self.agent and hasattr(self.agent, 'llm') else None
+        result = handle_agent_command(
+            _input,
+            console=self.console,
+            agent_team=self._agent_team,
+            ralph_loop=self._ralph_loop,
+            session=self.session,
+            llm=llm,
+        )
+        if result == "TEAM_KILLED":
+            self._agent_team = None
+            self._ralph_loop = None
+        elif result is not None:
+            from sepilot.agent.multi.team import AgentTeam
+
+            # 이전 팀이 있으면 리소스 정리
+            if self._agent_team is not None and self._agent_team is not getattr(result, 'team', result):
+                try:
+                    self._agent_team.kill_all()
+                except Exception:
+                    pass
+
+            # RalphLoop인 경우 (team 속성이 있음)
+            if hasattr(result, 'current_round') and hasattr(result, 'max_rounds'):
+                self._ralph_loop = result
+                self._agent_team = result.team
+            elif isinstance(result, AgentTeam):
+                self._agent_team = result
+                self._ralph_loop = None
+
+            # 팀 결과를 대화 컨텍스트에 추가
+            self._inject_team_results_to_context(_input, result)
+
+    def _inject_team_results_to_context(self, user_input: str, result: Any) -> None:
+        """팀 실행 결과를 대화 컨텍스트에 추가합니다."""
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        # 팀 객체에서 결과 추출
+        team = result.team if hasattr(result, 'team') else result
+
+        # 팀이 아직 실행 중이면 (백그라운드 전환 등) 주입하지 않음
+        if not getattr(team, 'is_done', False):
+            return
+
+        results = getattr(team, '_results', {})
+        if not results:
+            return
+
+        # 팀 결과를 AI 응답으로 기록
+        task = getattr(team, '_main_task', user_input)
+        parts = ["[에이전트 팀 실행 결과]"]
+        for role_name, output in results.items():
+            if not isinstance(output, str):
+                continue
+            text = output.strip()
+            if text and not text.startswith("[error]") and not text.startswith("[timeout]"):
+                # 각 역할의 핵심 내용만 (최대 1000자)
+                if len(text) > 1000:
+                    text = text[:1000] + "..."
+                parts.append(f"\n**{role_name}:**\n{text}")
+
+        if len(parts) > 1:
+            self.conversation_context.append(
+                HumanMessage(content=f"[/agent run] {task}")
+            )
+            self.conversation_context.append(
+                AIMessage(content="\n".join(parts))
+            )
 
     def _cmd_security(self, _input: str):
         """Security / DevSecOps commands - delegates to security_commands module."""
@@ -1763,10 +1820,6 @@ Type `/license full` or see LICENSE.md in the project directory
     def _cmd_commands(self, _input: str):
         """Custom commands system - delegates to custom_commands module."""
         handle_custom_commands_command(self.console, self._custom_command_manager, _input)
-
-    def _cmd_k8s_health(self, _input: str):
-        """Kubernetes health checks - delegates to k8s_commands module."""
-        handle_k8s_health_command(_input, self.agent, self.console)
 
     def _cmd_theme(self, _input: str):
         """Theme management - delegates to theme_commands module."""
@@ -1836,3 +1889,8 @@ Type `/license full` or see LICENSE.md in the project directory
     def _cmd_cost(self, _input: str):
         """Show estimated cost - delegates to context_commands module."""
         handle_cost(self.console, self.total_tokens, self.command_count, self.agent)
+
+    def _cmd_performance(self, _input: str):
+        """Show LLM output generation speed metrics."""
+        from sepilot.ui.commands.performance_commands import handle_performance
+        handle_performance(self.console, self.agent)

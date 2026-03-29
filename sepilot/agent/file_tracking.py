@@ -6,7 +6,6 @@ This module provides helpers for tracking file modifications during agent execut
 from pathlib import Path
 from typing import Any
 
-
 _IGNORE_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", "logs", "temp"}
 
 

@@ -7,12 +7,12 @@ from langchain_core.tools import tool
 
 
 @tool
-def git(operation: str, args: str = "", message: str = "", path: str = ".") -> str:
+def git(operation: str, extra_args: str = "", message: str = "", path: str = ".") -> str:
     """Perform Git operations (status, diff, add, commit, log, branch).
 
     Args:
         operation: Git operation to perform (status/diff/add/commit/log/branch)
-        args: Additional arguments for the operation (optional)
+        extra_args: Additional arguments for the operation (optional)
         message: Commit message (required for commit operation)
         path: Path to Git repository (default: current directory)
 
@@ -22,9 +22,9 @@ def git(operation: str, args: str = "", message: str = "", path: str = ".") -> s
     Examples:
         - git(operation="status")
         - git(operation="diff")
-        - git(operation="add", args=".")
+        - git(operation="add", extra_args=".")
         - git(operation="commit", message="Fix bug")
-        - git(operation="log", args="--oneline -5")
+        - git(operation="log", extra_args="--oneline -5")
     """
     repo_path = Path(path)
     if not (repo_path / ".git").exists():
@@ -43,8 +43,8 @@ def git(operation: str, args: str = "", message: str = "", path: str = ".") -> s
     try:
         if operation == "status":
             cmd = ["git", "status", "--short"]
-            if args:
-                cmd.extend(args.split())
+            if extra_args:
+                cmd.extend(extra_args.split())
 
             returncode, stdout, stderr = _run_git_command(cmd, repo_path)
 
@@ -75,10 +75,10 @@ def git(operation: str, args: str = "", message: str = "", path: str = ".") -> s
 
         elif operation == "diff":
             cmd = ["git", "diff", "--stat"]
-            if args:
-                if "--" not in args:
+            if extra_args:
+                if "--" not in extra_args:
                     cmd = ["git", "diff"]
-                cmd.extend(args.split())
+                cmd.extend(extra_args.split())
 
             returncode, stdout, stderr = _run_git_command(cmd, repo_path)
 
@@ -94,26 +94,26 @@ def git(operation: str, args: str = "", message: str = "", path: str = ".") -> s
             return stdout
 
         elif operation == "add":
-            if not args:
-                return "Error: Please specify files to add (use '.' for all)"
+            if not extra_args:
+                return "Error: Please specify files to add (use '.' for all, pass via extra_args)"
 
             cmd = ["git", "add"]
-            cmd.extend(args.split())
+            cmd.extend(extra_args.split())
 
             returncode, stdout, stderr = _run_git_command(cmd, repo_path)
 
             if returncode != 0:
                 return f"Error: {stderr}"
 
-            return f"Staged files: {args}"
+            return f"Staged files: {extra_args}"
 
         elif operation == "commit":
             if not message:
                 return "Error: Commit message is required"
 
             cmd = ["git", "commit", "-m", message]
-            if args:
-                cmd.extend(args.split())
+            if extra_args:
+                cmd.extend(extra_args.split())
 
             returncode, stdout, stderr = _run_git_command(cmd, repo_path)
 
@@ -127,9 +127,9 @@ def git(operation: str, args: str = "", message: str = "", path: str = ".") -> s
 
         elif operation == "log":
             cmd = ["git", "log", "--oneline", "-10"]
-            if args:
+            if extra_args:
                 cmd = ["git", "log"]
-                cmd.extend(args.split())
+                cmd.extend(extra_args.split())
 
             returncode, stdout, stderr = _run_git_command(cmd, repo_path)
 
@@ -143,18 +143,18 @@ def git(operation: str, args: str = "", message: str = "", path: str = ".") -> s
 
         elif operation == "branch":
             cmd = ["git", "branch"]
-            if args:
-                cmd.extend(args.split())
+            if extra_args:
+                cmd.extend(extra_args.split())
 
             returncode, stdout, stderr = _run_git_command(cmd, repo_path)
 
             if returncode != 0:
                 return f"Error: {stderr}"
 
-            if not args:
+            if not extra_args:
                 return f"Branches:\n{stdout}"
             else:
-                return stdout if stdout else f"Branch operation completed: {args}"
+                return stdout if stdout else f"Branch operation completed: {extra_args}"
 
         else:
             return f"Error: Unknown operation: {operation}. Valid: status/diff/add/commit/log/branch"

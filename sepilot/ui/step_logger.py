@@ -6,13 +6,13 @@ the agent's internal workflow without cluttering stdout.
 
 from __future__ import annotations
 
-import time
-import shutil
 import re
+import shutil
+import time
 from typing import TextIO
 
-from rich.console import Console
 from rich.cells import cell_len, chop_cells, set_cell_size
+from rich.console import Console
 
 
 class StepLogger:
@@ -337,6 +337,9 @@ class StepLogger:
         )
         for raw in steps:
             s = raw
+            # Collapse newlines and strip markup to avoid breaking box layout
+            s = s.replace("\n", " ").replace("\r", "")
+            s = re.sub(r'\[/?[a-z_]+\]', '', s)  # Strip Rich markup tags like [dim], [/dim]
             s = s.replace("🎯", "").replace("📋", "").strip()
             if s.startswith("[READ-ONLY]"):
                 s = s.replace("[READ-ONLY]", "", 1).strip()
@@ -396,7 +399,7 @@ class StepLogger:
         self._last_plan_progress_signature = signature
 
         completed = max(0, min(cur, len(cleaned)))
-        current_step = cleaned[cur]
+        _current_step = cleaned[cur]
         next_step = cleaned[cur + 1] if (cur + 1) < len(cleaned) else "마무리/응답 정리"
         header = f"작업 체크리스트 {cur + 1}/{len(cleaned)} · 완료 {completed}"
 
@@ -432,10 +435,10 @@ class StepLogger:
             self._ansi(f"│ {set_cell_size(clipped_header, width)} │", "1;37"),
             self._ansi(f"├{'─' * (width + 2)}┤", "36"),
         ]
-        for (row, color), clipped in zip(body_rows, clipped_body, strict=False):
+        for (_row, color), clipped in zip(body_rows, clipped_body, strict=False):
             checklist_lines.append(self._ansi(f"│ {set_cell_size(clipped, width)} │", color))
         checklist_lines.append(self._ansi(f"├{'─' * (width + 2)}┤", "36"))
-        for (row, color), clipped in zip(footer_rows, clipped_footer, strict=False):
+        for (_row, color), clipped in zip(footer_rows, clipped_footer, strict=False):
             checklist_lines.append(self._ansi(f"│ {set_cell_size(clipped, width)} │", color))
         checklist_lines.append(self._ansi(f"╰{'─' * (width + 2)}╯", "1;36"))
 

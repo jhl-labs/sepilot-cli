@@ -20,10 +20,11 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from rich.console import Console
 
 from sepilot.agent.base_agent import ReactAgent
+from sepilot.agent.execution_context import is_user_visible_conversation_message
 from sepilot.config.settings import Settings
 from sepilot.loggers.file_logger import FileLogger
 from sepilot.ui import InteractiveMode
@@ -195,9 +196,31 @@ def _run_interactive_mode(
         conversation_context: list[BaseMessage] = []
         max_context_messages = 50
 
+        def _uses_graph_context() -> bool:
+            return bool(agent and getattr(agent, "enable_memory", False))
+
+        def _sync_context_from_agent() -> bool:
+            nonlocal conversation_context
+            if not _uses_graph_context() or not agent or not hasattr(agent, "get_conversation_messages"):
+                return False
+
+            try:
+                messages = agent.get_conversation_messages()
+            except Exception:
+                return False
+
+            conversation_context.clear()
+            for msg in messages:
+                if is_user_visible_conversation_message(msg):
+                    conversation_context.append(msg)
+            return True
+
         def _trim_context():
             """Smart context management with auto-compaction based on token usage."""
             nonlocal conversation_context
+
+            if _uses_graph_context():
+                return
 
             if not conversation_context:
                 return
@@ -269,7 +292,14 @@ def _run_interactive_mode(
                 f"$ {command}\n"
                 f"{output}"
             )
-            conversation_context.append(HumanMessage(content=manual_summary))
+            if _uses_graph_context() and agent and hasattr(agent, "append_conversation_message"):
+                appended = agent.append_conversation_message(SystemMessage(content=manual_summary))
+                if appended:
+                    _sync_context_from_agent()
+                else:
+                    conversation_context.append(HumanMessage(content=manual_summary))
+            else:
+                conversation_context.append(HumanMessage(content=manual_summary))
             logger.log_tool_call(
                 tool_name="manual_shell",
                 input_data={"command": command},
@@ -287,9 +317,12 @@ def _run_interactive_mode(
                     "  /model apply[/yellow]"
                 )
                 return None
-            context_snapshot = list(conversation_context)
             try:
-                result = agent.execute(user_input, context_messages=context_snapshot)
+                if _uses_graph_context():
+                    result = agent.execute(user_input)
+                else:
+                    context_snapshot = list(conversation_context)
+                    result = agent.execute(user_input, context_messages=context_snapshot)
             except Exception as e:
                 from rich.markup import escape
                 console.print(f"[red]Error: {escape(str(e))}[/red]")
@@ -313,15 +346,21 @@ def _run_interactive_mode(
                             pure_user_input = para
                             break
 
-            conversation_context.append(HumanMessage(content=pure_user_input))
-            if result:
-                conversation_context.append(AIMessage(content=result))
-            _trim_context()
+            if _uses_graph_context():
+                _sync_context_from_agent()
+            else:
+                conversation_context.append(HumanMessage(content=pure_user_input))
+                if result:
+                    conversation_context.append(AIMessage(content=result))
+                _trim_context()
             return result
 
         # Show thread ID
         if agent and not thread_id and not no_memory and agent.get_thread_id():
             console.print(f"[dim]Thread ID: {agent.get_thread_id()}[/dim]")
+
+        if _uses_graph_context():
+            _sync_context_from_agent()
 
         # Start interactive mode
         interactive_mode = InteractiveMode(
@@ -523,40 +562,51 @@ def main(
     # Handle --resume: show thread selector (Claude Code style)
     if resume and not thread_id:
         from sepilot.memory import SqliteCheckpointer
-        checkpointer = SqliteCheckpointer()
-        threads = checkpointer.list_threads()
+        from sepilot.ui.input_utils import interactive_select
 
-        if not threads:
+        checkpointer = SqliteCheckpointer()
+        threads_meta = checkpointer.list_threads_with_metadata()
+
+        if not threads_meta:
             console.print("[yellow]No previous threads found. Starting new conversation.[/yellow]")
         else:
-            console.print("[bold cyan]Select a conversation to resume:[/bold cyan]\n")
+            # Build selector items from thread metadata
+            selector_items: list[dict[str, str]] = []
+            for t in threads_meta[:15]:
+                tid = t["thread_id"]
+                updated = t.get("updated_at", "")[:16]  # YYYY-MM-DD HH:MM
+                msg_count = t.get("message_count", 0)
+                preview = t.get("last_message_preview", "") or ""
+                if len(preview) > 60:
+                    preview = preview[:60] + "..."
 
-            for i, tid in enumerate(threads[:10], 1):  # Show top 10
-                console.print(f"  [cyan]{i}.[/cyan] {tid}")
+                label = f"{tid[:20]}"
+                desc_parts = []
+                if updated:
+                    desc_parts.append(updated)
+                if msg_count:
+                    desc_parts.append(f"{msg_count}msgs")
+                if preview:
+                    desc_parts.append(f'"{preview}"')
+                description = "  ".join(desc_parts)
 
-            console.print("\n  [dim]0. Start new conversation[/dim]")
-            console.print()
+                selector_items.append({"label": label, "description": description})
 
-            try:
-                choice = input("Select (0-10): ").strip()
-                if choice.isdigit():
-                    idx = int(choice)
-                    if idx == 0:
-                        console.print("[dim]Starting new conversation...[/dim]")
-                    elif 1 <= idx <= len(threads):
-                        thread_id = threads[idx - 1]
-                        console.print(f"[green]Resuming thread: {thread_id}[/green]")
-                    else:
-                        console.print("[yellow]Invalid selection. Starting new conversation.[/yellow]")
-                else:
-                    # Treat as thread ID
-                    if choice in threads:
-                        thread_id = choice
-                        console.print(f"[green]Resuming thread: {thread_id}[/green]")
-                    else:
-                        console.print(f"[yellow]Thread '{choice}' not found. Starting new conversation.[/yellow]")
-            except (EOFError, KeyboardInterrupt):
-                console.print("\n[dim]Cancelled. Starting new conversation.[/dim]")
+            # Add "new conversation" option at the end
+            selector_items.append({"label": "New conversation", "description": "Start fresh"})
+
+            selected = interactive_select(
+                selector_items,
+                title="Resume a conversation:",
+            )
+
+            if selected is None:
+                console.print("[dim]Cancelled. Starting new conversation.[/dim]")
+            elif selected == len(selector_items) - 1:
+                console.print("[dim]Starting new conversation...[/dim]")
+            else:
+                thread_id = threads_meta[selected]["thread_id"]
+                console.print(f"[green]Resuming thread: {thread_id}[/green]")
 
     # Handle git command
     if git:
@@ -703,16 +753,17 @@ def main(
         if not sys.stdin.isatty():
             stdin_input = sys.stdin.read().strip()
             if stdin_input:
-                if prompt:
-                    # Combine stdin with prompt
-                    prompt = f"{stdin_input}\n\n{prompt}"
-                else:
-                    prompt = stdin_input
+                prompt = f"{stdin_input}\n\n{prompt}" if prompt else stdin_input
         else:
             console.print("[yellow]Warning: --stdin specified but no piped input detected[/yellow]")
 
-    # No prompt given → default to interactive mode
+    # No prompt given → default to interactive mode only for real terminals.
     if not prompt:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise click.UsageError(
+                "No prompt provided. Use --interactive, pass --prompt/-p, or pipe input with --stdin."
+            )
+
         _run_interactive_mode(
             model=model,
             log_dir=log_dir,
@@ -951,8 +1002,8 @@ def install_lsp(language: str, check: bool):
     from sepilot.lsp.servers import (
         SERVER_CONFIGS,
         get_available_servers,
-        install_server,
         install_all_servers,
+        install_server,
     )
 
     if check:

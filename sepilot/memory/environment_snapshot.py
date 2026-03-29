@@ -146,10 +146,7 @@ class EnvironmentManager:
         Returns:
             True if the variable appears to contain sensitive data
         """
-        for pattern in self._secret_patterns:
-            if pattern.match(key):
-                return True
-        return False
+        return any(pattern.match(key) for pattern in self._secret_patterns)
 
     def _should_exclude(self, key: str) -> bool:
         """Check if a variable should be completely excluded.
@@ -160,10 +157,7 @@ class EnvironmentManager:
         Returns:
             True if the variable should not be stored
         """
-        for pattern in self._exclude_patterns:
-            if pattern.match(key):
-                return True
-        return False
+        return any(pattern.match(key) for pattern in self._exclude_patterns)
 
     def _mask_value(self, value: str) -> str:
         """Mask a sensitive value while preserving some info.

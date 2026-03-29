@@ -6,7 +6,6 @@ Enhanced with Claude Code-style features:
 - Claude Code compatible paths (.claude/skills/)
 """
 
-import asyncio
 import importlib
 import importlib.util
 import logging

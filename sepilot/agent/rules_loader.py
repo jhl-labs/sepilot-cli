@@ -58,11 +58,7 @@ class Rule:
         except ValueError:
             rel_path = file_path
 
-        for pattern in self.paths:
-            if _glob_match(rel_path, pattern):
-                return True
-
-        return False
+        return any(_glob_match(rel_path, pattern) for pattern in self.paths)
 
     def matches_any(self, file_paths: list[str], project_root: Path) -> bool:
         """Check if any of the file paths match this rule."""
@@ -155,13 +151,18 @@ class RulesLoader:
                 logger.warning(f"Failed to load rule from {md_file}: {e}")
 
     def get_active_rules(
-        self, active_files: list[str] | None = None
+        self,
+        active_files: list[str] | None = None,
+        include_project_rules: bool = True,
+        include_user_rules: bool = True,
     ) -> list[Rule]:
         """Get rules that are active for the given files.
 
         Args:
             active_files: List of file paths currently being worked on.
                 If None, only returns rules without path filters.
+            include_project_rules: Include project-local rules
+            include_user_rules: Include user-level rules
 
         Returns:
             List of active rules sorted by priority
@@ -171,6 +172,10 @@ class RulesLoader:
 
         active = []
         for rule in self._rules:
+            if rule.source_type == "project" and not include_project_rules:
+                continue
+            if rule.source_type == "user" and not include_user_rules:
+                continue
             if not rule.paths:
                 # No path filter = always active
                 active.append(rule)
@@ -179,12 +184,21 @@ class RulesLoader:
 
         return active
 
-    def get_rules_text(self, active_files: list[str] | None = None) -> str:
+    def get_rules_text(
+        self,
+        active_files: list[str] | None = None,
+        include_project_rules: bool = True,
+        include_user_rules: bool = True,
+    ) -> str:
         """Get formatted text of all active rules.
 
         Returns concatenated rule content for prompt injection.
         """
-        rules = self.get_active_rules(active_files)
+        rules = self.get_active_rules(
+            active_files,
+            include_project_rules=include_project_rules,
+            include_user_rules=include_user_rules,
+        )
         if not rules:
             return ""
 
@@ -230,4 +244,8 @@ def get_rules_loader(project_root: Path | None = None) -> RulesLoader:
     global _rules_loader
     if _rules_loader is None:
         _rules_loader = RulesLoader(project_root=project_root)
+    elif project_root is not None and _rules_loader.project_root != project_root:
+        _rules_loader.project_root = project_root
+        _rules_loader._rules.clear()
+        _rules_loader._loaded = False
     return _rules_loader

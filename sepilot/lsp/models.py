@@ -19,7 +19,7 @@ class Position:
         return {"line": self.line, "character": self.character}
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Position":
+    def from_dict(cls, data: dict) -> Position:
         """Create from LSP format."""
         return cls(line=data["line"], character=data["character"])
 
@@ -36,7 +36,7 @@ class Range:
         return {"start": self.start.to_dict(), "end": self.end.to_dict()}
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Range":
+    def from_dict(cls, data: dict) -> Range:
         """Create from LSP format."""
         return cls(
             start=Position.from_dict(data["start"]),
@@ -64,7 +64,7 @@ class Location:
         return {"uri": self.uri, "range": self.range.to_dict()}
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Location":
+    def from_dict(cls, data: dict) -> Location:
         """Create from LSP format."""
         return cls(uri=data["uri"], range=Range.from_dict(data["range"]))
 
@@ -94,7 +94,7 @@ class LocationLink:
     target_selection_range: Range
 
     @classmethod
-    def from_dict(cls, data: dict) -> "LocationLink":
+    def from_dict(cls, data: dict) -> LocationLink:
         """Create from LSP format."""
         return cls(
             origin_selection_range=(
@@ -154,7 +154,7 @@ class SymbolInformation:
     tags: list[int] = field(default_factory=list)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "SymbolInformation":
+    def from_dict(cls, data: dict) -> SymbolInformation:
         """Create from LSP format."""
         return cls(
             name=data["name"],
@@ -181,10 +181,10 @@ class DocumentSymbol:
     range: Range
     selection_range: Range
     detail: str | None = None
-    children: list["DocumentSymbol"] = field(default_factory=list)
+    children: list[DocumentSymbol] = field(default_factory=list)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "DocumentSymbol":
+    def from_dict(cls, data: dict) -> DocumentSymbol:
         """Create from LSP format."""
         return cls(
             name=data["name"],
@@ -207,7 +207,7 @@ class HoverInfo:
     language: str | None = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> "HoverInfo":
+    def from_dict(cls, data: dict) -> HoverInfo:
         """Create from LSP format."""
         contents = data.get("contents", "")
 
@@ -255,7 +255,7 @@ class Diagnostic:
     source: str | None = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Diagnostic":
+    def from_dict(cls, data: dict) -> Diagnostic:
         """Create from LSP format."""
         return cls(
             range=Range.from_dict(data["range"]),
@@ -294,7 +294,7 @@ class CallHierarchyItem:
     data: Any = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> "CallHierarchyItem":
+    def from_dict(cls, data: dict) -> CallHierarchyItem:
         """Create from LSP format."""
         return cls(
             name=data["name"],
@@ -340,7 +340,7 @@ class CallHierarchyIncomingCall:
     from_ranges: list[Range]
 
     @classmethod
-    def from_dict(cls, data: dict) -> "CallHierarchyIncomingCall":
+    def from_dict(cls, data: dict) -> CallHierarchyIncomingCall:
         """Create from LSP format."""
         return cls(
             from_item=CallHierarchyItem.from_dict(data["from"]),
@@ -356,7 +356,7 @@ class CallHierarchyOutgoingCall:
     from_ranges: list[Range]
 
     @classmethod
-    def from_dict(cls, data: dict) -> "CallHierarchyOutgoingCall":
+    def from_dict(cls, data: dict) -> CallHierarchyOutgoingCall:
         """Create from LSP format."""
         return cls(
             to_item=CallHierarchyItem.from_dict(data["to"]),
@@ -375,7 +375,7 @@ class TextDocumentIdentifier:
         return {"uri": self.uri}
 
     @classmethod
-    def from_file_path(cls, file_path: str) -> "TextDocumentIdentifier":
+    def from_file_path(cls, file_path: str) -> TextDocumentIdentifier:
         """Create from file path."""
         return cls(uri=f"file://{file_path}")
 
@@ -403,7 +403,7 @@ class InitializeResult:
     server_info: dict[str, str] | None = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> "InitializeResult":
+    def from_dict(cls, data: dict) -> InitializeResult:
         """Create from LSP format."""
         return cls(
             capabilities=data.get("capabilities", {}),

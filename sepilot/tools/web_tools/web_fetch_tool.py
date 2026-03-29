@@ -12,7 +12,6 @@ import httpx
 
 from sepilot.tools.base_tool import BaseTool
 
-
 # SSRF protection: blocked hosts and networks
 _BLOCKED_HOSTS = {
     "localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]",  # nosec B104
@@ -372,6 +371,7 @@ class WebFetchTool(BaseTool):
             # Ollama - use same model (no standard lightweight option)
             elif settings.ollama_base_url:
                 from langchain_openai import ChatOpenAI
+
                 from sepilot.config.llm_providers import _ensure_versioned_base_url
                 base_url = _ensure_versioned_base_url(settings.ollama_base_url)
                 return ChatOpenAI(
@@ -385,6 +385,7 @@ class WebFetchTool(BaseTool):
             # Default: OpenAI-compatible
             else:
                 from langchain_openai import ChatOpenAI
+
                 from sepilot.config.llm_providers import _ensure_versioned_base_url
                 base_url = _ensure_versioned_base_url(
                     settings.api_base_url or "http://localhost:11434"

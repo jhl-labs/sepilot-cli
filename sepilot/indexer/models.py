@@ -200,7 +200,7 @@ class ProjectIndex:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ProjectIndex":
+    def from_dict(cls, data: dict[str, Any]) -> ProjectIndex:
         """Create from dictionary."""
         return cls(
             project_root=data["project_root"],

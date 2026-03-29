@@ -42,7 +42,9 @@ You MUST respond with valid JSON in the following format:
 - Earlier phases should complete before later ones
 - Use context_from to pass results between tasks
 - Keep task descriptions specific and actionable
-- Always include acceptance criteria"""
+- Always include acceptance criteria
+- IMPORTANT: For bug fix tasks, prioritize developer and debugger roles. Keep the plan simple — avoid unnecessary roles (e.g., skip security_reviewer and devops unless explicitly needed)
+- IMPORTANT: The developer role MUST be assigned tasks that actually modify code files. Without developer tasks, no code changes will be produced."""
 
 DEVELOPER_SYSTEM_PROMPT = """You are a Developer agent specialized in code implementation.
 

@@ -1,6 +1,9 @@
-"""Agent Teams 전용 데이터 모델
+"""Agent Teams 전용 데이터 모델 (Legacy)
 
 PM 주도 역할 기반 Agent Teams 시스템에서 사용하는 데이터 모델을 정의합니다.
+
+Note: 새로운 멀티 에이전트 모델은 ``sepilot.agent.multi.models`` 에 정의되어 있습니다.
+이 모듈의 모델은 TeamOrchestrator(LLM SubAgent 기반)에서 계속 사용됩니다.
 """
 
 from dataclasses import dataclass, field
@@ -53,6 +56,11 @@ class TeamTaskAssignment:
     context_from: list[str] = field(default_factory=list)
     acceptance_criteria: str = ""
 
+    def __post_init__(self):
+        """Detach dependency lists from caller-owned containers."""
+        self.dependencies = list(self.dependencies)
+        self.context_from = list(self.context_from)
+
 
 @dataclass
 class PhaseGateResult:
@@ -70,6 +78,11 @@ class PhaseGateResult:
     passed: bool
     issues: list[str] = field(default_factory=list)
     recommendations: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        """Detach issue lists from caller-owned containers."""
+        self.issues = list(self.issues)
+        self.recommendations = list(self.recommendations)
 
 
 @dataclass
@@ -90,6 +103,12 @@ class TeamExecutionPlan:
     assignments: list[TeamTaskAssignment] = field(default_factory=list)
     phases: list[TeamPhase] = field(default_factory=list)
     gate_results: list[PhaseGateResult] = field(default_factory=list)
+
+    def __post_init__(self):
+        """Detach plan lists from caller-owned containers."""
+        self.assignments = list(self.assignments)
+        self.phases = list(self.phases)
+        self.gate_results = list(self.gate_results)
 
     @property
     def total_assignments(self) -> int:

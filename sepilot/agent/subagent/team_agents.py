@@ -12,7 +12,6 @@ from langchain_core.language_models import BaseChatModel
 from .base_subagent import BaseSubAgent
 from .models import SubAgentTask
 from .team_models import (
-    InterAgentMessage,
     TeamExecutionPlan,
     TeamPhase,
     TeamRole,
@@ -225,21 +224,35 @@ class PMAgent(BaseSubAgent):
         role_map = {r.value: r for r in TeamRole}
         phase_map = {p.value: p for p in TeamPhase}
 
-        for item in data.get("assignments", []):
+        raw_assignments = data.get("assignments", [])
+        if not isinstance(raw_assignments, list):
+            raise ValueError("assignments must be a list")
+
+        for item in raw_assignments:
+            if not isinstance(item, dict):
+                continue
+
             role_str = item.get("role", "developer")
             phase_str = item.get("phase", "implement")
 
             role = role_map.get(role_str, TeamRole.DEVELOPER)
             phase = phase_map.get(phase_str, TeamPhase.IMPLEMENT)
+            dependencies = item.get("dependencies", [])
+            if not isinstance(dependencies, list):
+                dependencies = []
+
+            context_from = item.get("context_from", [])
+            if not isinstance(context_from, list):
+                context_from = []
 
             assignment = TeamTaskAssignment(
-                task_id=item.get("task_id", f"T{len(assignments)+1}"),
+                task_id=item.get("task_id") or f"T{len(assignments)+1}",
                 role=role,
-                description=item.get("description", ""),
+                description=item.get("description") or "",
                 phase=phase,
-                dependencies=item.get("dependencies", []),
-                context_from=item.get("context_from", []),
-                acceptance_criteria=item.get("acceptance_criteria", ""),
+                dependencies=dependencies,
+                context_from=context_from,
+                acceptance_criteria=item.get("acceptance_criteria") or "",
             )
             assignments.append(assignment)
 

@@ -119,10 +119,7 @@ class RecursionDetector:
         # Check 3: Cyclic pattern detection (A → B → A → B or A → B → C → A → B → C)
         tools_list = list(self.recent_tools)
         cycle_detected, cycle_len = self._detect_cyclic_pattern(tools_list)
-        if cycle_detected:
-            return True
-
-        return False
+        return cycle_detected
 
     def get_repetition_info(self) -> dict[str, Any] | None:
         """Get information about detected repetition

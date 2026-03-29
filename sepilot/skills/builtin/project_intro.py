@@ -1,33 +1,19 @@
-"""Project Introduction Skill - Generate project documentation from codebase analysis"""
+"""Project Introduction Skill"""
 
-from ..base import BaseSkill, SkillMetadata, SkillResult
+from ..base import PromptSkill
 
 
-class ProjectIntroSkill(BaseSkill):
-    """Skill for generating project introduction documentation"""
-
-    def get_metadata(self) -> SkillMetadata:
-        return SkillMetadata(
-            name="project-intro",
-            description="Analyze project structure and generate introduction documentation",
-            version="1.0.0",
-            author="SEPilot",
-            triggers=[
-                "project intro",
-                "project introduction",
-                "introduce project",
-                "project overview",
-                "document project",
-                "project documentation",
-                "what is this project",
-                "explain project",
-            ],
-            category="documentation",
-        )
-
-    def execute(self, input_text: str, context: dict) -> SkillResult:
-        """Execute project introduction skill"""
-        intro_prompt = """## Project Introduction Documentation Task
+class ProjectIntroSkill(PromptSkill):
+    name = "project-intro"
+    description = "Analyze project structure and generate introduction documentation"
+    triggers = [
+        "project intro", "project introduction", "introduce project",
+        "project overview", "document project", "project documentation",
+        "what is this project", "explain project",
+    ]
+    category = "documentation"
+    prompt = """\
+## Project Introduction Documentation Task
 
 You are tasked with analyzing the current project and generating comprehensive introduction documentation.
 
@@ -102,10 +88,4 @@ Generate the documentation in Markdown format. The document should be:
 **IMPORTANT**:
 - Write the documentation to a file named `PROJECT_INTRO.md` in the project root
 - Do NOT include sensitive information (API keys, passwords, internal IPs, usernames)
-- Focus on publicly shareable information about the project structure and architecture
-"""
-        return SkillResult(
-            success=True,
-            message="Project introduction skill activated - analyzing project structure",
-            prompt_injection=intro_prompt,
-        )
+- Focus on publicly shareable information about the project structure and architecture"""

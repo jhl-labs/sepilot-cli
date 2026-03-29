@@ -130,23 +130,6 @@ def safe_load_cache_value(entry: Any) -> Any:
     return entry
 
 
-def normalize_approval_response(response: Any) -> dict[str, Any]:
-    """Normalize human approval responses into a consistent structure."""
-    if isinstance(response, dict):
-        decision = response.get("decision") or response.get("status") or "approve"
-        decision = str(decision).lower()
-        if decision in ("approve", "approved", "ok", "yes", "y"):
-            return {"status": "approved"}
-        if decision in ("deny", "denied", "no", "n", "reject"):
-            reason = response.get("reason") or response.get("message")
-            return {"status": "deny", "reason": reason}
-        if decision in ("respond", "feedback", "message"):
-            return {
-                "status": "feedback",
-                "message": response.get("message") or response.get("reason", "")
-            }
-    return {"status": "approved"}
-
 
 def parse_plan_steps(plan_text: str) -> list[str]:
     """Parse numbered plan steps from plan text.
@@ -711,7 +694,6 @@ __all__ = [
     'cache_entry_is_stale',
     'make_cache_entry',
     'safe_load_cache_value',
-    'normalize_approval_response',
     'parse_plan_steps',
     'looks_like_plan',
     'is_plan_request',

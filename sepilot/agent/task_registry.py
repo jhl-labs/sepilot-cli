@@ -395,8 +395,8 @@ class TaskRegistry:
         self._notify_listeners(task, "timeout")
         return task
 
-    def retry(self, task_id: str) -> TaskInfo | None:
-        """Mark task for retry.
+    def begin_retry(self, task_id: str) -> TaskInfo | None:
+        """Transition a running/failed task into retrying state.
 
         Args:
             task_id: Task ID to retry
@@ -409,18 +409,27 @@ class TaskRegistry:
             if not task:
                 return None
 
-            if not task.can_retry():
+            if task.retry_count >= task.max_retries:
                 logger.warning(f"Task {task_id} cannot be retried")
+                return task
+
+            if task.state not in (TaskState.RUNNING, TaskState.FAILED, TaskState.RETRYING):
+                logger.warning(f"Task {task_id} cannot begin retry from state {task.state}")
                 return task
 
             task.state = TaskState.RETRYING
             task.retry_count += 1
+            task.completed_at = None
             task.error = None
             task.error_traceback = None
             task.progress = 0.0
 
         self._notify_listeners(task, "retrying")
         return task
+
+    def retry(self, task_id: str) -> TaskInfo | None:
+        """Backward-compatible alias for begin_retry()."""
+        return self.begin_retry(task_id)
 
     def update_progress(
         self,

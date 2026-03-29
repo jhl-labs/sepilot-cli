@@ -27,7 +27,7 @@ class GoHandler:
     language = Language.GO
 
     def extract_ast(
-        self, file_path: str, content: str, tree: "tree_sitter.Tree"
+        self, file_path: str, content: str, tree: tree_sitter.Tree
     ) -> UnifiedAST:
         """Extract unified AST from Go parse tree."""
         ast = UnifiedAST(file_path=file_path, language=Language.GO)
@@ -41,12 +41,12 @@ class GoHandler:
 
         return ast
 
-    def _get_node_text(self, node: "tree_sitter.Node", content: str) -> str:
+    def _get_node_text(self, node: tree_sitter.Node, content: str) -> str:
         """Get text content of a node."""
         return content[node.start_byte : node.end_byte]
 
     def _extract_package(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str
     ) -> None:
         """Extract package name."""
         for node in self._find_nodes(root, ["package_clause"]):
@@ -56,7 +56,7 @@ class GoHandler:
                     break
 
     def _extract_imports(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str
     ) -> None:
         """Extract import statements."""
         for node in self._find_nodes(root, ["import_declaration"]):
@@ -69,7 +69,7 @@ class GoHandler:
                             self._parse_import_spec(ast, spec, content)
 
     def _parse_import_spec(
-        self, ast: UnifiedAST, node: "tree_sitter.Node", content: str
+        self, ast: UnifiedAST, node: tree_sitter.Node, content: str
     ) -> None:
         """Parse a single import spec."""
         path_node = node.child_by_field_name("path")
@@ -94,7 +94,7 @@ class GoHandler:
             )
 
     def _extract_functions(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract function and method definitions."""
         for node in self._find_nodes(root, ["function_declaration", "method_declaration"]):
@@ -103,7 +103,7 @@ class GoHandler:
                 ast.functions.append(func)
 
     def _parse_function(
-        self, node: "tree_sitter.Node", content: str, file_path: str
+        self, node: tree_sitter.Node, content: str, file_path: str
     ) -> FunctionSymbol | None:
         """Parse a function or method declaration."""
         name_node = node.child_by_field_name("name")
@@ -156,7 +156,7 @@ class GoHandler:
         )
 
     def _parse_parameters(
-        self, params_node: "tree_sitter.Node", content: str
+        self, params_node: tree_sitter.Node, content: str
     ) -> list[Parameter]:
         """Parse function parameters."""
         params = []
@@ -183,7 +183,7 @@ class GoHandler:
         return params
 
     def _extract_structs(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract struct definitions."""
         for node in self._find_nodes(root, ["type_declaration"]):
@@ -196,8 +196,8 @@ class GoHandler:
     def _parse_struct(
         self,
         ast: UnifiedAST,
-        spec_node: "tree_sitter.Node",
-        struct_node: "tree_sitter.Node",
+        spec_node: tree_sitter.Node,
+        struct_node: tree_sitter.Node,
         content: str,
         file_path: str,
     ) -> None:
@@ -278,7 +278,7 @@ class GoHandler:
         return methods
 
     def _extract_interfaces(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract interface definitions."""
         for node in self._find_nodes(root, ["type_declaration"]):
@@ -291,8 +291,8 @@ class GoHandler:
     def _parse_interface(
         self,
         ast: UnifiedAST,
-        spec_node: "tree_sitter.Node",
-        interface_node: "tree_sitter.Node",
+        spec_node: tree_sitter.Node,
+        interface_node: tree_sitter.Node,
         content: str,
         file_path: str,
     ) -> None:
@@ -337,7 +337,7 @@ class GoHandler:
         )
 
     def _parse_method_spec(
-        self, node: "tree_sitter.Node", content: str, file_path: str
+        self, node: tree_sitter.Node, content: str, file_path: str
     ) -> FunctionSymbol | None:
         """Parse an interface method specification."""
         name_node = node.child_by_field_name("name")
@@ -372,7 +372,7 @@ class GoHandler:
         )
 
     def _extract_variables(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract package-level variables and constants."""
         # Variables
@@ -390,7 +390,7 @@ class GoHandler:
     def _parse_var_spec(
         self,
         ast: UnifiedAST,
-        node: "tree_sitter.Node",
+        node: tree_sitter.Node,
         content: str,
         file_path: str,
         is_const: bool,
@@ -425,7 +425,7 @@ class GoHandler:
                     )
                 )
 
-    def _extract_calls(self, node: "tree_sitter.Node", content: str) -> list[str]:
+    def _extract_calls(self, node: tree_sitter.Node, content: str) -> list[str]:
         """Extract function calls."""
         calls = []
         for call_node in self._find_nodes(node, ["call_expression"]):
@@ -439,7 +439,7 @@ class GoHandler:
                         calls.append(self._get_node_text(field, content))
         return list(set(calls))
 
-    def _calculate_complexity(self, node: "tree_sitter.Node") -> int:
+    def _calculate_complexity(self, node: tree_sitter.Node) -> int:
         """Calculate cyclomatic complexity."""
         complexity = 1
         branch_nodes = [
@@ -451,13 +451,13 @@ class GoHandler:
             "default_case",
             "type_case",
         ]
-        for child in self._find_nodes(node, branch_nodes):
+        for _child in self._find_nodes(node, branch_nodes):
             complexity += 1
         return complexity
 
     def _find_nodes(
-        self, node: "tree_sitter.Node", types: list[str]
-    ) -> list["tree_sitter.Node"]:
+        self, node: tree_sitter.Node, types: list[str]
+    ) -> list[tree_sitter.Node]:
         """Find all nodes of given types recursively."""
         results = []
         if node.type in types:

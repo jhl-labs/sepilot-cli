@@ -22,9 +22,7 @@ from .models import (
     InitializeResult,
     Location,
     LocationLink,
-    Position,
     SymbolInformation,
-    TextDocumentIdentifier,
 )
 from .servers import LSPServerConfig
 
@@ -85,7 +83,7 @@ class LSPClient:
                 stderr=subprocess.PIPE,
                 cwd=str(self.workspace_root),
                 env={**os.environ, "PYTHONUNBUFFERED": "1"},
-                shell=use_shell,
+                shell=use_shell,  # nosec B602 - Windows .cmd/.bat compatibility
             )
 
             self._running = True

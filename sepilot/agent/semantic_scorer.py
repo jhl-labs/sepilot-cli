@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ class ScoredItem:
     source: str  # e.g., "semantic", "symbol", "dependency"
     metadata: dict[str, Any] | None = None
 
-    def __lt__(self, other: "ScoredItem") -> bool:
+    def __lt__(self, other: ScoredItem) -> bool:
         return self.score < other.score
 
 
@@ -137,7 +138,7 @@ class SemanticScorer:
         if len(vec1) != len(vec2):
             return 0.0
 
-        dot_product = sum(a * b for a, b in zip(vec1, vec2))
+        dot_product = sum(a * b for a, b in zip(vec1, vec2, strict=False))
         norm1 = sum(a * a for a in vec1) ** 0.5
         norm2 = sum(b * b for b in vec2) ** 0.5
 
@@ -166,7 +167,7 @@ class SemanticScorer:
 
         # Calculate TF-IDF-like score
         score = 0.0
-        for token, count in query_freq.items():
+        for token, _count in query_freq.items():
             if token in content_freq:
                 # Boost for exact matches, especially for longer tokens
                 token_weight = 1.0 + (len(token) / 10)

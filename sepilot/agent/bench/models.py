@@ -1,7 +1,7 @@
 import json
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
-from typing import Any
 
 
 class SWEInstance(BaseModel):
@@ -22,7 +22,12 @@ class SWEInstance(BaseModel):
     @classmethod
     def parse_json_string(cls, v):
         if isinstance(v, str):
-            return json.loads(v)
+            if not v.strip():
+                return []
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"invalid JSON list string: {e.msg}") from e
         return v
 
 

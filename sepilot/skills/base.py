@@ -173,3 +173,44 @@ class BaseSkill(ABC):
         if len(metadata.triggers) > 5:
             triggers_str += f" (+{len(metadata.triggers) - 5} more)"
         return f"{metadata.name} (v{metadata.version}): {metadata.description}\n  Triggers: {triggers_str}"
+
+
+class PromptSkill(BaseSkill):
+    """Convenience base for skills that only inject a prompt.
+
+    Subclasses just set class variables — no method overrides needed::
+
+        class MySkill(PromptSkill):
+            name = "my-skill"
+            description = "Does something"
+            triggers = ["my", "skill"]
+            category = "general"
+            prompt = "## Guidelines ..."
+    """
+
+    name: str = ""
+    description: str = ""
+    triggers: list[str] = []
+    category: str = "general"
+    prompt: str = ""
+
+    # Optional overrides (rarely needed)
+    version: str = "1.0.0"
+    author: str = "SEPilot"
+
+    def get_metadata(self) -> SkillMetadata:
+        return SkillMetadata(
+            name=self.name,
+            description=self.description,
+            version=self.version,
+            author=self.author,
+            triggers=self.triggers,
+            category=self.category,
+        )
+
+    def execute(self, input_text: str, context: dict) -> SkillResult:
+        return SkillResult(
+            success=True,
+            message=f"{self.name} skill activated",
+            prompt_injection=self.prompt,
+        )

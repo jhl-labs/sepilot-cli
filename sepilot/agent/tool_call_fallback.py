@@ -139,7 +139,14 @@ def _parse_json_markdown(content: str) -> list[dict]:
     for raw_json in matches:
         parsed = _relaxed_json_parse(raw_json)
         if not parsed or not isinstance(parsed, dict):
-            continue
+            # JSON might have literal newlines in string values (invalid JSON
+            # but common with CLI agents). Fix by escaping unescaped newlines
+            # inside string values.
+            fixed = _fix_literal_newlines_in_json(raw_json)
+            if fixed != raw_json:
+                parsed = _relaxed_json_parse(fixed)
+            if not parsed or not isinstance(parsed, dict):
+                continue
         name = parsed.get("name", "")
         args = parsed.get("arguments") or parsed.get("parameters") or {}
         if name:
@@ -275,6 +282,50 @@ def _validate_and_normalize(
             logger.debug("Unrecognized tool name '%s', skipping", name)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Fix literal newlines in JSON strings
+# ---------------------------------------------------------------------------
+
+
+def _fix_literal_newlines_in_json(raw: str) -> str:
+    """Escape literal newlines/tabs inside JSON string values.
+
+    CLI agents sometimes output JSON with real newlines inside string
+    values (e.g. file content), which is invalid JSON. This function
+    walks the string and escapes unescaped control characters within
+    quoted regions.
+    """
+    result = []
+    in_string = False
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            result.append(ch)
+        else:
+            if ch == '\\' and i + 1 < len(raw):
+                # Already escaped — pass through
+                result.append(ch)
+                result.append(raw[i + 1])
+                i += 2
+                continue
+            elif ch == '"':
+                in_string = False
+                result.append(ch)
+            elif ch == '\n':
+                result.append('\\n')
+            elif ch == '\r':
+                result.append('\\r')
+            elif ch == '\t':
+                result.append('\\t')
+            else:
+                result.append(ch)
+        i += 1
+    return "".join(result)
 
 
 # ---------------------------------------------------------------------------

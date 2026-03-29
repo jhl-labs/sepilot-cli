@@ -64,7 +64,7 @@ class FileCheckpointManager:
         """
         self.use_project_storage = use_project_storage
         self.project_path = project_path or os.getcwd()
-        self._project_manager: 'ProjectHistoryManager | None' = None
+        self._project_manager: ProjectHistoryManager | None = None
 
         # Determine storage directory
         if use_project_storage:

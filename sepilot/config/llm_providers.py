@@ -140,6 +140,8 @@ class LLMProviderFactory:
     # Generic model names (llama-3, mixtral, gemma) are NOT provider-specific
     # and should NOT be listed - they could run on Ollama, Groq, etc.
     PROVIDER_PATTERNS = {
+        "cli_agent": ["cli:"],
+        "tmux_agent": ["tmux:"],
         "anthropic": ["claude", "anthropic"],
         "google": ["gemini", "google/", "palm"],
         "openai": ["gpt-3.5", "gpt-4", "o1-", "o3-", "chatgpt"],
@@ -164,6 +166,7 @@ class LLMProviderFactory:
         """Detect provider from model name.
 
         Detection priority:
+        0. CLI agent prefix (e.g., "cli:claude", "cli:codex")
         1. Explicit provider prefix (e.g., "groq/llama-3", "bedrock/claude")
         2. Unambiguous model name patterns (e.g., "claude-3", "gpt-4")
         3. Ollama base URL configured → ollama
@@ -178,6 +181,12 @@ class LLMProviderFactory:
             Provider name string
         """
         model_lower = model_name.lower()
+
+        # 0. CLI/tmux agent prefix — early return
+        if model_lower.startswith("cli:"):
+            return "cli_agent"
+        if model_lower.startswith("tmux:"):
+            return "tmux_agent"
 
         # 1. Check explicit provider prefix patterns
         for provider, patterns in self.PROVIDER_PATTERNS.items():
@@ -230,6 +239,8 @@ class LLMProviderFactory:
 
         # Provider-specific initialization
         provider_methods = {
+            "cli_agent": self._create_cli_agent,
+            "tmux_agent": self._create_cli_agent,  # tmux도 동일 stub 반환
             "anthropic": self._create_anthropic,
             "google": self._create_google,
             "openai": self._create_openai,
@@ -251,6 +262,8 @@ class LLMProviderFactory:
     def _clean_model_name(self, model_name: str, provider: str) -> str:
         """Remove provider prefix from model name"""
         prefixes = {
+            "cli_agent": "cli:",
+            "tmux_agent": "tmux:",
             "bedrock": "bedrock/",
             "azure": "azure/",
             "openrouter": "openrouter/",
@@ -269,6 +282,33 @@ class LLMProviderFactory:
             or self.settings.https_proxy
             or not self.settings.ssl_verify
             or self.settings.ssl_cert_file
+        )
+
+    def _create_cli_agent(
+        self, model_name: str, params: dict, max_tokens: int, custom_headers: dict | None = None
+    ) -> "BaseChatModel":
+        """Create CLI Agent LLM (claude, codex, opencode, gemini CLI)"""
+        import shutil
+
+        from sepilot.config.cli_agent_llm import CLI_AGENT_CONFIGS, ChatCLIAgent
+
+        agent_name = model_name.lower()
+        config = CLI_AGENT_CONFIGS.get(agent_name, {"flags": ["-p"], "format": "json"})
+
+        if not shutil.which(agent_name):
+            raise LLMProviderError(
+                "cli_agent",
+                f"CLI tool '{agent_name}' not found in PATH",
+                f"Install {agent_name} or check your PATH",
+            )
+
+        return ChatCLIAgent(
+            cli_command=agent_name,
+            cli_flags=config["flags"],
+            model_name=model_name,
+            timeout=params.get("timeout", 300),
+            tool_call_format=config["format"],
+            stdin_as_flag=config.get("stdin_as_flag", ""),
         )
 
     def _create_anthropic(
@@ -433,8 +473,8 @@ class LLMProviderFactory:
                 "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"
             )
         try:
-            from langchain_aws import ChatBedrock
             import botocore.config
+            from langchain_aws import ChatBedrock
 
             # Configure boto client with timeout and proxy
             boto_config = botocore.config.Config(
@@ -711,6 +751,18 @@ def get_provider_info() -> dict[str, dict[str, Any]]:
         Dictionary with provider info
     """
     return {
+        "cli_agent": {
+            "name": "CLI Agent (subprocess)",
+            "models": ["cli:claude", "cli:codex", "cli:opencode", "cli:gemini"],
+            "env_vars": [],
+            "install": "Install the CLI tool (e.g., npm install -g @anthropic-ai/claude-code)",
+        },
+        "tmux_agent": {
+            "name": "Tmux Agent (pseudo-terminal)",
+            "models": ["tmux:claude", "tmux:codex", "tmux:opencode"],
+            "env_vars": [],
+            "install": "Install tmux + CLI tool (apt install tmux)",
+        },
         "openai": {
             "name": "OpenAI",
             "models": ["gpt-4", "gpt-4-turbo", "gpt-3.5-turbo", "o1-preview", "o1-mini"],

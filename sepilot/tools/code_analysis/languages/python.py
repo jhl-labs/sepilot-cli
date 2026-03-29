@@ -27,11 +27,11 @@ class PythonHandler:
     language = Language.PYTHON
 
     def extract_ast(
-        self, file_path: str, content: str, tree: "tree_sitter.Tree"
+        self, file_path: str, content: str, tree: tree_sitter.Tree
     ) -> UnifiedAST:
         """Extract unified AST from Python parse tree."""
         ast = UnifiedAST(file_path=file_path, language=Language.PYTHON)
-        lines = content.split("\n")
+        _lines = content.split("\n")
 
         self._extract_imports(ast, tree.root_node, content)
         self._extract_functions(ast, tree.root_node, content, file_path)
@@ -40,12 +40,12 @@ class PythonHandler:
 
         return ast
 
-    def _get_node_text(self, node: "tree_sitter.Node", content: str) -> str:
+    def _get_node_text(self, node: tree_sitter.Node, content: str) -> str:
         """Get text content of a node."""
         return content[node.start_byte : node.end_byte]
 
     def _extract_imports(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str
     ) -> None:
         """Extract import statements."""
         for node in self._find_nodes(root, ["import_statement", "import_from_statement"]):
@@ -98,7 +98,7 @@ class PythonHandler:
                 )
 
     def _extract_functions(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract function definitions."""
         for node in self._find_nodes(root, ["function_definition"]):
@@ -113,7 +113,7 @@ class PythonHandler:
                 ast.functions.append(func)
 
     def _parse_function(
-        self, node: "tree_sitter.Node", content: str, file_path: str
+        self, node: tree_sitter.Node, content: str, file_path: str
     ) -> FunctionSymbol | None:
         """Parse a function definition node."""
         name_node = node.child_by_field_name("name")
@@ -180,7 +180,7 @@ class PythonHandler:
         )
 
     def _parse_parameters(
-        self, params_node: "tree_sitter.Node", content: str
+        self, params_node: tree_sitter.Node, content: str
     ) -> list[Parameter]:
         """Parse function parameters."""
         params = []
@@ -210,7 +210,7 @@ class PythonHandler:
         return params
 
     def _parse_single_param(
-        self, node: "tree_sitter.Node", content: str
+        self, node: tree_sitter.Node, content: str
     ) -> Parameter | None:
         """Parse a single parameter."""
         if node.type == "identifier":
@@ -238,7 +238,7 @@ class PythonHandler:
         return None
 
     def _extract_classes(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract class definitions."""
         for node in self._find_nodes(root, ["class_definition"]):
@@ -328,7 +328,7 @@ class PythonHandler:
             )
 
     def _extract_variables(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract module-level variables."""
         for node in root.children:
@@ -360,7 +360,7 @@ class PythonHandler:
                             )
                         )
 
-    def _get_docstring(self, node: "tree_sitter.Node", content: str) -> str | None:
+    def _get_docstring(self, node: tree_sitter.Node, content: str) -> str | None:
         """Extract docstring from a function or class."""
         body = node.child_by_field_name("body")
         if not body or not body.children:
@@ -378,7 +378,7 @@ class PythonHandler:
                     return docstring[1:-1].strip()
         return None
 
-    def _extract_calls(self, node: "tree_sitter.Node", content: str) -> list[str]:
+    def _extract_calls(self, node: tree_sitter.Node, content: str) -> list[str]:
         """Extract function calls from a function body."""
         calls = []
         for call_node in self._find_nodes(node, ["call"]):
@@ -393,7 +393,7 @@ class PythonHandler:
                         calls.append(self._get_node_text(attr_node, content))
         return list(set(calls))
 
-    def _calculate_complexity(self, node: "tree_sitter.Node") -> int:
+    def _calculate_complexity(self, node: tree_sitter.Node) -> int:
         """Calculate cyclomatic complexity."""
         complexity = 1
         branch_nodes = [
@@ -407,13 +407,13 @@ class PythonHandler:
             "and",
             "or",
         ]
-        for child in self._find_nodes(node, branch_nodes):
+        for _child in self._find_nodes(node, branch_nodes):
             complexity += 1
         return complexity
 
     def _find_nodes(
-        self, node: "tree_sitter.Node", types: list[str]
-    ) -> list["tree_sitter.Node"]:
+        self, node: tree_sitter.Node, types: list[str]
+    ) -> list[tree_sitter.Node]:
         """Find all nodes of given types recursively."""
         results = []
         if node.type in types:

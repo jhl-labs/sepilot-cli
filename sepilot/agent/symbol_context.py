@@ -77,8 +77,8 @@ class SymbolContextGatherer:
     def __init__(
         self,
         project_root: str | Path,
-        indexer: "ProjectIndexer | None" = None,
-        lsp: "LSPOperations | None" = None,
+        indexer: ProjectIndexer | None = None,
+        lsp: LSPOperations | None = None,
     ):
         """Initialize the gatherer.
 

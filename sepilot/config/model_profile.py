@@ -29,6 +29,10 @@ class ModelConfig:
     reasoning_model: str | None = None
     quick_model: str | None = None
 
+    # CLI Agent settings
+    cli_command: str | None = None
+    cli_flags: list[str] = field(default_factory=list)
+
     # Custom headers
     custom_headers: dict[str, str] = field(default_factory=dict)
 
@@ -180,8 +184,8 @@ class ModelProfileManager:
     def save_profile(self, name: str) -> bool:
         """Save current configuration as a profile.
 
-        Note: API keys are NOT saved to profile files for security.
-        Use environment variables for API key management.
+        API keys are saved to a separate secrets file with restricted
+        permissions (~/.sepilot/profiles/.secrets/<name>.key).
 
         Args:
             name: Profile name
@@ -193,6 +197,13 @@ class ModelProfileManager:
             profile_path = self.profile_dir / f"{name}.json"
             with open(profile_path, 'w', encoding='utf-8') as f:
                 json.dump(self.current_config.to_dict(exclude_secrets=True), f, indent=2)
+
+            # Save API key to separate secrets file
+            if self.current_config.api_key:
+                self._save_secret(name, self.current_config.api_key)
+            else:
+                self._delete_secret(name)
+
             return True
         except Exception:
             return False
@@ -201,8 +212,8 @@ class ModelProfileManager:
         """Load a profile and replace current configuration.
 
         Replaces non-secret fields with profile values.
-        API key is preserved from environment or current config since
-        profiles don't store secrets.
+        API key is loaded from the secrets file, falling back to
+        current config or environment variables.
 
         Args:
             name: Profile name
@@ -220,15 +231,16 @@ class ModelProfileManager:
 
             previous_config = asdict(self.current_config)
 
-            # Preserve current api_key (not saved in profiles)
+            # Preserve current api_key as fallback
             preserved_api_key = self.current_config.api_key
 
             # Replace config with profile (not merge)
             self.current_config = ModelConfig.from_dict(data)
 
-            # Restore api_key from previous config or environment
+            # Restore api_key: secrets file > previous config > environment
             if not self.current_config.api_key:
-                self.current_config.api_key = preserved_api_key
+                saved_key = self._load_secret(name)
+                self.current_config.api_key = saved_key or preserved_api_key
 
             current_config = asdict(self.current_config)
             for key in previous_config:
@@ -238,6 +250,34 @@ class ModelProfileManager:
             return True
         except Exception:
             return False
+
+    def _secrets_dir(self) -> Path:
+        """Return the secrets directory, creating it with restricted permissions."""
+        secrets_dir = self.profile_dir / ".secrets"
+        if not secrets_dir.exists():
+            secrets_dir.mkdir(parents=True, exist_ok=True)
+            secrets_dir.chmod(0o700)
+        return secrets_dir
+
+    def _save_secret(self, name: str, api_key: str) -> None:
+        """Save API key to a secrets file with restricted permissions."""
+        secret_path = self._secrets_dir() / f"{name}.key"
+        secret_path.write_text(api_key, encoding='utf-8')
+        secret_path.chmod(0o600)
+
+    def _load_secret(self, name: str) -> str | None:
+        """Load API key from a secrets file."""
+        secret_path = self._secrets_dir() / f"{name}.key"
+        if secret_path.exists():
+            key = secret_path.read_text(encoding='utf-8').strip()
+            return key if key else None
+        return None
+
+    def _delete_secret(self, name: str) -> None:
+        """Delete a secrets file if it exists."""
+        secret_path = self._secrets_dir() / f"{name}.key"
+        if secret_path.exists():
+            secret_path.unlink()
 
     def delete_profile(self, name: str) -> bool:
         """Delete a profile
@@ -254,6 +294,7 @@ class ModelProfileManager:
                 return False
 
             profile_path.unlink()
+            self._delete_secret(name)
             return True
         except Exception:
             return False

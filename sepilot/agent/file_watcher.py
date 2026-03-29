@@ -6,9 +6,7 @@ were NOT made by the agent itself (i.e. changes from an external editor).
 
 import logging
 import threading
-import time
 from pathlib import Path
-from typing import Any
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -58,9 +56,7 @@ class _ChangeCollector(FileSystemEventHandler):
             if part in self._ignore_patterns:
                 return True
         ext = Path(path).suffix.lower()
-        if ext and ext not in self._watched_extensions:
-            return True
-        return False
+        return bool(ext and ext not in self._watched_extensions)
 
     # -- watchdog callbacks --------------------------------------------------
 

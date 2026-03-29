@@ -7,7 +7,6 @@ Useful for complex multi-file changes.
 import logging
 import os
 import re
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any

@@ -76,8 +76,8 @@ class SubAgentResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def is_success(self) -> bool:
-        """성공 여부 확인"""
-        return self.status == TaskStatus.SUCCESS
+        """성공 또는 부분 성공 여부 확인"""
+        return self.status in (TaskStatus.SUCCESS, TaskStatus.PARTIAL)
 
     def is_failure(self) -> bool:
         """실패 여부 확인"""
@@ -194,9 +194,13 @@ class ExecutionPlan:
     phases: list[list[SubAgentTask]] = field(default_factory=list)
     strategy: str = "mixed"
 
+    def __post_init__(self):
+        """Detach stored phase lists from caller-owned containers."""
+        self.phases = [list(phase) for phase in self.phases]
+
     def add_phase(self, tasks: list[SubAgentTask]):
         """실행 단계 추가"""
-        self.phases.append(tasks)
+        self.phases.append(list(tasks))
 
     @property
     def total_tasks(self) -> int:
@@ -211,5 +215,5 @@ class ExecutionPlan:
     def get_phase(self, phase_index: int) -> list[SubAgentTask]:
         """특정 단계의 작업 목록 반환"""
         if 0 <= phase_index < len(self.phases):
-            return self.phases[phase_index]
+            return list(self.phases[phase_index])
         return []

@@ -2,11 +2,13 @@
 
 import os
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Settings(BaseModel):
     """Global settings for SE Pilot"""
+
+    model_config = ConfigDict()
 
     # Model configuration
     model: str = Field(default="gpt-4-turbo-preview")
@@ -22,6 +24,14 @@ class Settings(BaseModel):
     timeout: int = Field(default=300)  # seconds
     use_enhanced_state: bool = Field(default=True)  # Use enhanced state management
     enable_streaming: bool = Field(default=True, description="Enable token-by-token streaming output")
+    load_project_instructions: bool = Field(
+        default_factory=lambda: os.getenv("SEPILOT_LOAD_PROJECT_INSTRUCTIONS", "0").lower() in ("1", "true", "yes"),
+        description="Enable automatic loading of project-local instruction/context files"
+    )
+    load_project_rules: bool = Field(
+        default_factory=lambda: os.getenv("SEPILOT_LOAD_PROJECT_RULES", "0").lower() in ("1", "true", "yes"),
+        description="Enable automatic loading of project-local rules"
+    )
 
     # Graph mode: 'enhanced' (full 17-node pipeline) or 'simplify' (minimal Claude Code-style loop)
     graph_mode: str = Field(
@@ -70,6 +80,13 @@ class Settings(BaseModel):
     # Memory monitoring settings
     memory_threshold_mb: int = Field(default=500, description="Memory usage warning threshold (MB)")
     memory_check_interval: int = Field(default=10, description="Check memory every N iterations")
+
+    # tmux agent orchestration settings
+    tmux_default_agent: str = Field(default="claude", description="tmux 오케스트레이션 기본 에이전트")
+    tmux_session_timeout: int = Field(default=600, description="tmux 에이전트 응답 대기 타임아웃 (초)")
+    tmux_pane_width: int = Field(default=200, description="tmux pane 너비")
+    tmux_pane_height: int = Field(default=50, description="tmux pane 높이")
+    tmux_max_parallel: int = Field(default=3, ge=1, le=10, description="tmux 동시 실행 최대 세션 수")
 
     # API Keys (loaded from environment)
     openai_api_key: str | None = Field(
@@ -177,10 +194,6 @@ class Settings(BaseModel):
 
     # Custom HTTP headers for LLM API calls (set via /model header)
     custom_headers: dict[str, str] = Field(default_factory=dict, description="Custom HTTP headers for LLM API calls")
-
-    class Config:
-        env_prefix = "SEPILOT_"
-        case_sensitive = False
 
     def get_llm_config(self) -> dict:
         """Get LLM configuration based on model type.

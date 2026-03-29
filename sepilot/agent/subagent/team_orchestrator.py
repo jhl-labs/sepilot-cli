@@ -1,7 +1,10 @@
-"""TeamOrchestrator - PM 주도 팀 워크플로우 오케스트레이터
+"""TeamOrchestrator - PM 주도 팀 워크플로우 오케스트레이터 (Legacy)
 
 SubAgentOrchestrator를 내부적으로 재사용하면서, PM이 생성한 역할 기반 실행 계획에 따라
 단계별로 팀 에이전트를 조율합니다.
+
+Note: tmux 기반 멀티 에이전트 팀에는 ``sepilot.agent.multi.AgentTeam`` 을 사용하세요.
+TeamOrchestrator는 LLM SubAgent 기반 팀 전용이며, 향후 AgentTeam과 통합될 예정입니다.
 """
 
 import logging
@@ -11,7 +14,7 @@ from typing import Any
 from langchain_core.language_models import BaseChatModel
 
 from .base_subagent import BaseSubAgent
-from .models import SubAgentResult, SubAgentTask, TaskStatus
+from .models import SubAgentResult, SubAgentTask
 from .orchestrator import SubAgentOrchestrator
 from .team_agents import PMAgent
 from .team_models import (
@@ -79,6 +82,12 @@ class TeamOrchestrator:
             use_task_registry=False,
         )
 
+    def _reset_execution_state(self) -> None:
+        """Reset per-run team context so previous executions cannot leak forward."""
+        self._message_bus = {}
+        self._task_results = {}
+        self._inner_orchestrator.reset_execution_state()
+
     def register_agent(self, role: TeamRole, agent: BaseSubAgent) -> None:
         """역할별 에이전트 등록
 
@@ -110,6 +119,7 @@ class TeamOrchestrator:
         """
         start_time = time.time()
         logger.info(f"Starting team task: {main_task}")
+        self._reset_execution_state()
 
         # 1. PM이 실행 계획 생성
         plan = await self._create_plan(main_task, context)
@@ -133,7 +143,7 @@ class TeamOrchestrator:
             )
 
             # a. assignments -> SubAgentTask 변환 (컨텍스트 주입)
-            tasks = self._to_subagent_tasks(assignments, self._task_results)
+            tasks = self._to_subagent_tasks(assignments, self._task_results, base_context=context)
 
             # b. 병렬 실행
             phase_results = await self._execute_phase_tasks(tasks)
@@ -182,18 +192,22 @@ class TeamOrchestrator:
     def _ordered_phases(self, plan: TeamExecutionPlan) -> list[TeamPhase]:
         """계획에 포함된 단계를 PHASE_ORDER 순서로 반환"""
         plan_phases = set(plan.phases)
+        assignment_phases = {assignment.phase for assignment in plan.assignments}
+        plan_phases.update(assignment_phases)
         return [p for p in PHASE_ORDER if p in plan_phases]
 
     def _to_subagent_tasks(
         self,
         assignments: list[TeamTaskAssignment],
         prior_results: dict[str, str],
+        base_context: dict[str, Any] | None = None,
     ) -> list[SubAgentTask]:
         """TeamTaskAssignment를 SubAgentTask로 변환 + 선행 결과 주입
 
         Args:
             assignments: 변환할 할당 목록
             prior_results: 선행 작업 결과 맵 (task_id -> 결과 문자열)
+            base_context: 현재 팀 실행에 공통으로 전달할 컨텍스트
 
         Returns:
             SubAgentTask 목록
@@ -206,7 +220,12 @@ class TeamOrchestrator:
                 if ctx_id in prior_results:
                     team_results[ctx_id] = prior_results[ctx_id]
 
-            context = {"team_results": team_results}
+            context = {
+                key: value
+                for key, value in (base_context or {}).items()
+                if key != "team_results"
+            }
+            context["team_results"] = team_results
 
             if assignment.acceptance_criteria:
                 context["acceptance_criteria"] = assignment.acceptance_criteria
@@ -249,7 +268,7 @@ class TeamOrchestrator:
             if not result:
                 continue
 
-            output_str = str(result.output) if result.output else ""
+            output_str = self._stringify_result_output(result.output)
             if result.is_failure():
                 output_str = f"[FAILED] {result.error or 'Unknown error'}"
 
@@ -268,6 +287,11 @@ class TeamOrchestrator:
             if assignment.task_id not in self._message_bus:
                 self._message_bus[assignment.task_id] = []
             self._message_bus[assignment.task_id].append(message)
+
+    @staticmethod
+    def _stringify_result_output(output: Any) -> str:
+        """Preserve falsy-but-meaningful outputs like 0 or False."""
+        return "" if output is None else str(output)
 
     def _check_quality_gate(
         self,
@@ -288,7 +312,7 @@ class TeamOrchestrator:
                 issues.append(f"[{task_id}] 작업 실패: {result.error}")
                 continue
 
-            output_lower = str(result.output).lower() if result.output else ""
+            output_lower = self._stringify_result_output(result.output).lower()
             found_keywords = [
                 kw for kw in quality_keywords if kw in output_lower
             ]

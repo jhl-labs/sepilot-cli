@@ -27,7 +27,7 @@ class JavaScriptHandler:
     language = Language.JAVASCRIPT
 
     def extract_ast(
-        self, file_path: str, content: str, tree: "tree_sitter.Tree"
+        self, file_path: str, content: str, tree: tree_sitter.Tree
     ) -> UnifiedAST:
         """Extract unified AST from JavaScript parse tree."""
         ast = UnifiedAST(file_path=file_path, language=Language.JAVASCRIPT)
@@ -40,12 +40,12 @@ class JavaScriptHandler:
 
         return ast
 
-    def _get_node_text(self, node: "tree_sitter.Node", content: str) -> str:
+    def _get_node_text(self, node: tree_sitter.Node, content: str) -> str:
         """Get text content of a node."""
         return content[node.start_byte : node.end_byte]
 
     def _extract_imports(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str
     ) -> None:
         """Extract import statements."""
         for node in self._find_nodes(root, ["import_statement"]):
@@ -105,7 +105,7 @@ class JavaScriptHandler:
                             )
 
     def _extract_functions(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract function definitions."""
         # Function declarations
@@ -128,7 +128,7 @@ class JavaScriptHandler:
                             ast.functions.append(func)
 
     def _parse_function(
-        self, node: "tree_sitter.Node", content: str, file_path: str
+        self, node: tree_sitter.Node, content: str, file_path: str
     ) -> FunctionSymbol | None:
         """Parse a function declaration node."""
         name_node = node.child_by_field_name("name")
@@ -172,8 +172,8 @@ class JavaScriptHandler:
 
     def _parse_arrow_function(
         self,
-        name_node: "tree_sitter.Node",
-        func_node: "tree_sitter.Node",
+        name_node: tree_sitter.Node,
+        func_node: tree_sitter.Node,
         content: str,
         file_path: str,
     ) -> FunctionSymbol | None:
@@ -217,7 +217,7 @@ class JavaScriptHandler:
         )
 
     def _parse_parameters(
-        self, params_node: "tree_sitter.Node", content: str
+        self, params_node: tree_sitter.Node, content: str
     ) -> list[Parameter]:
         """Parse function parameters."""
         params = []
@@ -253,7 +253,7 @@ class JavaScriptHandler:
         return params
 
     def _extract_classes(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract class definitions."""
         for node in self._find_nodes(root, ["class_declaration", "class"]):
@@ -302,7 +302,7 @@ class JavaScriptHandler:
             )
 
     def _parse_method(
-        self, node: "tree_sitter.Node", content: str, file_path: str
+        self, node: tree_sitter.Node, content: str, file_path: str
     ) -> FunctionSymbol | None:
         """Parse a class method."""
         name_node = node.child_by_field_name("name")
@@ -344,7 +344,7 @@ class JavaScriptHandler:
         )
 
     def _extract_variables(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str, file_path: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str, file_path: str
     ) -> None:
         """Extract module-level variables."""
         for node in root.children:
@@ -374,7 +374,7 @@ class JavaScriptHandler:
                         )
 
     def _extract_exports(
-        self, ast: UnifiedAST, root: "tree_sitter.Node", content: str
+        self, ast: UnifiedAST, root: tree_sitter.Node, content: str
     ) -> None:
         """Extract exports."""
         for node in self._find_nodes(root, ["export_statement"]):
@@ -388,7 +388,7 @@ class JavaScriptHandler:
                             if name_node:
                                 ast.exports.append(self._get_node_text(name_node, content))
 
-    def _extract_calls(self, node: "tree_sitter.Node", content: str) -> list[str]:
+    def _extract_calls(self, node: tree_sitter.Node, content: str) -> list[str]:
         """Extract function calls."""
         calls = []
         for call_node in self._find_nodes(node, ["call_expression"]):
@@ -402,7 +402,7 @@ class JavaScriptHandler:
                         calls.append(self._get_node_text(prop, content))
         return list(set(calls))
 
-    def _calculate_complexity(self, node: "tree_sitter.Node") -> int:
+    def _calculate_complexity(self, node: tree_sitter.Node) -> int:
         """Calculate cyclomatic complexity."""
         complexity = 1
         branch_nodes = [
@@ -426,8 +426,8 @@ class JavaScriptHandler:
         return complexity
 
     def _find_nodes(
-        self, node: "tree_sitter.Node", types: list[str]
-    ) -> list["tree_sitter.Node"]:
+        self, node: tree_sitter.Node, types: list[str]
+    ) -> list[tree_sitter.Node]:
         """Find all nodes of given types recursively."""
         results = []
         if node.type in types:

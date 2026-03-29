@@ -1,7 +1,6 @@
 """Agent implementation using LangGraph standard pattern with ToolNode"""
 
 import os
-import sys
 import re
 import time
 import uuid
@@ -10,13 +9,21 @@ from pathlib import Path
 from typing import Any, Literal
 
 try:
-    from langchain_openai import ChatOpenAI
+    from langchain_openai import ChatOpenAI  # noqa: F401 – used dynamically via globals/locals
 except ImportError:
-    from langchain_community.chat_models import ChatOpenAI
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+    pass
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, StateGraph
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Command, interrupt
 
 # Try to import SqliteSaver, fall back to MemorySaver if not available
@@ -41,43 +48,24 @@ try:
 except ImportError:
     HAS_PROMPT_TOOLKIT = False
 
-from sepilot.ui import ProgressDisplay, StatusPanel
-from sepilot.agent.enhanced_state import (
-    EnhancedAgentState,
-    create_initial_state,
-    state_to_summary,
-    AgentMode,
-    AgentStrategy,
-    ApprovalRequest,
-    ErrorLevel
-)
-from sepilot.agent import state_helpers, tool_tracker
-from sepilot.agent.state_builder import StateUpdateBuilder
-from sepilot.agent.error_recovery import ErrorRecoveryStrategy
-from sepilot.agent.request_classifier import triage_prompt_for_tools, classify_strategy
-from sepilot.config.settings import Settings
-from sepilot.loggers.file_logger import FileLogger
-from sepilot.prompts import load_prompt_profile
-from sepilot.utils.text import sanitize_text
 from sepilot.a2a.connector import A2AConnector
 from sepilot.a2a.handoff import SessionHandoffManager
 
 # A2A Protocol imports
 from sepilot.a2a.router import A2ARouter
 from sepilot.agent import state_helpers
-from sepilot.agent.tool_call_fallback import try_parse_text_tool_calls
 
 # Static utility functions (extracted for modularity)
 from sepilot.agent.agent_utils import (
     cache_entry_is_stale,
     canonicalize_args,
     check_task_completion,
-    is_detailed_plan_response,
-    is_plan_request,
     extract_paths_from_args,
     extract_required_files,
     extract_token_usage,
     format_tool_args,
+    is_detailed_plan_response,
+    is_plan_request,
     looks_like_plan,
     make_cache_entry,
     merge_updates,
@@ -86,31 +74,24 @@ from sepilot.agent.agent_utils import (
     should_skip_planning,
     truncate_text,
 )
-from sepilot.config.constants import (
-    CONTEXT_COMPACT_THRESHOLD,
-    CONTEXT_WARNING_THRESHOLD,
-    RECURSION_DETECTOR_THRESHOLD,
-    RECURSION_DETECTOR_WINDOW_SIZE,
-)
 from sepilot.agent.approval_handler import ApprovalHandler, normalize_approval_response
 from sepilot.agent.backtracking import BacktrackingManager, create_backtracking_manager
 from sepilot.agent.debate_node import DebateOrchestrator, create_debate_orchestrator
 from sepilot.agent.enhanced_state import (
     AgentMode,
+    AgentStrategy,
     EnhancedAgentState,
     ErrorLevel,
     create_initial_state,
     state_to_summary,
 )
-from sepilot.agent.mode_manager import (
-    ModeTransitionEngine,
-    get_mode_filtered_tools,
-    get_mode_prompt,
-    is_tool_allowed,
-    mode_calibration_cap,
-    EXEC_MAX_ITERATIONS,
-)
 from sepilot.agent.error_recovery import ErrorRecoveryStrategy
+from sepilot.agent.execution_context import (
+    find_execution_boundary,
+    get_current_user_query,
+    make_internal_human_message,
+    make_user_prompt_message,
+)
 from sepilot.agent.file_detector import FilePathDetector, create_file_detector
 from sepilot.agent.hierarchical_planner import HierarchicalPlanner, create_hierarchical_planner
 
@@ -118,9 +99,13 @@ from sepilot.agent.hierarchical_planner import HierarchicalPlanner, create_hiera
 from sepilot.agent.hooks import HookManager, get_hook_manager
 from sepilot.agent.instructions_loader import load_all_instructions
 from sepilot.agent.memory_bank import MemoryBank, create_memory_bank
-from sepilot.agent.rules_loader import get_rules_loader
-from sepilot.agent.subagent.worktree_manager import WorktreeManager
-from sepilot.tools.codebase_tools import CodebaseExplorer
+from sepilot.agent.mode_manager import (
+    EXEC_MAX_ITERATIONS,
+    ModeTransitionEngine,
+    get_mode_filtered_tools,
+    get_mode_prompt,
+    mode_calibration_cap,
+)
 
 # Pattern nodes for LangGraph visualization
 from sepilot.agent.pattern_nodes import (
@@ -142,18 +127,28 @@ from sepilot.agent.pattern_orchestrator import (
 
 # Self-reflection (Reflexion pattern)
 from sepilot.agent.reflection_node import ReflectionDecision, create_reflection_node
+from sepilot.agent.request_classifier import triage_prompt_for_tools
+from sepilot.agent.rules_loader import get_rules_loader
+from sepilot.agent.state_builder import StateUpdateBuilder
+from sepilot.agent.subagent.worktree_manager import WorktreeManager
 
 # File change tracking
-from sepilot.agent.request_classifier import triage_prompt_for_tools
-from sepilot.agent.state_builder import StateUpdateBuilder
 from sepilot.agent.thread_manager import ThreadManager
+from sepilot.agent.tool_call_fallback import try_parse_text_tool_calls
 
 # Tool execution (extracted for modularity)
 from sepilot.agent.tool_executor import create_enhanced_tool_node
 from sepilot.agent.tool_learning import ToolLearningSystem, create_tool_learning_system
+from sepilot.config.constants import (
+    CONTEXT_COMPACT_THRESHOLD,
+    CONTEXT_WARNING_THRESHOLD,
+    RECURSION_DETECTOR_THRESHOLD,
+    RECURSION_DETECTOR_WINDOW_SIZE,
+)
 from sepilot.config.settings import Settings
 from sepilot.loggers.file_logger import FileLogger
 from sepilot.prompts import load_prompt_profile
+from sepilot.tools.codebase_tools import CodebaseExplorer
 from sepilot.ui import ProgressDisplay, StatusPanel
 from sepilot.utils.text import sanitize_text
 
@@ -396,6 +391,7 @@ class ReactAgent:
         # Initialize LangGraph checkpoint system
         self.enable_memory = enable_memory
         self.thread_id = thread_id or f"thread_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        self.config = {"configurable": {"thread_id": self.thread_id}}
         # Suppress legacy "Deserializing unregistered type" warnings from older langgraph
         import warnings
         warnings.filterwarnings("ignore", message=".*Deserializing unregistered type.*")
@@ -787,7 +783,8 @@ class ReactAgent:
                                 self._progress_planning_notes,
                             )
 
-                # Update monitor with node execution (if monitor is available)
+                # --- Real-time node tracking ---
+                # Record completed node + signal next nodes as "executing"
                 # Check if this chunk contains an interrupt
                 if "__interrupt__" in chunk:
                     # Determine whether this is an auto-approved interrupt
@@ -917,6 +914,9 @@ class ReactAgent:
     @staticmethod
     def _check_thinking_model(llm) -> bool:
         """Check if a given LLM is a thinking/reasoning model that can't bind_tools."""
+        # CLI agents cannot bind_tools — treat them like thinking models
+        if getattr(llm, '_llm_type', '') == 'cli_agent':
+            return True
         model_name = str(getattr(llm, 'model_name', None) or getattr(llm, 'model', '') or '').lower()
         return bool(ReactAgent._THINKING_MODEL_RE.search(model_name))
 
@@ -925,7 +925,14 @@ class ReactAgent:
         self.is_thinking_model = self._check_thinking_model(self.llm)
 
         if self.is_thinking_model:
-            if self.console:
+            # CLI agents: pass tool schemas for prompt injection
+            if getattr(self.llm, '_llm_type', '') == 'cli_agent':
+                self.llm.tool_schemas = self.langchain_tools
+                if self.console:
+                    self.console.print(
+                        f"[cyan]🔌 CLI Agent mode: {self.llm.cli_command} (tools via text fallback)[/cyan]"
+                    )
+            elif self.console:
                 self.console.print(
                     "[yellow]⚠️  Thinking/reasoning model detected. Tool calling may be limited.[/yellow]"
                 )
@@ -1014,7 +1021,7 @@ class ReactAgent:
         - OpenAI, Anthropic, Google, Ollama (original)
         - AWS Bedrock, Azure OpenAI, OpenRouter, Groq, GitHub Models (new)
         """
-        from sepilot.config.llm_providers import LLMProviderFactory, LLMProviderError
+        from sepilot.config.llm_providers import LLMProviderError, LLMProviderFactory
 
         factory = LLMProviderFactory(self.settings, self.console)
 
@@ -1434,31 +1441,8 @@ class ReactAgent:
         - simple: File reads, simple edits → skip orchestrator/memory/planner
         - complex: Multi-step tasks → full pipeline
         """
-        messages = state.get("messages", [])
-
         # Get user prompt from CURRENT execution only.
-        # Without boundary isolation, context messages from previous conversations
-        # pollute the triage prompt, causing misclassification (e.g., a tool-use
-        # request being classified as "direct_response" because prior HumanMessages
-        # make the combined text look like a general question).
-        boundary_idx = self._find_execution_boundary(state)
-        current_messages = messages[boundary_idx:] if boundary_idx > 0 else messages
-
-        # Primary: use the last HumanMessage from current execution
-        # (this is the actual user prompt for this execution)
-        human_messages = [
-            m.content for m in reversed(current_messages)
-            if isinstance(m, HumanMessage) and m.content
-        ][:1]
-
-        if not human_messages:
-            # Fallback: search all messages for the latest HumanMessage
-            human_messages = [
-                m.content for m in reversed(messages)
-                if isinstance(m, HumanMessage) and m.content
-            ][:1]
-
-        user_prompt = human_messages[0][:2000] if human_messages else ""
+        user_prompt = get_current_user_query(state)[:2000]
 
         # Unified LLM-based triage: intent + complexity in a single call
         try:
@@ -1506,8 +1490,9 @@ class ReactAgent:
             default_patterns = ["memory_bank"]
 
         pending_mode_update = None
-        if self._pending_mode_update:
-            pending_mode_update = dict(self._pending_mode_update)
+        current_pending_mode_update = getattr(self, "_pending_mode_update", None)
+        if current_pending_mode_update:
+            pending_mode_update = dict(current_pending_mode_update)
             self._pending_mode_update = None
 
         builder = (StateUpdateBuilder()
@@ -1597,7 +1582,7 @@ class ReactAgent:
                             file_path = os.path.join(os.getcwd(), file_path)
 
                         if os.path.isfile(file_path):
-                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            with open(file_path, encoding='utf-8', errors='ignore') as f:
                                 content = f.read()
                                 # Limit content size
                                 if len(content) > 10000:
@@ -1660,9 +1645,7 @@ class ReactAgent:
         normalized = path.replace("\\", "/").lstrip("./")
         parts = normalized.split("/")
         internal_dirs = {"logs", ".sepilot", "__pycache__", ".pytest_cache", "temp"}
-        if any(part in internal_dirs for part in parts):
-            return False
-        return True
+        return not any(part in internal_dirs for part in parts)
 
     @staticmethod
     def _collect_substantive_changes(
@@ -1672,10 +1655,7 @@ class ReactAgent:
         """Filter file change lists to substantive project files."""
         changed_from_records: list[str] = []
         for fc in file_changes:
-            if isinstance(fc, str):
-                path = fc
-            else:
-                path = getattr(fc, "file_path", None)
+            path = fc if isinstance(fc, str) else getattr(fc, "file_path", None)
             if path and ReactAgent._is_substantive_change_path(path):
                 changed_from_records.append(path)
         changed_from_snapshot = [
@@ -1700,13 +1680,20 @@ class ReactAgent:
 
     @staticmethod
     def _is_analysis_only_request(user_query: str) -> bool:
-        """Return True when request is primarily analysis/explanation without implementation intent."""
+        """Return True when request is primarily analysis/explanation/diagnosis without implementation intent.
+
+        This keeps AUTO mode instead of transitioning to PLAN, which would
+        block bash_execute needed for diagnostic commands (kubectl, docker, etc.).
+        """
         if not user_query:
             return False
         lowered = user_query.lower()
         analysis_indicators = (
             "analyze", "analyse", "describe", "explain", "summarize", "summary",
-            "review", "understand", "read", "분석", "설명", "요약", "검토",
+            "review", "understand", "read",
+            "diagnose", "investigate", "troubleshoot", "status", "health",
+            "분석", "설명", "요약", "검토",
+            "진단", "파악", "조사", "상태", "점검", "장애",
         )
         # Reuse strict coding detector to avoid over-blocking legitimate coding tasks.
         return any(indicator in lowered for indicator in analysis_indicators) and not ReactAgent._is_explicit_coding_request(user_query)
@@ -1738,12 +1725,11 @@ class ReactAgent:
         if not messages:
             return {}
 
-        # Extract @ file references from user messages
+        # Extract @ file references from the current user message only.
         file_contents = []
-        for msg in messages:
-            if isinstance(msg, HumanMessage) and msg.content:
-                refs = self._extract_at_file_references(msg.content)
-                file_contents.extend(refs)
+        current_user_query = get_current_user_query(state)
+        if current_user_query:
+            file_contents.extend(self._extract_at_file_references(current_user_query))
 
         # Build file context if any files were referenced
         file_context = ""
@@ -1783,10 +1769,12 @@ class ReactAgent:
         messages_with_context = [direct_response_specialist_msg] + messages
 
         try:
+            _llm_t0 = time.monotonic()
             response = self.quick_llm.invoke(messages_with_context)
+            _llm_elapsed = time.monotonic() - _llm_t0
 
             # Extract and track token usage (works for both regular and thinking models)
-            tokens_used = self._track_token_usage(response, source="direct_response")
+            tokens_used, output_tokens = self._track_token_usage(response, source="direct_response")
 
             self._verbose_llm_trace(
                 "Direct Response",
@@ -1830,6 +1818,10 @@ class ReactAgent:
                 current_tokens = state.get("total_tokens_used", 0)
                 current_cost = state.get("estimated_cost", 0.0)
                 builder.track_tokens(current_tokens + tokens_used, current_cost + cost)
+
+            # Update status indicator with accurate output generation speed
+            if self.status_indicator:
+                self.status_indicator.update_token_rate(output_tokens, _llm_elapsed)
 
             return builder.build()
         except Exception as exc:
@@ -1886,12 +1878,7 @@ class ReactAgent:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 updates["force_termination"] = True
-                prompt_excerpt = ""
-                for msg in state.get("messages", []):
-                    if isinstance(msg, HumanMessage):
-                        prompt_excerpt = str(getattr(msg, "content", "")).strip()
-                        break
-                prompt_excerpt = prompt_excerpt[:160] if prompt_excerpt else "the current task"
+                prompt_excerpt = get_current_user_query(state).strip()[:160] or "the current task"
                 timeout_msg = AIMessage(
                     content=(
                         "Execution time limit reached before full completion. "
@@ -2065,11 +2052,7 @@ class ReactAgent:
             if current_mode == AgentMode.AUTO:
                 planning_notes = effective_state.get("planning_notes", [])
                 is_read_only_request = any("[READ-ONLY]" in n for n in planning_notes)
-                user_query = ""
-                for msg in effective_state.get("messages", []):
-                    if isinstance(msg, HumanMessage):
-                        user_query = getattr(msg, "content", "")
-                        break
+                user_query = get_current_user_query(effective_state)
                 if (
                     is_read_only_request
                     or is_plan_request(user_query)
@@ -2253,30 +2236,10 @@ class ReactAgent:
     def _compute_message_diff(
         self, old_messages: list[BaseMessage], new_messages: list[BaseMessage]
     ) -> list[BaseMessage]:
-        """Compute RemoveMessage + new message list for add_messages reducer compatibility.
-
-        Instead of replacing the entire messages list (which doesn't work with
-        add_messages reducer), we emit RemoveMessage for deleted messages and
-        include any new messages (e.g., summary messages) that were added.
-        """
-        old_ids = {getattr(m, 'id', id(m)) for m in old_messages}
-        new_ids = {getattr(m, 'id', id(m)) for m in new_messages}
-
-        result: list[BaseMessage] = []
-
-        # RemoveMessage for messages that were in old but not in new
-        for msg in old_messages:
-            msg_id = getattr(msg, 'id', None)
-            if msg_id and msg_id not in new_ids:
-                result.append(RemoveMessage(id=msg_id))
-
-        # Add new messages that were not in old (e.g., summary messages)
-        for msg in new_messages:
-            msg_id = getattr(msg, 'id', id(msg))
-            if msg_id not in old_ids:
-                result.append(msg)
-
-        return result
+        """Replace the persisted message list exactly for add_messages compatibility."""
+        if old_messages == new_messages:
+            return []
+        return [RemoveMessage(id=REMOVE_ALL_MESSAGES, content=""), *new_messages]
 
     def _agent_next_step(self, state: EnhancedAgentState) -> Literal["tools", "finalize"]:
         """Route agent output toward tools or verification."""
@@ -2424,14 +2387,14 @@ class ReactAgent:
                         "[bold red]⚠️ 3회 연속 거부되어 작업을 중단합니다.[/bold red]"
                     )
                 updates["force_termination"] = True
-                termination_message = HumanMessage(
+                termination_message = self._make_internal_human_message(
                     content="🛑 작업이 3회 연속 거부되어 중단합니다. "
                             "다른 접근 방식이 필요하거나 요청을 수정해 주세요."
                 )
                 return self._merge_updates(updates, {"messages": [termination_message]})
             reason = decision.get("reason") or "User denied the action."
             # Use HumanMessage so LLM treats this as user instruction, not its own statement
-            denial_message = HumanMessage(
+            denial_message = self._make_internal_human_message(
                 content=f"🛑 STOP: 사용자가 도구 실행을 거부했습니다.\n\n"
                         f"거부된 도구: {tool_list}\n"
                         f"사용자 지시: {reason}\n\n"
@@ -2452,7 +2415,7 @@ class ReactAgent:
             feedback = decision.get("message") or "사용자가 추가 지시를 제공했습니다."
             return self._merge_updates(
                 updates,
-                {"messages": [HumanMessage(content=feedback)]}
+                {"messages": [self._make_internal_human_message(feedback)]}
             )
 
         # Approved - reset denial counter
@@ -2509,12 +2472,7 @@ class ReactAgent:
             has_any_edits = file_edit_called and actual_changes
 
         # Detect if this is a modification task
-        messages = state.get("messages", [])
-        user_query = ""
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                user_query = getattr(msg, "content", "").lower()
-                break
+        user_query = get_current_user_query(state).lower()
 
         # SWE-bench profile: ALWAYS a modification task (bug fix)
         if prompt_profile.startswith("swe_bench"):
@@ -2588,20 +2546,13 @@ class ReactAgent:
         boundary_idx = self._find_execution_boundary(state)
         current_messages = messages[boundary_idx:] if boundary_idx < len(messages) else []
 
-        # Resolve current-turn user query (prefer boundary prompt if available)
-        user_query = ""
-        if boundary_idx > 0 and isinstance(messages[boundary_idx - 1], HumanMessage):
-            user_query = getattr(messages[boundary_idx - 1], "content", "")
-        if not user_query:
-            for msg in reversed(current_messages):
-                if isinstance(msg, HumanMessage):
-                    user_query = getattr(msg, "content", "")
-                    break
-        if not user_query:
-            for msg in reversed(messages):
-                if isinstance(msg, HumanMessage):
-                    user_query = getattr(msg, "content", "")
-                    break
+        # Resolve current-turn user query via the shared execution boundary helper.
+        user_query = get_current_user_query(state)
+        make_internal_human_message = getattr(
+            self,
+            "_make_internal_human_message",
+            ReactAgent._make_internal_human_message,
+        )
 
         current_turn_tool_messages = [
             msg for msg in current_messages if isinstance(msg, ToolMessage)
@@ -2667,7 +2618,7 @@ class ReactAgent:
                     updates["current_mode"] = desired_mode
                     updates["mode_iteration_count"] = 0
 
-            reminder = HumanMessage(
+            reminder = make_internal_human_message(
                 content=(
                     "요청은 실행 작업입니다. 설명만 하지 말고 즉시 도구를 호출하세요. "
                     "스크립트 실행의 경우 bash_execute(command=\"...\")를 사용하세요."
@@ -2723,7 +2674,7 @@ class ReactAgent:
                     "Do not repeat the plan — take action."
                 )
             )
-            execute_msg = HumanMessage(
+            execute_msg = make_internal_human_message(
                 content=f"{step_instruction} Call the appropriate tool now."
             )
             return {
@@ -2772,7 +2723,7 @@ class ReactAgent:
                     updates["required_files"] = []
                 else:
                     # Early iterations: request file modification
-                    reminder = HumanMessage(
+                    reminder = make_internal_human_message(
                         content=(
                             "아직 다음 파일이 요구사항을 충족하도록 수정되지 않았습니다: "
                             f"{', '.join(missing)}. 지금 해당 파일들을 업데이트하세요."
@@ -2796,7 +2747,7 @@ class ReactAgent:
 
             if tests_needed and not state.get("tests_requested"):
                 test_cmd = getattr(self.settings, "test_command", "pytest")
-                requests.append(HumanMessage(
+                requests.append(make_internal_human_message(
                     content=f"코드가 수정되었습니다. bash_execute(command=\"{test_cmd}\")로 테스트를 실행하세요."
                 ))
                 notes.append(f"테스트 실행 요청: {test_cmd}")
@@ -2804,7 +2755,7 @@ class ReactAgent:
 
             if lint_needed and not state.get("lint_requested"):
                 lint_cmd = getattr(self.settings, "lint_command", "ruff check .")
-                requests.append(HumanMessage(
+                requests.append(make_internal_human_message(
                     content=f"린트를 수행하세요. bash_execute(command=\"{lint_cmd}\")로 실행하십시오."
                 ))
                 notes.append(f"린트 실행 요청: {lint_cmd}")
@@ -2845,11 +2796,7 @@ class ReactAgent:
                 }
 
             # Get the latest user query (most relevant for completion check)
-            user_query = ""
-            for msg in reversed(messages):
-                if isinstance(msg, HumanMessage):
-                    user_query = getattr(msg, "content", "")
-                    break
+            user_query = get_current_user_query(state)
 
             # Get tool result and name
             tool_result = content if content else ""
@@ -2957,6 +2904,7 @@ class ReactAgent:
                         and confidence >= 0.5):
                     try:
                         import subprocess
+
                         from sepilot.agent.agent_utils import verify_patch_quality
                         # Get git diff with extended context for better review
                         diff_result = subprocess.run(
@@ -2989,10 +2937,10 @@ class ReactAgent:
                                         f"[bold yellow]🔍 Patch review: NEEDS_FIX — {issue_text}[/bold yellow]"
                                     )
                                 return {
-                                    "messages": [HumanMessage(content=(
+                                    "messages": [make_internal_human_message(
                                         f"Patch review identified issues: {issue_text}\n"
                                         "Please review and fix your changes before completing."
-                                    ))],
+                                    )],
                                     "verification_notes": [f"🔍 Patch review failed: {issue_text}"],
                                     "needs_additional_iteration": True,
                                     "_patch_review_done": True,
@@ -3028,7 +2976,7 @@ class ReactAgent:
                         }
 
                 # Lower confidence: give agent one more iteration to summarize
-                summary_request = HumanMessage(
+                summary_request = make_internal_human_message(
                     content=(
                         "Tool execution completed successfully. "
                         "Now provide a clear, concise response to the user summarizing the result. "
@@ -3078,7 +3026,8 @@ class ReactAgent:
             max_iter = state.get("max_iterations", self.settings.max_iterations)
             if iteration_count >= max_iter // 2:
                 # Half of iterations consumed with zero code changes — provide progress context
-                advisory_msg = HumanMessage(content=(
+                advisory_msg = make_internal_human_message(
+                    content=(
                     f"Progress note: {iteration_count}/{max_iter} iterations used. "
                     "No code changes have been made yet. "
                     "Consider applying file modifications based on your analysis so far."
@@ -3103,7 +3052,7 @@ class ReactAgent:
                         current_strategy = AgentStrategy(current_strategy.lower())
                 coding_strategies = {AgentStrategy.IMPLEMENT, AgentStrategy.DEBUG, AgentStrategy.REFACTOR, AgentStrategy.TEST}
                 if current_strategy in coding_strategies and iteration_count < 15:
-                    reminder = HumanMessage(
+                    reminder = make_internal_human_message(
                         content=(
                             "Your previous response was empty. Continue the coding task: "
                             "complete the required file updates and provide a clear final summary. "
@@ -3159,11 +3108,7 @@ class ReactAgent:
                     and current_strategy in coding_strategies
                     and not has_file_changes and not is_read_only and iteration_count < 15):
                 # Require concrete edits only when the request clearly asks for coding work.
-                original_prompt = ""
-                for msg in messages:
-                    if isinstance(msg, HumanMessage):
-                        original_prompt = getattr(msg, "content", "")
-                        break
+                original_prompt = get_current_user_query(state)
 
                 _vn_profile = getattr(self, "prompt_profile", "")
                 analysis_only = self._is_analysis_only_request(original_prompt)
@@ -3174,7 +3119,7 @@ class ReactAgent:
                 )
 
                 if coding_required:
-                    reminder = HumanMessage(
+                    reminder = make_internal_human_message(
                         content=(
                             "This is a coding/fix task and no substantive project files were modified yet. "
                             "Apply concrete code edits now (for example with file_edit/file_write), "
@@ -3367,9 +3312,22 @@ class ReactAgent:
                     latest_tool_output = content
                     break
 
+        # Detect stale mode-restricted responses: the LLM said "can't execute in X mode"
+        # but tools actually ran successfully after an automatic mode switch.
+        _stale_mode_response = False
+        if last_agent_response and latest_tool_output:
+            resp_lower = last_agent_response.lower()
+            if ("모드" in resp_lower or "mode" in resp_lower) and (
+                "실행할 수 없" in resp_lower
+                or "전환" in resp_lower
+                or "not available" in resp_lower
+                or "cannot execute" in resp_lower
+            ):
+                _stale_mode_response = True
+
         # In non-verbose mode, prioritize agent response over metadata
         if not self.verbose:
-            if last_agent_response:
+            if last_agent_response and not _stale_mode_response:
                 # Agent provided meaningful response (analysis, review, explanation, etc.)
                 # This is what the user wants to see - return it directly
                 # Note: Don't send to chat here - it was already sent in _agent_node
@@ -3456,7 +3414,7 @@ class ReactAgent:
         )
 
         # Combine agent response (if any) with metadata
-        if last_agent_response:
+        if last_agent_response and not _stale_mode_response:
             # Agent provided meaningful response - show it first, then metadata
             report = last_agent_response + "\n\n" + "─" * 50 + "\n\n" + metadata_summary
             # Note: Don't send to chat here - it was already sent in _agent_node
@@ -3479,18 +3437,17 @@ class ReactAgent:
         Returns the index of the first message AFTER the boundary (i.e., the
         start of current execution messages).
         """
-        all_messages = state.get("messages", [])
-        boundary_id = state.get("_execution_boundary_msg_id")
+        return find_execution_boundary(state)
 
-        if boundary_id:
-            for i, msg in enumerate(all_messages):
-                if getattr(msg, "id", None) == boundary_id:
-                    return i + 1  # messages after the prompt
-            # Boundary message not found (shouldn't happen); fall through
+    @staticmethod
+    def _make_user_prompt_message(content: str, *, message_id: str | None = None) -> HumanMessage:
+        """Create the persisted user-turn boundary message for an execution."""
+        return make_user_prompt_message(content, message_id=message_id)
 
-        # Legacy fallback: integer index
-        initial_count = state.get("_initial_message_count", 0)
-        return initial_count if initial_count > 0 else 0
+    @staticmethod
+    def _make_internal_human_message(content: str) -> HumanMessage:
+        """Create an internal control prompt that should not count as a user turn."""
+        return make_internal_human_message(content)
 
     # Delegate to agent_utils for analysis utilities
     _looks_like_plan = staticmethod(looks_like_plan)
@@ -3517,7 +3474,7 @@ class ReactAgent:
             total_chars = sum(len(getattr(m, 'content', '') or '') for m in messages)
             return (total_chars // 4) + (len(messages) * 4)
 
-    def _track_token_usage(self, response: Any, source: str = "agent") -> int:
+    def _track_token_usage(self, response: Any, source: str = "agent") -> tuple[int, int]:
         """Extract and track token usage from LLM response.
 
         Args:
@@ -3525,7 +3482,7 @@ class ReactAgent:
             source: Source identifier for logging (agent, planner, verifier, etc.)
 
         Returns:
-            Total tokens used
+            Tuple of (total_tokens, output_tokens)
         """
         input_tokens = 0
         output_tokens = 0
@@ -3564,7 +3521,7 @@ class ReactAgent:
             except Exception:
                 pass  # Don't let cost tracker errors break execution
 
-        return total_tokens
+        return total_tokens, output_tokens
 
     def _send_chat_response(self, content: str):
         """Send AI response to chat (web monitor)
@@ -3810,8 +3767,8 @@ class ReactAgent:
         # Scratchpad summary injection
         scratchpad_entries = state.get("scratchpad_entries", [])
         if scratchpad_entries:
-            from sepilot.tools.langchain_tools.think_tools import get_scratchpad_summary
             from sepilot.config.constants import SCRATCHPAD_MAX_SYSTEM_PROMPT_CHARS
+            from sepilot.tools.langchain_tools.think_tools import get_scratchpad_summary
             scratchpad_text = get_scratchpad_summary(scratchpad_entries, SCRATCHPAD_MAX_SYSTEM_PROMPT_CHARS)
             if scratchpad_text:
                 sections.extend([
@@ -3822,11 +3779,7 @@ class ReactAgent:
 
         planning_notes = state.get("planning_notes", [])
         is_read_only_request = any("[READ-ONLY]" in n for n in planning_notes)
-        user_query = ""
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                user_query = getattr(msg, "content", "")
-                break
+        user_query = get_current_user_query(state)
         is_plan_request_query = is_plan_request(user_query)
         require_tool_each_turn = not (is_read_only_request or is_plan_request_query)
 
@@ -3860,8 +3813,8 @@ class ReactAgent:
             else str(current_strategy or "")
         )
         from sepilot.skills.builtin.karpathy_guidelines import (
-            KARPATHY_CODE_TASK_TYPES,
             KARPATHY_CODE_STRATEGIES,
+            KARPATHY_CODE_TASK_TYPES,
             KARPATHY_GUIDELINES_PROMPT,
         )
         if (
@@ -3945,6 +3898,8 @@ class ReactAgent:
             # Optimized retry loop: only keep the final response to avoid context explosion
             final_response: BaseMessage | None = None
             accumulated_tokens = 0
+            accumulated_output_tokens = 0
+            accumulated_llm_elapsed = 0.0
             retries = 0
             max_plan_retries = 2
 
@@ -3954,8 +3909,13 @@ class ReactAgent:
             llm_to_use = self._get_mode_filtered_llm(current_mode)
 
             while True:
+                _llm_t0 = time.monotonic()
                 response = llm_to_use.invoke(messages_with_context)
-                accumulated_tokens += self._track_token_usage(response, source="agent")
+                _llm_elapsed = time.monotonic() - _llm_t0
+                _total, _out = self._track_token_usage(response, source="agent")
+                accumulated_tokens += _total
+                accumulated_output_tokens += _out
+                accumulated_llm_elapsed += _llm_elapsed
 
                 no_tool_response = (
                     isinstance(response, AIMessage)
@@ -3971,6 +3931,14 @@ class ReactAgent:
                         response.content, valid_names
                     )
                     if fallback_calls:
+                        # CLI agents may output many tool calls at once — cap to prevent runaway
+                        MAX_FALLBACK_TOOL_CALLS = 5
+                        if len(fallback_calls) > MAX_FALLBACK_TOOL_CALLS:
+                            self.logger.log_trace(
+                                "fallback_tool_calls_capped",
+                                {"from": len(fallback_calls), "to": MAX_FALLBACK_TOOL_CALLS},
+                            )
+                            fallback_calls = fallback_calls[:MAX_FALLBACK_TOOL_CALLS]
                         response = response.copy()
                         response.tool_calls = fallback_calls
                         no_tool_response = False
@@ -3985,11 +3953,7 @@ class ReactAgent:
                 # SWE-bench: retry ALL text-only responses (tools are mandatory).
                 # Other profiles: retry only plan-like text (LLM may need to think).
                 _is_swe = getattr(self, "prompt_profile", "").startswith("swe_bench")
-                user_query = ""
-                for msg in messages:
-                    if isinstance(msg, HumanMessage):
-                        user_query = getattr(msg, "content", "")
-                        break
+                user_query = get_current_user_query(state)
 
                 requires_plan_detail = is_plan_request(user_query)
                 requires_testing_detail = requires_plan_detail and any(
@@ -4062,9 +4026,16 @@ class ReactAgent:
                 new_cost = self._calculate_cost(new_total_tokens)
                 token_delta = {
                     "total_tokens_used": new_total_tokens,
-                    "estimated_cost": new_cost
+                    "estimated_cost": new_cost,
                 }
                 updates = self._merge_updates(updates, token_delta)
+
+                # Update status indicator with accurate output generation speed
+                # (bypasses state to avoid polluting LangGraph TypedDict schema)
+                if self.status_indicator:
+                    self.status_indicator.update_token_rate(
+                        accumulated_output_tokens, accumulated_llm_elapsed
+                    )
 
                 # Display token usage in real-time
                 if self.console:
@@ -4200,6 +4171,9 @@ class ReactAgent:
         # Start trace session if monitor is available
         # Reset iteration counter for new execution
         self.iteration_count = 0
+        if hasattr(self, "recursion_detector") and self.recursion_detector:
+            with contextlib.suppress(Exception):
+                self.recursion_detector.reset()
 
         # Start cost tracking session
         if hasattr(self, 'cost_tracker') and self.cost_tracker:
@@ -4232,31 +4206,51 @@ class ReactAgent:
 
         # Create initial message stack
         import uuid as _uuid
+        if getattr(self, "status_indicator", None):
+            self.status_indicator.update("[준비] 시스템 프롬프트를 구성하고 있어요...")
         base_system_prompt = self.prompt_template.get_system_prompt()
+        load_project_instructions = bool(getattr(self.settings, "load_project_instructions", False))
+        load_project_rules = bool(getattr(self.settings, "load_project_rules", False))
 
         # Inject user/project instructions (SEPILOT.md, CLAUDE.md, AGENT.md)
         try:
-            user_instructions = load_all_instructions()
+            if getattr(self, "status_indicator", None):
+                self.status_indicator.update("[준비] 사용자 지침과 규칙을 불러오고 있어요...")
+            user_instructions = load_all_instructions(
+                working_dir=Path(os.getcwd()),
+                include_project_sources=load_project_instructions,
+                include_project_rules=False,
+                include_user_rules=False,
+            )
             if user_instructions:
                 base_system_prompt += f"\n\n# User/Project Instructions\n\n{user_instructions}"
-        except Exception as e:
-            logger.debug(f"Failed to load instructions: {e}")
+        except Exception:
+            pass  # Non-critical: instructions loading is best-effort
 
         # Inject active rules based on files mentioned in prompt
         try:
-            if self.rules_loader:
-                rules_text = self.rules_loader.get_rules_text()
+            if getattr(self, "rules_loader", None):
+                rules_text = self.rules_loader.get_rules_text(
+                    include_project_rules=load_project_rules,
+                    include_user_rules=True,
+                )
                 if rules_text:
                     base_system_prompt += f"\n\n# Active Rules\n\n{rules_text}"
-        except Exception as e:
-            logger.debug(f"Failed to load rules: {e}")
+        except Exception:
+            pass  # Non-critical: rules loading is best-effort
 
         system_msg = SystemMessage(content=base_system_prompt)
-        human_msg = HumanMessage(content=prompt, id=f"exec_{_uuid.uuid4().hex[:12]}")
+        human_msg = self._make_user_prompt_message(
+            prompt,
+            message_id=f"exec_{_uuid.uuid4().hex[:12]}",
+        )
         message_stack: list[BaseMessage] = [system_msg]
         if context_messages:
             message_stack.extend(context_messages)
         message_stack.append(human_msg)
+
+        if getattr(self, "status_indicator", None):
+            self.status_indicator.update("[준비] 실행 상태를 초기화하고 있어요...")
 
         import uuid
         initial_state = create_initial_state(
@@ -4264,7 +4258,7 @@ class ReactAgent:
             working_directory=os.getcwd(),
             max_iterations=self.settings.max_iterations
         )
-        if self._session_mode_override:
+        if getattr(self, "_session_mode_override", None):
             initial_state.update(self._session_mode_override)
         exec_timeout_raw = os.getenv("SEPILOT_EXECUTION_TIMEOUT_SECONDS", "900")
         try:
@@ -4301,6 +4295,9 @@ class ReactAgent:
                 },
                 "recursion_limit": self.settings.max_iterations * recursion_multiplier
             }
+
+            if getattr(self, "status_indicator", None):
+                self.status_indicator.update("[시작] 그래프를 실행하고 LLM 응답을 기다리고 있어요...")
 
             final_state = self._invoke_with_interrupts(initial_state, config)
 
@@ -4489,6 +4486,16 @@ class ReactAgent:
         """Get the current thread ID."""
         return self.thread_id
 
+    @property
+    def thread_config(self) -> dict[str, Any] | None:
+        """Return the active LangGraph thread config for UI/status helpers."""
+        config = getattr(self, "config", None)
+        if config:
+            return config
+        if getattr(self, "thread_id", None):
+            return {"configurable": {"thread_id": self.thread_id}}
+        return None
+
     def get_session_summary(self) -> str:
         """Get session summary - delegates to ThreadManager."""
         self._thread_manager.thread_id = self.thread_id
@@ -4519,6 +4526,140 @@ class ReactAgent:
         self.thread_id = new_thread_id
         self.config = {"configurable": {"thread_id": new_thread_id}}
         return new_thread_id
+
+    def _reset_local_session_state(self) -> None:
+        """Reset in-memory helpers that should not leak across threads or rewinds."""
+        self.auto_approve_session = False
+        if hasattr(self, "_approval_handler") and self._approval_handler:
+            self._approval_handler.auto_approve_session = False
+
+        self._pending_mode_update = None
+        self._session_mode_override = None
+
+        self._progress_plan_steps = []
+        self._progress_current_step = 0
+        self._progress_planning_notes = []
+        self._progress_current_task = None
+
+        if hasattr(self, "recursion_detector") and self.recursion_detector:
+            with contextlib.suppress(Exception):
+                self.recursion_detector.reset()
+
+        if hasattr(self, "tool_cache") and self.tool_cache:
+            with contextlib.suppress(Exception):
+                self.tool_cache.invalidate()
+                self.tool_cache.reset_stats()
+
+        if self.step_logger:
+            self.step_logger._last_plan_signature = None
+            self.step_logger._last_plan_progress_signature = None
+            self.step_logger._checklist_lines_rendered = 0
+
+    def _build_context_reset_updates(self) -> dict[str, Any]:
+        """Build graph-state updates that clear derived execution context."""
+        import uuid
+
+        defaults = create_initial_state(
+            session_id=f"session_{uuid.uuid4().hex[:8]}",
+            working_directory=os.getcwd(),
+            max_iterations=self.settings.max_iterations,
+        )
+        reset_keys = {
+            "current_task",
+            "task_history",
+            "open_files",
+            "file_changes",
+            "staged_changes",
+            "active_processes",
+            "environment_vars",
+            "error_history",
+            "recent_errors",
+            "warning_count",
+            "tool_call_history",
+            "tool_results_cache",
+            "tools_used_count",
+            "pending_user_input",
+            "user_feedback",
+            "pending_approvals",
+            "iteration_count",
+            "total_tokens_used",
+            "estimated_cost",
+            "plan_created",
+            "plan_steps",
+            "current_plan_step",
+            "planning_notes",
+            "verification_notes",
+            "needs_additional_iteration",
+            "required_files",
+            "plan_execution_pending",
+            "missing_tasks",
+            "last_approval_status",
+            "force_termination",
+            "consecutive_llm_errors",
+            "scratchpad_entries",
+            "conversation_summary",
+            "important_context",
+            "triage_decision",
+            "triage_reason",
+            "current_strategy",
+            "confidence_level",
+            "needs_clarification",
+            "query_complexity",
+            "expected_tool_count",
+            "_task_complete_pending_response",
+            "_patch_review_done",
+            "exploration_performed",
+            "exploration_skipped",
+            "exploration_context",
+            "exploration_results",
+            "exploration_hints",
+            "explicit_files",
+            "project_type",
+            "reflection_count",
+            "reflection_decision",
+            "reflection_notes",
+            "failure_patterns",
+            "strategy_adjustment_history",
+            "last_reflection_insight",
+            "task_complexity",
+            "repetition_detected",
+            "repetition_info",
+            "stagnation_detected",
+            "consecutive_denials",
+            "task_type_detected",
+            "tests_requested",
+            "lint_requested",
+            "debate_decision",
+            "_last_compaction_iter",
+            "backtrack_decision",
+            "backtrack_performed",
+            "backtrack_reason",
+            "files_restored",
+            "active_patterns",
+            "modified_files",
+            "file_changes_count",
+        }
+        updates = {key: defaults[key] for key in reset_keys if key in defaults}
+        updates.update(
+            {
+                "hierarchical_plan": {},
+                "orchestration_plan": {},
+                "retrieved_memories": [],
+                "memory_context": "",
+            }
+        )
+        return updates
+
+    def reset_session_state(self, *, clear_checkpoint_state: bool = False) -> None:
+        """Reset ephemeral state that should not survive thread boundaries."""
+        if clear_checkpoint_state:
+            try:
+                config = {"configurable": {"thread_id": self.thread_id}}
+                self.graph.update_state(config, self._build_context_reset_updates())
+            except Exception:
+                pass
+
+        self._reset_local_session_state()
 
     def reset_plan_state(self) -> None:
         """Reset plan-related state fields in LangGraph checkpoint.
@@ -4564,6 +4705,97 @@ class ReactAgent:
         """Get all messages from current thread - delegates to ThreadManager."""
         self._thread_manager.thread_id = self.thread_id
         return self._thread_manager.get_conversation_messages()
+
+    def append_conversation_message(self, message: BaseMessage) -> bool:
+        """Append an out-of-band message to the current thread."""
+        return self.append_conversation_messages([message])
+
+    def append_conversation_messages(self, messages: list[BaseMessage]) -> bool:
+        """Append out-of-band messages to the current thread in order."""
+        if not self.enable_memory or not self.thread_config:
+            return False
+
+        try:
+            self.graph.update_state(self.thread_config, {"messages": list(messages)})
+            return True
+        except Exception:
+            return False
+
+    def replace_conversation_messages(self, messages: list[BaseMessage]) -> bool:
+        """Replace persisted thread messages exactly."""
+        if not self.enable_memory or not self.thread_config:
+            return False
+
+        try:
+            remove_all = RemoveMessage(id=REMOVE_ALL_MESSAGES, content="")
+            self.graph.update_state(self.thread_config, {"messages": [remove_all, *messages]})
+            return True
+        except Exception:
+            return False
+
+    def clear_conversation_messages(self) -> bool:
+        """Clear all persisted thread messages for the active conversation."""
+        return self.replace_conversation_messages([])
+
+    def compact_conversation_context(
+        self,
+        keep_recent: int = 10,
+        focus_instruction: str | None = None,
+        target_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Compact the persisted conversation thread instead of only local UI state."""
+        if not self.enable_memory or not self.thread_config:
+            return {"success": False, "error": "Memory is disabled"}
+
+        state = self.graph.get_state(self.thread_config)
+        messages = list(state.values.get("messages", [])) if state and state.values else []
+        if not messages:
+            return {"success": False, "error": "No conversation context to compact"}
+
+        from sepilot.agent.context_manager import ContextManager
+
+        max_tokens = getattr(self.settings, "context_window", None) or int(os.getenv("MAX_TOKENS", "96000"))
+        context_manager = ContextManager(max_context_tokens=max_tokens)
+
+        try:
+            if self.llm:
+                if target_tokens is not None:
+                    compacted = context_manager.summarize_to_token_limit(
+                        messages,
+                        self.llm,
+                        target_tokens=target_tokens,
+                        focus_instruction=focus_instruction,
+                    )
+                else:
+                    compacted = context_manager.summarize_messages(
+                        messages,
+                        self.llm,
+                        keep_recent=keep_recent,
+                        focus_instruction=focus_instruction,
+                    )
+                method = "summarized"
+            else:
+                raise RuntimeError("LLM unavailable")
+        except Exception:
+            if target_tokens is not None:
+                compacted = context_manager.compact_to_token_limit(
+                    messages,
+                    target_tokens=target_tokens,
+                    min_keep=max(keep_recent, 4),
+                )
+            else:
+                compacted = context_manager.compact_messages(messages, keep_recent=keep_recent)
+            method = "compacted"
+
+        if not self.replace_conversation_messages(compacted):
+            return {"success": False, "error": "Failed to update thread messages"}
+
+        return {
+            "success": True,
+            "method": method,
+            "messages_before": len(messages),
+            "messages_after": len(compacted),
+        }
 
     def cleanup(self) -> None:
         """Clean up resources"""

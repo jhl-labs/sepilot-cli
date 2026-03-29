@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from sepilot.indexer import DependencyGraph, ProjectIndexer
+    from sepilot.indexer import ProjectIndexer
     from sepilot.lsp import LSPOperations
 
 logger = logging.getLogger(__name__)
@@ -24,7 +23,7 @@ class RelatedFile:
     relevance_score: float
     reason: str
 
-    def __lt__(self, other: "RelatedFile") -> bool:
+    def __lt__(self, other: RelatedFile) -> bool:
         return self.relevance_score < other.relevance_score
 
 
@@ -42,8 +41,8 @@ class RelatedFileFinder:
     def __init__(
         self,
         project_root: str | Path,
-        indexer: "ProjectIndexer | None" = None,
-        lsp: "LSPOperations | None" = None,
+        indexer: ProjectIndexer | None = None,
+        lsp: LSPOperations | None = None,
     ):
         """Initialize the finder.
 
@@ -262,7 +261,7 @@ class RelatedFileFinder:
         if self._indexer:
             try:
                 callers = self._indexer.get_callers(symbol)
-                for file_path, caller in callers:
+                for file_path, _caller in callers:
                     related.append(
                         RelatedFile(
                             file_path=file_path,

@@ -179,7 +179,7 @@ class SideBySideDiffRenderer:
 
         for opcode, i1, i2, j1, j2 in matcher.get_opcodes():
             if opcode == 'equal':
-                for i, j in zip(range(i1, i2), range(j1, j2)):
+                for i, j in zip(range(i1, i2), range(j1, j2), strict=False):
                     old_num += 1
                     new_num += 1
                     result.append(DiffLine(

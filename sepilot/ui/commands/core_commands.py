@@ -12,6 +12,11 @@ from typing import Any
 from rich.console import Console
 from rich.markdown import Markdown
 
+from sepilot.agent.execution_context import (
+    is_user_turn_boundary_message,
+    is_user_visible_conversation_message,
+)
+
 
 def handle_help(console: Console, show_dynamic: bool = True) -> None:
     """Show help message.
@@ -300,6 +305,7 @@ def handle_history(
     history_file: str,
     conversation_context: list,
     input_text: str,
+    agent: Any | None = None,
 ) -> None:
     """Show command/conversation history.
 
@@ -308,6 +314,7 @@ def handle_history(
         history_file: Path to command history file
         conversation_context: List of conversation messages
         input_text: Original command input for parsing args
+        agent: Optional memory-backed agent for persisted thread history
     """
     args = input_text.strip().split()
 
@@ -337,14 +344,24 @@ def handle_history(
             console.print(f"[red]Error reading history: {e}[/red]")
         return
 
+    display_context = list(conversation_context)
+    if agent and getattr(agent, "enable_memory", False) is True:
+        try:
+            if hasattr(agent, "get_conversation_messages"):
+                persisted_messages = agent.get_conversation_messages()
+                if persisted_messages:
+                    display_context = list(persisted_messages)
+        except Exception:
+            pass
+
     # New mode: show conversations with response summaries
-    if not conversation_context:
+    if not display_context:
         console.print("[yellow]No conversation history in current session[/yellow]")
         console.print("[dim]Use /history cmd to see command history from file[/dim]")
         return
 
     # Extract user/assistant pairs
-    conversations = _extract_conversations(conversation_context)
+    conversations = _extract_conversations(display_context)
 
     if not conversations:
         console.print("[yellow]No complete conversations found[/yellow]")
@@ -403,9 +420,13 @@ def _extract_conversations(conversation_context: list) -> list[dict[str, str]]:
         content = getattr(msg, 'content', str(msg))
 
         if role in ('human', 'user'):
+            if role == 'human' and not is_user_turn_boundary_message(msg):
+                continue
             user_query = extract_user_query(content)
             current_user_msg = user_query or None
         elif role in ('ai', 'assistant') and current_user_msg:
+            if not is_user_visible_conversation_message(msg):
+                continue
             conversations.append({
                 'user': current_user_msg,
                 'assistant': content

@@ -1,7 +1,11 @@
 """SubAgent execution tools for LangChain agent."""
 
+import inspect
+import json
 import logging
 import os
+import shutil
+from types import SimpleNamespace
 
 from langchain_core.tools import tool
 
@@ -42,7 +46,7 @@ def _create_subagent_llm(role: str | None = None):
     VERIFIER_ROLES = {"tester", "security_reviewer"}
 
     try:
-        from sepilot.config.llm_providers import LLMProviderFactory, LLMProviderError
+        from sepilot.config.llm_providers import LLMProviderError, LLMProviderFactory
         from sepilot.config.settings import Settings
 
         settings = _current_settings or Settings()
@@ -79,6 +83,54 @@ def _get_worktree_manager():
     return WorktreeManager()
 
 
+def _build_tmux_team_assignments(main_task: str) -> list[dict[str, str]]:
+    """Return deterministic per-role assignments for tmux team fallback."""
+    return [
+        {
+            "role_name": "developer",
+            "task_description": (
+                f"다음 작업을 구현하세요:\n{main_task}\n\n"
+                "파일을 직접 수정하고 구현을 완료하세요."
+            ),
+        },
+        {
+            "role_name": "tester",
+            "task_description": (
+                f"다음 작업에 대한 테스트를 작성하세요:\n{main_task}\n\n"
+                "단위 테스트와 통합 테스트를 모두 포함하세요."
+            ),
+        },
+        {
+            "role_name": "reviewer",
+            "task_description": (
+                f"다음 작업의 코드를 리뷰하세요:\n{main_task}\n\n"
+                "보안, 성능, 코드 품질 관점에서 검토하고 개선점을 제안하세요."
+            ),
+        },
+    ]
+
+
+class _FallbackTmuxTeamLLM:
+    """Provide deterministic plan/review responses when no LLM is available."""
+
+    def __init__(self, main_task: str):
+        self._main_task = main_task
+
+    def invoke(self, messages):
+        system_text = "\n".join(
+            str(getattr(message, "content", ""))
+            for message in messages
+        )
+        if "assignments" in system_text:
+            payload = {"assignments": _build_tmux_team_assignments(self._main_task)}
+        else:
+            payload = {
+                "action": "done",
+                "reason": "LLM 없이 역할별 기본 작업으로 완료 처리",
+            }
+        return SimpleNamespace(content=json.dumps(payload, ensure_ascii=False))
+
+
 @tool
 def subagent_execute(
     main_task: str,
@@ -86,6 +138,7 @@ def subagent_execute(
     max_parallel: int = 3,
     aggregation_strategy: str = "concatenate",
     team_mode: bool = False,
+    agent_backend: str = "llm",
 ) -> str:
     """Execute a complex task using SubAgent system.
 
@@ -106,6 +159,11 @@ def subagent_execute(
         team_mode: PM 주도 팀 모드 활성화 (기본: False)
             - True: PM이 작업을 분해하고 8개 역할별 에이전트가 단계적으로 실행
             - False: 기존 SubAgent 시스템 사용 (하위 호환)
+        agent_backend: 에이전트 실행 백엔드 (기본: "llm")
+            - "llm": LLM API를 통한 실행 (기본, 기존 방식)
+            - "tmux": tmux 세션을 통한 CLI 에이전트 대화형 실행
+              tmux 백엔드는 team_mode=True와 함께 사용하면
+              각 팀 역할을 별도의 tmux 세션에서 실행합니다.
 
     Returns:
         통합된 최종 결과
@@ -115,6 +173,7 @@ def subagent_execute(
         - "src 디렉토리의 각 모듈에 대해 테스트를 생성해줘"
         - "모든 Python 파일에서 print 문을 logging으로 변경해줘"
         - team_mode=True: "인증 기능 추가 + 테스트 + 보안 검토" (PM이 역할 배분)
+        - agent_backend="tmux", team_mode=True: tmux 세션으로 팀 에이전트 실행
 
     Use Cases:
         - 프로젝트 전체 분석 (여러 파일 병렬 분석)
@@ -122,11 +181,14 @@ def subagent_execute(
         - 테스트 생성 및 실행 (모듈별 병렬 테스트 생성)
         - 문서 생성 (여러 모듈 문서 병렬 생성)
         - 팀 모드: 복합 작업 (구현 + 테스트 + 보안 검토 등)
+        - tmux 백엔드: CLI 에이전트의 자체 도구를 활용한 대화형 실행
     """
-    import asyncio
+
+    if agent_backend == "tmux" and team_mode:
+        return _tmux_team_via_agent_team(main_task)
 
     if team_mode:
-        return _run_async(_async_team_execute(main_task, max_parallel))
+        return _run_async(lambda: _async_team_execute(main_task, max_parallel))
 
     async def _async_execute():
         """Internal async implementation with worktree isolation."""
@@ -262,27 +324,43 @@ def subagent_execute(
                     f"cleaned up: {cleanup_result['cleaned_up']}"
                 )
 
-    return _run_async(_async_execute())
+    return _run_async(_async_execute)
 
 
-def _run_async(coro) -> str:
+def _run_async(coro_or_factory) -> str:
     """비동기 코루틴을 동기적으로 실행하는 헬퍼"""
     import asyncio
+    import threading
+
+    def _make_coro():
+        return coro_or_factory() if callable(coro_or_factory) else coro_or_factory
 
     try:
-        return asyncio.run(coro)
-    except RuntimeError as e:
-        if "cannot be called from a running event loop" in str(e):
-            import nest_asyncio
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(_make_coro())
+
+        result_box: dict[str, str] = {}
+        error_box: dict[str, Exception] = {}
+
+        def _runner() -> None:
             try:
-                nest_asyncio.apply()
-                return asyncio.run(coro)
-            except ImportError:
-                logger.warning("nest_asyncio not available, trying alternative method")
-                loop = asyncio.get_event_loop()
-                return loop.run_until_complete(coro)
-        raise
+                result_box["result"] = asyncio.run(_make_coro())
+            except Exception as exc:
+                error_box["error"] = exc
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join()
+
+        if "error" in error_box:
+            raise error_box["error"]
+        return result_box.get("result", "")
     except Exception as e:
+        maybe_coro = coro_or_factory if inspect.iscoroutine(coro_or_factory) else None
+        if maybe_coro is not None:
+            maybe_coro.close()
         logger.error(f"Async execution failed: {e}")
         return f"❌ 실행 실패: {str(e)}"
 
@@ -443,6 +521,83 @@ async def _async_team_execute(main_task: str, max_parallel: int = 3) -> str:
                 f"Team worktree {worktree.worktree_id} had no changes, "
                 f"cleaned up: {cleanup_result['cleaned_up']}"
             )
+
+
+def _tmux_team_via_agent_team(main_task: str) -> str:
+    """tmux 백엔드 팀 모드 — AgentTeam을 통해 실행.
+
+    기존 _async_tmux_team_execute를 대체합니다.
+    Settings에서 기본 에이전트를 가져와 dev-team 프리셋으로 실행합니다.
+    """
+    from sepilot.agent.multi.models import AgentRole, TeamPreset
+    from sepilot.agent.multi.team import AgentTeam
+
+    logger.info("tmux 팀 모드 실행 (AgentTeam): %s", main_task)
+
+    # Settings에서 기본 에이전트 가져오기
+    settings = _current_settings
+    default_agent = "claude"
+    if settings and hasattr(settings, "tmux_default_agent"):
+        configured_agent = settings.tmux_default_agent
+        if isinstance(configured_agent, str):
+            configured_agent = configured_agent.strip()
+        if configured_agent:
+            default_agent = configured_agent
+    from sepilot.tools.tmux.tmux_agent_configs import get_agent_config
+    agent_cmd = get_agent_config(default_agent)["command"]
+    if not shutil.which(agent_cmd):
+        return (
+            f"Error: 에이전트 '{agent_cmd}'이(가) PATH에 없습니다. "
+            "설치 후 다시 시도하세요."
+        )
+
+    preset = TeamPreset(
+        name="dev-team",
+        description="개발 팀 (자동 생성)",
+        roles=[
+            AgentRole(name="developer", agent_cmd=default_agent, system_prompt="코드를 구현하세요. 파일을 직접 수정하고 구현을 완료하세요."),
+            AgentRole(name="tester", agent_cmd=default_agent, system_prompt="테스트를 작성하세요. 단위 테스트와 통합 테스트를 모두 포함하세요."),
+            AgentRole(name="reviewer", agent_cmd=default_agent, system_prompt="코드를 리뷰하세요. 보안, 성능, 코드 품질 관점에서 검토하고 개선점을 제안하세요."),
+        ],
+    )
+
+    # LLM이 없으면 역할별 기본 할당으로 fallback
+    llm = None
+    if settings and hasattr(settings, "_current_llm"):
+        llm = settings._current_llm
+
+    if llm is None:
+        llm = _FallbackTmuxTeamLLM(main_task)
+
+    team = None
+    try:
+        team = AgentTeam(llm=llm)
+        results = team.run(main_task, preset)
+    except Exception as e:
+        return f"Error: AgentTeam 실행 실패: {e}"
+    finally:
+        try:
+            if team is not None:
+                team.kill_all()
+        except Exception:
+            pass
+
+    # 결과 포맷팅 (기존 출력 형식 유지)
+    output_lines = [
+        "=== tmux 팀 실행 결과 ===",
+        f"전체 작업: {main_task}",
+        f"에이전트: {default_agent} x {len(preset.roles)}",
+        "",
+    ]
+    for role_name, response in results.items():
+        truncated = response[:3000] if len(response) > 3000 else response
+        output_lines.append(f"--- [{role_name}] ---")
+        output_lines.append(truncated)
+        if len(response) > 3000:
+            output_lines.append(f"... (잘림, 원본 {len(response)}자)")
+        output_lines.append("")
+
+    return "\n".join(output_lines)
 
 
 __all__ = ['subagent_execute', 'set_current_settings']

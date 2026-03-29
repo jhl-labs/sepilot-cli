@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 
-from .base_subagent import BaseSubAgent, SimpleSubAgent
+from .base_subagent import BaseSubAgent
 from .models import (
     AggregatedResult,
     ExecutionPlan,
@@ -86,6 +86,13 @@ class SubAgentOrchestrator:
 
         if use_task_registry:
             self._init_registry()
+
+    def reset_execution_state(self) -> None:
+        """Reset per-run execution state before starting a new orchestration."""
+        self.active_tasks.clear()
+        self.results = {}
+        self._task_to_registry_id = {}
+        self._cancel_event = asyncio.Event()
 
     def _init_registry(self) -> None:
         """Initialize TaskRegistry integration."""
@@ -325,11 +332,18 @@ class SubAgentOrchestrator:
                     ready_tasks.append(task)
 
             if not ready_tasks:
-                # 순환 의존성 또는 잘못된 의존성
-                logger.error("Circular dependency detected or invalid dependencies")
-                # 나머지 작업들을 강제로 추가
+                # 순환 의존성 또는 잘못된 의존성 — 의존성을 무시하고 강제 실행
                 remaining = [t for t in tasks if t.task_id not in completed_ids]
                 if remaining:
+                    logger.warning(
+                        "Circular dependency or invalid dependencies detected "
+                        "for %d tasks: %s. Clearing dependencies and forcing execution.",
+                        len(remaining),
+                        [t.task_id for t in remaining],
+                    )
+                    # 의존성을 제거하여 실행 가능하게 만듦
+                    for t in remaining:
+                        t.dependencies = []
                     plan.add_phase(remaining)
                 break
 
@@ -362,6 +376,7 @@ class SubAgentOrchestrator:
             모든 작업의 결과
         """
         logger.info(f"Executing plan with {plan.total_phases} phases")
+        self.reset_execution_state()
 
         all_results: dict[str, SubAgentResult] = {}
         progress = ExecutionProgress(total_tasks=plan.total_tasks)
@@ -377,6 +392,7 @@ class SubAgentOrchestrator:
 
             # 결과 수집
             all_results.update(phase_results)
+            self.results.update(phase_results)
 
             # 진행 상황 업데이트
             for result in phase_results.values():
@@ -417,10 +433,15 @@ class SubAgentOrchestrator:
         if self._registry:
             for task in tasks:
                 from sepilot.agent.task_registry import TaskPriority as RegPriority
+                priority_value = getattr(task.priority, "value", task.priority)
+                try:
+                    registry_priority = RegPriority(int(priority_value))
+                except (TypeError, ValueError):
+                    registry_priority = RegPriority.NORMAL
                 reg_task = self._registry.register(
                     name=task.description[:50],
                     description=task.description,
-                    priority=RegPriority(task.priority.value),
+                    priority=registry_priority,
                     dependencies=[
                         self._task_to_registry_id.get(dep)
                         for dep in task.dependencies
@@ -603,6 +624,21 @@ class SubAgentOrchestrator:
             for agent in self.subagents:
                 if agent.agent_type == task.agent_type:
                     return agent
+            # 매칭 실패 시: developer 에이전트로 폴백 (도구 보유), 없으면 첫 번째 에이전트
+            logger.warning(
+                "No exact SubAgent match for task %s agent_type=%s, "
+                "falling back to developer agent",
+                task.task_id,
+                task.agent_type,
+            )
+            fallback = self._find_fallback_agent()
+            if fallback:
+                return fallback
+            raise ValueError(
+                f"No SubAgent registered for agent_type='{task.agent_type}' "
+                f"and no fallback available. "
+                f"Registered: {[a.agent_type for a in self.subagents]}"
+            )
 
         # can_handle()로 적절한 SubAgent 찾기
         for agent in self.subagents:
@@ -610,13 +646,21 @@ class SubAgentOrchestrator:
                 logger.info(f"Assigned {agent.agent_id} to task {task.task_id}")
                 return agent
 
-        # 적절한 SubAgent가 없으면 기본 SubAgent 생성
-        logger.warning(f"No suitable SubAgent found for task {task.task_id}, creating default")
-        default_agent = SimpleSubAgent(
-            agent_id=f"auto_{task.task_id}",
-            llm=self.llm
+        # 적절한 SubAgent가 없으면 developer로 폴백
+        logger.warning(f"No suitable SubAgent found for task {task.task_id}, using fallback")
+        fallback = self._find_fallback_agent()
+        if fallback:
+            return fallback
+        raise ValueError(
+            f"No suitable SubAgent for task {task.task_id} and no fallback available"
         )
-        return default_agent
+
+    def _find_fallback_agent(self) -> BaseSubAgent | None:
+        """developer 에이전트를 폴백으로 찾고, 없으면 첫 번째 에이전트 반환."""
+        for agent in self.subagents:
+            if agent.agent_type == "developer":
+                return agent
+        return self.subagents[0] if self.subagents else None
 
     async def aggregate_results(
         self,

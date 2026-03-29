@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .language_detector import LanguageDetector, get_language_detector
+from .language_detector import get_language_detector
 from .unified_ast import (
     ClassSymbol,
     FunctionSymbol,
@@ -20,7 +20,6 @@ from .unified_ast import (
     Parameter,
     SymbolKind,
     UnifiedAST,
-    VariableSymbol,
     Visibility,
 )
 
@@ -94,7 +93,7 @@ class TreeSitterParser:
                     self._parsers[lang] = parser
                 else:
                     module = __import__(module_name)
-                    language_fn = getattr(module, "language")
+                    language_fn = module.language
                     ts_lang = tree_sitter.Language(language_fn())
                     self._languages[lang] = ts_lang
                     parser = tree_sitter.Parser(ts_lang)
@@ -198,7 +197,7 @@ class TreeSitterParser:
 
         # Parse imports
         import_pattern = re.compile(r"^(?:from\s+(\S+)\s+)?import\s+(.+)$")
-        for i, line in enumerate(lines):
+        for _i, line in enumerate(lines):
             stripped = line.strip()
             if match := import_pattern.match(stripped):
                 module = match.group(1) or match.group(2).split(",")[0].strip()
@@ -316,7 +315,7 @@ class TreeSitterParser:
             re.compile(r"(?:const|let|var)\s+(\w+)\s*=\s*require\(['\"]([^'\"]+)['\"]\)"),
         ]
 
-        for i, line in enumerate(lines):
+        for _i, line in enumerate(lines):
             for pattern in import_patterns:
                 if match := pattern.search(line):
                     if len(match.groups()) == 3:
@@ -400,7 +399,7 @@ class TreeSitterParser:
         # Parse imports
         import_pattern = re.compile(r'import\s+(?:\(\s*)?["\']([^"\']+)["\']')
         in_import_block = False
-        for i, line in enumerate(lines):
+        for _i, line in enumerate(lines):
             stripped = line.strip()
             if stripped.startswith("import ("):
                 in_import_block = True
@@ -422,7 +421,7 @@ class TreeSitterParser:
         func_pattern = re.compile(r"func\s+(?:\((\w+)\s+\*?(\w+)\)\s+)?(\w+)\s*\(")
         for i, line in enumerate(lines):
             if match := func_pattern.search(line):
-                receiver_var = match.group(1)
+                _receiver_var = match.group(1)
                 receiver_type = match.group(2)
                 name = match.group(3)
 
@@ -490,7 +489,7 @@ class TreeSitterParser:
 
         # Parse use statements
         use_pattern = re.compile(r"use\s+([^;]+);")
-        for i, line in enumerate(lines):
+        for _i, line in enumerate(lines):
             if match := use_pattern.search(line):
                 module = match.group(1).strip()
                 ast.imports.append(ImportInfo(module=module, import_type="use"))
@@ -583,7 +582,7 @@ class TreeSitterParser:
         self,
         file_path: str,
         content: str,
-        tree: "tree_sitter.Tree",
+        tree: tree_sitter.Tree,
         language: Language,
     ) -> UnifiedAST:
         """Extract unified AST from tree-sitter parse tree.

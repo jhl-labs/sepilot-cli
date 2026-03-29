@@ -74,13 +74,23 @@ from sepilot.tools.langchain_tools.shell_tools import (
 # SubAgent execution
 from sepilot.tools.langchain_tools.subagent_tools import subagent_execute
 
-# Think / Scratchpad
-from sepilot.tools.langchain_tools.think_tools import think
-
 # Task management
 from sepilot.tools.langchain_tools.task_tools import (
     plan,
     todo_manage,
+)
+
+# Think / Scratchpad
+from sepilot.tools.langchain_tools.think_tools import think
+
+# tmux agent session management
+from sepilot.tools.langchain_tools.tmux_tools import (
+    tmux_create_session,
+    tmux_destroy,
+    tmux_orchestrate,
+    tmux_read,
+    tmux_send,
+    tmux_status,
 )
 
 # Web operations
@@ -153,6 +163,14 @@ def get_all_tools() -> list:
         # Advanced
         subagent_execute,
 
+        # tmux agent sessions
+        tmux_create_session,
+        tmux_send,
+        tmux_read,
+        tmux_status,
+        tmux_destroy,
+        tmux_orchestrate,
+
         # Think / Scratchpad
         think,
     ]
@@ -219,6 +237,14 @@ __all__ = [
 
     # Advanced
     'subagent_execute',
+
+    # tmux agent sessions
+    'tmux_create_session',
+    'tmux_send',
+    'tmux_read',
+    'tmux_status',
+    'tmux_destroy',
+    'tmux_orchestrate',
 
     # Think / Scratchpad
     'think',

@@ -43,24 +43,24 @@ triage
 ```
 """
 
+import logging
 from typing import Any
 
 from sepilot.agent.backtracking import BacktrackingManager, CheckpointType
-from sepilot.config.constants import (
-    EXPLORATION_MAX_FILES,
-    EXPLORATION_MAX_HINTS,
-    EXPLORATION_MAX_SEARCH_TIME_MS,
-)
 from sepilot.agent.debate_node import DebateOrchestrator
 from sepilot.agent.enhanced_state import EnhancedAgentState
+from sepilot.agent.execution_context import get_current_user_query
 from sepilot.agent.file_detector import FileDetectionResult, FilePathDetector
 from sepilot.agent.hierarchical_planner import HierarchicalPlanner, PlanDepth
 from sepilot.agent.memory_bank import MemoryBank
 from sepilot.agent.pattern_orchestrator import AdaptiveOrchestrator
 from sepilot.agent.tool_learning import ToolLearningSystem
+from sepilot.config.constants import (
+    EXPLORATION_MAX_FILES,
+    EXPLORATION_MAX_HINTS,
+    EXPLORATION_MAX_SEARCH_TIME_MS,
+)
 from sepilot.tools.codebase_tools import CodebaseExplorer
-
-import logging
 
 _logger = logging.getLogger(__name__)
 
@@ -257,12 +257,7 @@ class CodebaseExplorationNode:
     def __call__(self, state: EnhancedAgentState) -> dict[str, Any]:
         """Perform automatic codebase exploration if needed."""
         # 1. Extract user prompt
-        messages = state.get("messages", [])
-        user_prompt = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                user_prompt = getattr(msg, "content", "")
-                break
+        user_prompt = get_current_user_query(state)
 
         if not user_prompt:
             return {}
@@ -624,12 +619,7 @@ class MemoryRetrieverNode:
             return {"memory_retrieval_skipped": True}
 
         # Extract user query for similarity matching
-        messages = state.get("messages", [])
-        user_query = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                user_query = getattr(msg, "content", "")
-                break
+        user_query = get_current_user_query(state)
 
         # Extract keywords from query
         query_keywords = self._extract_keywords(user_query)
@@ -720,12 +710,7 @@ class HierarchicalPlannerNode:
             return {"hierarchical_planning_skipped": True}
 
         # Get task description
-        messages = state.get("messages", [])
-        task_description = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                task_description = getattr(msg, "content", "")
-                break
+        task_description = get_current_user_query(state)
 
         if not task_description:
             return {}
@@ -826,12 +811,7 @@ class ToolRecommenderNode:
             return {"tool_recommendations_skipped": True}
 
         # Get context
-        messages = state.get("messages", [])
-        task_description = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                task_description = getattr(msg, "content", "")
-                break
+        task_description = get_current_user_query(state)
 
         # Early exit if no task description
         if not task_description:
@@ -1003,12 +983,7 @@ class DebateCheckNode:
             return {"debate_decision": "skip", "debate_skipped": True}
 
         # Get task description
-        messages = state.get("messages", [])
-        task = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                task = getattr(msg, "content", "").lower()
-                break
+        task = get_current_user_query(state).lower()
 
         # Check for trigger keywords
         should_debate = any(trigger in task for trigger in self.DEBATE_TRIGGERS)
@@ -1051,12 +1026,7 @@ class DebateNode:
     def __call__(self, state: EnhancedAgentState) -> dict[str, Any]:
         """Conduct debate on current work."""
         # Get context
-        messages = state.get("messages", [])
-        task = ""
-        for msg in messages:
-            if hasattr(msg, "type") and msg.type == "human":
-                task = getattr(msg, "content", "")
-                break
+        task = get_current_user_query(state)
 
         # Get code context
         file_changes = state.get("file_changes", [])
@@ -1243,7 +1213,7 @@ class MemoryWriterNode:
 
             elif pattern == "hierarchical_planning":
                 # Was the plan effective?
-                plan = state.get("hierarchical_plan", {})
+                _plan = state.get("hierarchical_plan", {})
                 plan_steps = state.get("plan_steps", [])
                 contribution["steps_planned"] = len(plan_steps)
                 contribution["helpful"] = len(plan_steps) > 0 and outcome == "success"

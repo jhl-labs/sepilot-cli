@@ -9,7 +9,6 @@ from pathlib import Path
 
 from .unified_ast import Language
 
-
 # File extension to language mapping
 EXTENSION_MAP: dict[str, Language] = {
     # Python
@@ -130,12 +129,12 @@ class LanguageDetector:
         """
         # If we have an extension hint, prioritize that
         if hint_extension:
-            lang = EXTENSION_MAP.get(hint_extension.lower(), None)
+            lang = EXTENSION_MAP.get(hint_extension.lower())
             if lang and lang != Language.UNKNOWN:
                 return lang
 
         # Check content patterns
-        scores: dict[Language, int] = {lang: 0 for lang in Language}
+        scores: dict[Language, int] = dict.fromkeys(Language, 0)
 
         for language, patterns in CONTENT_PATTERNS.items():
             for pattern in patterns:
@@ -200,7 +199,7 @@ class LanguageDetector:
                 return lang
 
         # Count files by language
-        lang_counts: dict[Language, int] = {lang: 0 for lang in Language}
+        lang_counts: dict[Language, int] = dict.fromkeys(Language, 0)
 
         try:
             for file in root.rglob("*"):

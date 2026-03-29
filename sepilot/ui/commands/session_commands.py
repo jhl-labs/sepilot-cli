@@ -18,9 +18,13 @@ from datetime import datetime
 from typing import Any
 
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
+
+from sepilot.agent.execution_context import (
+    get_message_content,
+    is_user_turn_boundary_message,
+    is_user_visible_conversation_message,
+)
 
 
 def handle_resume(
@@ -57,7 +61,13 @@ def handle_resume(
     thread_arg = args[1] if len(args) > 1 else None
 
     if not thread_arg:
-        _show_available_threads(console, agent)
+        selected_tid = _interactive_thread_select(console, agent)
+        if selected_tid:
+            current_thread = agent.get_thread_id()
+            if selected_tid == current_thread:
+                console.print(f"[yellow]Already on this thread: {selected_tid}[/yellow]")
+                return True
+            return _switch_to_thread(console, agent, selected_tid, conversation_context)
         return False
 
     # Support numeric index (e.g. /resume 1)
@@ -80,43 +90,46 @@ def handle_resume(
     return _switch_to_thread(console, agent, thread_id, conversation_context)
 
 
-def _show_available_threads(console: Console, agent: Any) -> None:
-    """Show list of available threads with conversation topic."""
-    console.print("[bold cyan]📋 Available Conversation Threads[/bold cyan]\n")
+def _interactive_thread_select(console: Console, agent: Any) -> str | None:
+    """Show interactive arrow-key thread selector. Returns selected thread_id or None."""
+    from sepilot.ui.input_utils import interactive_select
 
     threads = agent.list_available_threads()
 
     if not threads:
         console.print("[yellow]No previous threads found[/yellow]")
         console.print("[dim]Start a new conversation and it will be saved automatically[/dim]")
-        return
+        return None
 
     current_thread_id = agent.get_thread_id()
 
-    for i, thread in enumerate(threads, 1):
+    # Build items for selector
+    selector_items: list[dict[str, str]] = []
+    for thread in threads:
         thread_id = thread.get("thread_id", "Unknown")
-        is_current = thread_id == current_thread_id
-
-        # Timestamp
         ts = _format_timestamp(thread.get("updated_at", "") or thread.get("created_at", ""))
-
-        # Message count
         msg_count = thread.get("message_count", 0)
-
-        # Topic = first user message
         topic = thread.get("first_message_preview", "") or thread.get("last_message_preview", "") or "No messages"
 
-        # Format display
-        marker = "[bold green]►[/bold green] " if is_current else "  "
-        current_tag = " [green](current)[/green]" if is_current else ""
-        idx_str = f"[cyan]{i}.[/cyan]"
+        if len(topic) > 50:
+            topic = topic[:50] + "..."
 
-        console.print(f"{marker}{idx_str} {topic}{current_tag}")
-        console.print(f"      [dim]{thread_id}  ·  {ts}  ·  {msg_count} msgs[/dim]")
+        current_marker = " (current)" if thread_id == current_thread_id else ""
+        label = f"{topic}{current_marker}"
+        description = f"{ts}  {msg_count} msgs  {thread_id[:24]}"
 
-    console.print()
-    console.print("[dim]💡 /resume <thread-id> 또는 /resume <번호> 로 이전 대화를 이어갈 수 있습니다[/dim]")
-    console.print(f"[dim]💡 현재 스레드: {current_thread_id}[/dim]")
+        selector_items.append({"label": label, "description": description})
+
+    selected = interactive_select(
+        selector_items,
+        title="Resume a conversation:",
+    )
+
+    if selected is None:
+        console.print("[dim]Cancelled.[/dim]")
+        return None
+
+    return threads[selected].get("thread_id")
 
 
 def _format_timestamp(ts: str) -> str:
@@ -144,16 +157,12 @@ def _switch_to_thread(
     if success:
         console.print(f"[bold green]✓ Successfully resumed thread: {thread_id}[/bold green]")
 
-        # Sync conversation_context with LangGraph messages
-        if conversation_context is not None and hasattr(agent, 'get_conversation_messages'):
-            messages = agent.get_conversation_messages()
-            conversation_context.clear()
-            for msg in messages:
-                msg_type = getattr(msg, 'type', '')
-                if msg_type in ('human', 'ai'):
-                    conversation_context.append(msg)
-            if conversation_context:
-                console.print(f"[dim]Restored {len(conversation_context)} messages to context[/dim]")
+        if hasattr(agent, "reset_session_state"):
+            agent.reset_session_state()
+
+        restored_count = _sync_conversation_context_from_agent(agent, conversation_context)
+        if restored_count:
+            console.print(f"[dim]Restored {restored_count} messages to context[/dim]")
 
         # Show session summary
         if hasattr(agent, 'get_session_summary'):
@@ -181,16 +190,16 @@ def _show_recent_messages(console: Console, agent: Any, thread_id: str, max_exch
             # Filter to human/ai messages only
             conversation = [
                 msg for msg in messages
-                if getattr(msg, 'type', '') in ('human', 'ai')
+                if is_user_visible_conversation_message(msg)
             ]
 
             if conversation:
                 # Take last N exchanges (each exchange = human + ai pair)
                 # Count human messages from the end to find the cutoff
                 human_count = 0
-                cutoff = len(conversation)
+                cutoff = 0
                 for i in range(len(conversation) - 1, -1, -1):
-                    if getattr(conversation[i], 'type', '') == 'human':
+                    if is_user_turn_boundary_message(conversation[i]):
                         human_count += 1
                         if human_count > max_exchanges:
                             cutoff = i + 1
@@ -200,8 +209,8 @@ def _show_recent_messages(console: Console, agent: Any, thread_id: str, max_exch
 
                 console.print("\n[bold]Recent conversation:[/bold]")
                 for msg in recent:
-                    role = "User" if getattr(msg, 'type', '') == "human" else "Assistant"
-                    content = getattr(msg, 'content', str(msg))
+                    role = "User" if is_user_turn_boundary_message(msg) else "Assistant"
+                    content = get_message_content(msg)
 
                     if len(content) > 200:
                         content = content[:200] + "..."
@@ -250,6 +259,9 @@ def handle_new(
     except Exception as e:
         console.print(f"[red]✗ Failed to create new thread: {e}[/red]")
         return None, 0, 0
+
+    if hasattr(agent, "reset_session_state"):
+        agent.reset_session_state()
 
     # Clear conversation context
     conversation_context.clear()
@@ -424,76 +436,61 @@ def _interactive_rewind(
         console.print("[yellow]No exchanges to rewind[/yellow]")
         return {}
 
-    # Step 1: Show exchanges
-    console.print()
-    console.print('[bold cyan]⏪ Restore conversation to the point before…[/bold cyan]')
-    console.print()
+    from sepilot.ui.input_utils import interactive_select
 
-    for i, ex in enumerate(exchanges, 1):
-        user_text = ex["user_text"]
-        if len(user_text) > 70:
-            user_text = user_text[:67] + "..."
-        user_text = user_text.replace('\n', ' ').strip()
+    # Step 1: Build exchange selector items
+    exchange_items: list[dict[str, str]] = []
+    for ex in exchanges:
+        user_text = ex["user_text"].replace('\n', ' ').strip()
+        if len(user_text) > 60:
+            user_text = user_text[:57] + "..."
 
-        # File change summary (if available from tool calls)
-        file_info = ""
+        file_desc = ""
         if ex["file_changes"]:
-            parts = []
-            for fc in ex["file_changes"][:3]:
-                parts.append(f"[dim]{fc}[/dim]")
-            file_info = "  " + " ".join(parts)
+            files = ", ".join(ex["file_changes"][:3])
             if len(ex["file_changes"]) > 3:
-                file_info += f" [dim]+{len(ex['file_changes']) - 3} more[/dim]"
+                files += f" +{len(ex['file_changes']) - 3}"
+            file_desc = f"  [{files}]"
 
-        console.print(f"  [cyan]{i}.[/cyan] {user_text}{file_info}")
+        exchange_items.append({"label": user_text, "description": file_desc})
 
-    console.print(f"  [dim]{len(exchanges) + 1}.[/dim] [dim]Cancel[/dim]")
-    console.print()
+    # Step 2: Select exchange with arrow keys
+    selected_idx = interactive_select(
+        exchange_items,
+        title="Restore conversation to the point before…",
+    )
 
-    # Step 2: Select exchange
-    try:
-        choice = input(f"Select (1-{len(exchanges) + 1}): ").strip()
-        if not choice.isdigit():
-            console.print("[dim]Cancelled[/dim]")
-            return {}
-        idx = int(choice)
-        if idx < 1 or idx > len(exchanges):
-            console.print("[dim]Cancelled[/dim]")
-            return {}
-    except (EOFError, KeyboardInterrupt):
-        console.print("\n[dim]Cancelled[/dim]")
+    if selected_idx is None:
+        console.print("[dim]Cancelled[/dim]")
         return {}
 
-    selected_count = len(exchanges) - idx + 1  # How many exchanges to remove from the end
+    selected_count = len(exchanges) - selected_idx  # How many exchanges to remove from the end
 
-    # Step 3: Select restore action
-    console.print()
-    console.print(f"[bold]Rewind {selected_count} exchange(s):[/bold]")
-    console.print()
-    console.print("  [cyan]1.[/cyan] Restore code and conversation")
-    console.print("  [cyan]2.[/cyan] Restore conversation only")
-    console.print("  [cyan]3.[/cyan] Restore code only")
-    console.print("  [cyan]4.[/cyan] Cancel")
-    console.print()
+    # Step 3: Select restore action with arrow keys
+    action_items = [
+        {"label": "Restore code and conversation", "description": ""},
+        {"label": "Restore conversation only", "description": ""},
+        {"label": "Restore code only", "description": ""},
+    ]
 
-    try:
-        action = input("Select action (1-4): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        console.print("\n[dim]Cancelled[/dim]")
+    action_idx = interactive_select(
+        action_items,
+        title=f"Rewind {selected_count} exchange(s):",
+    )
+
+    if action_idx is None:
+        console.print("[dim]Cancelled[/dim]")
         return {}
 
     results: dict[str, Any] = {}
 
-    if action == "1":
+    if action_idx == 0:
         results['conv_result'] = _rewind_conversation(agent, conversation_context, selected_count)
         results['code_result'] = _rewind_code(selected_count)
-    elif action == "2":
+    elif action_idx == 1:
         results['conv_result'] = _rewind_conversation(agent, conversation_context, selected_count)
-    elif action == "3":
+    elif action_idx == 2:
         results['code_result'] = _rewind_code(selected_count)
-    else:
-        console.print("[dim]Cancelled[/dim]")
-        return {}
 
     _display_rewind_results(console, results)
     return results
@@ -512,7 +509,7 @@ def _build_exchange_list(messages: list) -> list[dict[str, Any]]:
         msg = messages[i]
         msg_type = getattr(msg, 'type', '')
 
-        if msg_type == 'human':
+        if msg_type == 'human' and is_user_turn_boundary_message(msg):
             user_text = getattr(msg, 'content', str(msg))
             assistant_text = ""
             file_changes = []
@@ -522,7 +519,7 @@ def _build_exchange_list(messages: list) -> list[dict[str, Any]]:
             while j < len(messages):
                 next_msg = messages[j]
                 next_type = getattr(next_msg, 'type', '')
-                if next_type == 'human':
+                if next_type == 'human' and is_user_turn_boundary_message(next_msg):
                     break
                 if next_type == 'ai':
                     assistant_text = getattr(next_msg, 'content', '')
@@ -553,6 +550,22 @@ def _build_exchange_list(messages: list) -> list[dict[str, Any]]:
     return exchanges
 
 
+def _sync_conversation_context_from_agent(
+    agent: Any,
+    conversation_context: list | None,
+) -> int:
+    """Sync local conversation context from the agent's current LangGraph thread."""
+    if conversation_context is None or not hasattr(agent, "get_conversation_messages"):
+        return 0
+
+    messages = agent.get_conversation_messages()
+    conversation_context.clear()
+    for msg in messages:
+        if is_user_visible_conversation_message(msg):
+            conversation_context.append(msg)
+    return len(conversation_context)
+
+
 def _rewind_conversation(agent: Any, conversation_context: list, count: int) -> dict[str, Any]:
     """Rewind conversation messages."""
     messages_before = agent.get_conversation_messages()
@@ -563,11 +576,9 @@ def _rewind_conversation(agent: Any, conversation_context: list, count: int) -> 
     result = agent.rewind_messages(count)
 
     if result.get("success"):
-        pairs_to_remove = result.get("pairs_removed", count)
-        msgs_to_remove = pairs_to_remove * 2
-
-        if msgs_to_remove <= len(conversation_context):
-            conversation_context[:] = conversation_context[:-msgs_to_remove]
+        if hasattr(agent, "reset_session_state"):
+            agent.reset_session_state(clear_checkpoint_state=True)
+        _sync_conversation_context_from_agent(agent, conversation_context)
 
     return result
 
@@ -630,7 +641,7 @@ def _restore_environment_snapshot(count: int) -> dict[str, Any]:
             return {"success": False, "error": "No environment snapshot found"}
 
         checkpoint = manager.checkpoints[-(count + 1)]
-        env_manager = get_environment_manager()
+        _env_manager = get_environment_manager()
 
         # Get commands to restore environment
         # Note: We can't fully restore env in-process, just return commands
@@ -691,7 +702,7 @@ def _show_rewind_options(console: Console, agent: Any) -> None:
         content = getattr(msg, 'content', str(msg))
 
         if msg_type == 'human':
-            type_display = "[cyan]User[/cyan]"
+            type_display = "[cyan]User[/cyan]" if is_user_turn_boundary_message(msg) else "[magenta]Agent Prompt[/magenta]"
         elif msg_type == 'ai':
             type_display = "[green]Assistant[/green]"
         elif msg_type == 'tool':
@@ -708,7 +719,7 @@ def _show_rewind_options(console: Console, agent: Any) -> None:
     console.print(table)
     console.print()
 
-    human_count = sum(1 for m in messages if getattr(m, 'type', '') == 'human')
+    human_count = sum(1 for m in messages if is_user_turn_boundary_message(m))
     console.print(f"[dim]Total: {len(messages)} messages, {human_count} exchanges[/dim]")
     console.print()
     console.print("[dim]💡 Use /rewind N to remove the last N exchanges[/dim]")
@@ -828,6 +839,7 @@ def _show_enhanced_checkpoints(console: Console) -> None:
     # Try project history
     try:
         import os
+
         from sepilot.memory.project_history import get_project_history_manager
 
         pm = get_project_history_manager()
@@ -1139,6 +1151,7 @@ def handle_session_export(
         True if export successful
     """
     from pathlib import Path
+
     from sepilot.memory.session import SessionManager
 
     # Parse arguments
@@ -1220,6 +1233,7 @@ def handle_session_import(
         True if import successful
     """
     from pathlib import Path
+
     from sepilot.memory.session import SessionManager
 
     # Parse arguments
@@ -1304,7 +1318,6 @@ def handle_session(
 
 def _handle_session_info(console: Console, agent: Any | None) -> bool:
     """Show current session info."""
-    from sepilot.memory.session import SessionManager
 
     session_manager = None
     if agent and hasattr(agent, "session_manager"):

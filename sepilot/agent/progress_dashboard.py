@@ -66,7 +66,7 @@ def build_progress_dashboard(
         ]
 
         if tool_history:
-            unique_tools = sorted(set(tc.tool_name for tc in tool_history))
+            unique_tools = sorted({tc.tool_name for tc in tool_history})
             lines.append(f"Unique tools: {', '.join(unique_tools)}")
 
         if edited_paths:
@@ -118,16 +118,16 @@ def build_self_assessment(
     elif pct >= 40:
         # 40%+ budget used without edits — strong directive
         action_line = (
-            "WARNING: {pct}% budget used, 0 files edited. "
+            f"WARNING: {pct}% budget used, 0 files edited. "
             "Use file_read on the relevant file then file_edit NOW. "
             "Stop exploring — fix the bug immediately."
-        ).format(pct=pct)
+        )
     elif iteration >= 3:
         # 3+ iterations without edits — moderate directive
         action_line = (
-            "Note: {iter} iterations used, 0 files edited. "
+            f"Note: {iteration} iterations used, 0 files edited. "
             "You should use file_read on the relevant file then file_edit to fix the bug now."
-        ).format(iter=iteration)
+        )
     else:
         # Early iterations — workflow guidance
         action_line = (

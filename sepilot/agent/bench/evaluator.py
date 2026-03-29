@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from sepilot.agent.bench.models import BenchResult, EvaluationResult, Prediction
+from sepilot.agent.bench.models import BenchResult, EvaluationResult
 
 
 class Evaluator:
@@ -76,7 +76,12 @@ class Evaluator:
         for br in results:
             if br.instance_id in harness_results:
                 entry = harness_results[br.instance_id]
-                br.resolved = entry.get("resolved", False)
+                if isinstance(entry, dict):
+                    br.resolved = entry.get("resolved", False)
+                elif isinstance(entry, bool):
+                    br.resolved = entry
+                else:
+                    continue
                 if br.resolved:
                     br.test_result = "passed"
                 elif br.model_patch:

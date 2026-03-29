@@ -32,7 +32,6 @@ from sepilot.config.constants import (
 )
 
 if TYPE_CHECKING:
-    from sepilot.memory.environment_snapshot import EnvironmentSnapshot
     from sepilot.memory.file_checkpoint import FileCheckpointManager
     from sepilot.memory.history_writer import HistoryWriter
 
@@ -352,10 +351,10 @@ class BacktrackingManager:
         self._error_threshold: int | None = None
 
         # Lazy-loaded components
-        self._history_writer: 'HistoryWriter | None' = None
+        self._history_writer: HistoryWriter | None = None
         self._env_manager: Any = None
         self._project_manager: Any = None
-        self._file_checkpoint_manager: 'FileCheckpointManager | None' = None
+        self._file_checkpoint_manager: FileCheckpointManager | None = None
 
     def _generate_checkpoint_id(self) -> str:
         """Generate unique checkpoint ID."""
@@ -796,7 +795,7 @@ class BacktrackingManager:
             Created EnhancedCheckpoint
         """
         # Create base checkpoint
-        base_checkpoint = self.create_checkpoint(
+        _base_checkpoint = self.create_checkpoint(
             state=state,
             checkpoint_type=checkpoint_type,
             description=description,
@@ -827,7 +826,7 @@ class BacktrackingManager:
                 # Generate diffs if requested
                 if generate_diffs and changed_files:
                     try:
-                        from sepilot.memory.history_event import FileDiff, FileAction
+                        from sepilot.memory.history_event import FileDiff
                         for file_path in changed_files:
                             old_content = parent.file_states.get(file_path)
                             new_content = enhanced.file_states.get(file_path)

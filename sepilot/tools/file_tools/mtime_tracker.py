@@ -5,7 +5,6 @@ before editing. This prevents accidental overwrites of externally modified files
 """
 
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any

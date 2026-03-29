@@ -12,7 +12,7 @@ from typing import Any
 from rich.console import Console
 from rich.panel import Panel
 
-from sepilot.ui.input_utils import INPUT_CANCELLED, prompt_text
+from sepilot.ui.input_utils import INPUT_CANCELLED, interactive_select, prompt_text
 
 
 def handle_model_command(
@@ -98,6 +98,14 @@ def handle_model_command(
   • top_k         - Top-K sampling
   • top_p         - Top-P sampling
   • max_tokens    - Maximum tokens
+
+[bold yellow]🤖 CLI Agent (tmux):[/bold yellow]
+  [cyan]/model setup[/cyan] → 2) CLI Agent  외부 CLI 에이전트를 tmux로 연결
+                                지원: claude, opencode, codex, gemini
+  설정 후 sepilot이 tmux 세션을 통해 외부 에이전트를
+  대화형으로 제어·오케스트레이션합니다.
+  관련 도구: tmux_create_session, tmux_send, tmux_read,
+            tmux_status, tmux_destroy, tmux_orchestrate
 
 [bold yellow]💡 Tips:[/bold yellow]
   • Profiles are stored in ~/.sepilot/profiles/
@@ -510,9 +518,34 @@ def _handle_model_setup(
 
     default_url = current_base_url or "http://localhost:11434"
 
-    # Step 1: API Base URL
+    # Step 0: Provider type selection (API vs CLI Agent)
+    installed_agents = _detect_installed_cli_agents()
+
+    provider_items = [
+        {"label": "OpenAI 호환 API", "description": ""},
+    ]
+    if installed_agents:
+        agents_str = ", ".join(installed_agents)
+        provider_items.append({"label": "CLI Agent", "description": f"({agents_str} 감지됨)"})
+    else:
+        provider_items.append({"label": "CLI Agent", "description": "(감지된 CLI 없음)"})
+
+    provider_idx = interactive_select(
+        provider_items,
+        title="Model Setup — LLM 프로바이더를 선택하세요",
+    )
+    if provider_idx is None:
+        console.print("[dim]취소되었습니다.[/dim]")
+        return None
+
+    if provider_idx == 1:
+        return _handle_cli_agent_setup(
+            model_profile_manager, agent, console, create_llm_func,
+            agent_factory, session, installed_agents,
+        )
+
+    # --- OpenAI-compatible API path ---
     console.print()
-    console.print("[bold cyan]Model Setup[/bold cyan]")
     console.print("[dim]OpenAI 호환 API에서 모델을 선택합니다.[/dim]")
     console.print()
 
@@ -550,7 +583,6 @@ def _handle_model_setup(
 
     selected_model = None
     try:
-        import httpx
         models = _fetch_models(base_url, api_key)
     except Exception as e:
         console.print(f"[red]모델 목록 조회 실패: {e}[/red]")
@@ -586,11 +618,6 @@ def _handle_model_setup(
 
     # Step 5: Custom headers (optional)
     while True:
-        console.print()
-        console.print("[bold cyan]Custom HTTP Header 설정[/bold cyan]")
-        console.print("  [dim]1) 헤더 추가[/dim]")
-        console.print("  [dim]2) 완료 (설정 적용)[/dim]")
-
         # Show current headers if any
         current_headers = model_profile_manager.get_current_config().custom_headers
         if current_headers:
@@ -598,17 +625,19 @@ def _handle_model_setup(
             for k, v in current_headers.items():
                 console.print(f"  [dim]{k}: {v}[/dim]")
 
-        console.print()
-        choice = prompt_text(
-            "선택 (1/2): ",
-            session=session,
-            default="2",
+        header_items = [
+            {"label": "헤더 추가", "description": ""},
+            {"label": "완료 (설정 적용)", "description": ""},
+        ]
+        header_idx = interactive_select(
+            header_items,
+            title="Custom HTTP Header 설정",
         )
-        if choice == INPUT_CANCELLED:
-            console.print("\n[dim]취소되었습니다.[/dim]")
+        if header_idx is None:
+            console.print("[dim]취소되었습니다.[/dim]")
             return None
 
-        if choice == "1":
+        if header_idx == 0:
             header_key = prompt_text(
                 "Header 이름: ",
                 session=session,
@@ -956,8 +985,94 @@ def create_llm_from_config(config: Any, agent: Any, console: Console) -> Any | N
         return None
 
 
+def _detect_installed_cli_agents() -> list[str]:
+    """Detect installed CLI agents via shutil.which()."""
+    import shutil
+
+    agents = []
+    for name in ("claude", "opencode", "codex", "gemini"):
+        if shutil.which(name):
+            agents.append(name)
+    return agents
+
+
+def _handle_cli_agent_setup(
+    model_profile_manager: Any,
+    agent: Any,
+    console: Console,
+    create_llm_func: Callable,
+    agent_factory: Callable | None = None,
+    session: Any | None = None,
+    installed_agents: list[str] | None = None,
+) -> Any | None:
+    """Handle CLI Agent setup — select agent, configure, apply."""
+    if installed_agents is None:
+        installed_agents = _detect_installed_cli_agents()
+
+    if not installed_agents:
+        console.print("[red]설치된 CLI 에이전트가 없습니다.[/red]")
+        console.print("[dim]claude, codex, opencode, gemini 중 하나를 설치하세요.[/dim]")
+        return None
+
+    # Select agent
+    agent_items = [
+        {"label": name, "description": ""}
+        for name in installed_agents
+    ]
+    idx = interactive_select(
+        agent_items,
+        title="CLI Agent 선택",
+    )
+    if idx is None:
+        console.print("[dim]취소되었습니다.[/dim]")
+        return None
+
+    selected_agent = installed_agents[idx]
+
+    model_name = f"cli:{selected_agent}"
+    console.print(f"\n[green]선택된 에이전트: {selected_agent} → 모델명: {model_name}[/green]")
+
+    # Apply config
+    model_profile_manager.set_parameter("model", model_name)
+    model_profile_manager.set_parameter("max_tokens", "16000")
+    model_profile_manager.set_parameter("temperature", "0.3")
+
+    # Save profile
+    try:
+        model_profile_manager.save_profile("default-setup")
+        model_profile_manager.set_default_profile("default-setup")
+        console.print("[dim]프로필 'default-setup' 저장됨[/dim]")
+    except Exception:
+        pass
+
+    # Auto-apply to agent
+    console.print()
+    new_config = model_profile_manager.get_current_config()
+    if agent:
+        apply_ok = apply_model_config_to_agent(agent, new_config, console, create_llm_func)
+        if apply_ok:
+            console.print("[green]설정이 적용되었습니다.[/green]")
+            if hasattr(model_profile_manager, "clear_dirty_parameters"):
+                model_profile_manager.clear_dirty_parameters()
+        else:
+            console.print("[yellow]적용 실패. /model apply 로 재시도하세요.[/yellow]")
+    elif agent_factory:
+        try:
+            new_agent = agent_factory(new_config)
+            if new_agent:
+                console.print("[green]에이전트가 초기화되었습니다.[/green]")
+                if hasattr(model_profile_manager, "clear_dirty_parameters"):
+                    model_profile_manager.clear_dirty_parameters()
+                return new_agent
+        except Exception as e:
+            console.print(f"[red]에이전트 생성 실패: {e}[/red]")
+
+    return None
+
+
 __all__ = [
     'handle_model_command',
     'apply_model_config_to_agent',
     'create_llm_from_config',
+    '_detect_installed_cli_agents',
 ]

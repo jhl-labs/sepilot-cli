@@ -10,6 +10,12 @@ from sepilot.tools.code_analysis.ast_parser import (
     ComplexityCalculator,
     FunctionCallExtractor,
 )
+from sepilot.tools.code_analysis.language_detector import (
+    LanguageDetector,
+    detect_language,
+    get_language_detector,
+    is_supported_language,
+)
 from sepilot.tools.code_analysis.models import (
     ClassInfo,
     ComplexityInfo,
@@ -20,6 +26,11 @@ from sepilot.tools.code_analysis.models import (
     ImportInfo,
     Parameter,
     Reference,
+)
+from sepilot.tools.code_analysis.tree_sitter_parser import (
+    TreeSitterParser,
+    get_tree_sitter_parser,
+    parse_file,
 )
 
 # New multi-language support
@@ -32,17 +43,6 @@ from sepilot.tools.code_analysis.unified_ast import (
     UnifiedAST,
     VariableSymbol,
     Visibility,
-)
-from sepilot.tools.code_analysis.language_detector import (
-    LanguageDetector,
-    detect_language,
-    get_language_detector,
-    is_supported_language,
-)
-from sepilot.tools.code_analysis.tree_sitter_parser import (
-    TreeSitterParser,
-    get_tree_sitter_parser,
-    parse_file,
 )
 
 __all__ = [

@@ -361,17 +361,3 @@ class RAGContentFetcher:
             "total_size_mb": round(total_size / (1024 * 1024), 2),
             "cache_dir": str(self.cache_dir)
         }
-
-
-def fetch_url_sync(url: str, **kwargs) -> str | None:
-    """Synchronous wrapper for fetch_url.
-
-    Args:
-        url: The URL to fetch
-        **kwargs: Additional arguments for RAGContentFetcher
-
-    Returns:
-        Fetched content or None
-    """
-    fetcher = RAGContentFetcher(**kwargs)
-    return asyncio.run(fetcher.fetch_url(url))
