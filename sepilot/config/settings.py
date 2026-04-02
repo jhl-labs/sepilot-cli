@@ -33,10 +33,10 @@ class Settings(BaseModel):
         description="Enable automatic loading of project-local rules"
     )
 
-    # Graph mode: 'enhanced' (full 17-node pipeline) or 'simplify' (minimal Claude Code-style loop)
+    # Graph mode: 'enhanced' (full 17-node pipeline) or 'fast' (minimal ReAct loop for small models)
     graph_mode: str = Field(
         default_factory=lambda: os.getenv("SEPILOT_GRAPH_MODE", "enhanced"),
-        description="Graph mode: 'enhanced' (full pipeline) or 'simplify' (minimal agent loop)"
+        description="Graph mode: 'enhanced' (full pipeline) or 'fast' (minimal ReAct loop)"
     )
 
     # Human-in-the-loop settings

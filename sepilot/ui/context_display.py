@@ -595,3 +595,72 @@ class ContextDisplayManager:
                 "/compact로 압축하거나 계속 진행하세요[/yellow]"
             )
             self.console.print("[dim]   92% 도달 시 자동 압축됩니다. /context로 상세 보기[/dim]")
+
+
+# Token pricing per 1M tokens
+_MODEL_PRICING = {
+    "claude-opus-4": {"input": 15.0, "output": 75.0},
+    "claude-sonnet-4": {"input": 3.0, "output": 15.0},
+    "claude-3-7-sonnet": {"input": 3.0, "output": 15.0},
+    "claude-3-5-sonnet": {"input": 3.0, "output": 15.0},
+    "claude-3-5-haiku": {"input": 0.80, "output": 4.0},
+    "claude-3-opus": {"input": 15.0, "output": 75.0},
+    "claude-3-sonnet": {"input": 3.0, "output": 15.0},
+    "claude-3-haiku": {"input": 0.25, "output": 1.25},
+    "gpt-4o": {"input": 2.5, "output": 10.0},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.6},
+    "gpt-4-turbo": {"input": 10.0, "output": 30.0},
+    "gpt-4": {"input": 30.0, "output": 60.0},
+    "gpt-3.5-turbo": {"input": 0.5, "output": 1.5},
+    "gemini-1.5-pro": {"input": 3.5, "output": 10.5},
+    "gemini-1.5-flash": {"input": 0.075, "output": 0.3},
+    "default": {"input": 3.0, "output": 15.0},
+}
+
+
+def _get_model_pricing(model_name: str) -> dict[str, float]:
+    if not isinstance(model_name, str) or not model_name:
+        return _MODEL_PRICING["default"]
+    model_lower = model_name.lower()
+    if model_lower in _MODEL_PRICING:
+        return _MODEL_PRICING[model_lower]
+    best_key = None
+    best_len = 0
+    for key in _MODEL_PRICING:
+        if key == "default":
+            continue
+        if (key in model_lower or model_lower in key) and len(key) > best_len:
+            best_key = key
+            best_len = len(key)
+    return _MODEL_PRICING[best_key] if best_key else _MODEL_PRICING["default"]
+
+
+def estimate_cost(
+    total_tokens: int,
+    model_name: str,
+    input_ratio: float = 0.6,
+) -> dict[str, float]:
+    """Estimate cost for token usage.
+
+    Args:
+        total_tokens: Total tokens used
+        model_name: Model name for pricing
+        input_ratio: Ratio of input to total tokens
+
+    Returns:
+        Dictionary with input_cost, output_cost, total_cost
+    """
+    input_tokens = int(total_tokens * input_ratio)
+    output_tokens = total_tokens - input_tokens
+
+    pricing = _get_model_pricing(model_name)
+    input_cost = (input_tokens / 1_000_000) * pricing["input"]
+    output_cost = (output_tokens / 1_000_000) * pricing["output"]
+
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "total_cost": input_cost + output_cost,
+    }

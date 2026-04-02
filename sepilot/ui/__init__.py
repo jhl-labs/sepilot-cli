@@ -12,7 +12,7 @@ This module provides enhanced UI/UX components following SOLID principles:
 """
 
 from .completer import FileReferenceCompleter
-from .context_display import ContextDisplayManager, ContextUsageInfo
+from .context_display import ContextDisplayManager, ContextUsageInfo, estimate_cost
 from .dashboard import DashboardManager, create_dashboard, is_dashboard_available
 from .interactive import InteractiveMode
 from .key_bindings import KeyBindingsManager, create_key_bindings
@@ -62,6 +62,7 @@ __all__ = [
     # Context display (SOLID: Single Responsibility)
     "ContextDisplayManager",
     "ContextUsageInfo",
+    "estimate_cost",
     # Memory management (SOLID: Single Responsibility)
     "MemoryManager",
     "MemoryEntry",

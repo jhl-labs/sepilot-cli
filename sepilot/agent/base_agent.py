@@ -461,8 +461,8 @@ class ReactAgent:
         self.a2a_connector: A2AConnector | None = None
         self.handoff_manager: SessionHandoffManager | None = None
 
-        # Initialize Advanced Agent Patterns (skip for simplified graph mode)
-        if getattr(self.settings, 'graph_mode', 'enhanced') == 'simplify':
+        # Initialize Advanced Agent Patterns (skip for fast graph mode)
+        if getattr(self.settings, 'graph_mode', 'enhanced') == 'fast':
             self._init_stub_patterns()
         else:
             self._init_agent_patterns()
@@ -1100,97 +1100,72 @@ class ReactAgent:
 
     def _build_graph(self) -> StateGraph:
         """Build LangGraph workflow based on graph_mode setting."""
-        if getattr(self.settings, 'graph_mode', 'enhanced') == 'simplify':
-            return self._build_simplified_graph()
+        if getattr(self.settings, 'graph_mode', 'enhanced') == 'fast':
+            return self._build_fast_graph()
         return self._build_enhanced_graph()
 
-    def _build_simplified_graph(self) -> StateGraph:
-        """Minimal agent loop (Claude Code style) — 9 nodes.
+    def _build_fast_graph(self) -> StateGraph:
+        """Ultra-minimal ReAct loop — 5 nodes.
 
-        Designed for slow-inference / rate-limited environments.
-        Skips: orchestrator, memory, planner, tool_recommender, tool_recorder,
-               reflection, backtrack, debate, codebase_exploration.
+        Designed for small models (e.g., qwen3:8b) and fast iteration.
+        Only: agent, approval, tools, context_manager, iteration_guard.
+        No triage, verifier, reporter, or any pattern nodes.
 
         Graph structure:
-            triage
-              ├─→ direct_response → END
-              └─→ iteration_guard → context_manager → agent
-                                                        │
-                              ┌─────────────────────────┴──────────┐
-                              ↓                                    ↓
-                          approval → tools → verifier         verifier
-                              │                │                   │
-                              └────────────────┴───────────────────↓
-                                                iteration_guard ←→ reporter → END
+            iteration_guard → context_manager → agent
+                 ↑                                │
+                 │                    ┌───────────┴──────────┐
+                 │                    ↓                      ↓
+                 │                approval → tools       END (no tool call)
+                 │                             │
+                 └─────────────────────────────┘
         """
         workflow = StateGraph(EnhancedAgentState)
 
         # Tool node (reuse existing enhanced tool executor)
         enhanced_tool_node = create_enhanced_tool_node(self)
 
-        # ===== 9 nodes only =====
-        workflow.add_node("triage", self._triage_node)
-        workflow.add_node("direct_response", self._direct_response_node)
+        # ===== 5 nodes only =====
         workflow.add_node("iteration_guard", self._iteration_guard_node)
         workflow.add_node("context_manager", self._context_manager_node)
         workflow.add_node("agent", self._agent_node)
         workflow.add_node("approval", self._approval_node)
         workflow.add_node("tools", enhanced_tool_node)
-        workflow.add_node("verifier", self._verification_node)
-        workflow.add_node("reporter", self._reporting_node)
 
         # ===== Edges =====
-        workflow.set_entry_point("triage")
+        workflow.set_entry_point("iteration_guard")
 
-        # Triage: 2-way split (no orchestrator distinction)
-        workflow.add_conditional_edges(
-            "triage",
-            self._triage_next_step_simplified,
-            {"direct": "direct_response", "execute": "iteration_guard"}
-        )
-        workflow.add_edge("direct_response", END)
-
-        # Iteration guard: stop → reporter directly (no memory_writer)
+        # Iteration guard: continue → context_manager, stop → END
         workflow.add_conditional_edges(
             "iteration_guard",
             self._guard_decision,
-            {"continue": "context_manager", "stop": "reporter"}
+            {"continue": "context_manager", "stop": END}
         )
 
-        # Core loop: no tool_recommender
+        # Context manager → agent
         workflow.add_edge("context_manager", "agent")
 
-        # Agent routing (reuse existing)
+        # Agent: tool call → approval, no tool call → END
         workflow.add_conditional_edges(
             "agent",
-            self._agent_next_step,
-            {"tools": "approval", "finalize": "verifier"}
+            self._agent_next_step_fast,
+            {"tools": "approval", "done": END}
         )
 
-        # Approval routing (reuse existing)
+        # Approval routing
         workflow.add_conditional_edges(
             "approval",
             self._approval_next_step,
             {"run_tools": "tools", "retry": "iteration_guard"}
         )
 
-        # Tools → verifier (no tool_recorder)
-        workflow.add_edge("tools", "verifier")
-
-        # Verifier: simplified — no reflection/backtrack/debate pipeline
-        workflow.add_conditional_edges(
-            "verifier",
-            self._verification_next_step_simplified,
-            {"continue": "iteration_guard", "report": "reporter"}
-        )
-
-        # Exit
-        workflow.add_edge("reporter", END)
+        # Tools → back to iteration_guard (pure ReAct loop)
+        workflow.add_edge("tools", "iteration_guard")
 
         if self.console and self.verbose:
             self.console.print(
-                "[dim cyan]⚡ Simplified graph mode: 9 nodes "
-                "(triage → agent → tools loop)[/dim cyan]"
+                "[dim cyan]⚡ Fast graph mode: 5 nodes "
+                "(agent → tools ReAct loop)[/dim cyan]"
             )
 
         return workflow.compile(checkpointer=self.checkpointer)
@@ -1545,12 +1520,14 @@ class ReactAgent:
         else:
             return "complex"
 
-    def _triage_next_step_simplified(self, state: EnhancedAgentState) -> Literal["direct", "execute"]:
-        """Simplified triage: direct response or execute (no orchestrator distinction)."""
-        decision = state.get("triage_decision") or "use_tools"
-        if decision == "direct_response":
-            return "direct"
-        return "execute"
+    def _agent_next_step_fast(self, state: EnhancedAgentState) -> Literal["tools", "done"]:
+        """Fast mode routing: tool call → approval, otherwise → END."""
+        messages = state.get("messages", [])
+        if messages:
+            last = messages[-1]
+            if hasattr(last, "tool_calls") and last.tool_calls:
+                return "tools"
+        return "done"
 
     def _extract_at_file_references(self, text: str) -> list[tuple[str, str]]:
         """Extract @file references and read their contents.
@@ -3159,11 +3136,7 @@ class ReactAgent:
             return "continue"
         return "report"
 
-    def _verification_next_step_simplified(self, state: EnhancedAgentState) -> Literal["continue", "report"]:
-        """Simplified verifier routing: continue loop or report (no reflection pipeline)."""
-        if state.get("needs_additional_iteration"):
-            return "continue"
-        return "report"
+    # _verification_next_step_simplified removed — fast mode has no verifier node
 
     def _reflection_next_step(
         self, state: EnhancedAgentState
@@ -4286,9 +4259,9 @@ class ReactAgent:
         try:
             # Run the graph with LangGraph checkpoint configuration
             # Each iteration cycle goes through multiple nodes.
-            # Enhanced: ~15 nodes/iter, Simplified: ~7 nodes/iter
-            is_simplified = getattr(self.settings, 'graph_mode', 'enhanced') == 'simplify'
-            recursion_multiplier = 8 if is_simplified else 15
+            # Enhanced: ~15 nodes/iter, Fast: ~5 nodes/iter
+            is_fast = getattr(self.settings, 'graph_mode', 'enhanced') == 'fast'
+            recursion_multiplier = 6 if is_fast else 15
             config = {
                 "configurable": {
                     "thread_id": self.thread_id

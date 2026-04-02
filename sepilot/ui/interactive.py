@@ -62,6 +62,7 @@ from sepilot.ui.commands.core_commands import (
     handle_history,
 )
 from sepilot.ui.commands.custom_commands import handle_custom_commands_command
+from sepilot.ui.commands.effort_commands import handle_effort_command
 from sepilot.ui.commands.graph_commands import handle_graph_command
 from sepilot.ui.commands.mcp_commands import handle_mcp_command
 from sepilot.ui.commands.mode_commands import (
@@ -318,6 +319,7 @@ class InteractiveMode:
             '/auto': self._cmd_auto_mode,
             '/mode': self._cmd_mode,
             '/agent': self._cmd_agent,
+            '/effort': self._cmd_effort,
         }
 
         # Special commands
@@ -1732,6 +1734,12 @@ Type `/license full` or see LICENSE.md in the project directory
 
             # 팀 결과를 대화 컨텍스트에 추가
             self._inject_team_results_to_context(_input, result)
+
+    def _cmd_effort(self, _input: str):
+        """Change effort level - delegates to effort_commands module."""
+        # Extract argument after '/effort'
+        arg = _input[len('/effort'):].strip() if _input.lower().startswith('/effort') else _input.strip()
+        handle_effort_command(self.console, self.agent, arg)
 
     def _inject_team_results_to_context(self, user_input: str, result: Any) -> None:
         """팀 실행 결과를 대화 컨텍스트에 추가합니다."""

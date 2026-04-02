@@ -24,6 +24,9 @@ from sepilot.ui.commands.core_commands import (
 from sepilot.ui.commands.custom_commands import (
     handle_custom_commands_command,
 )
+from sepilot.ui.commands.effort_commands import (
+    handle_effort_command,
+)
 from sepilot.ui.commands.graph_commands import (
     handle_graph_command,
     show_basic_graph_info,
@@ -123,6 +126,8 @@ __all__ = [
     'get_rag_context',
     # Tools commands
     'handle_tools_command',
+    # Effort commands
+    'handle_effort_command',
     # Graph commands
     'handle_graph_command',
     'show_basic_graph_info',

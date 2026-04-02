@@ -451,9 +451,9 @@ def _run_interactive_mode(
     help="List available thread IDs and exit"
 )
 @click.option(
-    "--simplify",
+    "--fast",
     is_flag=True,
-    help="Use simplified 9-node graph (for slow models / rate-limited APIs)"
+    help="Use fast 5-node ReAct graph (for small models like qwen3:8b)"
 )
 @click.option(
     "--interactive", "-i",
@@ -498,7 +498,7 @@ def main(
     max_iterations: int,
     prompt_profile: str,
     no_memory: bool,
-    simplify: bool,
+    fast: bool,
     list_threads: bool,
     interactive: bool,    git: str | None,
     github: str | None,
@@ -506,10 +506,10 @@ def main(
     stdin: bool,
     print_cost: bool,
 ):
-    # --simplify flag sets graph mode via env var (picked up by Settings.graph_mode default_factory)
-    if simplify:
-        os.environ["SEPILOT_GRAPH_MODE"] = "simplify"
-        console.print("[dim cyan]⚡ Simplified graph mode enabled (9 nodes)[/dim cyan]")
+    # --fast flag sets graph mode via env var (picked up by Settings.graph_mode default_factory)
+    if fast:
+        os.environ["SEPILOT_GRAPH_MODE"] = "fast"
+        console.print("[dim cyan]⚡ Fast graph mode enabled (5-node ReAct loop)[/dim cyan]")
 
     # Combine positional prompt with -p option (positional takes precedence)
     if prompt_arg and not prompt:
