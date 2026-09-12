@@ -18,7 +18,9 @@
  * optional Chromium BiDi mapper stay external. Playwright and
  * `playwright-core` must be bundled: the standalone artifact has no adjacent
  * `node_modules`, while browser automation can use an already-installed
- * system Chromium through the daemon's executable-path fallback. `ssh2`
+ * system Chromium through the daemon's executable-path fallback. Playwright's
+ * optional Electron launcher is stubbed because Electron itself is not part of
+ * the standalone distribution. `ssh2`
  * embeds private-key parser/test strings that must not ship in the standalone
  * binary; docker-over-SSH is therefore stubbed out for the single-file build,
  * while local Docker socket usage through dockerode keeps working. `protobufjs`
@@ -170,6 +172,32 @@ const stubSsh2 = {
   },
 }
 
+// Playwright statically resolves its optional Electron launcher even when the
+// daemon only uses Chromium. `electron` is intentionally not installed (nor
+// supported) in the standalone binary, so give that unused branch a clear
+// runtime error instead of making every cross-platform release build fail at
+// bundle time.
+const stubElectron = {
+  name: 'stub-electron',
+  setup(build: import('bun').PluginBuilder) {
+    build.onResolve({ filter: /^electron(?:\/index\.js)?$/ }, () => ({
+      path: 'electron',
+      namespace: 'sepilot-electron-stub',
+    }))
+    build.onLoad({ filter: /.*/, namespace: 'sepilot-electron-stub' }, () => ({
+      contents: [
+        'const unsupported = () => {',
+        '  throw new Error("Electron is not available in the sepilot standalone binary.")',
+        '}',
+        'export const app = { commandLine: { appendSwitch: unsupported }, whenReady: unsupported }',
+        'export default { app }',
+        '',
+      ].join('\n'),
+      loader: 'js',
+    }))
+  },
+}
+
 const stubProtobufInquire = {
   name: 'stub-protobufjs-inquire',
   setup(build: import('bun').PluginBuilder) {
@@ -231,6 +259,7 @@ type BunBuildLike = {
       | typeof pinNpmUndiciSubpath
       | typeof stubReactDevtools
       | typeof stubSsh2
+      | typeof stubElectron
       | typeof stubProtobufInquire
       | typeof makePlaywrightCoreDirStandaloneSafe
     >
@@ -253,6 +282,7 @@ export async function compileWithBun(
       pinNpmUndiciSubpath,
       stubReactDevtools,
       stubSsh2,
+      stubElectron,
       stubProtobufInquire,
       makePlaywrightCoreDirStandaloneSafe,
     ],
@@ -285,6 +315,7 @@ export const __testables = {
   pinNpmUndiciSubpath,
   stubReactDevtools,
   stubSsh2,
+  stubElectron,
   stubProtobufInquire,
   makePlaywrightCoreDirStandaloneSafe,
 }
