@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "jsx": "react-jsx",
+    "jsxImportSource": "react",
+    "paths": {
+      "@sepilotd/presentation": ["../presentation/src/index.ts"],
+      "@sepilotd/presentation/*": ["../presentation/src/*"],
+      "@sepilotd/api-client": ["../api-client/src/index.ts"],
+      "@sepilotd/api-client/*": ["../api-client/src/*"]
+    }
+  },
+  "include": ["src/**/*"]
+}

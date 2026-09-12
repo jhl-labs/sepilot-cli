@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "../..",
+    "baseUrl": "../..",
+    "jsx": "react-jsx",
+    "paths": {
+      "@sepilotd/core": ["packages/core/src/index.ts"],
+      "@sepilotd/core/*": ["packages/core/src/*"],
+      "@sepilotd/api-client": ["packages/api-client/src/index.ts"],
+      "@sepilotd/api-client/*": ["packages/api-client/src/*"]
+    }
+  }
+}

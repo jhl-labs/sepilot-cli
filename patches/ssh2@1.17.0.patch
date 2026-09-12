@@ -1,0 +1,25 @@
+diff --git a/lib/protocol/constants.js b/lib/protocol/constants.js
+index 4e7db31..b8576ab 100644
+--- a/lib/protocol/constants.js
++++ b/lib/protocol/constants.js
+@@ -12,15 +12,14 @@ const { bindingAvailable, CIPHER_INFO, MAC_INFO } = require('./crypto.js');
+ const eddsaSupported = (() => {
+   if (typeof crypto.sign === 'function'
+-      && typeof crypto.verify === 'function') {
+-    const key =
+-      '-----BEGIN PRIVATE KEY-----\r\nMC4CAQAwBQYDK2VwBCIEIHKj+sVa9WcD'
+-      + '/q2DJUJaf43Kptc8xYuUQA4bOFj9vC8T\r\n-----END PRIVATE KEY-----';
++      && typeof crypto.verify === 'function'
++      && typeof crypto.generateKeyPairSync === 'function') {
+     const data = Buffer.from('a');
+     let sig;
+     let verified;
+     try {
+-      sig = crypto.sign(null, data, key);
+-      verified = crypto.verify(null, data, key, sig);
++      const { privateKey } = crypto.generateKeyPairSync('ed25519');
++      sig = crypto.sign(null, data, privateKey);
++      verified = crypto.verify(null, data, privateKey, sig);
+     } catch {}
+     return (Buffer.isBuffer(sig) && sig.length === 64 && verified === true);
+   }

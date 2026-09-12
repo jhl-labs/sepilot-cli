@@ -1,0 +1,53 @@
+{
+  "name": "@sepilotd/core",
+  "version": "1.0.4",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./canvas/parse": {
+      "types": "./dist/canvas/parse.d.ts",
+      "import": "./dist/canvas/parse.js",
+      "require": "./dist/canvas/parse.cjs"
+    },
+    "./canvas/image": {
+      "types": "./dist/canvas/image.d.ts",
+      "import": "./dist/canvas/image.js",
+      "require": "./dist/canvas/image.cjs"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "sepilot",
+    "types"
+  ],
+  "license": "LicenseRef-Sepilot-Source-Available-1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jhl-labs/sepilot-cli.git",
+    "directory": "packages/core"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\""
+  },
+  "devDependencies": {
+    "tsup": "8.5.1",
+    "typescript": "5.7.3"
+  }
+}

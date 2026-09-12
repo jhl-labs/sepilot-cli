@@ -1,0 +1,29 @@
+{
+  "name": "@sepilotd/bundle",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "LicenseRef-Sepilot-Source-Available-1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jhl-labs/sepilot-cli.git",
+    "directory": "packages/bundle"
+  },
+  "scripts": {
+    "build": "tsup",
+    "build:binary": "tsx scripts/build.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true});require('fs').rmSync('out',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "@sepilotd/cli": "workspace:*",
+    "@sepilotd/daemon": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "tsup": "8.5.1",
+    "tsx": "4.21.0",
+    "typescript": "5.7.3",
+    "yaml": "2.9.0"
+  }
+}

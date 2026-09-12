@@ -1,0 +1,71 @@
+diff --git a/dist/types/icns.js b/dist/types/icns.js
+index f2bfafef3723cb423b110304815e56e3f97f81e0..990ec2b1231a0f39c477f7df1b22e315d66d28d0 100644
+--- a/dist/types/icns.js
++++ b/dist/types/icns.js
+@@ -74,6 +74,14 @@ function getImageSize(type) {
+     const size = ICON_TYPE_SIZE[type];
+     return { width: size, height: size, type };
+ }
++function nextImageOffset(imageOffset, imageLength, inputLength, fileLength) {
++    // Every ICNS entry includes an eight-byte type/length header. Reject zero
++    // or undersized lengths instead of leaving the parser at the same offset.
++    if (imageLength < SIZE_HEADER || imageOffset + imageLength > inputLength || imageOffset + imageLength > fileLength) {
++        throw new TypeError('Invalid ICNS entry length');
++    }
++    return imageOffset + imageLength;
++}
+ exports.ICNS = {
+     validate: (input) => (0, utils_1.toUTF8String)(input, 0, 4) === 'icns',
+     calculate(input) {
+@@ -82,7 +90,7 @@ exports.ICNS = {
+         let imageOffset = SIZE_HEADER;
+         let imageHeader = readImageHeader(input, imageOffset);
+         let imageSize = getImageSize(imageHeader[0]);
+-        imageOffset += imageHeader[1];
++        imageOffset = nextImageOffset(imageOffset, imageHeader[1], inputLength, fileLength);
+         if (imageOffset === fileLength)
+             return imageSize;
+         const result = {
+@@ -93,7 +101,7 @@ exports.ICNS = {
+         while (imageOffset < fileLength && imageOffset < inputLength) {
+             imageHeader = readImageHeader(input, imageOffset);
+             imageSize = getImageSize(imageHeader[0]);
+-            imageOffset += imageHeader[1];
++            imageOffset = nextImageOffset(imageOffset, imageHeader[1], inputLength, fileLength);
+             result.images.push(imageSize);
+         }
+         return result;
+diff --git a/dist/types/utils.js b/dist/types/utils.js
+index 5224bbafe87551ac415cb3de234820ccc0ff6e2c..ee036bb51c8112fbf667d602bd16518d43beb587 100644
+--- a/dist/types/utils.js
++++ b/dist/types/utils.js
+@@ -49,9 +49,16 @@ function readUInt(input, bits, offset, isBigEndian) {
+ }
+ exports.readUInt = readUInt;
+ function readBox(input, offset) {
+-    if (input.length - offset < 4)
++    if (input.length - offset < 8)
++        return;
++    let boxSize = (0, exports.readUInt32BE)(input, offset);
++    // ISO BMFF size 0 means that the box extends to the end of the file. Keep
++    // the normalized size positive so callers cannot loop forever on the same
++    // offset. Extended-size boxes (size 1) are not supported by this parser.
++    if (boxSize === 0)
++        boxSize = input.length - offset;
++    if (boxSize < 8)
+         return;
+-    const boxSize = (0, exports.readUInt32BE)(input, offset);
+     if (input.length - offset < boxSize)
+         return;
+     return {
+@@ -67,9 +74,7 @@ function findBox(input, boxName, offset) {
+             break;
+         if (box.name === boxName)
+             return box;
+-        // Fix the infinite loop by ensuring offset always increases
+-        // If box.size is 0, advance by at least 8 bytes (the size of the box header)
+-        offset += box.size > 0 ? box.size : 8;
++        offset += box.size;
+     }
+ }
+ exports.findBox = findBox;

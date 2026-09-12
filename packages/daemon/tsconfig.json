@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "include": ["src/**/*"],
+  // `*.bun.test.ts` files run only under `bun test` (they import `bun:test` /
+  // `bun:sqlite`, builtins that don't exist under Node). They're typechecked by
+  // Bun's bundler, not `tsc`; including them here would pull `bun-types`'
+  // ambient globals into the Node program and clash with the daemon's `fetch`
+  // mocks. tsup builds from entry points only, so excluding them is harmless.
+  "exclude": ["src/**/*.bun.test.ts"]
+}

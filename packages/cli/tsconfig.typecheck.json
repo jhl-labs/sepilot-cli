@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "../..",
+    "baseUrl": "../..",
+    "paths": {
+      "@sepilotd/core": ["packages/core/src/index.ts"],
+      "@sepilotd/core/*": ["packages/core/src/*"],
+      "@sepilotd/presentation": ["packages/presentation/src/index.ts"],
+      "@sepilotd/presentation/*": ["packages/presentation/src/*"],
+      "@sepilotd/api-client": ["packages/api-client/src/index.ts"],
+      "@sepilotd/api-client/*": ["packages/api-client/src/*"]
+    }
+  }
+}

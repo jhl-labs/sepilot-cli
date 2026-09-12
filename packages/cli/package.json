@@ -1,0 +1,65 @@
+{
+  "name": "@sepilotd/cli",
+  "version": "1.0.4",
+  "type": "module",
+  "license": "LicenseRef-Sepilot-Source-Available-1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jhl-labs/sepilot-cli.git",
+    "directory": "packages/cli"
+  },
+  "main": "./dist/lib.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/lib.d.ts",
+      "import": "./dist/lib.js"
+    }
+  },
+  "bin": {
+    "sepilot": "./dist/index.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "sepilot"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.typecheck.json --noEmit",
+    "clean": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\""
+  },
+  "dependencies": {
+    "chalk": "5.6.2",
+    "cli-highlight": "2.1.11",
+    "commander": "13.1.0",
+    "diff": "8.0.4",
+    "ink": "5.2.1",
+    "ink-text-input": "6.0.0",
+    "marked": "15.0.12",
+    "react": "18.3.1",
+    "string-width": "8.2.0",
+    "undici": "6.28.0",
+    "wrap-ansi": "9.0.2",
+    "ws": "8.21.1",
+    "yaml": "2.8.3"
+  },
+  "devDependencies": {
+    "@sepilotd/api-client": "workspace:*",
+    "@sepilotd/presentation": "workspace:*",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/ws": "8.18.1",
+    "tsup": "8.5.1",
+    "typescript": "5.7.3"
+  }
+}

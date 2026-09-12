@@ -1,0 +1,25 @@
+export type {
+  ImageCanvasAssetRef,
+  ImageCanvasHistoryStep,
+  ImageCanvasJobDraft,
+  ImageCanvasOperation,
+  ImageCanvasOutputKind,
+  ImageCanvasProject,
+  ImageCanvasProviderLike,
+  ImageCanvasRecommendedModel,
+  ImageCanvasSize,
+  ImageCanvasWorkflowRef,
+} from '@sepilotd/core'
+export {
+  IMAGE_CANVAS_OPERATIONS,
+  clampImageCanvasSteps,
+  clampImageCanvasStrength,
+  enabledImageCanvasProvidersFor,
+  imageCanvasOperationIsVideo,
+  imageCanvasOperationNeedsImage,
+  imageCanvasOperationNeedsMask,
+  imageCanvasRecommendedModelsFor,
+  isImageCanvasOperation,
+  normalizeImageCanvasJobDraft,
+  providerSupportsImageCanvasOperation,
+} from '@sepilotd/core'
