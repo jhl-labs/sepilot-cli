@@ -282,8 +282,8 @@ importers:
         specifier: 3.36.0
         version: 3.36.0
       smol-toml:
-        specifier: 1.6.1
-        version: 1.6.1
+        specifier: 1.7.1
+        version: 1.7.1
       tsup:
         specifier: 8.5.1
         version: 8.5.1(tsx@4.21.0)(typescript@5.7.3)(yaml@2.8.3)
@@ -2400,8 +2400,8 @@ packages:
     resolution: {integrity: sha512-stxByr12oeeOyY2BlviTNQlYV5xOj47GirPr4yA1hE9JCtxfQN0+tVbkxwCtYDQWhEKWFHsEK48ORg5jrouCAg==}
     engines: {node: '>=20'}
 
-  smol-toml@1.6.1:
-    resolution: {integrity: sha512-dWUG8F5sIIARXih1DTaQAX4SsiTXhInKf1buxdY9DIg4ZYPZK5nGM1VRIYmEbDbsHt7USo99xSLFu5Q1IqTmsg==}
+  smol-toml@1.7.1:
+    resolution: {integrity: sha512-PPlsspAZ4jbMBu5DMFhfUGDQLu/vrL4SyBROVS37x8ynnVmFIs1VPBz1Co8Xks3TvpIaZXmU85y4DrQ+UyVFoQ==}
     engines: {node: '>= 18'}
 
   sonic-boom@4.2.1:
@@ -4981,7 +4981,7 @@ snapshots:
       ansi-styles: 6.2.3
       is-fullwidth-code-point: 5.1.0
 
-  smol-toml@1.6.1: {}
+  smol-toml@1.7.1: {}
 
   sonic-boom@4.2.1:
     dependencies:
