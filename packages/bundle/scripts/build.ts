@@ -144,14 +144,12 @@ function fail(msg: string): never {
 }
 
 function run(cmd: string, args: string[], cwd: string = REPO_ROOT): void {
-  // Node's execFileSync does not resolve Windows `.cmd` shims from PATH. pnpm
-  // and npm are installed as those shims on GitHub's Windows runner, whereas
-  // Unix exposes them as executables. Select the concrete shim so the release
-  // matrix can build its Windows artifact without invoking a shell.
-  const executable =
-    process.platform === 'win32' && (cmd === 'pnpm' || cmd === 'npm') ? `${cmd}.cmd` : cmd
-  log(`$ ${executable} ${args.join(' ')}  (cwd=${cwd})`)
-  execFileSync(executable, args, { cwd, stdio: 'inherit' })
+  // pnpm/npm are Windows `.cmd` shims. Node cannot execute those directly
+  // (`EINVAL`), so delegate their PATH resolution to the Windows command
+  // shell. Commands and arguments here are build-script controlled, never
+  // user-provided; Unix keeps the direct executable invocation.
+  log(`$ ${cmd} ${args.join(' ')}  (cwd=${cwd})`)
+  execFileSync(cmd, args, { cwd, stdio: 'inherit', shell: process.platform === 'win32' })
 }
 
 function parseTargets(arg: string | undefined): TargetName[] {
