@@ -145,7 +145,7 @@ function fail(msg: string): never {
 
 function run(cmd: string, args: string[], cwd: string = REPO_ROOT): void {
   log(`$ ${cmd} ${args.join(' ')}  (cwd=${cwd})`)
-  execFileSync(cmd, args, { cwd, stdio: 'inherit' })
+  execFileSync(cmd, args, { cwd, stdio: 'inherit', shell: process.platform === 'win32' })
 }
 
 function parseTargets(arg: string | undefined): TargetName[] {
