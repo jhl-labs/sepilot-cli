@@ -189,7 +189,7 @@ type ChannelRuntimeSummary = {
 
 type DeliveryRouteReadiness = 'available' | 'unavailable' | 'unknown'
 
-const REQUIRED_SKILL_IDS = ['monitor-infrastructure', 'research-to-jpad'] as const
+const REQUIRED_SKILL_IDS = ['monitor-infrastructure'] as const
 
 function optionalFailureKind(error: unknown): OptionalFailureKind {
   let status: number | null = null

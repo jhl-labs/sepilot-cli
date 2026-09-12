@@ -34,7 +34,6 @@ const BASE_ASSISTANT_TOOL_NAMES = [
 
 const REQUIRED_ASSISTANT_SKILL_IDS = [
   'monitor-infrastructure',
-  'research-to-jpad',
 ] as const
 
 const ASSISTANT_OPERATION_CORRELATION_LIMIT = 10
