@@ -1,0 +1,118 @@
+{
+  "name": "@sepilotd/api-client",
+  "version": "1.0.4",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./desktop": {
+      "types": "./dist/desktop.d.ts",
+      "import": "./dist/desktop.js",
+      "require": "./dist/desktop.cjs"
+    },
+    "./apps": {
+      "types": "./dist/apps.d.ts",
+      "import": "./dist/apps.js",
+      "require": "./dist/apps.cjs"
+    },
+    "./http": {
+      "types": "./dist/http.d.ts",
+      "import": "./dist/http.js",
+      "require": "./dist/http.cjs"
+    },
+    "./extension": {
+      "types": "./dist/extension.d.ts",
+      "import": "./dist/extension.js",
+      "require": "./dist/extension.cjs"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js",
+      "require": "./dist/node.cjs"
+    },
+    "./launcher": {
+      "types": "./dist/launcher/index.d.ts",
+      "import": "./dist/launcher/index.js",
+      "require": "./dist/launcher/index.cjs"
+    },
+    "./daemon/http": {
+      "types": "./dist/daemon/http.d.ts",
+      "import": "./dist/daemon/http.js",
+      "require": "./dist/daemon/http.cjs"
+    },
+    "./daemon/types": {
+      "types": "./dist/daemon/types.d.ts",
+      "import": "./dist/daemon/types.js",
+      "require": "./dist/daemon/types.cjs"
+    },
+    "./daemon/image-canvas": {
+      "types": "./dist/daemon/image-canvas.d.ts",
+      "import": "./dist/daemon/image-canvas.js",
+      "require": "./dist/daemon/image-canvas.cjs"
+    },
+    "./daemon/chat-surface": {
+      "types": "./dist/daemon/chat-surface.d.ts",
+      "import": "./dist/daemon/chat-surface.js",
+      "require": "./dist/daemon/chat-surface.cjs"
+    },
+    "./daemon/chat-transport": {
+      "types": "./dist/daemon/chat-transport.d.ts",
+      "import": "./dist/daemon/chat-transport.js",
+      "require": "./dist/daemon/chat-transport.cjs"
+    },
+    "./daemon/ws": {
+      "types": "./dist/daemon/ws.d.ts",
+      "import": "./dist/daemon/ws.js",
+      "require": "./dist/daemon/ws.cjs"
+    },
+    "./daemon/stream": {
+      "types": "./dist/daemon/stream.d.ts",
+      "import": "./dist/daemon/stream.js",
+      "require": "./dist/daemon/stream.cjs"
+    },
+    "./gateway/http": {
+      "types": "./dist/gateway/http.d.ts",
+      "import": "./dist/gateway/http.js",
+      "require": "./dist/gateway/http.cjs"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "api-client",
+    "sepilot"
+  ],
+  "license": "LicenseRef-Sepilot-Source-Available-1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jhl-labs/sepilot-cli.git",
+    "directory": "packages/api-client"
+  },
+  "scripts": {
+    "build": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\" && tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc -p tsconfig.typecheck.json --noEmit",
+    "clean": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\""
+  },
+  "dependencies": {
+    "@sepilotd/core": "workspace:*",
+    "ws": "8.21.1"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.1",
+    "tsup": "8.5.1",
+    "typescript": "5.7.3"
+  }
+}

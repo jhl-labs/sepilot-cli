@@ -1,0 +1,37 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": [
+    "tsconfig.base.json",
+    "build.features.yaml"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": [
+        "^build"
+      ],
+      "env": [
+        "NODE_ENV",
+        "SEPILOTD_RELEASE_BUILD"
+      ],
+      "outputs": [
+        "dist/**",
+        "out/**"
+      ]
+    },
+    "dev": {
+      "dependsOn": [
+        "^build"
+      ],
+      "cache": false,
+      "persistent": true
+    },
+    "typecheck": {
+      "dependsOn": [
+        "^build"
+      ]
+    },
+    "clean": {
+      "cache": false
+    }
+  }
+}

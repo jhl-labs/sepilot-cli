@@ -1,0 +1,98 @@
+{
+  "name": "@sepilotd/daemon",
+  "version": "1.0.4",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./embedded": {
+      "types": "./dist/embedded.d.ts",
+      "import": "./dist/embedded.js"
+    },
+    "./main": {
+      "types": "./dist/main.d.ts",
+      "import": "./dist/main.js"
+    },
+    "./benchmark": {
+      "types": "./dist/benchmark.d.ts",
+      "import": "./dist/benchmark.js"
+    },
+    "./dist/*": "./dist/*"
+  },
+  "bin": {
+    "sepilotd": "./dist/index.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "sepilot",
+    "daemon"
+  ],
+  "license": "LicenseRef-Sepilot-Source-Available-1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jhl-labs/sepilot-cli.git",
+    "directory": "packages/daemon"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch --onSuccess \"node dist/index.js\"",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.typecheck.json --noEmit",
+    "clean": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\""
+  },
+  "dependencies": {
+    "@sepilotd/api-client": "workspace:*",
+    "@sepilotd/core": "workspace:*",
+    "@xterm/addon-serialize": "0.14.0",
+    "@xterm/headless": "6.0.0",
+    "better-sqlite3": "12.11.1",
+    "diff": "8.0.4",
+    "dockerode": "4.0.10",
+    "node-pty": "1.1.0",
+    "node-telegram-bot-api": "0.67.0",
+    "pdf-parse": "2.4.5",
+    "pino-pretty": "13.1.3",
+    "playwright": "1.59.1",
+    "sqlite-vec": "0.1.9",
+    "undici": "6.28.0",
+    "yaml": "2.8.3"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "0.91.1",
+    "@fastify/multipart": "10.0.0",
+    "@fastify/websocket": "11.2.0",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@types/better-sqlite3": "7.6.13",
+    "@types/dockerode": "4.0.1",
+    "@types/node": "22.19.19",
+    "@types/node-telegram-bot-api": "0.64.14",
+    "@types/picomatch": "3.0.2",
+    "@types/ws": "8.18.1",
+    "bun-types": "1.3.14",
+    "chrono-node": "2.9.1",
+    "cron-parser": "4.9.0",
+    "fastify": "5.12.4",
+    "nats": "2.29.3",
+    "ollama": "0.6.3",
+    "openai": "6.34.0",
+    "picomatch": "4.0.4",
+    "simple-git": "3.36.0",
+    "smol-toml": "1.8.0",
+    "tsup": "8.5.1",
+    "typescript": "5.7.3",
+    "ws": "8.21.1",
+    "zod": "3.25.76",
+    "zod-to-json-schema": "3.25.2"
+  }
+}

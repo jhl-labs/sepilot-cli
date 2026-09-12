@@ -1,0 +1,25 @@
+/** Explicit user command syntax, never a natural-language scheduling classifier. */
+export function isTaskInvocation(input: string): boolean {
+  // Prefix-only: quoted examples, code, environment variables and $taskboard
+  // are data. Selecting task management does not select a mutation or a time.
+  return /^\s*\$task(?:\s|$)/u.test(input)
+}
+
+export const TASK_MANAGEMENT_TOOLS = [
+  'schedule_create', 'schedule_list', 'schedule_get', 'schedule_runs',
+  'schedule_update', 'schedule_pause', 'schedule_resume', 'schedule_cancel',
+  'schedule_run_now', 'question',
+] as const
+
+export const TASK_DISCOVERY_GUIDANCE = 'A leading $task command selects task management, not automatic creation. For ordinary language, judge the whole request: use Tasks for requested future, recurring, monitoring, or background actions, not merely a date, deadline, hypothetical, explanation, negation, or synchronous work. Words such as task or 태스크 are not triggers: resolve the intended object and operation from the conversation. Existing durable task status, results, and changes also use Tasks without a new scheduling phrase; generic work items, project tickets, and programming tasks do not. If the intended object, timing, or target is ambiguous, ask briefly before any mutation. Discover scheduler-advanced with agent.tools and transfer to react when scheduling tools are needed but not visible. Respect tool restrictions and unavailable capabilities; never claim scheduling without a persisted receipt.'
+
+export const TASK_INVOCATION_GUIDANCE = `Task management ($task):
+- A leading, unquoted $task followed by whitespace or end of input explicitly selects task management. It does not by itself authorize creation, select a time, or grant unattended approval. Quoted examples, code, environment variables, and longer names such as $taskboard are literal content.
+- Interpret the whole current request and relevant conversation semantically in any language. Use durable scheduling when the user wants an action to happen later, repeat, monitor/check back, or continue as an explicitly requested background agent task. A future date, deadline, hypothetical, explanation of scheduling, or ordinary synchronous request alone is not a request to schedule. Respect negation and requested notification conditions.
+- Words such as task or 태스크 alone do not select this capability. Resolve what the user is referring to from the current request and relevant conversation: an existing durable agent job, a project ticket or checklist item, programming/runtime terminology, or work in general. Follow-up references to an established durable job can request status, results, or changes without repeating a time or the word task. Prior discussion of scheduling is context, not continuing authorization: the current request must ask for the operation. If the object is unclear, clarify what kind of task is intended before creating or changing anything; do not assume a generic task means a scheduled job.
+- For both $task and ordinary language, determine the requested operation before calling tools: list/detail/history use schedule_list/get/runs; changes reuse the canonical job through schedule_update/pause/resume/cancel; existing immediate runs use schedule_run_now. Inspect existing jobs before modifying them; ask if multiple jobs match rather than guessing or changing all.
+- Create through schedule_create only for a clear scheduling/background request. Use @now only for explicitly requested immediate background execution. For a new task with missing or ambiguous execution timing, ask one concise question instead of inventing a schedule. A bare $task should explain these options or ask what to manage, without creating anything. Resolve relative dates against current time and timezone; confirm the resolved time/cadence and timezone in the receipt.
+- The task skill governs registration and management only. Do not copy task itself into schedule_create.skill_refs for the future payload; persist only separately selected workflow skills actually needed to execute that payload.
+- Persist a self-contained instruction including required inputs, workspace, expected result, and notification conditions. Distinguish the future payload from the current registration action; do not execute the future payload inline or use a sleeping shell. Do not invent unattended approval, skill selection, or a delivery destination.
+- If scheduling tools are not visible, discover the scheduler-advanced group with agent.tools and transfer to react with the required discovered tools through agent.transfer when available. Preserve explicit tool restrictions and approval policy. If scheduling is disabled or unavailable, say so; do not claim a reservation or use a shell workaround.
+- Confirm only persisted tool receipts: report task id, pending/running versus completed state, and how to inspect results. Registration or a running receipt does not prove completion. Do not create a second job as a backup or poll repeatedly after acknowledging a detached run.`

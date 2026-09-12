@@ -1,0 +1,69 @@
+{
+  "name": "@sepilotd/presentation",
+  "version": "1.0.4",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./canvas/react": {
+      "types": "./dist/canvas/react.d.ts",
+      "import": "./dist/canvas/react.js",
+      "require": "./dist/canvas/react.cjs"
+    },
+    "./artifacts/react": {
+      "types": "./dist/artifacts/react.d.ts",
+      "import": "./dist/artifacts/react.js",
+      "require": "./dist/artifacts/react.cjs"
+    },
+    "./artifacts/shared": {
+      "types": "./dist/artifacts/shared.d.ts",
+      "import": "./dist/artifacts/shared.js",
+      "require": "./dist/artifacts/shared.cjs"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "presentation",
+    "sepilot"
+  ],
+  "license": "LicenseRef-Sepilot-Source-Available-1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jhl-labs/sepilot-cli.git",
+    "directory": "packages/presentation"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\""
+  },
+  "dependencies": {
+    "@sepilotd/core": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": "^18.3.0 || ^19.0.0",
+    "react-dom": "^18.3.0 || ^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "react": "19.2.5",
+    "react-dom": "19.2.5",
+    "tsup": "8.5.1",
+    "typescript": "5.7.3"
+  }
+}

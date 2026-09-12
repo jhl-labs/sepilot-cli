@@ -1,0 +1,214 @@
+# sepilotd example configuration
+# Copy to ~/.sepilotd/config.yaml and customize
+
+version: 1
+
+device:
+  id: "auto-generated-on-init"
+  name: "my-machine"
+  role: "desktop"   # desktop | server | edge
+
+daemon:
+  port: 17600
+  host: "127.0.0.1"
+
+gateway:
+  url: "http://127.0.0.1:17610"
+
+providers:
+  # Local Ollama (no API key needed)
+  - id: "ollama"
+    type: "ollama"
+    baseUrl: "http://localhost:11434"
+    models: ["llama3.3", "qwen3"]
+    default: true
+
+  # OpenAI (requires API key)
+  # - id: "openai"
+  #   type: "openai"
+  #   apiKey: "${OPENAI_API_KEY}"
+  #   models: ["gpt-4o", "gpt-4o-mini"]
+
+  # OpenAI-compatible endpoint (including Ollama-compatible /v1 gateways)
+  # Keep the chat model and embedding model in the same provider if the endpoint exposes both.
+  # - id: "ollama-cloud"
+  #   type: "openai"
+  #   apiKey: "ollama"
+  #   baseUrl: "http://your-openai-compatible-endpoint/v1"
+  #   models: ["glm-4.7:cloud", "qwen3-embedding:8b"]
+  #   default: true
+
+  # Anthropic (requires API key)
+  # - id: "anthropic"
+  #   type: "anthropic"
+  #   apiKey: "${ANTHROPIC_API_KEY}"
+  #   models: ["claude-sonnet-4-20250514"]
+
+agent:
+  autonomy: "supervised"    # readonly | supervised | autonomous
+  thinkingLevel: "medium"   # off | low | medium | high | max
+
+# Optional structured search backend. The ai-search adapter calls POST
+# /v1/search and also accepts AI_SEARCH_URL / AI_SEARCH_API_KEY from the
+# daemon environment. Keep credentials out of this file.
+# webSearch:
+#   provider: "ai-search"
+#   endpoint: "https://search.example.com"
+#   trustedDomains: []
+
+channels: []
+  # - type: "github-issue"
+  #   enabled: true
+  #   config:
+  #     owner: "your-org"
+  #     repo: "your-repo"
+  #     labels: ["ai-task"]
+  # - type: "telegram"
+  #   enabled: true
+  #   config:
+  #     botToken: "${TELEGRAM_BOT_TOKEN}"
+  # - type: "mattermost"
+  #   enabled: true
+  #   config:
+  #     serverUrl: "https://mattermost.example.invalid"
+  #     botToken: "${MATTERMOST_BOT_TOKEN}"
+  #     webhookToken: "${MATTERMOST_WEBHOOK_TOKEN}"
+  #     botUserId: "bot-user-id"
+  #     allowedTeams: ["team-id"]
+  #     allowedChannels: ["channel-id"]
+  #     allowedUsers: ["user-id"]
+  #   # Configure Mattermost's outgoing webhook target as:
+  #   # https://<daemon-origin>/api/v1/webhooks/mattermost
+
+# Optional collection root for new Mattermost/Telegram/etc. sessions. An
+# explicit /cwd in a chat still wins and remains bound to that session.
+channelPipeline:
+  defaultWorkspaceRoot: "~/workspace"
+
+# Personal-assistant outbound integrations are runtime-environment only:
+# - Environment-managed Mattermost (cluster/systemd): set
+#   SEPILOTD_MATTERMOST_FROM_ENV=true plus MATTERMOST_SERVER_URL,
+#   MATTERMOST_BOT_TOKEN, MATTERMOST_WEBHOOK_TOKEN, and at least one bounded
+#   SEPILOTD_MATTERMOST_ALLOWED_TEAMS/CHANNELS/USERS list. The effective channel
+#   exists only in memory; its credentials are never copied into config.yaml.
+# - Notification Relay: NOTIFY_RELAY_BASE_URL, NOTIFY_RELAY_DESTINATION_ID,
+#   NOTIFY_RELAY_TOKEN (optional service/environment labels are documented in
+#   docs/architecture/04-deployment.md).
+# - JPAD Agent API: JPAD_PERSONAL_API_TOKEN (optional JPAD_BASE_URL override).
+# Never commit these values or package them into a release artifact.
+
+mcp:
+  servers: []
+  # Built-in connector templates are available without adding a marketplace:
+  #   sepilot mcp search notion
+  #   sepilot mcp install notion --marketplace builtin
+  #   sepilot mcp install linear --marketplace builtin
+  #   sepilot mcp install atlassian --marketplace builtin
+  #   sepilot secrets set GITHUB_TOKEN
+  #   sepilot mcp install github --marketplace builtin
+  #
+  # Email / Google Workspace / Zapier templates bridge to a reviewed remote
+  # MCP endpoint selected by the user or organization:
+  #   sepilot mcp install google-workspace-remote --marketplace builtin --var GOOGLE_WORKSPACE_MCP_URL=https://...
+  #   sepilot mcp install email-remote --marketplace builtin --var EMAIL_MCP_URL=https://...
+  #   sepilot mcp install zapier-remote --marketplace builtin --var ZAPIER_MCP_URL=https://...
+  client:
+    # These are client-side capabilities exposed to connected MCP servers.
+    # Keep them disabled unless a specific MCP server needs them.
+    roots:
+      enabled: false
+      listChanged: true
+      entries: []
+      # - uri: "file:///home/me/project"
+      #   name: "project"
+    sampling:
+      enabled: false
+      # provider: "ollama"
+      # model: "llama3.3"
+      maxTokens: 1024
+    elicitation:
+      enabled: false
+      mode: "decline" # decline | accept-defaults
+      applyDefaults: true
+
+memory:
+  encryption: true
+  vectorBackend: "auto"  # auto | sqlite-vec | sqlite-scan | qdrant | opensearch | elasticsearch | meilisearch | custom-api
+  # Semantic search is disabled by default.
+  # embeddingProvider: "openai"
+  # embeddingModel: "text-embedding-3-small"
+  # For OpenAI-compatible endpoints, the embedding model is often different from the chat model.
+  # Example:
+  # embeddingProvider: "ollama-cloud"
+  # embeddingModel: "qwen3-embedding:8b"
+  # qdrant:
+  #   url: "http://127.0.0.1:6333"
+  #   apiKey: "${QDRANT_API_KEY}"
+  #   collection: "sepilotd-memory"
+  # opensearch:
+  #   url: "http://127.0.0.1:9200"
+  #   index: "sepilotd-memory"
+  #   username: "admin"
+  #   password: "${OPENSEARCH_PASSWORD}"
+  # elasticsearch:
+  #   url: "http://127.0.0.1:9200"
+  #   index: "sepilotd-memory"
+  #   apiKey: "${ELASTICSEARCH_API_KEY}"
+  # meilisearch:
+  #   url: "http://127.0.0.1:7700"
+  #   index: "sepilotd-memory"
+  #   apiKey: "${MEILISEARCH_API_KEY}"
+  #   embedder: "sepilotd_memory"
+  # customApi:
+  #   url: "http://127.0.0.1:8080"
+  #   apiKey: "${CUSTOM_RAG_API_KEY}"
+  #   auth:
+  #     type: "bearer" # none | bearer | api-key | basic
+  #     # headerName: "x-api-key" # useful with type: api-key
+  #     # username: "${CUSTOM_RAG_USER}" # useful with type: basic
+  #     # password: "${CUSTOM_RAG_PASSWORD}"
+  #   headers:
+  #     X-Tenant: "local"
+  #   healthPath: "/health"
+  #   upsertPath: "/vectors/upsert"
+  #   deletePath: "/vectors/delete"
+  #   searchPath: "/vectors/search"
+  #   timeoutMs: 15000
+  # rag:
+  #   defaultLimit: 8
+  #   candidateMultiplier: 5
+  #   scoreThreshold: 0
+  #   rerank:
+  #     enabled: false
+  #     provider: "custom-api" # local | custom-api
+  #     endpoint: "http://127.0.0.1:8081/rerank"
+  #     apiKey: "${CUSTOM_RERANK_API_KEY}"
+  #     auth:
+  #       type: "bearer"
+  #     headers:
+  #       X-Tenant: "local"
+  #     # healthPath: "/health" # empty uses a dry-run POST to endpoint
+  #     timeoutMs: 10000
+  #     weight: 0.35
+
+security:
+  toolPolicy: "policies.yaml"
+  auditLog: true
+  # terminal.run isolation tier:
+  #   local      — run on the host (default; file tools always host-side)
+  #   docker     — per-command container (needs Docker daemon + image)
+  #   bubblewrap — per-command user-namespace sandbox (needs `bwrap`; no daemon)
+  # In docker/bubblewrap mode built-in fs.* and apply_patch tools are hidden by
+  # default, so their workspace access goes through the isolated terminal.run mount.
+  # Set sandboxHostFileTools: "allow" only for legacy compatibility; doing so
+  # lets fs.read/fs.write/fs.edit/etc. bypass the sandbox namespace.
+  sandbox: "local"   # local | docker | bubblewrap
+  sandboxHostFileTools: "deny" # deny (default) | allow
+  # sandboxBubblewrap:
+  #   networkMode: "none"        # none unshares the net namespace; host keeps networking
+  #   readOnlyWorkspace: false   # true binds the workspace read-only
+  #   projectHostToolchains: true # mount verified Go/Node/Python/Rust/etc. runtimes read-only
+  #   bwrapPath: "bwrap"         # override the bwrap binary path
+
+observability:
+  telemetry: false
