@@ -86,10 +86,11 @@ function trimPresentationContent(content: string): string {
 }
 
 function stripRepeatedProtocolStem(value: string, stem: AnswerProtocolStem): string {
-  const repeatedStem = new RegExp(`^[ \\t]*${stem}:[ \\t]*`, 'i')
   let body = value
-  while (repeatedStem.test(body)) {
-    body = body.replace(repeatedStem, '')
+  for (;;) {
+    const marker = /^[ \\t]*([A-Z]+):[ \\t]*/i.exec(body)
+    if (!marker || marker[1]?.toUpperCase() !== stem) break
+    body = body.slice(marker[0].length)
   }
   return body
 }

@@ -17,17 +17,17 @@
 import './generated/version.js'
 import { createHash } from 'node:crypto'
 import {
-  existsSync,
-  mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
-  renameSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { VEC0_PATH } from './generated/vec-asset.js'
+
+const materializedVec0ByHash = new Map<string, string>()
 
 // Parent Node tooling such as `tsx` can inject NODE_PATH. The standalone binary
 // must resolve its embedded dependency graph deterministically, so clear it
@@ -97,32 +97,23 @@ function resolveSelfExec(): { command: string; prefixArgs: string[] } {
  * sqlite-vec backend can `loadExtension()`.
  *
  * The file is named exactly `vec0.so` (matching what `sqlite-vec` ships) inside
- * a per-content-hash directory: SQLite derives the extension's init function
- * from the *base filename*, so it must stay `vec0.so` for `sqlite3_vec_init` to
- * be found; the hashed directory keeps concurrent / repeated runs from clashing
- * while letting them reuse an already-extracted copy. Returns the real path, or
- * `undefined` if anything goes wrong (the daemon then degrades to the non-vector
- * `sqlite-scan` backend, exactly as it does without sqlite-vec).
+ * a securely-created per-process directory: SQLite derives the extension's init
+ * function from the *base filename*, so it must stay `vec0.so` for
+ * `sqlite3_vec_init` to be found. The content hash cache avoids duplicate writes
+ * inside one process without trusting a predictable path in the shared OS temp
+ * directory. Returns the real path, or `undefined` if anything goes wrong (the
+ * daemon then degrades to the non-vector `sqlite-scan` backend).
  */
 function materializeVec0(bunfsPath: string): string | undefined {
   try {
     const bytes = readFileSync(bunfsPath)
     const hash = createHash('sha256').update(bytes).digest('hex').slice(0, 16)
-    const dir = join(tmpdir(), 'sepilot-vec', hash)
-    mkdirSync(dir, { recursive: true })
+    const cached = materializedVec0ByHash.get(hash)
+    if (cached) return cached
+    const dir = mkdtempSync(join(tmpdir(), `sepilot-vec-${hash}-`))
     const realPath = join(dir, 'vec0.so')
-    if (!existsSync(realPath)) {
-      const partial = join(dir, `vec0.so.${process.pid}.partial`)
-      writeFileSync(partial, bytes)
-      // Atomic-ish rename so a concurrent reader never sees a half-written file.
-      try {
-        renameSync(partial, realPath)
-      } catch {
-        // Lost the race or rename unsupported across temp filesystems — if the
-        // destination now exists (another writer won) that's fine.
-        if (!existsSync(realPath)) writeFileSync(realPath, bytes)
-      }
-    }
+    writeFileSync(realPath, bytes, { flag: 'wx', mode: 0o700 })
+    materializedVec0ByHash.set(hash, realPath)
     return realPath
   } catch {
     return undefined

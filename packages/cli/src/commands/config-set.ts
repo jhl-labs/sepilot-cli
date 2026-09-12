@@ -47,6 +47,8 @@ const SCALAR_DAEMON_KEYS = new Set<string>([
   'scheduler.surfaces.desktop',
 ])
 
+const UNSAFE_CONFIG_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor'])
+
 function shouldUseDaemonApi(key: string): boolean {
   return SCALAR_DAEMON_KEYS.has(key) && isDaemonConfigUpdateKey(key)
 }
@@ -109,15 +111,29 @@ async function configSetViaYaml(
     const config = YAML.parse(content)
 
     const parts = key.split('.')
-    let obj = config
+    if (
+      parts.some((part) => part.length === 0)
+      || parts.some((part) => UNSAFE_CONFIG_PATH_SEGMENTS.has(part))
+    ) {
+      throw new Error(`unsafe config path: ${key}`)
+    }
+    if (!config || typeof config !== 'object' || Array.isArray(config)) {
+      throw new Error('config root must be a mapping')
+    }
+    let obj = config as Record<string, unknown>
     for (let i = 0; i < parts.length - 1; i++) {
-      if (obj[parts[i]] === undefined) {
-        obj[parts[i]] = {}
+      const part = parts[i]!
+      if (obj[part] === undefined) {
+        obj[part] = {}
       }
-      obj = obj[parts[i]]
+      const child = obj[part]
+      if (!child || typeof child !== 'object' || Array.isArray(child)) {
+        throw new Error(`config path is not a mapping: ${parts.slice(0, i + 1).join('.')}`)
+      }
+      obj = child as Record<string, unknown>
     }
 
-    const lastKey = parts[parts.length - 1]
+    const lastKey = parts[parts.length - 1]!
     const oldValue = obj[lastKey]
     obj[lastKey] = typedValue
 

@@ -2,12 +2,13 @@ import { appendFile, readFile, readdir, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { SwarmEvent, SwarmRun, SwarmAgentHandle } from '@sepilotd/core'
+import { assertSafeId } from '../../../utils/safe-id.js'
 
 export class SwarmRunStore {
   constructor(private sessionsDir: string) {}
 
   private path(runId: string): string {
-    return join(this.sessionsDir, `${runId}.jsonl`)
+    return join(this.sessionsDir, `${assertSafeId(runId, 'swarm run id')}.jsonl`)
   }
 
   async append(runId: string, event: SwarmEvent): Promise<void> {

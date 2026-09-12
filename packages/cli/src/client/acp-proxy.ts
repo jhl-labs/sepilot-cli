@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import type { Readable, Writable } from 'node:stream'
 import {
   createAcpInitializeResult,
@@ -117,7 +118,7 @@ export function runAcpProxy(deps: AcpProxyDeps, streams: AcpProxyStreams): AcpPr
         return { ...base, result: createAcpInitializeResult() }
       case 'session/new':
       case 'newThread': {
-        const threadId = `acp-${Date.now()}-${Math.floor(Math.random() * 1e6)}`
+        const threadId = `acp-${randomUUID()}`
         lastThreadId = threadId
         return msg.method === 'session/new'
           ? { ...base, result: { sessionId: threadId } }

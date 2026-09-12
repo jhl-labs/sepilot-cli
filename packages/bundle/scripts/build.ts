@@ -28,8 +28,8 @@
  *      literals confined to that feature's own source) — fails the build if
  *      any leaked in, proving the disabled feature's code is truly absent.
  *   7. Write `out/<outFile>.sha256` (sha256sum format).
- *   8. Restore the committed stubs (`feature-registration.ts`, `vec-asset.ts`)
- *      so the working tree stays clean.
+ *   8. Restore the pre-build stubs (`feature-registration.ts`, `vec-asset.ts`)
+ *      so the working tree stays clean, including before an initial commit.
  *
  * Usage:
  *   `tsx scripts/build.ts [target]`  — default target: linux-x64.
@@ -479,31 +479,26 @@ function restoreStub(generatedPath: string): void {
 function writeGeneratedFeatureRegistration(repoRoot: string = REPO_ROOT): {
   generatedPath: string
   disabled: string[]
+  originalContents: string
 } {
   log('Step 1/8: generating daemon feature-registration manifest...')
   const featuresFile =
     process.env.SEPILOT_BUILD_FEATURES_FILE ?? join(repoRoot, 'build.features.yaml')
   const generatedPath = join(repoRoot, 'packages/daemon/src/generated/feature-registration.ts')
+  const originalContents = readFileSync(generatedPath, 'utf8')
   const { disabled } = generateFeatureRegistration({ featuresFile, outFile: generatedPath })
   log(
     `Step 1/8: build features: ${
       disabled.length === 0 ? 'all enabled' : `disabled = ${disabled.join(', ')}`
     }`,
   )
-  return { generatedPath, disabled }
+  return { generatedPath, disabled, originalContents }
 }
 
-function restoreFeatureRegistrationStub(generatedPath: string, repoRoot: string = REPO_ROOT): void {
-  try {
-    execFileSync('git', ['checkout', '--', generatedPath], { cwd: repoRoot, stdio: 'inherit' })
-    log('Step 1/8: restored the committed feature-registration.ts stub via `git checkout --`.')
-  } catch (err) {
-    log(
-      `Step 1/8: WARNING — could not restore feature-registration.ts via \`git checkout --\` (${
-        err instanceof Error ? err.message : String(err)
-      }); leaving the generated file in place.`,
-    )
-  }
+function restoreFeatureRegistrationStub(generatedPath: string, originalContents: string): void {
+  mkdirSync(dirname(generatedPath), { recursive: true })
+  writeFileSync(generatedPath, originalContents)
+  log('Step 1/8: restored the pre-build feature-registration.ts contents.')
 }
 
 // ── version override (target-independent; written once for the whole run) ────
@@ -612,8 +607,11 @@ function main(): void {
   log(`targets: ${targets.join(', ')}`)
   // Generate the feature-registration manifest *before* the turbo build so the
   // daemon dist that turbo produces below already reflects it.
-  const { generatedPath: featureRegistrationPath, disabled: disabledFeatures } =
-    writeGeneratedFeatureRegistration()
+  const {
+    generatedPath: featureRegistrationPath,
+    disabled: disabledFeatures,
+    originalContents: featureRegistrationStub,
+  } = writeGeneratedFeatureRegistration()
   try {
     buildDeps()
     verifyBunNetworkDispatcherBridge()
@@ -626,7 +624,7 @@ function main(): void {
       restoreVersionStub(versionPath)
     }
   } finally {
-    restoreFeatureRegistrationStub(featureRegistrationPath)
+    restoreFeatureRegistrationStub(featureRegistrationPath, featureRegistrationStub)
   }
   log(
     `build features: ${

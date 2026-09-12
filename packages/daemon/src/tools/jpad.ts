@@ -6,7 +6,6 @@ import type {
   ToolResult,
 } from './registry.js'
 
-const DEFAULT_JPAD_BASE_URL = 'https://jpad.euno.work/api/v1'
 const DEFAULT_JPAD_TIMEOUT_MS = 30_000
 const MAX_JPAD_CONTENT_BYTES = 1024 * 1024
 const MAX_JPAD_RECEIPT_ID_CHARS = 512
@@ -204,9 +203,16 @@ export function createJpadTools(options: JpadToolOptions = {}): ToolDefinitionRu
     ? Math.max(1, Math.trunc(options.timeoutMs!))
     : DEFAULT_JPAD_TIMEOUT_MS
   const pageReadsBySession = new Map<string, Map<string, string>>()
-  const configuredBaseUrl = () => (
-    env.JPAD_BASE_URL?.trim() || DEFAULT_JPAD_BASE_URL
-  ).replace(/\/+$/, '')
+  const configuredBaseUrl = () => {
+    const baseUrl = env.JPAD_BASE_URL?.trim()
+    if (!baseUrl) {
+      throw new JpadRequestError(
+        'JPAD_BASE_URL is not configured in the daemon environment.',
+        'JPAD_NOT_CONFIGURED_USER',
+      )
+    }
+    return baseUrl.replace(/\/+$/, '')
+  }
 
   function pageReadsForSession(sessionId: string): Map<string, string> {
     const existing = pageReadsBySession.get(sessionId)
