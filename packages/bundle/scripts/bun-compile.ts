@@ -170,6 +170,26 @@ const stubSsh2 = {
   },
 }
 
+const stubElectron = {
+  name: 'stub-electron',
+  setup(build: import('bun').PluginBuilder) {
+    build.onResolve({ filter: /^electron$/ }, () => ({
+      path: 'electron',
+      namespace: 'sepilot-electron-stub',
+    }))
+    build.onLoad({ filter: /.*/, namespace: 'sepilot-electron-stub' }, () => ({
+      contents: [
+        'export const app = new Proxy({}, {',
+        '  get() { throw new Error("Electron automation is not available in the standalone binary.") },',
+        '})',
+        'export default { app }',
+        '',
+      ].join('\n'),
+      loader: 'js',
+    }))
+  },
+}
+
 const stubProtobufInquire = {
   name: 'stub-protobufjs-inquire',
   setup(build: import('bun').PluginBuilder) {
@@ -231,6 +251,7 @@ type BunBuildLike = {
       | typeof pinNpmUndiciSubpath
       | typeof stubReactDevtools
       | typeof stubSsh2
+      | typeof stubElectron
       | typeof stubProtobufInquire
       | typeof makePlaywrightCoreDirStandaloneSafe
     >
@@ -253,6 +274,7 @@ export async function compileWithBun(
       pinNpmUndiciSubpath,
       stubReactDevtools,
       stubSsh2,
+      stubElectron,
       stubProtobufInquire,
       makePlaywrightCoreDirStandaloneSafe,
     ],
@@ -285,6 +307,7 @@ export const __testables = {
   pinNpmUndiciSubpath,
   stubReactDevtools,
   stubSsh2,
+  stubElectron,
   stubProtobufInquire,
   makePlaywrightCoreDirStandaloneSafe,
 }
