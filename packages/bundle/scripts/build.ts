@@ -143,9 +143,16 @@ function fail(msg: string): never {
   process.exit(1)
 }
 
+// On Windows, pnpm/npm are installed as .cmd shims that execFileSync can't
+// resolve without a shell; other commands here (bun, tar, curl) are real
+// executables and must NOT go through the shell, or Windows path arguments
+// with spaces get split by cmd.exe.
+const SHELL_REQUIRED_ON_WINDOWS = new Set(['pnpm', 'npm'])
+
 function run(cmd: string, args: string[], cwd: string = REPO_ROOT): void {
   log(`$ ${cmd} ${args.join(' ')}  (cwd=${cwd})`)
-  execFileSync(cmd, args, { cwd, stdio: 'inherit' })
+  const shell = process.platform === 'win32' && SHELL_REQUIRED_ON_WINDOWS.has(cmd)
+  execFileSync(cmd, args, { cwd, stdio: 'inherit', shell })
 }
 
 function parseTargets(arg: string | undefined): TargetName[] {
