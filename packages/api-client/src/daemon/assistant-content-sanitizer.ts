@@ -15,10 +15,20 @@ const INTERNAL_AGENT_FALLBACK_PROGRESS_PATTERNS = [
   /\bLast tool output:\s*([\s\S]+)/i,
 ]
 
-const ANSWER_PROTOCOL_STEM_PATTERN = /^[ \t]*(ANSWER|INCOMPLETE):[ \t]*(.*)$/i
+const ANSWER_PROTOCOL_STEM_PATTERN = /^[ \t]*(ANSWER|INCOMPLETE):/i
 const MAX_ANSWER_PROTOCOL_STEM_SCAN_NONEMPTY_LINES = 4
 
 type AnswerProtocolStem = 'ANSWER' | 'INCOMPLETE'
+
+function parseAnswerProtocolLine(line: string): { stem: AnswerProtocolStem; body: string } | null {
+  // Separate the fixed prefix from its body. Overlapping whitespace and dot
+  // repetitions ending at `$` backtrack on Unicode line separators.
+  const match = line.match(ANSWER_PROTOCOL_STEM_PATTERN)
+  if (!match) return null
+  let bodyStart = match[0].length
+  while (line[bodyStart] === ' ' || line[bodyStart] === '\t') bodyStart += 1
+  return { stem: match[1]!.toUpperCase() as AnswerProtocolStem, body: line.slice(bodyStart) }
+}
 
 // Large enough to keep a gate-rejected "unverified draft" (often a full
 // markdown report) readable instead of cutting it off mid-section.
@@ -100,11 +110,11 @@ function findAnswerProtocolStem(content: string): {
     nonEmptySeen += 1
     if (nonEmptySeen > MAX_ANSWER_PROTOCOL_STEM_SCAN_NONEMPTY_LINES) break
 
-    const match = line.match(ANSWER_PROTOCOL_STEM_PATTERN)
+    const match = parseAnswerProtocolLine(line)
     if (!match) continue
     return {
-      stem: match[1]!.toUpperCase() as AnswerProtocolStem,
-      body: match[2] ?? '',
+      stem: match.stem,
+      body: match.body,
       lineIndex: i,
       lines,
     }
@@ -125,8 +135,8 @@ function stripProtocolStem(content: string): string {
     }
     if (inFence) return line
 
-    const match = line.match(ANSWER_PROTOCOL_STEM_PATTERN)
-    return match ? match[2] ?? '' : line
+    const match = parseAnswerProtocolLine(line)
+    return match ? match.body : line
   })
 
   return [found.body, ...rest].join('\n').trim()
