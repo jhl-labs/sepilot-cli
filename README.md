@@ -4,6 +4,30 @@
 the local daemon that owns sessions, tools, approvals, memory, skills, and MCP
 integrations. The CLI communicates with the daemon through HTTP and WebSocket.
 
+## Features
+
+- **Local-first agent daemon** — `sepilotd` owns sessions, tools, approvals,
+  memory, skills, and MCP integrations on your machine; `sepilot` is a thin
+  CLI client that talks to it over HTTP and WebSocket.
+- **Interactive terminal UI** — streaming chat in an Ink-based TUI with
+  markdown rendering, artifacts, and canvas surfaces.
+- **Multi-provider models** — pluggable LLM providers (Anthropic, OpenAI,
+  Ollama, and more) behind one agent loop.
+- **Extensibility** — skills, plugins, extensions, hooks, and MCP servers.
+- **Memory & knowledge** — SQLite-backed memory with vector search, RAG, a
+  personal wiki, snippets, and personal/team docs.
+- **Rich toolset** — persistent terminal (PTY), LSP, browser automation,
+  document and media processing, and sandboxed execution.
+- **Scheduler & notifications** — cron-style jobs and reminders with delivery
+  channels such as Telegram.
+- **Human-in-the-loop security** — permission-gated tool approvals, sandboxing,
+  and secrets kept out of the repository.
+- **Operational by design** — gateway with A2A/ACP surfaces, monitoring,
+  observability, diagnostics, backup, migration, retention, and self-update.
+- **Standalone binary** — one self-contained `sepilot` binary that embeds the
+  daemon, installed through checksum-verified scripts for macOS, Linux, and
+  Windows.
+
 ## License
 
 This repository is **source-available, not open source** under the
