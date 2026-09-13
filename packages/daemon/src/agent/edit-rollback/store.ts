@@ -1,6 +1,7 @@
 import { mkdir, readdir, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import type { EditCheckpointFile, EditCheckpointSummary } from '@sepilotd/core'
 import { createLogger } from '../../logger.js'
 import { buildUnifiedDiff } from '../../tools/edit-diff.js'
@@ -13,6 +14,8 @@ interface FileSnapshot {
   path: string
   hadFileBefore: boolean
   contentBefore: Buffer | null
+  postHash?: string | null
+  postParent?: string
 }
 
 interface CheckpointRecord {
@@ -39,7 +42,26 @@ interface PersistedManifest {
     hadFileBefore: boolean
     /** Relative blob filename inside the checkpoint dir, when content was captured. */
     blob: string | null
+    postHash?: string | null
+    postParent?: string
   }>
+}
+
+export class RewindConflictError extends Error {
+  constructor(readonly paths: string[]) {
+    super(`Rewind refused: files changed outside this checkpoint or lack a verified postimage: ${paths.join(', ')}`)
+  }
+}
+
+function currentHash(path: string): string | null {
+  try {
+    // Never follow a replacement symlink while verifying a rewind target.
+    if (!lstatSync(path).isFile()) throw new Error(`Not a regular file: ${path}`)
+    return createHash('sha256').update(readFileSync(path)).digest('hex')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
 }
 
 export interface EditSnapshotStoreOptions {
@@ -60,6 +82,13 @@ export interface RewindFilesResult {
    * True when a checkpoint persist failed for this session, so the
    * durable history the rewind ran against may be missing edits.
    */
+  incompleteHistory: boolean
+}
+
+export interface RewindPreview {
+  checkpoint: EditCheckpointSummary
+  checkpointIds: string[]
+  files: Array<{ path: string; operation: 'restore' | 'remove'; diff?: string; conflict: boolean }>
   incompleteHistory: boolean
 }
 
@@ -86,6 +115,7 @@ export class EditSnapshotStore {
   private seqCounter = 0
   private pendingPersist: Promise<void> = Promise.resolve()
   private readonly persistFailures = new Map<string, number>()
+  private readonly rewinding = new Set<string>()
 
   constructor(options: EditSnapshotStoreOptions = {}) {
     this.persistDir = options.persistDir
@@ -184,6 +214,14 @@ export class EditSnapshotStore {
 
   commitCheckpoint(sessionId: string, checkpointId: string): EditCheckpointSummary {
     const record = this.requireOpen(sessionId, checkpointId)
+    // Capture before returning control to another edit; never lazily sample the
+    // postimage from the asynchronous persistence queue after a user edit.
+    for (const file of record.files.values()) {
+      try {
+        file.postHash = currentHash(file.path)
+        file.postParent = realpathSync(dirname(file.path))
+      } catch { file.postHash = undefined }
+    }
     record.status = 'committed'
     record.closedAt = new Date().toISOString()
     const summary = toSummary(record)
@@ -252,6 +290,43 @@ export class EditSnapshotStore {
     return manifests.map(manifestToSummary)
   }
 
+  async previewRewind(sessionId: string, checkpointId: string): Promise<RewindPreview> {
+    const manifests = await this.loadManifests(sessionId)
+    const index = manifests.findIndex(manifest => manifest.checkpointId === checkpointId)
+    if (index < 0) throw new Error(`Edit checkpoint ${checkpointId} not found for session ${sessionId}`)
+    const earliest = new Map<string, { manifest: PersistedManifest; file: PersistedManifest['files'][number] }>()
+    const latest = new Map<string, PersistedManifest['files'][number]>()
+    for (const manifest of manifests.slice(index)) for (const file of manifest.files) {
+      if (!earliest.has(file.path)) earliest.set(file.path, { manifest, file })
+      latest.set(file.path, file)
+    }
+    const files: RewindPreview['files'] = []
+    let diffBudget = 128_000
+    for (const [path, { manifest, file }] of earliest) {
+      const expected = latest.get(path)!
+      let conflict = true
+      let diff: string | undefined
+      try {
+        conflict = expected.postHash === undefined || currentHash(path) !== expected.postHash
+          || realpathSync(dirname(path)) !== expected.postParent
+        // A mismatched path may be a replacement symlink. Never follow it for
+        // display. Old snapshots without postimages are deliberately not safe.
+        if (!conflict && diffBudget > 0) {
+          const before = expected.postHash === null ? null : await readFile(path)
+          const after = file.hadFileBefore && file.blob
+            ? await readFile(join(this.checkpointDir(sessionId, manifest.checkpointId), file.blob)) : null
+          if (isTextBuffer(before) && isTextBuffer(after)) {
+            diff = buildUnifiedDiff(path, before?.toString('utf8') ?? '', after?.toString('utf8') ?? '')
+            if (diff && diff.length > diffBudget) diff = `${diff.slice(0, diffBudget)}\n[preview truncated]`
+            diffBudget -= diff?.length ?? 0
+          }
+        }
+      } catch { conflict = true }
+      files.push({ path, operation: file.hadFileBefore ? 'restore' : 'remove', conflict, ...(diff ? { diff } : {}) })
+    }
+    return { checkpoint: manifestToSummary(manifests[index]), checkpointIds: manifests.slice(index).map(manifest => manifest.checkpointId), files, incompleteHistory: this.hasPersistFailures(sessionId) }
+  }
+
   /**
    * Restore every touched file to its state *before* the given committed
    * checkpoint: for each file across the target and all later
@@ -259,13 +334,36 @@ export class EditSnapshotStore {
    * checkpoints are deleted afterwards — like `git reset`, history past
    * the rewind point no longer describes the working tree.
    */
-  async rewindFiles(sessionId: string, checkpointId: string): Promise<RewindFilesResult> {
+  async rewindFiles(sessionId: string, checkpointId: string, expectedCheckpointIds?: string[]): Promise<RewindFilesResult> {
+    if (this.rewinding.has(sessionId)) throw new RewindConflictError(['rewind already in progress'])
+    this.rewinding.add(sessionId)
+    try { return await this.rewindFilesOnce(sessionId, checkpointId, expectedCheckpointIds) }
+    finally { this.rewinding.delete(sessionId) }
+  }
+
+  private async rewindFilesOnce(sessionId: string, checkpointId: string, expectedCheckpointIds?: string[]): Promise<RewindFilesResult> {
     const manifests = await this.loadManifests(sessionId)
     const targetIndex = manifests.findIndex((m) => m.checkpointId === checkpointId)
     if (targetIndex === -1) {
       throw new Error(`Edit checkpoint ${checkpointId} not found for session ${sessionId}`)
     }
     const selected = manifests.slice(targetIndex)
+    if (expectedCheckpointIds && JSON.stringify(expectedCheckpointIds) !== JSON.stringify(selected.map(manifest => manifest.checkpointId))) {
+      throw new RewindConflictError(['checkpoint scope changed since preview'])
+    }
+    if (this.hasPersistFailures(sessionId) || [...(this.bySession.get(sessionId)?.values() ?? [])].some(record => record.status === 'open')) {
+      throw new RewindConflictError(['checkpoint history incomplete or edit still active'])
+    }
+    const latestByPath = new Map<string, PersistedManifest['files'][number]>()
+    for (const manifest of selected) for (const file of manifest.files) latestByPath.set(file.path, file)
+    const conflicts = [...latestByPath].flatMap(([path, expected]) => {
+      try { return expected.postHash !== undefined && currentHash(path) === expected.postHash
+        && expected.postParent === realpathSync(dirname(path)) ? [] : [path] }
+      catch { return [path] }
+    })
+    // Preflight every target before changing any: a conflict in the last file
+    // must not rewind the first files and then fail halfway through.
+    if (conflicts.length) throw new RewindConflictError(conflicts)
     const earliestByPath = new Map<
       string,
       { manifest: PersistedManifest; file: PersistedManifest['files'][number] }
@@ -278,13 +376,19 @@ export class EditSnapshotStore {
       }
     }
 
-    const restoredFiles: string[] = []
+    // Read all blobs before the first mutation so missing snapshot data does
+    // not leave an otherwise valid multi-file rewind half applied.
+    const restoreContents = new Map<string, Buffer | null>()
     for (const { manifest, file } of earliestByPath.values()) {
+      restoreContents.set(file.path, file.hadFileBefore && file.blob
+        ? await readFile(join(this.checkpointDir(sessionId, manifest.checkpointId), file.blob)) : null)
+    }
+    const restoredFiles: string[] = []
+    for (const { file } of earliestByPath.values()) {
       if (file.hadFileBefore && file.blob) {
-        const blobPath = join(this.checkpointDir(sessionId, manifest.checkpointId), file.blob)
-        const content = await readFile(blobPath)
+        const content = restoreContents.get(file.path)!
         await mkdir(dirname(file.path), { recursive: true })
-        await writeFile(file.path, content)
+        await writeFile(file.path, content!)
       } else {
         try {
           await unlink(file.path)
@@ -349,7 +453,7 @@ export class EditSnapshotStore {
         blob = join('blobs', String(blobIndex++))
         await writeFile(join(dir, blob), snap.contentBefore)
       }
-      files.push({ path: snap.path, hadFileBefore: snap.hadFileBefore, blob })
+      files.push({ path: snap.path, hadFileBefore: snap.hadFileBefore, blob, postHash: snap.postHash, postParent: snap.postParent })
     }
     const manifest: PersistedManifest = {
       checkpointId: record.checkpointId,

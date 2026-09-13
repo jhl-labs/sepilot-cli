@@ -110,8 +110,13 @@ export function consumeToolCallActionProgress(
   const exposedToolByName = new Map(exposedTools.map(tool => [tool.name, tool]))
   let firstProgress: AgentActionProgress | null = null
   for (const toolCall of toolCalls) {
-    const rawProgress = toolCall.arguments[ACTION_PROGRESS_ARGUMENT]
+    let rawProgress: unknown = toolCall.arguments[ACTION_PROGRESS_ARGUMENT]
     delete toolCall.arguments[ACTION_PROGRESS_ARGUMENT]
+    // Accept an explicitly serialized annotation, never infer one from prose
+    // or reinterpret ordinary tool arguments. Bound parsing and discard invalid data.
+    if (typeof rawProgress === 'string' && rawProgress.length <= 4096) {
+      try { rawProgress = JSON.parse(rawProgress) } catch { rawProgress = null }
+    }
     if (!firstProgress && isRecord(rawProgress)) {
       const summary = normalizeField(rawProgress.summary)
       const nextStep = normalizeField(rawProgress.nextStep)

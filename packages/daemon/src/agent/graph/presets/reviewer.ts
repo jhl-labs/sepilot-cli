@@ -9,6 +9,8 @@ import { withOptionalToolNameAllowlist } from '../../../tools/role-filter.js'
 export interface ReviewerGraphOptions {
   enableDebate?: boolean
   preserveProtocolOutput?: boolean
+  /** The caller must run its own authoritative quality-conclusion gate. */
+  outcomeReviewOwner?: N.AgentNodeOptions['outcomeReviewOwner']
 }
 
 export function buildReviewerGraph(
@@ -37,6 +39,8 @@ export function buildReviewerGraph(
     .addNode('agent', N.agent({
       ...deps,
       systemPrompt: (deps.systemPrompt ?? '') + '\n\nYou are a code reviewer. Read the code carefully, identify bugs, security issues, performance problems, and style violations. Be specific with line references.',
+    }, {
+      outcomeReviewOwner: preserveProtocolOutput ? options.outcomeReviewOwner : 'node',
     }), { lifecycleState: 'thinking' })
     .addNode('tools', N.toolExecutor(deps), {
       lifecycleState: 'acting',

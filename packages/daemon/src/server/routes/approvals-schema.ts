@@ -12,6 +12,11 @@ export const approvalRequestSchema = z.object({
   approved: z.boolean().optional(),
   decision: z.enum(['approved', 'feedback', 'denied']).optional(),
   note: z.string().trim().min(1).optional(),
+  /**
+   * With a denial: stop the run immediately instead of granting the model
+   * its one read-only turn to propose another approach ("deny & stop").
+   */
+  stop: z.boolean().optional(),
   approvedBy: z.string().optional(),
   sessionId: z.string().optional(),
   scope: z.enum(['once', 'session', 'always', 'run', 'session-all']).optional(),

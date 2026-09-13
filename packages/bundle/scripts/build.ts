@@ -143,10 +143,8 @@ function fail(msg: string): never {
   process.exit(1)
 }
 
-// On Windows, pnpm/npm are installed as .cmd shims that execFileSync can't
-// resolve without a shell; other commands here (bun, tar, curl) are real
-// executables and must NOT go through the shell, or Windows path arguments
-// with spaces get split by cmd.exe.
+// Windows package managers are .cmd shims; native executables must retain
+// direct argv handling, particularly for paths containing spaces.
 const SHELL_REQUIRED_ON_WINDOWS = new Set(['pnpm', 'npm'])
 
 function run(cmd: string, args: string[], cwd: string = REPO_ROOT): void {
@@ -165,18 +163,9 @@ function parseTargets(arg: string | undefined): TargetName[] {
 // ── Step 2: build cli + daemon (and deps) ───────────────────────────────────
 function buildDeps(): void {
   log('Step 2/8: building @sepilotd/cli + @sepilotd/daemon (+ deps) via turbo...')
-  // The daemon's DTS build can fail on a pre-existing benchmark.ts error; the
-  // ESM dist/*.js is what `bun --compile` consumes, so a non-zero turbo exit
-  // here is tolerated as long as the dist artifacts below exist.
-  try {
-    run('pnpm', ['turbo', 'build', '--filter', '@sepilotd/bundle...'])
-  } catch (err) {
-    log(
-      `turbo build exited non-zero (likely the known daemon DTS error) — verifying dist artifacts: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    )
-  }
+  // Existing dist files do not prove that the current source built. Never
+  // package stale JavaScript after a failed workspace build (including DTS).
+  run('pnpm', ['turbo', 'build', '--filter', '@sepilotd/bundle...'])
   const required = [
     join(REPO_ROOT, 'packages/cli/dist/lib.js'),
     join(REPO_ROOT, 'packages/daemon/dist/main.js'),
@@ -642,6 +631,7 @@ export const __testables = {
   STUB_CONTENTS,
   VERSION_STUB_CONTENTS,
   parseTargets,
+  run,
   buildDeps,
   verifyBunNetworkDispatcherBridge,
   obtainVecLoadable,

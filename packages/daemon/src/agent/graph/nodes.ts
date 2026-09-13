@@ -18,12 +18,14 @@ import type {
   GraphNodeDeps,
 } from './types.js'
 import {
+  stopReasonApprovalDenied,
   stopReasonBudget,
   stopReasonCostGate,
   stopReasonCompletionGate,
   stopReasonUserActionRequired,
   INCOMPLETE_OUTPUT_PREFIX,
   stopReasonNoProgress,
+  stopReasonStuckRepeat,
 } from '../stop-reason.js'
 import {
   createGraphApprovalCheckpoint,
@@ -33,6 +35,10 @@ import {
   getAbortError,
   isAbortError,
 } from '../../abort.js'
+import { DEFAULT_SUBAGENT_MAX_ITERATIONS } from '../iteration-budget.js'
+import { observeWorkProgress } from '../work-progress.js'
+import { resolveControlCallTimeoutMs } from '../control-call-policy.js'
+import { resolveThinkingLevel } from '../../providers/thinking-policy.js'
 import { daemonDataDir } from '../../storage/home.js'
 import {
   buildPromptFinalMessages,
@@ -207,8 +213,13 @@ import {
   reusableObservationsFromHistory,
 } from '../observation-coverage.js'
 import {
+  blockSourceFromMetadata,
+  buildApprovalDenialGraceMessage,
   buildApprovalDeniedTurnOutput,
+  buildPolicyFrictionMessage,
   isTrustedApprovalDenialResult,
+  POLICY_FRICTION_WARNING_THRESHOLD,
+  trustedApprovalDenialDetails,
 } from '../approval-failure.js'
 import {
   buildSkillExecutionCompletionFailureOutput,
@@ -337,6 +348,11 @@ import {
   promoteOpenQuestionsFromPlannerMemory,
   shouldEscalateOpenQuestions,
 } from './open-questions.js'
+import {
+  askLoopControlQuestion,
+  buildDifferentApproachMessage,
+  canAskLoopControlQuestion,
+} from './loop-control-question.js'
 import {
   buildLlmRequestEvent,
   buildLlmTurnId,
@@ -516,6 +532,7 @@ const CODER_VISIBLE_TOOL_NAMES = new Set([
   'service.restart',
   'service.remove',
   'subagent.dispatch',
+  'subagent.job',
   'system.info',
   'todowrite',
   'question',
@@ -1412,6 +1429,8 @@ async function buildAgentMessages(
   })
   if (s.memories.length) msgs.push({ role: 'system', content: `[Relevant memories]\n${s.memories.join('\n')}` })
   const routingBriefMessage = buildRoutingBriefMessage(s)
+  const backgroundEvidence = context?.activeRuns?.backgroundEvidence(context.agentContext.sessionId)
+  if (backgroundEvidence) msgs.push({ role: 'user', content: backgroundEvidence })
   if (routingBriefMessage) msgs.push({ role: 'system', content: routingBriefMessage })
   const seedContractMessage = formatSeedContract(s.seedContract)
   // Acknowledge delivery once. Instructions remain in the compaction-proof
@@ -1981,6 +2000,7 @@ function auxMaxTokens(
   context: GraphExecutionContext | undefined,
   base: number,
   observedCeiling?: number,
+  requestPolicy?: { thinkingLevel: ChatRequest['thinkingLevel']; modelRole?: 'main' | 'aux' },
 ): number {
   // Resolve the AUX model's reasoning flag, not the main model's. When aux
   // calls run on a separate reasoning model, hidden reasoning tokens are
@@ -1988,8 +2008,14 @@ function auxMaxTokens(
   // entirely by reasoning and the visible output comes back empty, forcing a
   // heuristic fallback. Sizing off the main model missed this whenever the
   // aux model reasons but the main model does not.
-  const modelInfo = resolveModelInfo(deps, context, 'aux')
-  const thinking = modelInfo?.capabilities.thinking ?? false
+  const modelInfo = resolveModelInfo(deps, context, requestPolicy?.modelRole ?? 'aux')
+  // A declared off dialect is a request capability, not a model-name guess.
+  // Do not allocate hidden-reasoning headroom when this very request disables
+  // it. Unknown/uncontrollable endpoints keep the compatibility headroom.
+  const thinkingDisabled = requestPolicy?.thinkingLevel === ThinkingLevel.Off
+    && (modelInfo?.capabilities.thinkingControl === 'reasoning-effort'
+      || modelInfo?.capabilities.thinkingControl === 'chat-template-kwargs')
+  const thinking = (modelInfo?.capabilities.thinking ?? false) && !thinkingDisabled
   const requested = thinking ? Math.max(base * 12, 8000) : base
   // Auxiliary graph calls return bounded plans, judgments, or small JSON
   // envelopes. They need reasoning headroom, but never a main-answer-sized
@@ -3338,6 +3364,20 @@ function presentCodingFinalizerCandidate(
   }
 
   const gate = preEvaluatedGate ?? evaluateCompletionGate(state, candidate)
+  // A presentation model may omit or contradict an already evidenced draft.
+  // Reuse that draft only if the SAME current-state gate accepts it; this is
+  // not a shortcut around fresh evidence, changed files, or failed tests.
+  if (gate.decision === 'block' && evidenceBackedDraft && candidate !== evidenceBackedDraft) {
+    const retainedGate = evaluateCompletionGate(state, evidenceBackedDraft)
+    if (retainedGate.decision === 'pass' && !retainedGate.budgetExhausted) {
+      recordCriterionVerdictSnapshot(state, retainedGate)
+      state.completionDiagnostics = {
+        ...state.completionDiagnostics,
+        gate: { decision: 'pass', unmet: [], reason: 'retained draft passes the current evidence gate' },
+      }
+      return presentFinalAnswer(state, evidenceBackedDraft)
+    }
+  }
   recordCriterionVerdictSnapshot(state, gate)
   if (gate.decision === 'pass' && gate.budgetExhausted !== true) {
     state.completionDiagnostics = {
@@ -8237,7 +8277,7 @@ export const autoDecompose = (
     minLengthChars?: number
     /** Max number of sub-task subagents fanned out per pass. Default 4. */
     maxSubagents?: number
-    /** Per-subagent iteration cap surfaced via subagent.dispatch. Default 12. */
+    /** Per-subagent iteration cap surfaced via subagent.dispatch. Default 24. */
     subagentMaxIterations?: number
   } = {},
 ) => async function* (
@@ -8305,7 +8345,7 @@ export const autoDecompose = (
   if (subtasks.length < 2) return s
 
   const maxFanout = Math.max(2, Math.min(8, options.maxSubagents ?? 4))
-  const subagentMaxIterations = options.subagentMaxIterations ?? 12
+  const subagentMaxIterations = options.subagentMaxIterations ?? DEFAULT_SUBAGENT_MAX_ITERATIONS
   const trimmed = subtasks.slice(0, maxFanout)
 
   yield {
@@ -9534,17 +9574,12 @@ const MAX_RUN_RECOVERY_EXHAUSTED_FINALS = 1
 // whole. Past it the node reserves one tool-free final synthesis and then ends
 // honestly with INCOMPLETE and the retained evidence.
 const MAX_AGENT_NODE_REPAIR_TURNS = 6
-// A recovery decision is part of the execution control plane, so it must get
-// the same first-token opportunity as the main agent. A shorter private cap
-// caused otherwise healthy local/cloud reasoning models to time out three
-// times while their ordinary turns routinely produced a first token between
-// 45s and 90s.
-const NO_PROGRESS_RECOVERY_TIMEOUT_MS = 90_000
 // Some reasoning-capable OpenAI-compatible endpoints cannot honor an explicit
 // thinking-off request unless their thinking-control dialect is configured.
 // Give those models enough bounded output room to reach the compact structured
-// decision; the independent 45-second control budget remains the hard wall-
-// clock bound. Providers that do support thinking-off normally return much
+// decision; the separately configured control transaction bounds total work,
+// while provider first-token and active-stream guards detect stalled transport.
+// Providers that do support thinking-off normally return much
 // earlier and do not consume this ceiling.
 const NO_PROGRESS_RECOVERY_BASE_TOKENS = 8_000
 const RECOVERY_ACTION_SECURITY_EFFECTS = new Set([
@@ -11241,10 +11276,7 @@ async function requestImplementationCausalDiagnosis(
   state.implementationCausalDiagnosisAttemptCount = causalAttempt
 
   const model = resolveModelId(deps, context, 'aux')
-  const timeoutMs = Math.min(
-    resolveProviderStreamFirstTokenMs() ?? NO_PROGRESS_RECOVERY_TIMEOUT_MS,
-    NO_PROGRESS_RECOVERY_TIMEOUT_MS,
-  )
+  const timeoutMs = resolveControlCallTimeoutMs()
   const semanticSystemPrompt = [
     'You are a source-grounded causal analyst for a general-purpose coding agent.',
     'Analyze only the supplied successful tool evidence. Do not prescribe a patch. Select a read-only observation only when one causal fact is missing.',
@@ -11507,10 +11539,7 @@ async function requestNoProgressRecoveryJudgment(
   // decide whether further progress is possible. Give convergence its own
   // lazily-created lane so the decision remains model-judged instead of
   // silently falling back to a structural counter.
-  const controlTimeoutMs = Math.min(
-    resolveProviderStreamFirstTokenMs() ?? NO_PROGRESS_RECOVERY_TIMEOUT_MS,
-    NO_PROGRESS_RECOVERY_TIMEOUT_MS,
-  )
+  const controlTimeoutMs = resolveControlCallTimeoutMs()
   // Each judgment evaluates a newer evidence checkpoint. Reusing the first
   // judgment's wall-clock deadline makes every later judgment fail instantly,
   // while still consuming the recovery-count budget as if an LLM had decided.
@@ -11898,6 +11927,7 @@ async function requestNoProgressRecoveryJudgment(
         context,
         4_000,
         state.effectiveMaxOutputTokens,
+        { thinkingLevel: ThinkingLevel.Off },
       ),
     }
     if (!reserveRecoveryProviderCall(state)) return null
@@ -12022,6 +12052,7 @@ async function requestNoProgressRecoveryJudgment(
         context,
         4_000,
         state.effectiveMaxOutputTokens,
+        { thinkingLevel: ThinkingLevel.Off },
       ),
     }
     try {
@@ -12218,6 +12249,7 @@ async function requestNoProgressRecoveryJudgment(
           context,
           NO_PROGRESS_RECOVERY_BASE_TOKENS,
           state.effectiveMaxOutputTokens,
+          { thinkingLevel: ThinkingLevel.Off },
         ),
       }
       lastRequest = request
@@ -13323,6 +13355,56 @@ export const iterationGuard = (
             `${s.noProgressIterations} consecutive graph iterations produced no new tool execution or accepted final answer.`,
             'The completed tool evidence remains available for the final explanation.',
           ].join(' ')
+      // Doom-loop question (P2-4): an interactive run asks the human before
+      // the forced final synthesis. Bounded per run; headless runs fall
+      // through to the unchanged forced-final path.
+      if (canAskLoopControlQuestion(s, context)) {
+        const answer = await askLoopControlQuestion(s, {
+          sessionId: context!.agentContext.sessionId,
+          requestQuestion: context!.requestQuestion,
+        }, { kind: 'no_progress', count: s.noProgressIterations })
+        if (answer?.decision === 'continue') {
+          // One more full no-progress cycle; the counter resets once.
+          s.noProgressIterations = 0
+          s.lastIterationToolCallCount = executedToolCalls
+          return s
+        }
+        if (answer?.decision === 'different_approach') {
+          // Exactly one more turn: the next no-progress iteration re-arms the limit.
+          s.noProgressIterations = Math.max(0, maxNoProgress - 1)
+          appendUniqueSystemMessage(
+            s,
+            buildDifferentApproachMessage({
+              kind: 'no_progress',
+              count: maxNoProgress,
+              guidance: answer.guidance,
+            }),
+            'loop-control-different-approach',
+            { replacePrefix: '[Loop-control]' },
+          )
+          s.lastIterationToolCallCount = executedToolCalls
+          return s
+        }
+        if (answer?.decision === 'stop') {
+          s.shouldStop = true
+          s.budgetExhausted = true
+          s.stopReason = stopReasonNoProgress({
+            layer: 'question',
+            budget: maxNoProgress,
+            used: s.noProgressIterations,
+            contract: s.seedContract,
+          })
+          s.output = buildBudgetExhaustedMessage({
+            mode: 'graph',
+            layer: 'no_progress',
+            iterationBudget: s.noProgressIterations,
+            detail: 'stopped at the user\'s request',
+            contract: s.seedContract,
+          })
+          s.lastIterationToolCallCount = executedToolCalls
+          return s
+        }
+      }
       if ((s.recoveryExhaustedFinalCount ?? 0) >= MAX_RUN_RECOVERY_EXHAUSTED_FINALS) {
         // The single evidence-based final synthesis already ran and the run
         // still made no progress. Scheduling it again only restarts the same
@@ -13400,6 +13482,7 @@ export const iterationGuard = (
     )
     s.output = s.output || buildBudgetExhaustedMessage({
       mode: 'graph',
+      layer: 'iteration',
       iterationBudget: s.maxIterations,
       contract: s.seedContract,
     })
@@ -13666,6 +13749,15 @@ export const toolRecommender = (deps: Deps) => async (
   return s
 }
 
+/** During the post-denial grace turn only policy read-only tools are offered. */
+function filterToolsForApprovalDenialGrace<T extends { name: string }>(
+  s: AgentState,
+  tools: T[],
+): T[] {
+  if (!s.approvalDenialGrace) return tools
+  return tools.filter((tool) => isPolicyReadOnlyTool(tool.name))
+}
+
 export const nativeToolAgent = (deps: Deps) => async function* (
   s: AgentState,
   context?: GraphExecutionContext,
@@ -13692,7 +13784,10 @@ export const nativeToolAgent = (deps: Deps) => async function* (
     (context?.strictFinalAnswerProtocol ?? false)
     || (context?.suppressSpeculativeFinalDeltas ?? false)
     || shouldReviewCandidateFinal
-  const allTools = getVisibleToolDefinitionsForAgent(deps, context, s.seedContract, s.input)
+  const allTools = filterToolsForApprovalDenialGrace(
+    s,
+    getVisibleToolDefinitionsForAgent(deps, context, s.seedContract, s.input),
+  )
   const fileEditTools = allTools.filter((tool) => isFileEditToolName(tool.name))
   const artifactWriteCadence = evaluateArtifactWriteCadence(s, context)
   const restrictToFileEditTools = shouldUseFileEditOnlyTools(
@@ -13991,7 +14086,12 @@ export const nativeToolAgent = (deps: Deps) => async function* (
     // continuation budget is spent on the user-facing synthesis itself.
     thinkingLevel: boundedImplementationDecisionTurn || (s.lengthContinuationCount ?? 0) > 0
       ? ThinkingLevel.Off
-      : context?.thinkingLevel as import('@sepilotd/core').ThinkingLevel | undefined,
+      : resolveThinkingLevel(context?.thinkingLevel, {
+          phase: context?.activeGraphNodeId,
+          toolNames: providerRequestTools.map((tool) => tool.name),
+          executionFailure: s.toolCallHistory?.at(-1)?.status === 'error'
+            && s.toolCallHistory?.at(-1)?.executionObserved === true,
+        }),
     maxTokens: resolveFittedGraphMaxTokens(requestedMaxTokens, requestFit),
   }
   yield buildEstimatedGraphContextUsage(s, context, requestFit)
@@ -14545,7 +14645,10 @@ export const promptReActAgent = (deps: Deps) => async function* (
     || shouldReviewCandidateFinal
   const allTools = toolFreeFinal
     ? []
-    : getVisibleToolDefinitionsForAgent(deps, context, s.seedContract, s.input)
+    : filterToolsForApprovalDenialGrace(
+      s,
+      getVisibleToolDefinitionsForAgent(deps, context, s.seedContract, s.input),
+    )
   const fileEditTools = allTools.filter((tool) => isFileEditToolName(tool.name))
   const artifactWriteCadence = evaluateArtifactWriteCadence(s, context)
   const restrictToFileEditTools = shouldUseFileEditOnlyTools(
@@ -14850,7 +14953,11 @@ export const promptReActAgent = (deps: Deps) => async function* (
         || adaptiveTransportRepair
         || (s.lengthContinuationCount ?? 0) > 0
         ? ThinkingLevel.Off
-        : context?.thinkingLevel as import('@sepilotd/core').ThinkingLevel | undefined,
+        : resolveThinkingLevel(context?.thinkingLevel, {
+            phase: context?.activeGraphNodeId,
+            executionFailure: s.toolCallHistory?.at(-1)?.status === 'error'
+              && s.toolCallHistory?.at(-1)?.executionObserved === true,
+          }),
       maxTokens: resolveFittedGraphMaxTokens(requestedMaxTokens, requestFit),
     }
     yield buildEstimatedGraphContextUsage(s, context, requestFit)
@@ -15336,7 +15443,12 @@ export const promptReActAgent = (deps: Deps) => async function* (
   return s
 }
 
-export const agent = (deps: Deps) => async function* (
+export interface AgentNodeOptions {
+  /** Only internal phases whose caller runs an authoritative quality gate. */
+  outcomeReviewOwner?: 'node' | 'parent'
+}
+
+export const agent = (deps: Deps, options: AgentNodeOptions = {}) => async function* (
   s: AgentState,
   context?: GraphExecutionContext,
 ): AsyncGenerator<import('@sepilotd/core').AgentEvent, AgentState, void> {
@@ -15497,7 +15609,7 @@ export const agent = (deps: Deps) => async function* (
         s.seedContract?.executionIntent?.kind === 'inspection'
         && s.seedContract.executionIntent.workspaceMutation === 'forbidden'
       )
-    const stuck = shouldRepairStuckToolRepeat({
+    const detectStuck = () => shouldRepairStuckToolRepeat({
       history: s.toolCallHistory,
       repairedCount: persistObserveOnlyStuckRepair
         ? (s.observeOnlyStuckRepeatRepairCount ?? 0)
@@ -15509,8 +15621,94 @@ export const agent = (deps: Deps) => async function* (
           ? DEFAULT_PERMANENT_FAILURE_CHURN_THRESHOLD
           : undefined,
     })
+    let stuck = detectStuck()
     if (persistObserveOnlyStuckRepair && !stuck.stuck && !stuck.exhausted) {
       s.observeOnlyStuckRepeatRepairCount = 0
+    }
+    if (
+      stuck.exhausted
+      && !s.stuckRepeatForcedFinal
+      && !hasActiveBoundedImplementationRecovery(s, context)
+      && (s.loopControlGraceTurns ?? 0) > 0
+    ) {
+      // A loop-control answer granted this turn: skip the forced final once.
+      s.loopControlGraceTurns = (s.loopControlGraceTurns ?? 0) - 1
+      stuck = { stuck: false }
+    } else if (
+      stuck.exhausted
+      && !s.stuckRepeatForcedFinal
+      && !hasActiveBoundedImplementationRecovery(s, context)
+      && canAskLoopControlQuestion(s, context)
+    ) {
+      // Doom-loop question (P2-4): ask the human before closing the evidence
+      // phase. Bounded per run (MAX_LOOP_CONTROL_QUESTIONS); a headless run
+      // never reaches this branch and keeps the forced final below.
+      const stuckEntry = findStuckRepeatEntry(s.toolCallHistory, { ...stuck, stuck: true })
+      const answer = await askLoopControlQuestion(s, {
+        sessionId: context!.agentContext.sessionId,
+        requestQuestion: context!.requestQuestion,
+      }, { kind: 'stuck_repeat', tool: stuck.tool, count: stuck.count ?? 0 })
+      if (answer?.decision === 'continue') {
+        // Reset the repair counter once and grant one more repair cycle.
+        if (persistObserveOnlyStuckRepair) {
+          s.observeOnlyStuckRepeatRepairCount = 0
+        } else {
+          repairedStuckRepeatCount = 0
+        }
+        s.loopControlGraceTurns = 1
+        yield {
+          type: 'thinking',
+          content: '[supervisor] User chose to continue after the stuck-loop repairs were exhausted; granting one more repair cycle.',
+        }
+        stuck = detectStuck()
+      } else if (answer?.decision === 'different_approach') {
+        s.loopControlGraceTurns = 1
+        const signature = stuckEntry
+          ? signatureOf({ tool: stuckEntry.tool, input: stuckEntry.input })
+          : undefined
+        if (stuckEntry) {
+          recordFailedAttempt(
+            s,
+            { name: stuckEntry.tool, arguments: stuckEntry.input },
+            'user asked for a different approach: do not repeat this call',
+          )
+        }
+        s.messages.push({
+          role: 'system',
+          content: buildDifferentApproachMessage({
+            kind: 'stuck_repeat',
+            tool: stuck.tool,
+            count: stuck.count ?? 0,
+            signature,
+            guidance: answer.guidance,
+          }),
+          metadata: { reminderKind: 'stuck' },
+        })
+        yield {
+          type: 'thinking',
+          content: '[supervisor] User asked for a different approach; the repeated call signature is now blocked for one turn.',
+        }
+        stuck = { stuck: false }
+      } else {
+        s.shouldStop = true
+        s.budgetExhausted = true
+        s.stopReason = stopReasonStuckRepeat({
+          tool: stuck.tool,
+          layer: 'question',
+          contract: s.seedContract,
+        })
+        s.output = buildBudgetExhaustedMessage({
+          mode: 'graph',
+          layer: 'stuck_repeat',
+          detail: `${stuck.tool ?? 'tool'} x${stuck.count ?? 0}, stopped at the user's request`,
+          contract: s.seedContract,
+        })
+        yield {
+          type: 'thinking',
+          content: '[supervisor] User chose to stop after the stuck-loop repairs were exhausted.',
+        }
+        return s
+      }
     }
     if (
       stuck.exhausted
@@ -15653,6 +15851,16 @@ export const agent = (deps: Deps) => async function* (
         }
       }
       removeSystemReminders(s, ['reflection-next-invocation'])
+      if (enforceApprovalDenialGrace(s)) {
+        yield {
+          type: 'thinking',
+          content: `[supervisor] The model requested a side-effecting tool after the user declined ${s.approvalDenied?.toolName ?? 'the tool'}; stopping without executing it.`,
+        }
+        if (context?.textDeltaMode === 'live' && !context.agentSubgraphNodeId && s.output) {
+          yield { type: 'text_delta', text: s.output }
+        }
+        return s
+      }
     } catch (error) {
       removeSystemReminders(s, ['reflection-next-invocation'])
       // Once this graph has emitted tool evidence, the enclosing chat route
@@ -16284,7 +16492,8 @@ export const agent = (deps: Deps) => async function* (
       deterministicSkillCompletionPolicy
       && skillExecutionCompletion.missing.length === 0
     const shouldReviewCurrentOutput =
-      !deterministicSkillCompletionSatisfied
+      options.outcomeReviewOwner !== 'parent'
+      && !deterministicSkillCompletionSatisfied
       && shouldReviewAgentOutputWithLLM(s, currentTurnMessages, context)
     const hasPendingRecoveryForCurrentTurn = hasPendingRunOutcomeReviewRecovery(currentTurnMessages)
     const hasOutcomeRecoveryForCurrentTurn = hasRunOutcomeReviewRecoverySinceLastUser(currentTurnMessages)
@@ -16906,7 +17115,10 @@ export const agent = (deps: Deps) => async function* (
         runContract: s.seedContract,
         evidenceLedger: s.evidenceLedger,
         userInstructions: activeUserInstructions(s.steeringNotes),
-        maxTokens: auxMaxTokens(deps, context, OUTCOME_REVIEW_MAX_TOKENS),
+        maxTokens: auxMaxTokens(deps, context, OUTCOME_REVIEW_MAX_TOKENS, s.effectiveMaxOutputTokens, {
+          thinkingLevel: ThinkingLevel.Off,
+          modelRole: 'main',
+        }),
       })
       try {
         const reviewResponse = await guardedProviderChat({
@@ -17325,6 +17537,7 @@ async function judgeRepeatedSuccessfulToolCalls(
       context,
       REPEATED_TOOL_CALL_JUDGMENT_MAX_TOKENS,
       state.effectiveMaxOutputTokens,
+      { thinkingLevel: ThinkingLevel.Off },
     ),
   }
 
@@ -17460,7 +17673,8 @@ export const toolExecutor = (deps: Deps) => async function* (
   const deferredExactToolBudgetRepairs: string[] = []
   let deferredCanonicalReadTargetRepair: string | undefined
   let deferredInternalPlaceholderRepair: string | undefined
-  let approvalDenied: AgentState['approvalDenied']
+  let approvalDenied: (NonNullable<AgentState['approvalDenied']> & { stop?: boolean; note?: string })
+    | undefined
   let userActionRequired: string | undefined
 
   if (graphContext?.toolSecurityEffectBoundary === 'observe-only' && s.toolCalls.length > 0) {
@@ -18252,6 +18466,7 @@ export const toolExecutor = (deps: Deps) => async function* (
   }
 
   for await (const event of runToolExecution({
+    delegationToolNames: graphContext?.modeControl?.delegationToolNames,
     messages: s.messages,
     toolCalls: s.toolCalls,
     sessionId: graphContext?.agentContext.sessionId ?? '',
@@ -18313,7 +18528,11 @@ export const toolExecutor = (deps: Deps) => async function* (
         approvalDenied = {
           toolCallId: event.toolCallId,
           ...(deniedCall?.name ? { toolName: deniedCall.name } : {}),
+          ...trustedApprovalDenialDetails(event.metadata),
         }
+      }
+      if (blockSourceFromMetadata(event.metadata)) {
+        s.frictionCount = (s.frictionCount ?? 0) + 1
       }
       const delegated = delegatedUsageFromMetadata(event.metadata)
       if (delegated) {
@@ -18376,6 +18595,7 @@ export const toolExecutor = (deps: Deps) => async function* (
           deps.tools.securityDescriptor(matchedCall.name)?.effect ?? 'unknown'
         const executionObserved =
           event.metadata?.[TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY] === true
+        const blocked = blockSourceFromMetadata(event.metadata) !== null
         const historyEntry = {
           toolCallId: matchedCall.id,
           tool: matchedCall.name,
@@ -18384,9 +18604,10 @@ export const toolExecutor = (deps: Deps) => async function* (
           executionObserved,
           securityEffect,
           ...(event.executionPosture ? { executionPosture: event.executionPosture } : {}),
-          ...(status === 'error'
+          ...(status === 'error' && !blocked
             ? { failureCode: structuredToolFailureCodeFromOutput(summarizedOutput) }
             : {}),
+          ...(blocked ? { blocked: true } : {}),
           ts: Date.now(),
           outputFingerprint: createHash('sha256').update(event.output).digest('hex'),
           // fs.read coverage is derived from the exact range visible to the
@@ -18397,6 +18618,7 @@ export const toolExecutor = (deps: Deps) => async function* (
             ? summarizedOutput
             : summarizedOutput.slice(0, 4_000),
         }
+        s.workProgress = observeWorkProgress(s.workProgress, historyEntry)
         s.toolCallHistory = [
           ...(s.toolCallHistory ?? []),
           historyEntry,
@@ -18431,7 +18653,12 @@ export const toolExecutor = (deps: Deps) => async function* (
           )
           if (todoItems) s.todoList = todoItems
         }
-        if (status === 'error') {
+        if (status === 'error' && blocked) {
+          // A policy/approval refusal is friction, not evidence that the
+          // action fails. It is counted in frictionCount above and left out of
+          // the failed-attempt guard; exact identical repeats are still caught
+          // by the stuck-repeat exact threshold.
+        } else if (status === 'error') {
           // Remember the failed action by structural signature so the
           // failed-attempt guard can block a structurally-identical retry.
           recordFailedAttempt(
@@ -18594,13 +18821,72 @@ export const toolExecutor = (deps: Deps) => async function* (
     s.output = userActionRequired
   }
   if (approvalDenied) {
-    s.approvalDenied = approvalDenied
-    s.shouldStop = true
-    s.budgetExhausted = false
-    s.output = buildApprovalDeniedTurnOutput(approvalDenied.toolName, s.input)
+    if (approvalDenied.stop || s.approvalDenialGrace) {
+      // "Deny & stop", or a second denial while a grace turn is already open:
+      // end the run now without executing anything else.
+      terminateAfterApprovalDenial(s, approvalDenied)
+    } else {
+      // A plain denial grants one side-effect-free turn: the runners filter
+      // the catalog to read-only tools and the agent node ends the run if the
+      // model still asks for a side effect.
+      s.approvalDenialGrace = {
+        toolCallId: approvalDenied.toolCallId,
+        ...(approvalDenied.toolName ? { toolName: approvalDenied.toolName } : {}),
+        toolTurnsRemaining: 1,
+      }
+      const graceMessage = buildApprovalDenialGraceMessage(approvalDenied)
+      appendUniqueSystemMessage(s, graceMessage.content as string, 'approval_denial_grace')
+    }
+  }
+  if (
+    (s.frictionCount ?? 0) > POLICY_FRICTION_WARNING_THRESHOLD
+    && s.frictionWarningIssued !== true
+  ) {
+    s.frictionWarningIssued = true
+    const frictionMessage = buildPolicyFrictionMessage(s.frictionCount ?? 0)
+    appendUniqueSystemMessage(s, frictionMessage.content as string, 'policy_friction')
   }
   s.toolCalls = []
   return s
+}
+
+/**
+ * Terminal denial state shared by the immediate ("deny & stop") path and the
+ * grace-violation path: no further tool executes, the run reports
+ * `approval_denied`, and the final text names the declined tool.
+ */
+function terminateAfterApprovalDenial(
+  s: AgentState,
+  denial: { toolCallId: string; toolName?: string },
+): void {
+  s.approvalDenied = {
+    toolCallId: denial.toolCallId,
+    ...(denial.toolName ? { toolName: denial.toolName } : {}),
+  }
+  s.approvalDenialGrace = undefined
+  s.shouldStop = true
+  s.budgetExhausted = false
+  s.stopReason = stopReasonApprovalDenied(denial.toolName ?? 'tool', denial.toolCallId)
+  s.output = buildApprovalDeniedTurnOutput(denial.toolName, s.input)
+}
+
+/**
+ * Post-denial guard for the agent node: during the side-effect-free grace
+ * turn the model may inspect with read-only tools once, but any side-effecting
+ * call (including a retry of the declined one) or a further tool turn past the
+ * grace budget ends the run instead of executing.
+ */
+export function enforceApprovalDenialGrace(s: AgentState): boolean {
+  const grace = s.approvalDenialGrace
+  if (!grace || s.toolCalls.length === 0) return false
+  const sideEffecting = s.toolCalls.some((call) => !isPolicyReadOnlyTool(call.name))
+  if (sideEffecting || grace.toolTurnsRemaining <= 0) {
+    terminateAfterApprovalDenial(s, grace)
+    s.toolCalls = []
+    return true
+  }
+  grace.toolTurnsRemaining -= 1
+  return false
 }
 
 export const reflection = (
@@ -18620,7 +18906,9 @@ export const reflection = (
   s: AgentState,
   context?: GraphExecutionContext,
 ): Promise<AgentState> => {
-  if (s.approvalDenied || s.userActionRequired) {
+  if (s.approvalDenied || s.approvalDenialGrace || s.userActionRequired) {
+    // A human decision (or a prerequisite only the user can satisfy) is not a
+    // tool failure to critique.
     s.toolResults = []
     return s
   }
@@ -19357,8 +19645,8 @@ export const validationBrief = () => async (
     s,
     [
       '[Validation phase]',
-      formatSeedContract(s.seedContract),
-      formatEvidenceLedgerForPrompt(s),
+      // buildAgentMessages supplies the current contract and evidence once.
+      // A phase-local copy becomes both redundant and stale after new tools.
       s.seedContract
         ? 'Validate against every acceptance criterion. If any criterion cannot be checked, end with UNVERIFIED and name the blocker.'
         : '',
@@ -19556,6 +19844,17 @@ async function requestQualityConclusion(
     ].filter(Boolean).join('\n'))
     .join('\n')
   const checkpointDelta = await qualityCheckpointDeltaSummary(state, context)
+  // Acceptance authority must not be a truncated prefix of the user's goal.
+  // Fallback contracts often repeat that goal verbatim; reference the exact
+  // copy above while retaining every criterion and constraint below.
+  const qualityContract = state.seedContract
+    ? formatSeedContract({
+        ...state.seedContract,
+        summary: state.seedContract.summary === state.input
+          ? 'Same as ACTIVE USER GOAL above.'
+          : state.seedContract.summary,
+      })
+    : undefined
   const request: ChatRequest = {
     model,
     messages: [
@@ -19576,9 +19875,13 @@ async function requestQualityConclusion(
       {
         role: 'user',
         content: [
-          `ACTIVE USER GOAL:\n${state.input.slice(0, 2_000)}`,
-          state.seedContract
-            ? `RUN CONTRACT:\n${(formatSeedContract(state.seedContract) ?? '').slice(0, 4_000)}`
+          `ACTIVE USER GOAL:\n${state.input}`,
+          formatActiveUserInstructions(activeUserInstructions(state.steeringNotes)),
+          qualityContract
+            ? `RUN CONTRACT:\n${qualityContract}`
+            : '',
+          state.validationPlan?.length
+            ? `REQUIRED VALIDATION PLAN:\n${state.validationPlan.join('\n')}`
             : '',
           state.implementationSummary
             ? `IMPLEMENTATION SUMMARY:\n${state.implementationSummary.slice(0, 2_000)}`
@@ -19605,12 +19908,10 @@ async function requestQualityConclusion(
       context,
       4_000,
       state.effectiveMaxOutputTokens,
+      { thinkingLevel: ThinkingLevel.Off },
     ),
   }
-  const timeoutMs = Math.min(
-    resolveProviderStreamFirstTokenMs() ?? NO_PROGRESS_RECOVERY_TIMEOUT_MS,
-    NO_PROGRESS_RECOVERY_TIMEOUT_MS,
-  )
+  const timeoutMs = resolveControlCallTimeoutMs()
   try {
     const response = await runAuxiliaryLlmChat({
       provider: deps.provider,
@@ -19633,6 +19934,8 @@ async function requestQualityConclusion(
     state.totalUsage.inputTokens += response.usage.inputTokens
     state.totalUsage.outputTokens += response.usage.outputTokens
     recordUsage(deps, context, model, response.usage)
+    // A parsable prefix is not a completed quality verdict.
+    if (response.finishReason === 'length') return null
     const call = response.message.toolCalls?.length === 1
       && response.message.toolCalls[0]?.name === conclusionTool.name
       ? response.message.toolCalls[0]
@@ -19698,6 +20001,56 @@ function compactQualityEvidenceOutput(output: string, limit = 900): string {
   const headLength = Math.floor(available / 2)
   const tailLength = available - headLength
   return `${normalized.slice(0, headLength)}${marker}${normalized.slice(-tailLength)}`
+}
+
+/**
+ * Reuse post-mutation checks at a phase handoff, but never infer acceptance
+ * from a green exit code. The same authoritative controller used after normal
+ * validation must judge the current contract and source/diff evidence first.
+ * Missing, stale, rejected, or unavailable evidence leaves the normal
+ * validator (and its tools) available. Review and the final gate still run.
+ */
+export const validationEvidenceHandoff = (deps: Deps) => async (
+  s: AgentState,
+  context?: GraphExecutionContext,
+): Promise<AgentState> => {
+  if (
+    s.phaseUsageStart?.phase !== 'validation'
+    || s.shouldStop
+    || s.toolCalls.length > 0
+    || s.steeringNotes?.length
+    || contractRequiresRenderedUiValidation(s.seedContract)
+    || s.validationPhaseToolHistoryStartIndex !== s.toolCallHistory?.length
+    || !inheritedValidationEvidenceEntries(s).some((entry) => (
+      entry.executionObserved === true
+      && entry.tool === 'terminal.run'
+      && entry.input.actionPurpose === 'validate'
+    ))
+  ) return s
+  const evidenceIdentity = () => createHash('sha256').update(JSON.stringify({
+    input: s.input,
+    contract: s.seedContract,
+    validationPlan: s.validationPlan,
+    tools: s.toolCallHistory,
+    mutations: s.implementationMutationEvidence,
+    checkpoint: s.currentEditCheckpointId,
+    steering: s.steeringNotes,
+  })).digest('hex')
+  const reviewedIdentity = evidenceIdentity()
+  const conclusion = await requestQualityConclusion(deps, s, 'validation', context)
+  if (
+    conclusion?.decision === 'VERIFIED'
+    && s.phaseUsageStart?.phase === 'validation'
+    && !s.shouldStop
+    && s.toolCalls.length === 0
+    && reviewedIdentity === evidenceIdentity()
+  ) {
+    s.output = `${conclusion.decision}: ${conclusion.summary}`
+    s.qualityConclusionResolvedPhase = 'validation'
+    s.qualityConclusionRecoveryRequested = undefined
+    s.qualityConclusionRetryTarget = undefined
+  }
+  return s
 }
 
 export const validationCompletionGuard = (deps?: Deps) => async (
@@ -19822,8 +20175,7 @@ export const reviewBrief = () => async (
     [
       '[Review phase]',
       'Review the completed coding work for correctness, regressions, missing validation, and remaining risk.',
-      formatSeedContract(s.seedContract),
-      formatEvidenceLedgerForPrompt(s),
+      // The current contract/evidence is supplied by buildAgentMessages.
       s.seedContract
         ? 'Check whether the implementation and validation evidence satisfy every acceptance criterion.'
         : '',
@@ -19957,6 +20309,8 @@ export function recordPhaseTransition(
       s.validationToolHistoryStartIndex = latestSuccessfulImplementationMutationBoundary(s)
       s.validationPhaseToolHistoryStartIndex = s.toolCallHistory?.length ?? 0
       s.validationConvergenceNudgeCount = 0
+      s.qualityConclusionResolvedPhase = undefined
+      s.qualityConclusionRecoveryRequested = undefined
     }
     s.internalGraphContinuation = false
   } else {
@@ -20677,6 +21031,21 @@ export const captureValidationOutcome = () => async (
   return s
 }
 
+function completionGateRecoveryEvent(s: AgentState): AgentEvent {
+  return {
+    type: 'recovery', scope: 'output_synthesis', kind: 'completion_gate_blocked',
+    action: 'repair_missing_evidence', recoverable: true,
+    message: 'Completion requires additional evidence; retaining the current draft and execution evidence.',
+    details: {
+      reason: s.completionDiagnostics?.gate?.reason,
+      unmet: s.completionDiagnostics?.gate?.unmet,
+      blocks: s.completionGateBlocks ?? 0,
+      evidenceRevision: s.workProgress?.revision ?? 0,
+      iteration: s.iteration,
+    },
+  }
+}
+
 export const codingFinalizer = (deps: Deps) => async function* (
   s: AgentState,
   context?: GraphExecutionContext,
@@ -20732,6 +21101,7 @@ export const codingFinalizer = (deps: Deps) => async function* (
       reviewedGate,
     )
     if (s.completionDiagnostics?.gate?.decision === 'block') {
+      yield completionGateRecoveryEvent(s)
       recordPhaseTransition(s, 'implementation')
       s.implementationModelRecoveryRequested = true
       s.shouldStop = false
@@ -20813,6 +21183,7 @@ export const codingFinalizer = (deps: Deps) => async function* (
     // available to the main run, but avoid turning the final report into
     // another long generation that can stall an otherwise completed task.
     temperature: context?.temperature,
+    thinkingLevel: resolveThinkingLevel(context?.thinkingLevel, { phase: 'coding-finalizer' }),
     maxTokens: finalizerMaxTokens(deps, context, 500),
   }
 
@@ -20927,6 +21298,7 @@ export const codingFinalizer = (deps: Deps) => async function* (
   // directly to the broad implementation model here can discard the focused
   // gate defect and restart repository discovery until a loop guard fires.
   if (s.completionDiagnostics?.gate?.decision === 'block') {
+    yield completionGateRecoveryEvent(s)
     recordPhaseTransition(s, 'implementation')
     // recordPhaseTransition resets phase-local recovery state, so request the
     // controller after the transition has completed.

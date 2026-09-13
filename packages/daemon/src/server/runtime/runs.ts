@@ -24,6 +24,7 @@ export interface PendingToolExecutionSnapshot {
 }
 
 export interface SessionRunCheckpoint {
+  autonomy?: import('@sepilotd/core').AutonomyLevel
   sessionId: string
   provider: string
   model: string

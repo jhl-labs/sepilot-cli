@@ -44,6 +44,7 @@ import {
 import {
   chatRequestSchema,
   isDesktopExternalAgentMode,
+  resolveChatHardMaxIterations,
   resolveChatMaxIterations,
   type ChatBody,
 } from './chat-schema.js'
@@ -78,11 +79,13 @@ import {
   buildSseResponseHeaders,
   createAgentInactivityProbe,
   createSseLifecycle,
+  describePendingDecisionTimeout,
   isSubstantiveAgentActivity,
   registerSseDisconnectHandler,
   resolveAgentInactivityMs,
   resolvePendingDecisionTimeoutMs,
   trackSseConnection,
+  type PendingDecision,
 } from '../sse-response.js'
 import { isStreamWriteStoppedError, writeSseFrame } from '../sse-write.js'
 import { createAgentStreamOutputTracker } from './agent-stream-output.js'
@@ -587,6 +590,10 @@ export async function chatStreamRoutes(app: FastifyInstance) {
       let clientClosed = false
       let terminalSessionPersisted = false
       let activeModeRouter: AgentModeRouter | null = null
+      // Set when the approval registry parks this run: the prompt stays open
+      // and its checkpoint stays on disk, so the stream ends with an
+      // APPROVAL_TIMEOUT frame plus a resumable `approval_timeout` done.
+      let parkedDecision: PendingDecision | null = null
       const preflightAbortController = new AbortController()
       const stopRun = async () => {
         clientClosed = true
@@ -995,6 +1002,17 @@ export async function chatStreamRoutes(app: FastifyInstance) {
             runId: messageId,
             forcePrompt: options?.forcePrompt,
             signal: options?.signal,
+            onParked: (approval) => {
+              parkedDecision = {
+                kind: 'approval',
+                id: approval.requestId,
+                label: approval.tool,
+                since: Date.parse(approval.requestedAt),
+              }
+              // Same abort-without-cancel path the decision watchdog uses:
+              // the wait rejects through `signal`, the registry entry stays.
+              void activeModeRouter?.stop().catch(() => {})
+            },
           })
         let emitQuestionRequestEvent: (event: AgentEvent) => Promise<void> = async () => undefined
         const requestQuestion = createQuestionRequester(runtime.questions, async (question) => {
@@ -1019,7 +1037,7 @@ export async function chatStreamRoutes(app: FastifyInstance) {
             systemPrompt: systemPrompt(),
             previousMessages,
             maxIterations: resolveChatMaxIterations(body),
-            hardMaxIterations: body.maxIterations !== undefined,
+            hardMaxIterations: resolveChatHardMaxIterations(body),
             auditLogger: runtime.auditLogger,
             usageTracker: runtime.usageTracker,
             spendBudget: runtime.config.limits,
@@ -1396,8 +1414,12 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           // stop() may make a router return normally. A watchdog trip is
           // nevertheless a terminal failure, not permission to synthesize a
           // successful done event and fallback final answer.
-          if (lifecycle.isInactivityTripped()) {
-            throw new Error('Agent run stopped after an inactivity timeout.')
+          if (lifecycle.isInactivityTripped() || parkedDecision) {
+            throw new Error(
+              parkedDecision
+                ? 'Agent run parked on a pending approval.'
+                : 'Agent run stopped after an inactivity timeout.',
+            )
           }
           if (providerError) {
             recordChatProviderFailure(runtime, activeSelection, providerError)
@@ -1577,22 +1599,30 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           recordTaskEvent('task.failed', 'error', {
             durationMs: Date.now() - taskStartedAt,
             attempts: activeAttempt,
-            code: lifecycle.isInactivityTripped() ? 'TIMEOUT' : 'INTERNAL_ERROR',
+            code: lifecycle.isInactivityTripped() || parkedDecision ? 'TIMEOUT' : 'INTERNAL_ERROR',
             message: err instanceof Error ? err.message : String(err),
           })
           notifyChatCompletion('failed', err instanceof Error ? err.message : String(err))
-          if (lifecycle.isInactivityTripped()) {
+          if (lifecycle.isInactivityTripped() || parkedDecision) {
             // Convert the abort/throw into a structured signal the cli can
             // recognise instead of a generic INTERNAL_ERROR, and say *what*
             // stalled (provider never responded vs. a stuck step). The run
             // lease and keepalive timer are released by the outer finally.
             try {
               if (!reply.raw.writableEnded) {
-                const timeoutFrame = inactivityProbe.describe({
-                  inactivityMs: AGENT_INACTIVITY_MS,
-                  provider: selectedProvider.id,
-                  model: selectedModel,
-                })
+                const parked = parkedDecision as PendingDecision | null
+                const timeoutFrame = parked
+                  ? describePendingDecisionTimeout({
+                      decisionTimeoutMs: resolvePendingDecisionTimeoutMs(),
+                      pending: parked,
+                      provider: selectedProvider.id,
+                      model: selectedModel,
+                    })
+                  : inactivityProbe.describe({
+                      inactivityMs: AGENT_INACTIVITY_MS,
+                      provider: selectedProvider.id,
+                      model: selectedModel,
+                    })
                 await send('error', {
                   type: 'error',
                   error: timeoutFrame,
@@ -1606,7 +1636,9 @@ export async function chatStreamRoutes(app: FastifyInstance) {
                   {
                     error: {
                       code: 'TIMEOUT',
-                      message: 'Agent run stopped after an inactivity timeout.',
+                      message: parked
+                        ? 'Agent run parked on a pending approval.'
+                        : 'Agent run stopped after an inactivity timeout.',
                     },
                     retryable: false,
                   },
@@ -1617,7 +1649,11 @@ export async function chatStreamRoutes(app: FastifyInstance) {
                   stopReason: timeoutFrame.stopReason,
                 }
                 await persistAgentSessionEvent(runtime.sessions, sessionId, failedDoneEvent)
-                await runtime.sessions.updateMeta?.(sessionId, { status: 'abandoned' })
+                // A parked run is resumable from its checkpoint; do not mark
+                // the session abandoned the way a genuine stall does.
+                if (!parked) {
+                  await runtime.sessions.updateMeta?.(sessionId, { status: 'abandoned' })
+                }
                 terminalSessionPersisted = true
                 await send(failedDoneEvent.type, failedDoneEvent, {
                   id: nextReplayableCursor(),

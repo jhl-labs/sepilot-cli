@@ -11,6 +11,9 @@ export interface EnvironmentInfo {
   gitBranch?: string
   today: string
   timeZone?: string
+  /** Clock snapshot when this turn's environment was collected, not a tool observation time. */
+  capturedAt?: string
+  localTime?: string
 }
 
 export interface GatherEnvironmentOptions {
@@ -32,6 +35,10 @@ export async function gatherEnvironmentInfo(
     nodeVersion: process.version,
     daemonVersion: DAEMON_VERSION,
     today: toIsoDate(now, timeZone),
+    capturedAt: now.toISOString(),
+    localTime: new Intl.DateTimeFormat('en-GB', {
+      timeZone, hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+    }).format(now),
     ...(timeZone ? { timeZone } : {}),
   }
   const shellEnv = process.env.SHELL
@@ -65,6 +72,10 @@ export function formatEnvironmentBlock(
     lines.push(`- Git branch: ${info.gitBranch}`)
   }
   lines.push(`- Today: ${info.today}${info.timeZone ? ` (host timezone: ${info.timeZone})` : ''}`)
+  if (info.capturedAt) {
+    lines.push(`- Turn clock snapshot: ${info.capturedAt}${info.localTime ? `; host local time ${info.today} ${info.localTime}` : ''}`)
+    lines.push('- This clock anchors relative dates and remaining time today; it is not a source retrieval timestamp. Host timezone is not necessarily the user timezone. Honor an explicitly supplied user timezone, and refresh time through an available tool for time-sensitive work after a long run.')
+  }
   return lines.join('\n')
 }
 

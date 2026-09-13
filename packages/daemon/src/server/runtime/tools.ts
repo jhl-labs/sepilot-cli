@@ -24,6 +24,7 @@ import {
 import {
   createManagedProcessFollowTool,
   createManagedProcessReadTool,
+  createManagedProcessWriteTool,
   createManagedProcessSessionsTool,
   createManagedProcessStartTool,
   createManagedProcessStopTool,
@@ -162,6 +163,7 @@ export function buildToolRegistry(
     }),
   )
   toolRegistry.register(createManagedProcessReadTool(managedProcesses))
+  toolRegistry.register(createManagedProcessWriteTool(managedProcesses))
   toolRegistry.register(createManagedProcessFollowTool(managedProcesses))
   toolRegistry.register(createManagedProcessWaitTool(managedProcesses))
   toolRegistry.register(createManagedProcessStopTool(managedProcesses))

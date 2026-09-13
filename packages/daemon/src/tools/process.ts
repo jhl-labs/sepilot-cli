@@ -8,7 +8,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { access, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import type { Readable } from 'node:stream'
+import type { Readable, Writable } from 'node:stream'
 import { StringDecoder } from 'node:string_decoder'
 import { promisify } from 'node:util'
 import xtermHeadless from '@xterm/headless'
@@ -306,6 +306,7 @@ function normalizeManagedLoopbackPorts(rawNetwork: unknown): number[] | null {
 }
 
 const MANAGED_PROCESS_START_FIELDS = new Set([
+  'interactive',
   'executable',
   'args',
   'cwd',
@@ -326,6 +327,7 @@ function invalidManagedProcessStartShape(output: string): ToolResult {
 }
 
 function validateManagedProcessStartShape(input: Record<string, unknown>): ToolResult | null {
+  if (input.interactive !== undefined && typeof input.interactive !== 'boolean') return invalidManagedProcessStartShape('interactive must be a boolean')
   const unsupported = Object.keys(input).filter((key) => !MANAGED_PROCESS_START_FIELDS.has(key))
   if (unsupported.length > 0) {
     return invalidManagedProcessStartShape(
@@ -631,7 +633,7 @@ type ManagedProcessLifetime = 'bounded' | 'session'
 
 interface ManagedProcessRecord {
   id: string
-  child: ChildProcessByStdio<null, Readable, Readable>
+  child: ChildProcessByStdio<Writable | null, Readable, Readable>
   pid: number
   command: string
   cwd?: string
@@ -751,6 +753,7 @@ function parseSignal(rawSignal: unknown): NodeJS.Signals {
 
 function snapshotManagedProcess(record: ManagedProcessRecord) {
   return {
+    interactive: record.child.stdin !== null,
     id: record.id,
     pid: record.pid,
     command: record.command,
@@ -968,6 +971,7 @@ export class ManagedProcessRegistry {
   }
 
   start(input: {
+    interactive?: boolean
     executable: string
     args?: string[]
     cwd?: string
@@ -996,8 +1000,8 @@ export class ManagedProcessRegistry {
         ? { ...process.env, ...input.env, ...prepared.env }
         : process.env,
       detached: isolatedProcessGroup,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
+      stdio: [input.interactive ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+    }) as ChildProcessByStdio<Writable | null, Readable, Readable>
     const id = randomUUID()
 
     let resolveExit: (() => void) | undefined
@@ -1043,6 +1047,7 @@ export class ManagedProcessRegistry {
       record.stdout.append(chunk)
       record.pty?.append(chunk)
     })
+    child.stdin?.on('error', () => { /* write callback reports closed input; never crash the daemon */ })
     child.stderr.on('data', (chunk: Buffer | string) => {
       record.stderr.append(chunk)
     })
@@ -1099,6 +1104,19 @@ export class ManagedProcessRegistry {
 
   get(id: string): ManagedProcessRecord | null {
     return this.records.get(id) ?? null
+  }
+
+  async writeInput(id: string, text: string, end = false): Promise<void> {
+    const record = this.get(id)
+    if (!record || record.status !== 'running') throw new Error('Managed process is not running')
+    if (!record.child.stdin || record.child.stdin.destroyed) throw new Error('Process was not started with interactive=true or stdin is closed')
+    if (Buffer.byteLength(text) > 16_384) throw new Error('Input exceeds 16384 bytes')
+    const stream = record.child.stdin
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Input write timed out; delivery is uncertain, do not blindly resend')), 5000)
+      stream.write(text, error => { clearTimeout(timer); if (error) reject(error); else resolve() })
+    })
+    if (end) stream.end()
   }
 
   list(): ReturnType<typeof snapshotManagedProcess>[] {
@@ -1508,6 +1526,7 @@ export function createManagedProcessStartTool(
       type: 'object',
       properties: {
         executable: { type: 'string', description: 'Executable to spawn.' },
+        interactive: { type: 'boolean', description: 'Keep stdin open for explicit process.write input. Defaults to false.' },
         args: { type: 'array', items: { type: 'string' }, description: 'Command arguments.' },
         cwd: { type: 'string', description: 'Working directory for the child process. Defaults to the active session cwd.' },
         env: {
@@ -1525,7 +1544,7 @@ export function createManagedProcessStartTool(
           description: "Lifecycle scope. 'bounded' is temporary and uses ttlMs/default TTL. 'session' disables TTL and survives agent turns, but is still stopped when the daemon shuts down. Defaults to 'bounded'.",
         },
         pty: {
-          description: 'Allocate a headless terminal for full-screen/TUI output. Use true for defaults or provide bounded columns/rows. No interactive stdin is available.',
+          description: 'Allocate a headless terminal for full-screen/TUI output. Use true for defaults or provide bounded columns/rows. Enable interactive separately to accept input.',
           anyOf: [
             { type: 'boolean' },
             {
@@ -1662,6 +1681,7 @@ export function createManagedProcessStartTool(
           let record
           try {
             record = registry.start({
+              interactive: input.interactive === true,
               executable: prepared.executable,
               args: prepared.args,
               cwd: prepared.cwd,
@@ -1713,6 +1733,7 @@ export function createManagedProcessStartTool(
           }
         }
         const record = registry.start({
+          interactive: input.interactive === true,
           executable,
           args,
           cwd: requestedCwd,
@@ -1799,6 +1820,24 @@ export function createManagedProcessFollowTool(
         status: 'success',
         durationMs: Date.now() - start,
       }
+    },
+  }
+}
+
+export function createManagedProcessWriteTool(registry: ManagedProcessRegistry): ToolDefinitionRuntime {
+  return {
+    name: 'process.write',
+    description: 'Send explicit input to a managed process started with interactive=true. Input may execute commands or cause side effects; review before sending. Waiting timeout does not prove non-delivery.',
+    resumeSafety: 'replay-risky',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' }, text: { type: 'string', maxLength: 16384 }, end: { type: 'boolean', description: 'Close stdin after this input' } }, required: ['id', 'text'], additionalProperties: false },
+    async execute(input, context) {
+      const startedAt = Date.now()
+      try {
+        throwIfAborted(context?.signal, 'Process input canceled before delivery')
+        if (typeof input.id !== 'string' || typeof input.text !== 'string' || !registry.isAccessible(input.id, context?.workspaceRoot)) throw new Error('Managed process not found or invalid input')
+        await registry.writeInput(input.id, input.text, input.end === true)
+        return { status: 'success', output: JSON.stringify({ id: input.id, bytesWritten: Buffer.byteLength(input.text), inputClosed: input.end === true }), durationMs: Date.now() - startedAt }
+      } catch (error) { return { status: 'error', output: error instanceof Error ? error.message : String(error), durationMs: Date.now() - startedAt } }
     },
   }
 }

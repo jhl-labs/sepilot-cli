@@ -750,6 +750,8 @@ export const outboundWebhookSchema = z.object({
 })
 
 export const commandHookEventSchema = z.enum([
+  'post:subagent:start',
+  'post:subagent:stop',
   'pre:agent:run',
   'post:agent:run',
   'pre:tool:execute',
@@ -774,6 +776,10 @@ export const commandHookSchema = z.object({
   /** Shell command. Receives the hook payload as JSON on stdin; exit 2 aborts. */
   command: z.string().min(1),
   timeoutMs: z.number().int().min(100).max(60_000).optional(),
+  async: z.boolean().optional(),
+}).strict().refine((hook) => !hook.async || hook.event.startsWith('post:'), {
+  message: 'Async command hooks are observational and only supported for post events; they cannot gate an operation',
+  path: ['async'],
 })
 
 export const DEFAULT_CHANNEL_PIPELINE_HEALTH_THRESHOLDS = {
@@ -1100,7 +1106,7 @@ export const configSchema = z.object({
       autonomy: z
         .enum(['readonly', 'accept-edits', 'workspace-write', 'supervised', 'autonomous'])
         .default('supervised'),
-      thinkingLevel: z.enum(['off', 'low', 'medium', 'high', 'max']).default('medium'),
+      thinkingLevel: z.enum(['auto', 'off', 'low', 'medium', 'high', 'max']).default('medium'),
       defaultProvider: z.string().optional(),
       defaultModel: z.string().optional(),
       auxModel: z.string().trim().min(1).optional(),

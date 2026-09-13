@@ -71,19 +71,25 @@ export function createPersonalDocsRepo(): PersonalDocsRepo {
       }
     },
     upsert(input) {
+      return db.transaction(() => {
       const id = input.id ?? crypto.randomUUID()
+      const existing = db.prepare('SELECT updated_at FROM personal_docs WHERE id=?').get(id) as { updated_at: number } | undefined
+      if (input.expectedUpdatedAt !== undefined && existing?.updated_at !== input.expectedUpdatedAt) {
+        throw Object.assign(new Error('Document changed on another device. Reload before saving; your draft is preserved.'), { statusCode: 409 })
+      }
       const file = fileFor(id)
       const dir = dirname(file)
       mkdirSync(dir, { recursive: true, mode: 0o700 })
       secureDir(dir)
       writeFileSync(file, input.content, 'utf-8')
       secureFile(file)
-      const now = Date.now()
+      const now = Math.max(Date.now(), (existing?.updated_at ?? 0) + 1)
       db.prepare(
         `INSERT INTO personal_docs (id, path, updated_at) VALUES (?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET path=excluded.path, updated_at=excluded.updated_at`,
       ).run(id, input.path, now)
       return { id, path: input.path, updatedAt: now }
+      })()
     },
     remove(id) {
       const file = fileFor(id)

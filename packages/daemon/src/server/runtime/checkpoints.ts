@@ -240,6 +240,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export interface ApprovalRunCheckpoint {
+  autonomy?: import('@sepilotd/core').AutonomyLevel
   requestId: string
   sessionId: string
   provider: string

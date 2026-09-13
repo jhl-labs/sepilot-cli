@@ -299,6 +299,7 @@ export interface PreToolExecuteOutcome {
  * must not take down all tool execution, so a throw counts as `continue`.
  */
 export async function emitPreToolExecute(opts: {
+  signal?: AbortSignal
   hookRegistry?: HookRegistry
   sessionId: string
   provider: string
@@ -318,7 +319,7 @@ export async function emitPreToolExecute(opts: {
         toolCall: opts.toolCall,
         cwd: opts.cwd,
       },
-    })
+    }, opts.signal)
   } catch {
     return { blocked: false }
   }

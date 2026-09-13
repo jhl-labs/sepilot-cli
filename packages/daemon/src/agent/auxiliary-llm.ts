@@ -14,6 +14,7 @@ import {
   type ProviderCircuitBreaker,
 } from '../providers/circuit-breaker.js'
 import { logLlmCallTraceDetached } from '../observability/agent-trace.js'
+import { resolveCallDeadline } from './control-call-policy.js'
 
 const DEFAULT_AUXILIARY_LLM_TIMEOUT_MS = 25_000
 export const DEFAULT_AUXILIARY_LLM_TURN_BUDGET_MS = 25_000
@@ -330,17 +331,12 @@ async function runSingleAuxiliaryLlmChat(input: {
   transport?: AuxiliaryLlmTransport
   sessionId?: string
 }): Promise<ChatResponse> {
-  const perCallTimeoutMs = input.timeoutMs ?? resolveAuxiliaryLlmTimeoutMs()
   const remainingBudgetMs = input.budget?.remainingMs() ?? null
   if (remainingBudgetMs !== null && remainingBudgetMs <= 0) {
     input.budget?.exhaust()
     throw new AuxiliaryLlmBudgetExhaustedError(input.budget?.budgetMs ?? null)
   }
-  const timeoutMs = perCallTimeoutMs === null
-    ? remainingBudgetMs
-    : remainingBudgetMs === null
-      ? perCallTimeoutMs
-      : Math.min(perCallTimeoutMs, remainingBudgetMs)
+  const timeoutMs = resolveCallDeadline(input.timeoutMs, resolveAuxiliaryLlmTimeoutMs(), remainingBudgetMs)
   const controller = new AbortController()
   const unregisterBudget = input.budget?.register(controller) ?? (() => {})
   const finishActiveRequest = input.budget?.beginRequest({

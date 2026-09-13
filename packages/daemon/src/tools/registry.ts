@@ -103,8 +103,8 @@ export interface ToolExecutionContext {
   /**
    * Optional sink for nested agent events a tool wants surfaced on the
    * parent run's stream — currently subagent.dispatch forwarding its
-   * subagent's progress as `subagent_progress`. The agent loop buffers
-   * these during tool execution and yields them before the tool result.
+   * subagent's progress as `subagent_progress`. The agent loop streams
+   * these while the tool is executing, including nested approval requests.
    * Undefined for tools/contexts that don't produce nested events.
    */
   emitEvent?: (event: AgentEvent) => void

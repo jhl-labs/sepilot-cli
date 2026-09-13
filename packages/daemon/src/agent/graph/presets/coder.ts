@@ -12,6 +12,7 @@ import { childStateFrom, mergeChildInto } from '../subgraph-state.js'
 import { buildFocusedLoopGraph } from './focused-loop.js'
 import { logAgentDebugTrace } from '../../../observability/agent-trace.js'
 import { inputLimitsCurrentTurnToDocumentArtifact } from '../../task-contract.js'
+import { isFocusedSingleFileReplacement } from '../../request-shape.js'
 
 const operationalToolAllowlist = [
   'process.*',
@@ -41,10 +42,28 @@ const operationalSystemPrompt = [
   'Stop only bounded validation helpers; do not stop the requested long-lived runtime before reporting completion.',
 ].join(' ')
 
+const focusedEditToolAllowlist = [
+  'fs.read',
+  'fs.edit',
+  'fs.write',
+  'apply_patch',
+] as const
+
+const focusedEditSystemPrompt = [
+  'You are executing a tightly scoped single-file literal replacement inside a coding session.',
+  'Read the named file, make only the requested substitution, and preserve all unrelated content exactly.',
+  'Use the narrow file-editing tools directly; do not inventory the repository, create a plan, or run unrelated builds and tests.',
+  'After the edit, read the file back to confirm the requested value changed and the surrounding content was preserved, then answer concisely.',
+].join(' ')
+
 function routesToOperationalSubgraph(state: AgentState): boolean {
   const intent = state.seedContract?.executionIntent
   return intent?.workspaceMutation === 'forbidden'
     && (intent.kind === 'operational-action' || intent.kind === 'inspection')
+}
+
+function routesToFocusedEditSubgraph(state: AgentState): boolean {
+  return isFocusedSingleFileReplacement(state.input)
 }
 
 function requestedTerminalToolCall(state: AgentState): ToolCall | undefined {
@@ -213,6 +232,7 @@ export const __testables = {
   operationalToolAllowlist,
   requestedTerminalToolCall,
   routesToOperationalSubgraph,
+  routesToFocusedEditSubgraph,
   routesDirectlyToCurrentDocumentPhase,
   routeImplementationAgentResult,
   routeImplementationGuardResult,
@@ -253,7 +273,7 @@ export function buildCoderGraph(deps: Deps): AgentGraph {
       'Match implementation and validation evidence to each acceptance criterion independently. In particular, do not accept a requirement to add or update regression coverage when the change evidence contains no matching test artifact, even if an existing suite passes.',
       'End your summary with exactly one of these two lines, on its own line, as the final line: "VERIFIED: <evidence>" if the review found no blocking issues, or "UNVERIFIED: <one-line blocker>" if a backtrack is needed. The orchestrator reads only this stem; hedging earlier in the review does not trigger a backtrack.',
     ].filter(Boolean).join('\n\n'),
-  }, { preserveProtocolOutput: true })
+  }, { preserveProtocolOutput: true, outcomeReviewOwner: 'parent' })
   const operationalGraph = buildFocusedLoopGraph({
     ...deps,
     systemPrompt: stripToolCatalog(deps.systemPrompt),
@@ -263,6 +283,14 @@ export function buildCoderGraph(deps: Deps): AgentGraph {
     requireCurrentTurnToolEvidence: true,
     initialToolCall: requestedTerminalToolCall,
     completeAfterInitialToolResult: true,
+  })
+  const focusedEditGraph = buildFocusedLoopGraph({
+    ...deps,
+    systemPrompt: stripToolCatalog(deps.systemPrompt),
+  }, {
+    systemPrompt: focusedEditSystemPrompt,
+    toolAllowlist: focusedEditToolAllowlist,
+    requireCurrentTurnToolEvidence: true,
   })
 
   return new AgentGraph()
@@ -283,6 +311,8 @@ export function buildCoderGraph(deps: Deps): AgentGraph {
           capabilities: intent?.capabilities ?? [],
           route: routesToOperationalSubgraph(s)
             ? 'operational_subgraph'
+            : routesToFocusedEditSubgraph(s)
+              ? 'focused_edit_subgraph'
             : routesDirectlyToCurrentDocumentPhase(s)
               ? 'current_document_inventory'
             : 'codebase_exploration',
@@ -304,6 +334,29 @@ export function buildCoderGraph(deps: Deps): AgentGraph {
           contractMin: 8,
           parentShare: 0.5,
           hardCap: 16,
+        }),
+      }),
+      mapOut: (parent, child) => {
+        const output = child.output
+        mergeChildInto(parent, child)
+        parent.output = output
+        return parent
+      },
+    }), {
+      lifecycleState: 'thinking',
+    })
+    .addNode('focused_edit_subgraph', agentSubgraphNode({
+      nodeId: 'focused_edit_subgraph',
+      graph: focusedEditGraph,
+      forwardMessages: true,
+      mapIn: (parent) => childStateFrom(parent, {
+        taskType: 'code',
+        maxIterations: childIterationBudget(parent, {
+          min: 6,
+          legacyMax: 10,
+          contractMin: 10,
+          parentShare: 0.5,
+          hardCap: 12,
         }),
       }),
       mapOut: (parent, child) => {
@@ -409,6 +462,9 @@ export function buildCoderGraph(deps: Deps): AgentGraph {
     .addNode('validation_brief', N.validationBrief(), {
       lifecycleState: 'thinking',
     })
+    .addNode('validation_evidence_handoff', N.validationEvidenceHandoff(deps), {
+      lifecycleState: 'thinking',
+    })
     .addNode('validation_context_manager', N.contextManager(deps), {
       lifecycleState: 'thinking',
     })
@@ -418,7 +474,7 @@ export function buildCoderGraph(deps: Deps): AgentGraph {
     .addNode('validator', N.agent({
       ...deps,
       systemPrompt: validatorBaseSystemPrompt,
-    }), {
+    }, { outcomeReviewOwner: 'parent' }), {
       lifecycleState: 'thinking',
     })
     .addNode('validation_tools', N.toolExecutor(deps), {
@@ -538,12 +594,14 @@ export function buildCoderGraph(deps: Deps): AgentGraph {
       'execution_intent_router',
       (s: AgentState) => {
         if (routesToOperationalSubgraph(s)) return 'operational_subgraph'
+        if (routesToFocusedEditSubgraph(s)) return 'focused_edit_subgraph'
         if (routesDirectlyToCurrentDocumentPhase(s)) return 'current_document_inventory'
         return 'codebase_exploration'
       },
-      ['operational_subgraph', 'current_document_inventory', 'codebase_exploration'],
+      ['operational_subgraph', 'focused_edit_subgraph', 'current_document_inventory', 'codebase_exploration'],
     )
     .addEdge('operational_subgraph', '__end__')
+    .addEdge('focused_edit_subgraph', '__end__')
     .addConditionalEdge(
       'current_document_inventory',
       (s: AgentState) => s.toolCalls.length > 0
@@ -612,7 +670,14 @@ export function buildCoderGraph(deps: Deps): AgentGraph {
       ['mark_finalize_phase', 'mark_validation_phase'],
     )
     .addEdge('mark_validation_phase', 'validation_brief')
-    .addEdge('validation_brief', 'validation_context_manager')
+    .addEdge('validation_brief', 'validation_evidence_handoff')
+    .addConditionalEdge(
+      'validation_evidence_handoff',
+      (s: AgentState) => s.qualityConclusionResolvedPhase === 'validation'
+        ? 'capture_validation'
+        : 'validation_context_manager',
+      ['capture_validation', 'validation_context_manager'],
+    )
     .addEdge('validation_context_manager', 'validation_tool_recommender')
     .addEdge('validation_tool_recommender', 'validator')
     .addConditionalEdge(

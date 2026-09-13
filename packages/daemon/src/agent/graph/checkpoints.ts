@@ -76,6 +76,9 @@ export function cloneGraphState(
   const elideMessages = forCheckpoint && depth > resolveCheckpointSubgraphDepth()
   return {
     ...state,
+    workProgress: state.workProgress
+      ? { revision: state.workProgress.revision, seen: [...state.workProgress.seen] }
+      : undefined,
     input: state.input,
     effectiveContextWindowTokens: state.effectiveContextWindowTokens,
     messages: elideMessages
@@ -357,6 +360,7 @@ export function createGraphApprovalCheckpoint(
     skillExecutionPolicies: cloneCheckpointSkillExecutionPolicies(
       context.agentContext.skillExecutionPolicies,
     ),
+    autonomy: context.autonomy,
     requireToolApproval: context.agentContext.requireToolApproval,
     runContract: state.seedContract,
     messages: state.messages.map(cloneMessage),
@@ -399,6 +403,7 @@ export function createGraphRunCheckpoint(
     skillExecutionPolicies: cloneCheckpointSkillExecutionPolicies(
       context.agentContext.skillExecutionPolicies,
     ),
+    autonomy: context.autonomy,
     requireToolApproval: context.agentContext.requireToolApproval,
     runContract: state.seedContract,
     messages: state.messages.map(cloneMessage),

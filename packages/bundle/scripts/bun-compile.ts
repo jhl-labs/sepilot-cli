@@ -170,6 +170,10 @@ const stubSsh2 = {
   },
 }
 
+// Playwright bundles its Electron loader even though this standalone product
+// only exposes browser automation. Resolve the optional import without shipping
+// Electron; invoking the unsupported branch must fail explicitly, not succeed
+// silently. Keep this in the source repository so public projection retains it.
 const stubElectron = {
   name: 'stub-electron',
   setup(build: import('bun').PluginBuilder) {

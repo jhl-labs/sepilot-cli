@@ -30,6 +30,7 @@ export interface JobsBatchSubmitResult {
 }
 
 export interface JobSnapshot {
+  activity?: Array<{ idx: number; status: string; sessionId: string; phase: string; toolName?: string; approvalRequestId?: string; updatedAt: number }>
   id: string
   kind?: string
   status: string
@@ -54,6 +55,7 @@ export interface JobItemsPage {
 }
 
 export interface JobsClient {
+  list(options?: { status?: string; kind?: string; limit?: number; offset?: number }): Promise<{ jobs: JobSnapshot[]; nextOffset: number | null }>
   submitBatch(req: JobsBatchSubmitRequest): Promise<JobsBatchSubmitResult>
   get(jobId: string): Promise<JobSnapshot>
   getItems(jobId: string, since: number): Promise<JobItemsPage>
@@ -85,6 +87,11 @@ export function createJobsClient(deps: JobsClientDeps): JobsClient {
   })
 
   return {
+    async list(options = {}) {
+      const query = new URLSearchParams()
+      for (const [key, value] of Object.entries(options)) if (value !== undefined) query.set(key, String(value))
+      return client.request(`${API_PREFIX}/jobs?${query}`, { headers: auth })
+    },
     async submitBatch(req) {
       return client.request<JobsBatchSubmitResult>(`${API_PREFIX}/jobs/batch`, {
         method: 'POST',

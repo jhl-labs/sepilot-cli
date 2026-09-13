@@ -576,6 +576,15 @@ export function createTerminalChatStreamPresenter(): TerminalChatStreamPresenter
           break
         case 'subagent_progress': {
           closeInlineText(frames)
+          if (event.inner.type === 'approval_request') {
+            const inner = event.inner
+            frames.push({ kind: 'approval_request', subagentId: event.subagentId,
+              sessionId: event.subagentId, requestId: inner.requestId,
+              toolName: inner.toolCall.name, preview: formatToolCall(inner.toolCall, 200),
+              input: inner.toolCall.arguments as Record<string, unknown>,
+            })
+            break
+          }
           const summary = summarizeSubagentProgressInner(event.inner)
           frames.push({
             kind: 'subagent_progress',

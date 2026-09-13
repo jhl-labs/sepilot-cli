@@ -10,7 +10,7 @@ import { z } from 'zod'
  * and surfaces as a 400 with `code: 'SUBAGENT_TOOL_ESCALATION'`.
  */
 export const subagentDispatchRequestSchema = z.object({
-  prompt: z.string().min(1, 'prompt required'),
+  prompt: z.string().refine((value) => value.trim().length > 0, 'prompt required'),
   system: z.string().optional(),
   category: z.string().min(1).optional(),
   agentId: z.string().min(1).optional(),
@@ -18,4 +18,7 @@ export const subagentDispatchRequestSchema = z.object({
   tools: z.array(z.string().min(1)).optional(),
   model: z.string().min(1).optional(),
   parentSessionId: z.string().min(1).optional(),
+  contextPacket: z.string().optional(),
+  cwd: z.string().min(1).optional(),
+  isolation: z.literal('worktree').optional(),
 })

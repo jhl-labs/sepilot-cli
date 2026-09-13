@@ -109,14 +109,23 @@ export function stopReasonObservationBudget(input: {
 }
 
 export function stopReasonNoProgress(input?: {
-  layer?: 'cycle' | 'recovery' | 'provider'
+  layer?: 'cycle' | 'recovery' | 'provider' | 'continuation' | 'question'
   contract?: AgentRunContract
+  budget?: number
+  used?: number
 }): RunStopReason {
   return {
     kind: 'incomplete',
     code: 'no_progress',
-    summary: 'Run stopped because it kept revisiting the same state without advancing.',
-    ...withDetail({ layer: input?.layer, criteria: criteriaIds(input?.contract) }),
+    summary: input?.layer === 'continuation'
+      ? 'Run stopped at its iteration budget because the last cycle produced no new evidence or artifacts.'
+      : 'Run stopped because it kept revisiting the same state without advancing.',
+    ...withDetail({
+      layer: input?.layer,
+      budget: input?.budget,
+      used: input?.used,
+      criteria: criteriaIds(input?.contract),
+    }),
     resumable: true,
     nextActions: ['resume', 'retry'],
   }
@@ -124,13 +133,21 @@ export function stopReasonNoProgress(input?: {
 
 export function stopReasonStuckRepeat(input?: {
   tool?: string
+  /** `question`: the user chose to stop when asked about the repeated call. */
+  layer?: 'question'
   contract?: AgentRunContract
 }): RunStopReason {
   return {
     kind: 'incomplete',
     code: 'stuck_repeat',
-    summary: 'Run stopped after the same tool call repeated past the repair limit.',
-    ...withDetail({ tool: input?.tool, criteria: criteriaIds(input?.contract) }),
+    summary: input?.layer === 'question'
+      ? 'Run stopped at the user\'s request after the same tool call kept repeating.'
+      : 'Run stopped after the same tool call repeated past the repair limit.',
+    ...withDetail({
+      tool: input?.tool,
+      layer: input?.layer,
+      criteria: criteriaIds(input?.contract),
+    }),
     resumable: true,
     nextActions: ['resume', 'retry'],
   }

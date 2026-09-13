@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { spawn } from 'node:child_process'
+import { runBoundedCommand } from '../utils/bounded-command.js'
 import { isAbsolute } from 'node:path'
 import { z } from 'zod'
 import { redactSensitive } from '../memory/sensitive.js'
@@ -95,7 +95,7 @@ export interface ScriptMonitorRunnerDeps {
 export function scriptMonitorConfigFromMetadata(
   metadata: Record<string, unknown> | null | undefined,
 ): ScriptMonitorConfig | null {
-  if (!metadata || !Object.prototype.hasOwnProperty.call(metadata, 'scriptMonitor')) return null
+  if (!metadata || !Object.hasOwn(metadata, 'scriptMonitor')) return null
   return scriptMonitorConfigSchema.parse(metadata.scriptMonitor)
 }
 
@@ -143,54 +143,19 @@ async function executeProbe(
   signal?: AbortSignal,
 ): Promise<string> {
   const launch = scriptMonitorLaunch(config)
-  return await new Promise<string>((resolve, reject) => {
-    const child = spawn(launch.command, launch.args, {
-      cwd: launch.cwd,
-      // Scheduled probes do not inherit provider tokens or daemon credentials.
-      env: monitorEnvironment(),
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    let stdout = ''
-    let stderr = ''
-    let outputBytes = 0
-    let settled = false
-    const finish = (error?: Error) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      signal?.removeEventListener('abort', abort)
-      if (error) reject(error)
-      else resolve(stdout)
-    }
-    const append = (current: string, chunk: Buffer): string => {
-      outputBytes += chunk.length
-      if (outputBytes > OUTPUT_MAX_BYTES) {
-        child.kill('SIGKILL')
-        finish(new Error(`script output exceeded ${OUTPUT_MAX_BYTES} bytes`))
-      }
-      return current + chunk.toString('utf8')
-    }
-    child.stdout.on('data', (chunk: Buffer) => { stdout = append(stdout, chunk) })
-    child.stderr.on('data', (chunk: Buffer) => { stderr = append(stderr, chunk) })
-    child.once('error', (error) => finish(error))
-    child.once('close', (code, terminatedBy) => {
-      if (code === 0) return finish()
-      const detail = redactSensitive(stderr.trim().slice(0, 500)).redacted
-      finish(new Error(`script exited ${code ?? terminatedBy ?? 'unknown'}${detail ? `: ${detail}` : ''}`))
-    })
-    const abort = () => {
-      child.kill('SIGTERM')
-      finish(new Error('script monitor aborted'))
-    }
-    signal?.addEventListener('abort', abort, { once: true })
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL')
-      finish(new Error(`script timed out after ${config.timeoutMs}ms`))
-    }, config.timeoutMs)
-    timer.unref?.()
-    if (signal?.aborted) abort()
+  const result = await runBoundedCommand({
+    ...launch,
+    // Scheduled probes do not inherit provider tokens or daemon credentials.
+    env: monitorEnvironment(),
+    signal,
+    timeoutMs: config.timeoutMs,
+    maxOutputBytes: OUTPUT_MAX_BYTES,
   })
+  if (result.exitCode !== 0) {
+    const detail = redactSensitive(result.stderr.trim().slice(0, 500)).redacted
+    throw new Error(`script exited ${result.exitCode ?? result.signal ?? 'unknown'}${detail ? `: ${detail}` : ''}`)
+  }
+  return result.stdout
 }
 
 function priorityFor(evaluation: MonitorEvaluationResult): 'normal' | 'high' | 'critical' {

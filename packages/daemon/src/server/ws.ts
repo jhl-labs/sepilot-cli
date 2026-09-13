@@ -418,6 +418,8 @@ export async function wsRoutes(app: FastifyInstance) {
             && msg.maxIterations <= 500
               ? msg.maxIterations
               : undefined
+          // A requested budget is not a hard cap; only an explicit flag hardens it.
+          const requestedHardMaxIterations = msg.hardMaxIterations === true
           const temperature =
             typeof msg.temperature === 'number'
             && msg.temperature >= 0
@@ -1127,7 +1129,7 @@ export async function wsRoutes(app: FastifyInstance) {
                 maxIterations: resolveChatMaxIterations({
                   maxIterations: requestedMaxIterations,
                 }),
-                hardMaxIterations: requestedMaxIterations !== undefined,
+                hardMaxIterations: requestedHardMaxIterations,
                 auditLogger: runtime.auditLogger,
                 usageTracker: runtime.usageTracker,
                 spendBudget: runtime.config.limits,

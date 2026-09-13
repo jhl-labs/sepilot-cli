@@ -1,4 +1,5 @@
 import { recoveredReactSteering, withSteeringCheckpoint } from '../../agent/react-steering.js'
+import { resolveResumeAutonomy } from '../runtime/resume-autonomy.js'
 import { randomUUID } from 'node:crypto'
 import type { AgentEvent } from '@sepilotd/core'
 import type { FastifyInstance } from 'fastify'
@@ -140,6 +141,8 @@ export function registerSessionResumeRoute(app: FastifyInstance): void {
     }
 
     const checkpoint = checkpointClaim.checkpoint
+    const resumedAutonomy = resolveResumeAutonomy(checkpoint.autonomy, runtime.autonomy)
+    if (checkpoint.autonomy !== undefined && checkpoint.autonomy !== runtime.autonomy) checkpoint.requireToolApproval = true
     if (!checkpointMatchesSessionWorkspace(session, checkpoint)) {
       await checkpointClaim.release()
       return reply.status(409).send({
@@ -175,7 +178,7 @@ export function registerSessionResumeRoute(app: FastifyInstance): void {
       checkpointTools,
       runtime.toolExecutions,
       runtime.policyEngine,
-      runtime.autonomy,
+      resumedAutonomy,
     )
     const currentTool =
       checkpoint.pendingToolExecution?.toolCalls[checkpoint.pendingToolExecution.startIndex]
@@ -304,7 +307,7 @@ export function registerSessionResumeRoute(app: FastifyInstance): void {
         provider,
         tools: checkpointTools,
         policy: runtime.policyEngine,
-        autonomy: runtime.autonomy,
+        autonomy: resumedAutonomy,
         maxIterations: checkpoint.maxIterations,
         systemPrompt: checkpoint.systemPrompt,
         auditLogger: runtime.auditLogger,

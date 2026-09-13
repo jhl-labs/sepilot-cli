@@ -286,6 +286,8 @@ export interface ChatOptions {
    * + write the full document chain in one turn). Hard ceiling 500.
    */
   maxIterations?: number
+  /** Treat maxIterations as a hard cap: disables continuation cycles and repair slack. Automation/bench only. */
+  hardMaxIterations?: boolean
   /** Sampling temperature (0~2). Daemon clamps and forwards to provider. */
   temperature?: number
   cwd?: string
@@ -507,17 +509,44 @@ export interface DaemonUpdateProjectInput {
 }
 
 export interface SubagentDispatchInput {
+  isolation?: 'worktree'
+  cwd?: string
   prompt: string
   system?: string
   category?: string
   agentId?: string
   maxIterations?: number
+  /** Treat maxIterations as a hard cap: disables continuation cycles and repair slack. Automation/bench only. */
+  hardMaxIterations?: boolean
   tools?: string[]
   model?: string
   parentSessionId?: string
 }
 
+export interface SessionInboxItem {
+  seq: number
+  sessionId: string
+  source: 'subagent' | 'hook' | 'monitor' | 'scheduler'
+  sourceId: string
+  title: string
+  body: string
+  createdAt: number
+  acknowledgedAt: number | null
+}
+
+export interface WorkItem {
+  key: string
+  kind: 'job' | 'run' | 'process' | 'schedule' | 'approval' | 'service' | 'chat'
+  id: string
+  sessionId?: string
+  status: string
+  title: string
+  detail: string
+  action: string
+}
+
 export interface SubagentDispatchResult {
+  worktree?: { path: string; branch: string; baseCommit: string; retained: boolean; reason: string }
   output: string
   sessionId: string
   category?: string
@@ -605,6 +634,8 @@ export interface WorkPlanStartInput {
   model?: string
   tools?: string[]
   maxIterations?: number
+  /** Treat maxIterations as a hard cap: disables continuation cycles and repair slack. Automation/bench only. */
+  hardMaxIterations?: boolean
 }
 
 export interface WorkPlanStartResult {
@@ -816,6 +847,8 @@ export function sanitizeChatOptions(
   } else {
     delete next.maxIterations
   }
+  if (options.hardMaxIterations === true) next.hardMaxIterations = true
+  else delete next.hardMaxIterations
 
   if (
     typeof options.temperature === 'number' &&
@@ -1572,12 +1605,14 @@ export class DaemonClient {
       scope?: 'once' | 'session' | 'always' | 'run' | 'session-all'
       rule?: { tool: string; pattern: string }
       note?: string
+      /** With a denial: stop the run immediately instead of granting a read-only follow-up turn. */
+      stop?: boolean
     } & DaemonRequestControlOptions = {},
   ): Promise<DaemonApprovalResponseResult> {
-    const { sessionId, scope = 'once', rule, note, ...request } = options
+    const { sessionId, scope = 'once', rule, note, stop, ...request } = options
     const body =
       typeof approved === 'boolean'
-        ? { requestId, approved, sessionId, scope, rule, note }
+        ? { requestId, approved, sessionId, scope, rule, note, ...(stop ? { stop } : {}) }
         : {
             requestId,
             decision: approved,
@@ -1586,6 +1621,7 @@ export class DaemonClient {
             scope,
             rule,
             note,
+            ...(stop ? { stop } : {}),
           }
     return this.post('/approvals/respond', body, request)
   }
@@ -2952,6 +2988,43 @@ export class DaemonClient {
     return checkpoints
   }
 
+  async listSessionInbox(sessionId: string, options: { after?: number; limit?: number; unreadOnly?: boolean } = {}): Promise<{ items: SessionInboxItem[]; nextCursor: number | null }> {
+    const query = new URLSearchParams()
+    for (const [key, value] of Object.entries(options)) if (value !== undefined) query.set(key, String(value))
+    return this.get(`/sessions/${encodeURIComponent(sessionId)}/inbox?${query}`)
+  }
+
+  async listWork(): Promise<{ items: WorkItem[]; unavailable: string[]; truncated: string[] }> {
+    const [work, chats] = await Promise.allSettled([
+      this.get<{ items: WorkItem[]; unavailable: string[]; truncated: string[] }>('/work'), this.backgroundChatJobs(),
+    ])
+    const result = work.status === 'fulfilled' ? work.value : { items: [] as WorkItem[], unavailable: ['work'], truncated: [] as string[] }
+    if (chats.status === 'fulfilled') {
+      if (chats.value.jobs.length > 100) result.truncated.push('chat')
+      result.items.push(...chats.value.jobs.slice(0, 100).map(j => ({ key: `chat:${j.jobId}`, kind: 'chat' as const, id: j.jobId, sessionId: j.sessionId, status: j.status, title: 'Background chat', detail: j.progress?.label ?? '', action: `sepilot tasks inspect chat:${j.jobId}` })))
+    } else result.unavailable.push('chat')
+    if (work.status === 'rejected' && chats.status === 'rejected') throw work.reason
+    return result
+  }
+
+  async readManagedProcess(id: string, offsets: { stdoutOffset?: number; stderrOffset?: number } = {}): Promise<{ status: string; stdout: string; stderr: string; screen?: string; nextStdoutOffset: number; nextStderrOffset: number }> {
+    const query = new URLSearchParams()
+    for (const [key, value] of Object.entries(offsets)) if (value !== undefined) query.set(key, String(value))
+    return this.get(`/work/process/${encodeURIComponent(id)}?${query}`)
+  }
+
+  async stopManagedProcess(id: string): Promise<{ status: string }> {
+    return this.request<ApiEnvelope<{ status: string }>>(apiPath(`/work/process/${encodeURIComponent(id)}`), { method: 'DELETE' }).then(r => r.data)
+  }
+
+  async writeManagedProcess(id: string, text: string, end = false): Promise<{ accepted: boolean }> {
+    return this.post(`/work/process/${encodeURIComponent(id)}/input`, { text, end })
+  }
+
+  async acknowledgeSessionInbox(sessionId: string, seq: number): Promise<{ acknowledged: boolean }> {
+    return this.post(`/sessions/${encodeURIComponent(sessionId)}/inbox/ack`, { seq })
+  }
+
   /**
    * Restore every file touched at or after the checkpoint to its state
    * before it, then drop the rewound checkpoints — git-reset semantics:
@@ -2960,12 +3033,17 @@ export class DaemonClient {
   async rewindSessionFiles(
     sessionId: string,
     checkpointId: string,
+    expectedCheckpointIds?: string[],
   ): Promise<{
     checkpoint: EditCheckpointSummary
     restoredFiles: string[]
     incompleteHistory: boolean
   }> {
-    return this.post(`/sessions/${encodeURIComponent(sessionId)}/rewind`, { checkpointId })
+    return this.post(`/sessions/${encodeURIComponent(sessionId)}/rewind`, { checkpointId, ...(expectedCheckpointIds ? { expectedCheckpointIds } : {}) })
+  }
+
+  async previewSessionRewind(sessionId: string, checkpointId: string): Promise<{ checkpoint: EditCheckpointSummary; checkpointIds: string[]; files: Array<{ path: string; operation: 'restore' | 'remove'; diff?: string; conflict: boolean }>; incompleteHistory: boolean }> {
+    return this.get(`/sessions/${encodeURIComponent(sessionId)}/checkpoints/${encodeURIComponent(checkpointId)}/preview`)
   }
 
   async projects(): Promise<DaemonProject[]> {

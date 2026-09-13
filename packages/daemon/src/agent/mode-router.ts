@@ -66,7 +66,10 @@ import { AgentEngine, type ApprovalCallback } from './engine.js'
 import { buildEnhancedGraph } from './graph/builder.js'
 import { cloneGraphState } from './graph/checkpoints.js'
 import type { AgentGraph } from './graph/engine.js'
-import { resolveRunIterationBudget } from './graph/iteration-budget.js'
+import {
+  resolveRunIterationBudget,
+  type RunBudgetSurface,
+} from './iteration-budget.js'
 import type { GraphAgentRegistry, GraphBuilder } from './graph/registry.js'
 import type { AgentState, GraphExecutionContext } from './graph/types.js'
 import { resolveInstantModeToolNames } from './instant-mode-tool-intent.js'
@@ -99,7 +102,6 @@ import {
   DURABLE_RUN_CONTRACT_TOOL_NAME,
   formatRunContractForPrompt,
   parseDurableRunContractPlan,
-  resolveMaxContinuationCycles,
 } from './task-contract.js'
 import {
   cloneMessage,
@@ -111,6 +113,7 @@ import {
   beginCurrentAgentTurnUserMessage,
   preparePreviousMessagesForTurn,
 } from './turn-context.js'
+import { isFocusedSingleFileReplacement } from './request-shape.js'
 import {
   triggerPostAgentRun,
   triggerPreAgentRun,
@@ -261,8 +264,13 @@ export interface ModeRouterOptions {
   reviewToollessFinals?: boolean
   durableRunContracts?: boolean
   maxContinuationCycles?: number
-  /** An explicitly requested maxIterations value is a hard user-visible cap. */
+  /**
+   * Explicit hard cap. Only benches/automation set this; a client-supplied
+   * `maxIterations` alone is a requested budget and keeps continuation cycles.
+   */
   hardMaxIterations?: boolean
+  /** Execution surface used to pick iteration/continuation defaults (default `chat`). */
+  budgetSurface?: RunBudgetSurface
   /**
    * Per-turn mode decision from the cheap intent router, when one ran. Auto
    * routing trusts a confident, non-fallback hint instead of re-routing the
@@ -377,6 +385,7 @@ export class AgentModeRouter {
       clearToolExecution: this.options.clearToolExecution,
       toolStats: this.options.toolStatsStore,
       workspaceMutationTracker: this.options.workspaceMutationTracker,
+      editSnapshotStore: this.options.editSnapshotStore,
       journalStateBoard: this.options.journalStateBoard,
       activeRuns: this.options.activeRuns,
       journalSteeringConsumed: this.options.journalSteeringConsumed,
@@ -496,6 +505,16 @@ export class AgentModeRouter {
       && this.artifactWriteSupport(mode) !== 'supported'
     ) {
       return context
+    }
+    // A single literal substitution already has a conservative structural
+    // boundary and the coder graph routes it through a file-only loop. A
+    // second model call cannot add useful decomposition or evidence policy,
+    // but it delays the first read substantially on local/remote models.
+    if (isFocusedSingleFileReplacement(input)) {
+      return {
+        ...context,
+        runContract: fallback,
+      }
     }
     if (
       !this.durableRunContractPlannerEnabled()
@@ -635,8 +654,12 @@ export class AgentModeRouter {
   }
 
   private maxContinuationCycles(): number {
-    if (this.options.hardMaxIterations) return 0
-    return resolveMaxContinuationCycles(this.options.maxContinuationCycles, 6)
+    return resolveRunIterationBudget({
+      surface: this.options.budgetSurface ?? 'chat',
+      requested: this.options.maxIterations,
+      hardMaxIterations: this.options.hardMaxIterations,
+      maxContinuationCycles: this.options.maxContinuationCycles,
+    }).maxContinuationCycles
   }
 
   private memoryContextTitle(source: MemoryEntry['source']): string {
@@ -1118,11 +1141,12 @@ export class AgentModeRouter {
       totalUsage: { ...(context.executionHandoff?.usage ?? { inputTokens: 0, outputTokens: 0 }) },
       iteration: context.executionHandoff?.iterations ?? 0,
       maxIterations: resolveRunIterationBudget({
-        requestedIterations: this.options.maxIterations,
-        graphIterations: this.resolveGraphMaxIterations(mode),
-        runContract: context.runContract,
-        defaultIterations: 10,
-      }),
+        surface: this.options.budgetSurface ?? 'chat',
+        requested: this.options.maxIterations,
+        graphPreset: this.resolveGraphMaxIterations(mode),
+        contract: context.runContract,
+        hardMaxIterations: this.options.hardMaxIterations,
+      }).maxIterations,
       shouldStop: false,
       seedContract: context.runContract,
       taskType: 'simple',
@@ -1278,6 +1302,7 @@ export class AgentModeRouter {
     const hookObservation = createAgentRunHookObservation()
     const runAbortController = new AbortController()
     this.activeRunAbortController = runAbortController
+    const unregisterCanceller = this.options.activeRuns?.registerCanceller(context.sessionId, () => this.stop(), { ifAbsent: true })
     // Admit steering while routing is still in flight; the selected engine
     // adopts queued notes when it registers its live state.
     this.options.activeRuns?.upsert({ sessionId: context.sessionId, currentNode: 'routing',
@@ -1424,6 +1449,7 @@ export class AgentModeRouter {
       }
     } finally {
       if (this.activeRunAbortController === runAbortController) {
+        unregisterCanceller?.()
         this.options.activeRuns?.finish(context.sessionId)
         this.activeRunAbortController = null
       }
@@ -1456,6 +1482,7 @@ export class AgentModeRouter {
     }
     const controller = new AbortController()
     this.activeRunAbortController = controller
+    const unregisterCanceller = this.options.activeRuns?.registerCanceller(checkpoint.sessionId, () => this.stop(), { ifAbsent: true })
     try {
       const context: AgentContext = {
         sessionId: checkpoint.sessionId, provider: checkpoint.provider, model: checkpoint.model,
@@ -1477,6 +1504,7 @@ export class AgentModeRouter {
       yield event
     } finally {
       if (controller.signal.aborted) observation.status = 'aborted'
+      unregisterCanceller?.()
       if (this.activeRunAbortController === controller) this.activeRunAbortController = null
       await triggerPostAgentRun(this.options.hookRegistry, completeAgentRunHookData(hookData, observation))
     }

@@ -544,19 +544,20 @@ export function publishApprovalPendingNotification(
   _config: Pick<SepilotdConfig, 'notifications'> | undefined,
   input: {
     approval: PendingApproval
-    outcome?: 'pending' | 'expired'
+    /** `parked` replaces the former `expired`: the run paused, nothing was denied. */
+    outcome?: 'pending' | 'parked' | 'expired'
   },
 ): NotificationItem {
-  const outcome = input.outcome ?? 'pending'
+  const outcome = input.outcome === 'expired' ? 'parked' : (input.outcome ?? 'pending')
   const approval = input.approval
   const title =
-    outcome === 'expired'
-      ? `Approval expired: ${approval.tool}`
+    outcome === 'parked'
+      ? `Approval still pending: ${approval.tool}`
       : `Approval needed: ${approval.tool}`
   const summary = summarizeApprovalInput(approval)
   const body =
-    outcome === 'expired'
-      ? `Run continued with a denial for ${summary}.`
+    outcome === 'parked'
+      ? `The run is paused and will continue when you answer (stop reason approval_timeout): ${summary}.`
       : `Waiting for approval until ${approval.expiresAt}: ${summary}.`
   return publishStoredNotification({
     title,

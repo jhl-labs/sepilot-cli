@@ -31,6 +31,7 @@ import { createRuntimeBackedModeRouterOptions } from '../runtime/mode-router-opt
 import {
   chatRequestSchema,
   isDesktopExternalAgentMode,
+  resolveChatHardMaxIterations,
   resolveChatMaxIterations,
   type ChatBody,
 } from './chat-schema.js'
@@ -143,8 +144,9 @@ const chatResponseSchema = z.object({
     content: z.string(),
     toolCalls: z.array(toolCallSchema).optional(),
     usage: tokenUsageSchema,
-    stopReason: runStopReasonSchema.optional(),
     routerDecision: routerDecisionSchema.optional(),
+    /** Structured termination reason; absent on legacy daemons. */
+    stopReason: runStopReasonSchema.optional(),
   }),
 })
 
@@ -191,6 +193,7 @@ const chatBackgroundJobStatusSchema = z.object({
       message: z.string(),
     })
     .optional(),
+  stopReason: runStopReasonSchema.optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 })
@@ -679,7 +682,7 @@ function replayChatResultFromEvents(
       sessionId,
       messageId,
       content: assistant.content,
-      stopReason: sessionEnd.stopReason,
+      ...(sessionEnd.stopReason ? { stopReason: sessionEnd.stopReason } : {}),
       usage: {
         inputTokens: sessionEnd.totalTokens.input,
         outputTokens: sessionEnd.totalTokens.output,
@@ -754,11 +757,12 @@ function parseBackgroundChatResult(payload: Record<string, unknown> | null) {
   ) {
     return null
   }
+  const stopReason = runStopReasonSchema.safeParse(result.stopReason)
   return {
     sessionId: result.sessionId,
     messageId: result.messageId,
     content: result.content,
-    stopReason: runStopReasonSchema.safeParse(result.stopReason).data,
+    stopReason: stopReason.success ? (stopReason.data as RunStopReason) : undefined,
   }
 }
 
@@ -866,6 +870,7 @@ async function runBackgroundChatJob(
       ...(unsuccessful ? { error: { code: result.stopReason!.code, message: result.stopReason!.summary ?? `Agent stopped: ${result.stopReason!.code}` } } : {}),
       messageId: result.messageId,
       content: result.content,
+      ...(result.stopReason ? { stopReason: result.stopReason } : {}),
       updatedAt: now,
     })
     try {
@@ -1739,7 +1744,7 @@ export async function chatRoutes(app: FastifyInstance) {
             systemPrompt,
             previousMessages,
             maxIterations: resolveChatMaxIterations(body),
-            hardMaxIterations: body.maxIterations !== undefined,
+            hardMaxIterations: resolveChatHardMaxIterations(body),
             auditLogger: runtime.auditLogger,
             usageTracker: runtime.usageTracker,
             spendBudget: runtime.config.limits,
@@ -1818,7 +1823,7 @@ export async function chatRoutes(app: FastifyInstance) {
           outputTracker.consume(event)
           if (event.type === 'done') {
             totalUsage = event.usage
-            stopReason = event.stopReason
+            if (event.stopReason) stopReason = event.stopReason
           }
           if (event.type === 'tool_call') toolCalls.push(event.toolCall)
           if (event.type === 'error') {
@@ -2048,6 +2053,7 @@ export async function chatRoutes(app: FastifyInstance) {
                 content: retainedEvidenceIncomplete,
                 toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
                 usage: totalUsage,
+                ...(stopReason ? { stopReason } : {}),
                 routerDecision:
                   routing.decision.fallback && routing.decision.reason === 'router disabled'
                     ? undefined
@@ -2124,7 +2130,7 @@ export async function chatRoutes(app: FastifyInstance) {
             content,
             toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
             usage: totalUsage,
-            stopReason,
+            ...(stopReason ? { stopReason } : {}),
             // SSE callers see this via the `router_decision` event; surface
             // the same payload to JSON callers so automation / tests can
             // observe when the router overrode the caller's `mode` / `persona`

@@ -1,4 +1,5 @@
 import { repeatedBrowserClickWithoutProgress } from './browser-progress.js'
+import { resolveThinkingLevel } from '../providers/thinking-policy.js'
 import { userActionRequiredOutput } from './user-action-required-output.js'
 import { MODE_TRANSFER_TOOL, type ModeControl } from './mode-control.js'
 import { randomUUID } from 'node:crypto'
@@ -60,6 +61,14 @@ import {
 import type { RunResumeStage, SessionRunCheckpoint } from '../server/runtime/runs.js'
 import type { ToolExecutionRecord } from '../server/runtime/tool-executions.js'
 import { createAbortError, isAbortError } from '../abort.js'
+
+function isApprovalParkedSignal(error: unknown): boolean {
+  return Boolean(
+    error
+    && typeof error === 'object'
+    && (error as { code?: unknown }).code === 'APPROVAL_PARKED',
+  )
+}
 import {
   compactOversizedToolProtocolUnits,
   DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW,
@@ -258,6 +267,7 @@ import type {
   PendingToolExecution,
 } from './tool-execution.js'
 import {
+  blockSourceFromMetadata,
   buildApprovalDeniedTurnOutput,
   createApprovalGraceState,
   observeApprovalOutcomeAfterTools,
@@ -280,12 +290,29 @@ import {
   stopReasonBudget,
   stopReasonCompleted,
   stopReasonCompletionGate,
+  stopReasonNoProgress,
   stopReasonObservationBudget,
   stopReasonPolicyBlocked,
   stopReasonSpendBudget,
   stopReasonUserAbort,
   stopReasonUserActionRequired,
+  stopReasonWallClock,
 } from './stop-reason.js'
+import {
+  describeToolApprovalPosture,
+  toolApprovalDescriptionSuffix,
+  type ToolApprovalPostureMap,
+} from './tool-approval-catalog.js'
+import {
+  buildToolApprovalPostureParagraph,
+  TOOL_APPROVAL_POSTURE_PROMPT_PREFIX,
+} from './system-prompt.js'
+import {
+  CONTINUATION_MARKER_METADATA_KEY,
+  evaluateProgressSince,
+  findProgressMarkerIndex,
+  parseRunWallClockBudgetMs,
+} from './progress-signal.js'
 import {
   logAgentDebugTrace,
   logAgentRunTrace,
@@ -300,7 +327,7 @@ import {
   buildProviderContextUsageEvent,
 } from './context-usage.js'
 import { createLiveTextDeltaEmitter } from './live-text-delta.js'
-import { runAuxiliaryLlmChat, type AuxiliaryLlmTurnBudget } from './auxiliary-llm.js'
+import { runAuxiliaryLlmChat, AuxiliaryLlmTurnBudget, DEFAULT_AUXILIARY_LLM_TURN_BUDGET_MS } from './auxiliary-llm.js'
 import {
   buildMemoryWriteFailureOutput,
   buildMemoryWriteRecoveryMessage,
@@ -443,13 +470,20 @@ export function buildAutonomyHint(
     case AutonomyLevel.Autonomous:
       return [
         'The user has enabled AUTONOMOUS mode.',
-        'Policy-allowed tools can run without interactive approval prompts.',
-        'A tool with an explicit ask policy may still pause on an interactive',
-        'surface for human approval; unattended runs block it instead.',
+        'Policy-allowed tools (rule `autonomous` or `supervised`) run directly once',
+        'the deny rules pass, without interactive approval prompts.',
+        'Hard denies still apply regardless of autonomy: deny_patterns, deny_paths,',
+        'deny_executables, workspace boundaries, blocked tools, and unmatched tools',
+        'under a deny-by-default policy. A denied tool will not become available by',
+        'retrying or rephrasing the call; choose a policy-allowed alternative instead.',
+        'A tool with an explicit `ask` policy (and raw shell wrappers such as',
+        '`bash -c`) may still pause on an interactive surface for human approval;',
+        'unattended runs block it instead.',
         'Do not assume every available tool can run unattended. Prefer allowed',
         'read/search tools or allowlisted commands when they are sufficient.',
-        'If the task genuinely needs an approval-required tool, state the concrete',
-        'blocker when no interactive approval surface is available.',
+        'If the task genuinely needs an approval-required tool and no interactive',
+        'approval surface is available, state the concrete blocker and the exact',
+        'command, and continue with whatever parts of the task do not need it.',
       ].join(' ')
     default:
       return null
@@ -831,6 +865,7 @@ export interface AgentEngineOptions {
    * needs to switch tactics instead of retrying the same call. */
   toolStats?: import('./tool-learning/store.js').ToolStatsStore
   workspaceMutationTracker?: import('./workspace-mutation/tracker.js').WorkspaceMutationTracker
+  editSnapshotStore?: import('./edit-rollback/store.js').EditSnapshotStore
   /** Persist exact criterion-to-observation links for lean ReAct runs. */
   journalStateBoard?: (sessionId: string, board: AgentStateBoardSnapshot) => Promise<void>
   activeRuns?: ActiveRunRegistry
@@ -980,6 +1015,8 @@ export class AgentEngine implements IAgentEngine {
   private tools: ToolRegistry
   private policy: PolicyEngine
   private autonomy: AutonomyLevel
+  /** Absolute wall-clock ceiling for the active run; read once per run entry. */
+  private runWallClock: { startedAt: number; budgetMs?: number } | null = null
   private modeControl?: ModeControl
   private semanticRouting: boolean
   private maxIterations: number
@@ -1009,6 +1046,7 @@ export class AgentEngine implements IAgentEngine {
   private clearToolExecutionFn?: (sessionId: string) => Promise<void>
   private toolStats?: import('./tool-learning/store.js').ToolStatsStore
   private workspaceMutationTracker?: import('./workspace-mutation/tracker.js').WorkspaceMutationTracker
+  private editSnapshotStore?: import('./edit-rollback/store.js').EditSnapshotStore
   private journalStateBoard?: (sessionId: string, board: AgentStateBoardSnapshot) => Promise<void>
   private strictFinalAnswerProtocol: boolean
   private reviewOutcomes: boolean
@@ -1053,6 +1091,7 @@ export class AgentEngine implements IAgentEngine {
     this.clearToolExecutionFn = options.clearToolExecution
     this.toolStats = options.toolStats
     this.workspaceMutationTracker = options.workspaceMutationTracker
+    this.editSnapshotStore = options.editSnapshotStore
     this.journalStateBoard = options.journalStateBoard
     this.activeRuns = options.activeRuns
     this.journalSteeringConsumed = options.journalSteeringConsumed
@@ -2119,21 +2158,41 @@ export class AgentEngine implements IAgentEngine {
     if (!systemPrompt) return systemPrompt
     return systemPrompt
       .replace(/^Available tools:[^\n]*\n?/m, '')
+      .replace(new RegExp(`^${TOOL_APPROVAL_POSTURE_PROMPT_PREFIX}[^\\n]*\\n?`, 'm'), '')
       .replace(
         /^Your autonomy level is: [^.\n]+\.$/m,
         `Your autonomy level is: ${this.autonomy}.`,
       )
   }
 
+  /**
+   * Static approval posture of every registered tool for this run. Evaluated
+   * from rule modes, autonomy and the primary agent only — no input, no
+   * execution — so the model learns which tools will prompt or are
+   * unavailable before it plans around them.
+   */
+  private describeRunToolApprovalPosture(context: AgentContext): ToolApprovalPostureMap {
+    return describeToolApprovalPosture(
+      this.tools.list(),
+      this.policy,
+      this.autonomy,
+      context.primaryAgentId,
+      { autoApprove: context.autoApprove },
+    )
+  }
+
   private buildInitialMessages(input: string, context: AgentContext): Message[] {
     const messages: Message[] = []
     const autonomyHint = buildAutonomyHint(this.autonomy, context.primaryAgentId)
+    const postureParagraph = buildToolApprovalPostureParagraph(
+      this.describeRunToolApprovalPosture(context),
+    )
     const systemPrompt = this.stripDuplicateToolNameList(context.systemPrompt)
-    if (systemPrompt || autonomyHint) {
+    if (systemPrompt || autonomyHint || postureParagraph) {
       messages.push({
         role: 'system',
         content: appendAnswerProtocolSystemPrompt(
-          [systemPrompt, autonomyHint].filter(Boolean).join('\n\n'),
+          [systemPrompt, autonomyHint, postureParagraph].filter(Boolean).join('\n\n'),
         ),
       })
     } else {
@@ -2194,6 +2253,7 @@ export class AgentEngine implements IAgentEngine {
     }
 
     await this.saveApprovalCheckpoint({
+      autonomy: this.autonomy,
       requestId,
       sessionId: context.sessionId,
       provider: context.provider,
@@ -2241,6 +2301,7 @@ export class AgentEngine implements IAgentEngine {
     }
 
     await this.saveRunCheckpoint({
+      autonomy: this.autonomy,
       sessionId: context.sessionId,
       provider: context.provider,
       model: context.model,
@@ -2477,7 +2538,18 @@ export class AgentEngine implements IAgentEngine {
         }
       : undefined
 
+    let editCheckpointId: string | undefined
+    let editSummary: import('@sepilotd/core').EditCheckpointSummary | undefined
+    const snapshots = this.editSnapshotStore
+    const editCheckpoint = snapshots ? {
+      recordPreEdit: async (path: string) => {
+        editCheckpointId ??= snapshots.openCheckpoint(context.sessionId, `Tool batch ${iteration}`)
+        await snapshots.recordPreEdit(context.sessionId, editCheckpointId, path)
+      },
+    } : undefined
+    try {
     for await (const event of runToolExecution({
+      delegationToolNames: this.modeControl?.delegationToolNames,
       messages,
       toolCalls,
       sessionId: context.sessionId,
@@ -2536,6 +2608,7 @@ export class AgentEngine implements IAgentEngine {
       saveToolExecution: (record) => this.saveToolExecution?.(record) ?? Promise.resolve(),
       toolStats: this.toolStats,
       workspaceMutation,
+      editCheckpoint,
     })) {
       if (event.type === 'tool_call') {
         toolNameByCallId.set(event.toolCall.id, event.toolCall.name)
@@ -2580,6 +2653,15 @@ export class AgentEngine implements IAgentEngine {
         })
       }
     }
+    } finally {
+      // Preserve recoverable edits even when cancellation interrupts the tool
+      // iterator. A committed checkpoint records bytes, not task completion.
+      if (snapshots && editCheckpointId) {
+        editSummary = snapshots.commitCheckpoint(context.sessionId, editCheckpointId)
+        await snapshots.flush()
+      }
+    }
+    if (editSummary) yield { type: 'edit_checkpoint_resolved', checkpoint: editSummary }
 
     // runToolExecution appends the matching tool message after yielding each
     // result. Checkpoint callbacks above annotate intermediate results before
@@ -2715,6 +2797,7 @@ export class AgentEngine implements IAgentEngine {
       readOnlyInvocationRepairToolCallIds(messages),
     )
     const focusedRepositoryRequest = latestUserText(messages)
+    const toolApprovalPosture = this.describeRunToolApprovalPosture(context)
     const exactToolCardinalityIdentities = resolveToolCardinalityIdentities(
       this.tools.list(),
     )
@@ -2775,6 +2858,10 @@ export class AgentEngine implements IAgentEngine {
     let repairedRunOutcomeCount = countOutcomeRecoveryPrompts(messages)
     let repairedOutcomeReviewCount = 0
     let repairedOutcomeReviewSynthesisCount = 0
+    // Mutations require final adjudication. Optional router/planner failure must
+    // not prevent that safety boundary from running. Share one bounded reserve
+    // across all mutation-review repairs, never reset it for every attempt.
+    let mutationReviewBudget: AuxiliaryLlmTurnBudget | undefined
     let outcomeReviewSynthesisEvidenceCount = messages.filter(
       (message) => message.role === 'tool',
     ).length
@@ -2865,6 +2952,49 @@ export class AgentEngine implements IAgentEngine {
       !(signal?.aborted ?? false);
       i++
     ) {
+      const wallClock = this.runWallClock
+      if (
+        wallClock?.budgetMs !== undefined
+        && Date.now() - wallClock.startedAt >= wallClock.budgetMs
+      ) {
+        this.state = 'done'
+        await this.persistRunCheckpoint(context, messages, totalUsage, i, 'observing')
+        const wallClockContent = buildBudgetExhaustedMessage({
+          mode: 'react',
+          layer: 'wall_clock',
+          iterationBudget: wallClock.budgetMs,
+          contract: context.runContract,
+        })
+        if (this.textDeltaMode !== 'live') {
+          yield { type: 'text_delta', text: wallClockContent }
+        }
+        yield { type: 'message', content: wallClockContent }
+        yield {
+          type: 'done',
+          usage: totalUsage,
+          stopReason: stopReasonWallClock(wallClock.budgetMs),
+        }
+        await this.safeTriggerPostHook('post:agent:run', {
+          status: 'incomplete',
+          sessionId: context.sessionId,
+          provider: context.provider,
+          model: context.model,
+          usage: { ...totalUsage },
+          iteration: i,
+          output: wallClockContent,
+        })
+        await logAgentRunTrace({
+          source: 'react',
+          status: 'incomplete',
+          mode: 'react',
+          sessionId: context.sessionId,
+          provider: context.provider,
+          model: context.model,
+          iteration: i,
+          usage: { ...totalUsage },
+        })
+        return
+      }
       this.activeRuns?.upsert({ sessionId: context.sessionId, graphId: 'react',
         currentNode: pendingToolExecution ? 'tools' : 'agent', iteration: i,
         maxIterations: effectiveMaxIterations(), tokensInput: totalUsage.inputTokens,
@@ -3110,9 +3240,16 @@ export class AgentEngine implements IAgentEngine {
         || tool.name === 'terminal.run'
         || isPolicyReadOnlyTool(tool.name, this.tools.securityDescriptor(tool.name))
       ) && (
+        // A denial grants one side-effect-free turn: offer only policy
+        // read-only tools so the catalog and the grace message agree.
         !approvalGraceState.denial
-        || this.tools.securityDescriptor(tool.name)?.effect === 'observe'
-      ))
+        || isPolicyReadOnlyTool(tool.name)
+      )).map((tool) => {
+        // Announce the static approval posture in the catalog itself so the
+        // model does not discover prompts and blocks one call at a time.
+        const suffix = toolApprovalDescriptionSuffix(toolApprovalPosture.get(tool.name))
+        return suffix ? { ...tool, description: `${tool.description}${suffix}` } : tool
+      })
       const allToolNames = new Set(allToolsForRequest.map((tool) => tool.name))
       const skillCompletionBeforeRequest = evaluateSkillExecutionCompletion(
         messages,
@@ -3320,6 +3457,8 @@ export class AgentEngine implements IAgentEngine {
           `[User question during execution] ${note.message}`),
       ].filter(Boolean).join('\n\n')
       if (steeringContent) messagesForRequest = [...messagesForRequest, { role: 'system', content: steeringContent }]
+      const backgroundEvidence = this.activeRuns?.backgroundEvidence(context.sessionId)
+      if (backgroundEvidence) messagesForRequest = [...messagesForRequest, { role: 'user', content: backgroundEvidence }]
       const messagesWithBudgetHint = isLastIteration && !canAutoContinueAfterBudget
         ? canTransferOnLocalFinal && controlToolsForRequest.length > 0
           ? [...messagesForRequest, { role: 'system' as const, content: 'This is the final step in the current mode. Answer from retained evidence, or call agent.transfer alone if the remaining goal needs another execution mode. No further actions or discovery can run in this mode. The original turn budget and all authorization boundaries remain in force.' }]
@@ -3452,7 +3591,9 @@ export class AgentEngine implements IAgentEngine {
           ? ThinkingLevel.Off
           : disableThinkingForProviderRecovery
           ? undefined
-          : (this.thinkingLevel as ChatRequest['thinkingLevel']),
+          : resolveThinkingLevel(this.thinkingLevel, {
+              toolNames: requestTools?.map((tool) => tool.name),
+            }),
         maxTokens:
           !useBoundedFinalContext
           && !forceFinalAfterDegenerateOutput
@@ -3507,7 +3648,12 @@ export class AgentEngine implements IAgentEngine {
             iteration: i + 1,
             request,
           },
-        })
+        }, signal)
+        if (signal?.aborted) {
+          this.state = 'done'
+          yield { type: 'done', usage: totalUsage, stopReason: stopReasonUserAbort() }
+          return
+        }
         if (preLlm.action === 'abort') {
           yield {
             type: 'error',
@@ -3655,6 +3801,30 @@ export class AgentEngine implements IAgentEngine {
           : null
         const actionProgress = argumentActionProgress ?? contentActionProgress
         if (toolCalls && toolCalls.length > 0) {
+          if (approvalGraceState.denial) {
+            // The side-effect-free turn after a denial may inspect, never act.
+            // A non-read-only call (including a retry of the denied one) is
+            // not executed; the run ends as approval_denied instead.
+            const sideEffectingCall = toolCalls.find((call) => (
+              !isPolicyReadOnlyTool(call.name)
+            ))
+            if (sideEffectingCall || approvalGraceState.toolTurnsRemaining <= 0) {
+              yield {
+                type: 'thinking',
+                content: sideEffectingCall
+                  ? `[supervisor] The model requested ${sideEffectingCall.name} after the user declined ${approvalGraceState.denial.toolName ?? 'the tool'}; stopping without executing it.`
+                  : '[supervisor] The post-denial turn budget is spent; stopping without further tool calls.',
+              }
+              yield* this.finishAfterApprovalDenial(
+                context,
+                totalUsage,
+                i + 1,
+                approvalGraceState.denial,
+                latestUserText(messages),
+              )
+              return
+            }
+          }
           const duplicateToolCallGroups = findDuplicateToolCallGroups(toolCalls)
           if (
             shouldRepairDuplicateToolCalls({
@@ -4109,13 +4279,15 @@ export class AgentEngine implements IAgentEngine {
             const status = resultMessage?.metadata?.toolResultStatus === 'success'
               ? 'success' as const
               : 'error' as const
+            const blocked = blockSourceFromMetadata(resultMessage?.metadata) !== null
             return {
               tool: call.name,
               input: call.arguments,
               status,
-              ...(status === 'error'
+              ...(status === 'error' && !blocked
                 ? { failureCode: structuredToolFailureCode(resultMessage) }
                 : {}),
+              ...(blocked ? { blocked: true } : {}),
               ts: Date.now(),
             }
           })
@@ -4289,7 +4461,11 @@ export class AgentEngine implements IAgentEngine {
             )
             return
           }
-          if (i >= iterationBudget - 1 && canAutoContinueAfterBudget) {
+          if (
+            i >= iterationBudget - 1
+            && canAutoContinueAfterBudget
+            && evaluateProgressSince(messages, findProgressMarkerIndex(messages)).progressed
+          ) {
             const nextCycle = continuationCycle + 1
             await this.persistRunCheckpoint(
               context,
@@ -4300,6 +4476,7 @@ export class AgentEngine implements IAgentEngine {
             )
             messages.push({
               role: 'system',
+              metadata: { [CONTINUATION_MARKER_METADATA_KEY]: nextCycle },
               content: buildContinuationPrompt({
                 mode: 'react',
                 cycle: nextCycle,
@@ -4366,6 +4543,28 @@ export class AgentEngine implements IAgentEngine {
           content,
         }
 
+        if (
+          content.trim() === UNUSABLE_PROMPT_TOOL_CALL_OUTPUT
+          && approvalGraceState.denial
+          && !suppressToolCallsForFinalIteration
+        ) {
+          // During the side-effect-free grace turn the outbound catalog holds
+          // only read-only tools, so a call that was rejected as unavailable is
+          // a retry or rewrite of the declined side effect. Repairing it would
+          // only invite another attempt; end the run as approval_denied.
+          yield {
+            type: 'thinking',
+            content: `[supervisor] The model requested an unavailable tool after the user declined ${approvalGraceState.denial.toolName ?? 'the tool'}; stopping without executing it.`,
+          }
+          yield* this.finishAfterApprovalDenial(
+            context,
+            totalUsage,
+            i + 1,
+            approvalGraceState.denial,
+            latestUserText(messages),
+          )
+          return
+        }
         if (
           content.trim() === UNUSABLE_PROMPT_TOOL_CALL_OUTPUT
           && repairedInvalidToolResponseCount < 1
@@ -4928,6 +5127,11 @@ export class AgentEngine implements IAgentEngine {
             maxTokens: OUTCOME_REVIEW_MAX_TOKENS,
           })
           const reviewTurnId = buildLlmTurnId(context.sessionId, i + 1, 'outcome-review')
+          const requiresMutationReview = unavailableOutcomeReviewReason(messages) !== null
+          if (requiresMutationReview && !mutationReviewBudget) {
+            mutationReviewBudget = new AuxiliaryLlmTurnBudget(DEFAULT_AUXILIARY_LLM_TURN_BUDGET_MS)
+          }
+          const reviewBudget = requiresMutationReview ? mutationReviewBudget : this.auxiliaryLlmBudget
           try {
             yield buildLlmRequestEvent({
               sessionId: context.sessionId,
@@ -4936,7 +5140,7 @@ export class AgentEngine implements IAgentEngine {
               request: reviewRequest,
               turnId: reviewTurnId,
               providerId: this.provider.id,
-              timeoutMs: this.auxiliaryLlmBudget?.remainingMs(),
+              timeoutMs: reviewBudget?.remainingMs(),
               auxiliary: true,
             })
             const reviewResponse = await runAuxiliaryLlmChat({
@@ -4945,7 +5149,7 @@ export class AgentEngine implements IAgentEngine {
               label: 'outcome review',
               breaker: this.providerCircuitBreaker,
               signal,
-              budget: this.auxiliaryLlmBudget,
+              budget: reviewBudget,
             })
             this.recordLlmUsage(context, reviewResponse.usage)
             totalUsage.inputTokens += reviewResponse.usage.inputTokens
@@ -5173,6 +5377,7 @@ export class AgentEngine implements IAgentEngine {
               error: error instanceof Error ? error.message : String(error),
               meta: { node: 'outcome-review', turnId: reviewTurnId, failed: true },
             })
+            if (isAbortError(error) || signal?.aborted) throw error
             exhaustedOutcomeReviewReason = unavailableOutcomeReviewReason(messages)
           }
         }
@@ -5251,7 +5456,9 @@ export class AgentEngine implements IAgentEngine {
         yield { type: 'message', content: finalContent }
         this.state = 'done'
         yield { type: 'state_change', state: 'done' }
-        const finalStopReason = forceFinalAfterObservationBudget
+        const finalStopReason = approvalGraceState.denial && isIncompleteOutput(finalContent)
+          ? stopReasonApprovalDenied(approvalGraceState.denial.toolName ?? 'tool')
+          : forceFinalAfterObservationBudget
           ? stopReasonObservationBudget({
               incomplete: isIncompleteOutput(finalContent),
               contract: context.runContract,
@@ -5288,6 +5495,10 @@ export class AgentEngine implements IAgentEngine {
         await this.clearRunCheckpoint(context.sessionId)
         return
       } catch (err: unknown) {
+        // A parked approval (timeout without an answer) must unwind to the
+        // caller so the run lease is released and the checkpoint is kept for
+        // /approvals/resume; it is neither a provider failure nor a user abort.
+        if (isApprovalParkedSignal(err)) throw err
         if ((signal?.aborted ?? false) || (this.aborted && isAbortError(err))) {
           this.state = 'done'
           yield { type: 'done', usage: totalUsage, stopReason: stopReasonUserAbort() }
@@ -5558,7 +5769,62 @@ export class AgentEngine implements IAgentEngine {
     }
 
     const finalIterationBudget = effectiveMaxIterations()
-    if (continuationCycle < this.maxContinuationCycles) {
+    // Continuation is progress-driven, not count-driven: a cycle that produced
+    // new tool evidence, artifact mutations or a verified partial may continue
+    // while cycles remain; a cycle that produced nothing stops now even if
+    // cycles remain. A zero-iteration budget never ran a cycle to judge.
+    const progressSinceCycleStart = finalIterationBudget > 0
+      ? evaluateProgressSince(messages, findProgressMarkerIndex(messages))
+      : undefined
+    if (
+      progressSinceCycleStart
+      && !progressSinceCycleStart.progressed
+      && this.maxContinuationCycles > 0
+    ) {
+      this.state = 'done'
+      await this.persistRunCheckpoint(context, messages, totalUsage, 0, 'observing')
+      const noProgressContent = buildBudgetExhaustedMessage({
+        mode: 'react',
+        layer: 'continuation',
+        iterationBudget: finalIterationBudget,
+        contract: context.runContract,
+      })
+      if (this.textDeltaMode !== 'live') {
+        yield { type: 'text_delta', text: noProgressContent }
+      }
+      yield { type: 'message', content: noProgressContent }
+      yield {
+        type: 'done',
+        usage: totalUsage,
+        stopReason: stopReasonNoProgress({
+          layer: 'continuation',
+          budget: this.maxContinuationCycles,
+          used: continuationCycle,
+          contract: context.runContract,
+        }),
+      }
+      await this.safeTriggerPostHook('post:agent:run', {
+        status: 'incomplete',
+        sessionId: context.sessionId,
+        provider: context.provider,
+        model: context.model,
+        usage: { ...totalUsage },
+        iteration: finalIterationBudget,
+        output: noProgressContent,
+      })
+      await logAgentRunTrace({
+        source: 'react',
+        status: 'incomplete',
+        mode: 'react',
+        sessionId: context.sessionId,
+        provider: context.provider,
+        model: context.model,
+        iteration: finalIterationBudget,
+        usage: { ...totalUsage },
+      })
+      return
+    }
+    if (continuationCycle < this.maxContinuationCycles && finalIterationBudget > 0) {
       const nextCycle = continuationCycle + 1
       await this.persistRunCheckpoint(
         context,
@@ -5569,6 +5835,7 @@ export class AgentEngine implements IAgentEngine {
       )
       messages.push({
         role: 'system',
+        metadata: { [CONTINUATION_MARKER_METADATA_KEY]: nextCycle },
         content: buildContinuationPrompt({
           mode: 'react',
           cycle: nextCycle,
@@ -5605,6 +5872,7 @@ export class AgentEngine implements IAgentEngine {
     )
     const incompleteContent = buildBudgetExhaustedMessage({
       mode: 'react',
+      layer: 'iteration',
       iterationBudget: finalIterationBudget,
       contract: context.runContract,
     })
@@ -5645,53 +5913,62 @@ export class AgentEngine implements IAgentEngine {
   }
 
   async *run(input: string, context: AgentContext): AsyncIterable<AgentEvent> {
-    if (this.hookRegistry && this.emitAgentRunHooks) {
-      const hookResult = await this.hookRegistry.trigger({
-        event: 'pre:agent:run',
-        data: { input, context },
-      })
-      if (hookResult.action === 'abort') {
-        yield { type: 'error', error: { code: 'FORBIDDEN', message: 'Agent run blocked by hook' } }
-        return
-      }
-    }
-
-    this.state = 'thinking'
     this.aborted = false
     const abortController = new AbortController()
     this.runAbortController = abortController
-    yield { type: 'state_change', state: 'thinking' }
-
-    const messages = context.executionHandoff
-      ? [
-          ...this.buildInitialMessages(input, { ...context, previousMessages: [] }).filter((message) => message.role === 'system' && !context.executionHandoff!.messages.some((retained) => !retained.metadata?.runtimeContext && retained.role === 'system' && JSON.stringify(retained.content) === JSON.stringify(message.content))),
-          ...context.executionHandoff.messages.filter((message) => !message.metadata?.runtimeContext).map(cloneMessage),
-        ]
-      : this.buildInitialMessages(input, context)
-    const totalUsage: TokenUsage = { ...(context.executionHandoff?.usage ?? { inputTokens: 0, outputTokens: 0 }) }
-    const focusedProcessObservation = !this.semanticRouting && !context.executionHandoff && extractFocusedProcessObservationCall(input)
-    const focusedObservationToolAvailable = focusedProcessObservation
-      ? this.tools.toToolDefinitions().some((tool) => tool.name === focusedProcessObservation.toolName)
-      : false
-    const initialPendingToolExecution: PendingToolExecution | undefined =
-      focusedProcessObservation && focusedObservationToolAvailable
-        ? {
-            toolCalls: [{
-              id: `focused-process-observation-${randomUUID()}`,
-              name: focusedProcessObservation.toolName,
-              arguments: focusedProcessObservation.arguments,
-            }],
-            startIndex: 0,
-          }
-        : undefined
-    if (initialPendingToolExecution) {
-      messages.push({
-        role: 'assistant',
-        content: '',
-        toolCalls: initialPendingToolExecution.toolCalls.map(cloneToolCall),
-      })
+    this.runWallClock = {
+      startedAt: Date.now(),
+      budgetMs: parseRunWallClockBudgetMs(process.env.SEPILOTD_RUN_MAX_WALL_MS),
     }
     try {
+      if (this.hookRegistry && this.emitAgentRunHooks) {
+        const hookResult = await this.hookRegistry.trigger({
+          event: 'pre:agent:run',
+          data: { input, context },
+        }, abortController.signal)
+        if (hookResult.action === 'abort' && !abortController.signal.aborted) {
+          yield { type: 'error', error: { code: 'FORBIDDEN', message: 'Agent run blocked by hook' } }
+          return
+        }
+      }
+
+      if (abortController.signal.aborted) {
+        this.state = 'done'
+        yield { type: 'done', usage: { inputTokens: 0, outputTokens: 0 }, stopReason: stopReasonUserAbort() }
+        return
+      }
+      this.state = 'thinking'
+      yield { type: 'state_change', state: 'thinking' }
+
+      const messages = context.executionHandoff
+        ? [
+            ...this.buildInitialMessages(input, { ...context, previousMessages: [] }).filter((message) => message.role === 'system' && !context.executionHandoff!.messages.some((retained) => !retained.metadata?.runtimeContext && retained.role === 'system' && JSON.stringify(retained.content) === JSON.stringify(message.content))),
+            ...context.executionHandoff.messages.filter((message) => !message.metadata?.runtimeContext).map(cloneMessage),
+          ]
+        : this.buildInitialMessages(input, context)
+      const totalUsage: TokenUsage = { ...(context.executionHandoff?.usage ?? { inputTokens: 0, outputTokens: 0 }) }
+      const focusedProcessObservation = !this.semanticRouting && !context.executionHandoff && extractFocusedProcessObservationCall(input)
+      const focusedObservationToolAvailable = focusedProcessObservation
+        ? this.tools.toToolDefinitions().some((tool) => tool.name === focusedProcessObservation.toolName)
+        : false
+      const initialPendingToolExecution: PendingToolExecution | undefined =
+        focusedProcessObservation && focusedObservationToolAvailable
+          ? {
+              toolCalls: [{
+                id: `focused-process-observation-${randomUUID()}`,
+                name: focusedProcessObservation.toolName,
+                arguments: focusedProcessObservation.arguments,
+              }],
+              startIndex: 0,
+            }
+          : undefined
+      if (initialPendingToolExecution) {
+        messages.push({
+          role: 'assistant',
+          content: '',
+          toolCalls: initialPendingToolExecution.toolCalls.map(cloneToolCall),
+        })
+      }
       if (context.runContract) {
         yield { type: 'run_contract', contract: context.runContract }
       }
@@ -5717,6 +5994,10 @@ export class AgentEngine implements IAgentEngine {
     this.aborted = false
     const abortController = new AbortController()
     this.runAbortController = abortController
+    this.runWallClock = {
+      startedAt: Date.now(),
+      budgetMs: parseRunWallClockBudgetMs(process.env.SEPILOTD_RUN_MAX_WALL_MS),
+    }
     try {
       yield* this.runWithLiveState(
         checkpoint.messages.map(cloneMessage),
@@ -5760,6 +6041,10 @@ export class AgentEngine implements IAgentEngine {
     this.aborted = false
     const abortController = new AbortController()
     this.runAbortController = abortController
+    this.runWallClock = {
+      startedAt: Date.now(),
+      budgetMs: parseRunWallClockBudgetMs(process.env.SEPILOTD_RUN_MAX_WALL_MS),
+    }
     const resumedState: AgentState = checkpoint.pendingToolExecution?.toolCalls.length
       ? 'acting'
       : 'thinking'

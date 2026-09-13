@@ -1,0 +1,6 @@
+diff --git a/dist/chunks/rpc.-pEldfrD.js b/dist/chunks/rpc.-pEldfrD.js
+index 72fb158..006ca48 100644
+--- a/dist/chunks/rpc.-pEldfrD.js
++++ b/dist/chunks/rpc.-pEldfrD.js
+@@ -43,0 +44 @@ function createRuntimeRpc(options) {
++		timeout: Number(process.env.VITEST_WORKER_RPC_TIMEOUT_MS) || void 0,

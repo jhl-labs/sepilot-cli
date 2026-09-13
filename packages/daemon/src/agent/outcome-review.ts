@@ -206,6 +206,19 @@ function looksLikeKeyboardShortcutLiteral(value: string): boolean {
   return /^(?:ctrl|control|cmd|command|alt|option|shift|meta)(?:\+[a-z0-9_-]+(?:\/[a-z0-9_-]+)*)+$/i.test(value)
 }
 
+function looksLikeEscapedContentLiteral(value: string): boolean {
+  const trimmed = value.trim()
+  if (!/\\[nrt]/.test(trimmed)) {
+    return false
+  }
+
+  // normalizeEvidencePath intentionally accepts Windows separators. Preserve
+  // file-like Windows paths such as `src\\new\\file.ts`, but do not turn an
+  // escaped read-back such as `key=value\\nnext=value\\n` into the synthetic
+  // repository path `key=value/nnext=value/n`.
+  return !pathHasFileExtension(normalizeEvidencePath(trimmed))
+}
+
 function hasExplicitRepositoryPathPrefix(value: string): boolean {
   return /^(?:\.{1,2}\/|\/|[A-Za-z]:\/)/.test(value)
 }
@@ -258,6 +271,7 @@ function looksLikeRepositoryPath(value: string, source: 'code' | 'bare' = 'code'
     || looksLikeMimeType(trimmed)
     || looksLikeExtensionOnlyLiteral(trimmed)
     || looksLikeKeyboardShortcutLiteral(trimmed)
+    || looksLikeEscapedContentLiteral(originalValue)
     || /^@[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/.test(trimmed)
     || trimmed.includes('\n')
     || /\s/.test(trimmed)

@@ -6,6 +6,7 @@ import type {
   Job,
   JobItem,
   JobKind,
+  JobProgress,
   JobStatus,
   PartitionedQueueStatus,
 } from './types.js'
@@ -26,6 +27,7 @@ interface JobRow {
 }
 
 interface ItemRow {
+  progress_json: string | null
   job_id: string
   idx: number
   status: ItemStatus
@@ -60,6 +62,7 @@ const toJob = (r: JobRow): Job => ({
 })
 
 const toItem = (r: ItemRow): JobItem => ({
+  progress: r.progress_json ? JSON.parse(r.progress_json) as JobProgress : null,
   jobId: r.job_id,
   idx: r.idx,
   status: r.status,
@@ -119,6 +122,7 @@ function ensureSchema(db: SqliteDatabase): void {
   ensureColumn(db, 'job_items', 'attempts', 'attempts INTEGER NOT NULL DEFAULT 0')
   ensureColumn(db, 'job_items', 'max_attempts', 'max_attempts INTEGER NOT NULL DEFAULT 1')
   ensureColumn(db, 'job_items', 'created_at', 'created_at INTEGER NOT NULL DEFAULT 0')
+  ensureColumn(db, 'job_items', 'progress_json', 'progress_json TEXT')
   db.prepare(`UPDATE job_items SET created_at=? WHERE created_at=0`).run(Date.now())
   db.prepare(
     `CREATE INDEX IF NOT EXISTS job_items_finished
@@ -138,6 +142,8 @@ export interface JobsRepo {
   create(input: { kind: JobKind; total: number; concurrency: number }): Job
   getOrCreateOpenJob(input: { kind: JobKind; concurrency: number }): Job
   get(id: string): Job | null
+  findSubagentRequest(parentSessionId: string, requestKey: string): JobItem | null
+  list(options?: { status?: JobStatus; kind?: JobKind; limit?: number; offset?: number }): Job[]
   insertItems(
     jobId: string,
     items: Array<{
@@ -153,12 +159,15 @@ export interface JobsRepo {
   ): JobItem
   listItems(jobId: string, sinceIdx: number): JobItem[]
   listCompletedItems(jobId: string, sinceIdx: number): JobItem[]
+  listActivity(jobId: string): Array<JobProgress & { idx: number; status: ItemStatus }>
   startItem(jobId: string, idx: number): void
+  updateItemProgress(jobId: string, idx: number, progress: JobProgress): void
+  cancelRemainingItems(jobId: string, reason: string): void
   claimNextPartitioned(jobId: string): JobItem | null
   completeItem(
     jobId: string,
     idx: number,
-    payload: { status: 'succeeded'; result: unknown } | { status: 'failed'; error: string },
+    payload: { status: 'succeeded'; result: unknown } | { status: 'failed'; error: string; result?: unknown },
   ): void
   requeueItem(jobId: string, idx: number, error?: string | null): void
   finalizePartitionedJob(jobId: string): Job | null
@@ -191,6 +200,23 @@ export function createJobsRepo(): JobsRepo {
     return toJob(db.prepare('SELECT * FROM jobs WHERE id=?').get(id) as JobRow)
   }
   return {
+    findSubagentRequest(parentSessionId, requestKey) {
+      const row = db.prepare(`SELECT i.* FROM job_items i JOIN jobs j ON j.id=i.job_id
+        WHERE j.kind='subagent' AND i.session_id=? AND json_extract(i.request_json, '$.requestKey')=? LIMIT 1`)
+        .get(parentSessionId, requestKey) as ItemRow | undefined
+      return row ? toItem(row) : null
+    },
+    list(options = {}) {
+      const limit = Math.min(100, Math.max(1, Math.floor(options.limit ?? 30)))
+      const offset = Math.max(0, Math.floor(options.offset ?? 0))
+      const clauses: string[] = []
+      const values: Array<string | number> = []
+      if (options.status) { clauses.push('status=?'); values.push(options.status) }
+      if (options.kind) { clauses.push('kind=?'); values.push(options.kind) }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+      return (db.prepare(`SELECT * FROM jobs ${where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`)
+        .all(...values, limit, offset) as JobRow[]).map(toJob)
+    },
     create({ kind, total, concurrency }) {
       return createJob({ kind, total, concurrency })
     },
@@ -273,10 +299,15 @@ export function createJobsRepo(): JobsRepo {
         db
           .prepare(
             `SELECT * FROM job_items WHERE job_id=? AND idx>=?
-             AND status IN ('succeeded','failed') ORDER BY idx`,
+             AND status IN ('succeeded','failed','canceled') ORDER BY idx`,
           )
           .all(jobId, sinceIdx) as ItemRow[]
       ).map(toItem)
+    },
+    listActivity(jobId) {
+      const rows = db.prepare(`SELECT idx, status, progress_json FROM job_items
+        WHERE job_id=? AND progress_json IS NOT NULL ORDER BY idx`).all(jobId) as Array<Pick<ItemRow, 'idx' | 'status' | 'progress_json'>>
+      return rows.map((row) => ({ idx: row.idx, status: row.status, ...JSON.parse(row.progress_json!) as JobProgress }))
     },
     startItem(jobId, idx) {
       db.prepare(
@@ -284,6 +315,17 @@ export function createJobsRepo(): JobsRepo {
          SET status='running', attempts=attempts+1, error=NULL, started_at=?, finished_at=NULL
          WHERE job_id=? AND idx=?`,
       ).run(Date.now(), jobId, idx)
+    },
+    updateItemProgress(jobId, idx, progress) {
+      db.prepare(`UPDATE job_items SET progress_json=?, session_id=COALESCE(session_id, ?)
+        WHERE job_id=? AND idx=? AND status='running'`).run(JSON.stringify(progress), progress.sessionId, jobId, idx)
+    },
+    cancelRemainingItems(jobId, reason) {
+      db.transaction(() => {
+        const canceled = db.prepare(`UPDATE job_items SET status='canceled', error=?, finished_at=?
+          WHERE job_id=? AND status IN ('queued','running')`).run(reason, Date.now(), jobId)
+        db.prepare('UPDATE jobs SET canceled=canceled+? WHERE id=?').run(canceled.changes, jobId)
+      })()
     },
     claimNextPartitioned(jobId) {
       const claim = db.transaction(() => {
@@ -318,6 +360,9 @@ export function createJobsRepo(): JobsRepo {
       return row ? toItem(row) : null
     },
     completeItem(jobId, idx, payload) {
+      // Terminal item states are immutable, including late results after cancel.
+      const current = db.prepare('SELECT status FROM job_items WHERE job_id=? AND idx=?').get(jobId, idx) as { status: ItemStatus } | undefined
+      if (!current || !['queued', 'running'].includes(current.status)) return
       const now = Date.now()
       if (payload.status === 'succeeded') {
         db.prepare(
@@ -328,9 +373,9 @@ export function createJobsRepo(): JobsRepo {
         db.prepare(`UPDATE jobs SET succeeded=succeeded+1 WHERE id=?`).run(jobId)
       } else {
         db.prepare(
-          `UPDATE job_items SET status='failed', error=?, finished_at=?
+          `UPDATE job_items SET status='failed', error=?, finished_at=?, result_json=?
            WHERE job_id=? AND idx=?`,
-        ).run(payload.error, now, jobId, idx)
+        ).run(payload.error, now, payload.result === undefined ? null : JSON.stringify(payload.result), jobId, idx)
         db.prepare(`UPDATE jobs SET failed=failed+1 WHERE id=?`).run(jobId)
       }
     },
@@ -349,6 +394,7 @@ export function createJobsRepo(): JobsRepo {
         )
         .get(jobId) as { count: number }
       const current = db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId) as JobRow | undefined
+      if (current && !['pending', 'running'].includes(current.status)) return toJob(current)
       if (remaining.count > 0) return current ? toJob(current) : null
       const failed = db
         .prepare(`SELECT COUNT(*) AS count FROM job_items WHERE job_id=? AND status='failed'`)
@@ -415,7 +461,7 @@ export function createJobsRepo(): JobsRepo {
           acc[row.status] += 1
           return acc
         },
-        { queued: 0, running: 0, succeeded: 0, failed: 0 } as Record<ItemStatus, number>,
+        { queued: 0, running: 0, succeeded: 0, failed: 0, canceled: 0 } as Record<ItemStatus, number>,
       )
       const firstActive = rows.findIndex(
         (row) => row.status === 'queued' || row.status === 'running',
@@ -454,13 +500,20 @@ export function createJobsRepo(): JobsRepo {
       ).run(status, isStart ? 1 : 0, now, isEnd ? 1 : 0, now, error, id)
     },
     markInProgressFailed() {
-      const r = db
+      return db.transaction(() => {
+        const now = Date.now()
+        db.prepare(`UPDATE job_items SET status='failed', error='daemon restart', finished_at=?
+          WHERE status IN ('queued','running') AND job_id IN
+          (SELECT id FROM jobs WHERE status IN ('pending','running') AND kind <> 'meeting_voice')`).run(now)
+        const r = db
         .prepare(
-          `UPDATE jobs SET status='failed', error='daemon restart', finished_at=?
+          `UPDATE jobs SET status='failed', error='daemon restart', finished_at=?,
+            failed=(SELECT COUNT(*) FROM job_items WHERE job_id=jobs.id AND status='failed')
          WHERE status IN ('pending','running') AND kind <> 'meeting_voice'`,
         )
-        .run(Date.now())
-      return r.changes
+        .run(now)
+        return r.changes
+      })()
     },
     listInProgress() {
       return (

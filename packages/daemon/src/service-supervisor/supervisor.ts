@@ -681,6 +681,12 @@ export class ServiceSupervisor {
     return [...this.records.values()].map(toSnapshot)
   }
 
+  /** Read-only inventory: listing a task must not trigger probes or restarts. */
+  async inventory(): Promise<ServiceSnapshot[]> {
+    await this.ensureLoaded()
+    return [...this.records.values()].map(toSnapshot)
+  }
+
   async status(id: string): Promise<ServiceSnapshot> {
     const record = await this.requireRecord(id)
     await this.reconcile(record, { checkHealth: true, applyRestartPolicy: true })

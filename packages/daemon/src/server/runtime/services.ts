@@ -20,6 +20,7 @@ import {
 } from '@sepilotd/core'
 import type { ScheduledAgentSkillRef } from '@sepilotd/api-client'
 import type { SepilotdConfig } from '../../config/schema.js'
+import { resolveRunIterationBudget } from '../../agent/iteration-budget.js'
 import { AgentEngine } from '../../agent/engine.js'
 import { createAgentOutputTracker } from '../../agent/event-output.js'
 import { registerBuiltinGraphs, builtinGraphBuilders } from '../../agent/graph/presets/index.js'
@@ -63,6 +64,7 @@ import { createInternalJobRunner, ensureInternalJobs } from '../../scheduler/int
 import { schedulerNotificationAudience } from '../../scheduler/notification-subscriptions.js'
 import { nextRecurringRun, parseWhen, SchedulerParseError } from '../../scheduler/time-parser.js'
 import { createNotificationsRepo } from '../../notifications/repo.js'
+import { SessionInbox } from './session-inbox.js'
 import { createObservabilityRepo } from '../../observability/events.js'
 import { publishNotification } from '../../notifications/broker.js'
 import { publishSchedulerRunNotification } from '../../notifications/publish.js'
@@ -435,6 +437,10 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       throw error
     })
     const waitForApproval = deps.waitForApproval
+    const schedulerBudget = resolveRunIterationBudget({
+      surface: 'scheduler',
+      schedulerMaxIterations: config.scheduler?.maxIterations,
+    })
     const engine = new AgentEngine({
       provider,
       tools: toolRegistry,
@@ -447,7 +453,8 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       // an interactive chat answer. On the engine default of 10 a nightly
       // briefing over 13 tickers exhausted the budget and reported INCOMPLETE
       // with its report already written to disk.
-      maxIterations: config.scheduler?.maxIterations ?? 40,
+      maxIterations: schedulerBudget.maxIterations,
+      maxContinuationCycles: schedulerBudget.maxContinuationCycles,
       strictFinalAnswerProtocol:
         process.env.SEPILOTD_STRICT_ANSWER_PROTOCOL === '1'
         || Boolean(skillContext.systemPrompt?.trim()),
@@ -573,6 +580,8 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
 
     if (opts.parentSessionId && !opts.suppressDelivery) {
       try {
+        new SessionInbox().tryPublish({ sessionId: opts.parentSessionId, source: 'scheduler', sourceId: opts.sessionId,
+          eventKey: opts.sessionId, title: 'Scheduled task result', body: finalContent })
         const parentSession = await sessions.get(opts.parentSessionId)
         if (parentSession) {
           await sessions.appendEvent(opts.parentSessionId, {
@@ -644,6 +653,10 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       },
       notify(input) {
         const job = jobStore.get(input.jobId)
+        if (job?.parentSessionId && !job.channelType && !job.channelTarget) {
+          new SessionInbox().tryPublish({ sessionId: job.parentSessionId, source: 'monitor', sourceId: job.id,
+            eventKey: input.id, title: input.title, body: input.body })
+        }
         publishSchedulerRunNotification({
           ...input,
           audience: job ? schedulerNotificationAudience(job) : null,

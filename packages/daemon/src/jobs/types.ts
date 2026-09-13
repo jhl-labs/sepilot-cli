@@ -1,6 +1,14 @@
-export type JobKind = 'batch' | 'migration' | 'subagent' | 'meeting_voice'
+export type JobKind = 'batch' | 'migration' | 'subagent' | 'meeting_voice' | 'hook'
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'canceled'
-export type ItemStatus = 'queued' | 'running' | 'succeeded' | 'failed'
+export type ItemStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled'
+
+export interface JobProgress {
+  sessionId: string
+  phase: string
+  toolName?: string
+  approvalRequestId?: string
+  updatedAt: number
+}
 
 export interface Job {
   id: string
@@ -18,6 +26,7 @@ export interface Job {
 }
 
 export interface JobItem {
+  progress?: JobProgress | null
   jobId: string
   idx: number
   status: ItemStatus

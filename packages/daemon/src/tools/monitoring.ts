@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { SessionInbox } from '../server/runtime/session-inbox.js'
 import { redactSensitive } from '../memory/sensitive.js'
 import {
   createMonitorStateRepo,
@@ -308,6 +309,11 @@ export function createMonitorEvaluateTool(): ToolDefinitionRuntime {
           observedAt,
           now: startedAt,
         })
+        if (result.shouldNotify && context?.sessionId && !context.channelContext) {
+          new SessionInbox().tryPublish({ sessionId: context.sessionId, source: 'monitor',
+            sourceId: monitorId, eventKey: `${scoped}:${monitorId}:${result.stateVersion}`,
+            title: `Monitor ${monitorId}: ${status}`, body: evidence.redacted })
+        }
         return {
           status: 'success',
           output: JSON.stringify(result),

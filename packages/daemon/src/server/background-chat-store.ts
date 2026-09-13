@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import type { RunStopReason } from '@sepilotd/core'
 import { dirname, join } from 'node:path'
 import type { SessionEvent } from '@sepilotd/core'
 
@@ -15,6 +16,8 @@ export interface BackgroundChatJob {
     code?: string
     message: string
   }
+  /** Structured termination reason of the completed run, when known. */
+  stopReason?: RunStopReason
   createdAt: string
   updatedAt: string
 }
@@ -72,6 +75,22 @@ function toPersistedJob(job: BackgroundChatJob): PersistedBackgroundChatJob {
   }
 }
 
+function parseStopReason(value: unknown): RunStopReason | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as Partial<RunStopReason>
+  if (typeof candidate.kind !== 'string' || typeof candidate.code !== 'string') return undefined
+  return {
+    kind: candidate.kind,
+    code: candidate.code,
+    summary: typeof candidate.summary === 'string' ? candidate.summary : undefined,
+    detail: candidate.detail && typeof candidate.detail === 'object' ? { ...candidate.detail } : undefined,
+    resumable: candidate.resumable === true,
+    nextActions: Array.isArray(candidate.nextActions)
+      ? candidate.nextActions.filter((entry): entry is RunStopReason['nextActions'][number] => typeof entry === 'string')
+      : [],
+  }
+}
+
 function parsePersistedJobs(raw: string): BackgroundChatJob[] {
   const parsed = JSON.parse(raw) as unknown
   if (!parsed || typeof parsed !== 'object') return []
@@ -110,6 +129,7 @@ function parsePersistedJobs(raw: string): BackgroundChatJob[] {
                   : 'Background chat failed.',
             }
           : undefined,
+      stopReason: parseStopReason(candidate.stopReason),
       createdAt: candidate.createdAt,
       updatedAt: candidate.updatedAt,
     })

@@ -123,7 +123,7 @@ export const configUpdateRequestSchema = z
     'agent.autonomy': z
       .enum(['readonly', 'accept-edits', 'workspace-write', 'supervised', 'autonomous'])
       .optional(),
-    'agent.thinkingLevel': z.enum(['off', 'low', 'medium', 'high', 'max']).optional(),
+    'agent.thinkingLevel': z.enum(['auto', 'off', 'low', 'medium', 'high', 'max']).optional(),
     'agent.disabledTools': z.array(z.string().trim().min(1)).max(1000).optional(),
     'agent.graphNodeModelOverrides': agentGraphNodeModelOverridesSchema.optional(),
     'device.name': z.string().min(1).optional(),

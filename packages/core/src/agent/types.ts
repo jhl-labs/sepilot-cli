@@ -11,6 +11,7 @@ export enum AutonomyLevel {
 }
 
 export enum ThinkingLevel {
+  Auto = 'auto',
   Off = 'off',
   Low = 'low',
   Medium = 'medium',
@@ -371,6 +372,8 @@ export interface ChatResponse {
 }
 
 export interface LlmRequestDigest {
+  maxOutputTokens?: number
+  thinkingLevel?: string
   model: string
   providerId?: string
   source?: string

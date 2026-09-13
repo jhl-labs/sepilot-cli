@@ -1,6 +1,7 @@
 import { z } from 'zod'
 
 export const WikiNodeInput = z.object({
+  expectedUpdatedAt: z.number().int().nonnegative().optional(),
   id: z.string().optional(),
   parentId: z.string().nullable().optional(),
   title: z.string().min(1),

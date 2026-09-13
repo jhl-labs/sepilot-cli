@@ -2,9 +2,15 @@ import chalk from 'chalk'
 import { isUnsuccessfulAgentResult } from './run-outcome.js'
 import {
   createTerminalChatStreamFrameConsumer,
+  describeStopReason,
+  shouldRenderStopCard,
   type DaemonChatStreamPayload,
+  type DaemonPendingDecision,
+  type RunStopLocale,
+  type RunStopReason,
   type TerminalChatStreamFrame,
 } from '@sepilotd/api-client'
+import { formatRunStopCard, type RunStopHintMode } from '../tui/utils/run-stop-card.js'
 
 interface Writer {
   write(text: string): void
@@ -329,8 +335,32 @@ const BARE_INACTIVITY_MESSAGE =
  * The daemon's raw `error.message` is correct but sometimes operationally
  * framed; for those codes we substitute a hint the user can act on.
  */
-function explainErrorCode(code: string | undefined, fallback: string): string {
+export function explainErrorCode(
+  code: string | undefined,
+  fallback: string,
+  context: {
+    stopReason?: RunStopReason
+    pendingDecision?: DaemonPendingDecision
+    locale?: RunStopLocale
+  } = {},
+): string {
   switch (code) {
+    case 'APPROVAL_TIMEOUT':
+    case 'QUESTION_TIMEOUT': {
+      // Structured fields win over the daemon's prose: the pending decision
+      // tells the user exactly what to answer, the stopReason how to resume.
+      const pending = context.pendingDecision
+      const copy = context.stopReason
+        ? describeStopReason(context.stopReason, context.locale ?? 'en')
+        : undefined
+      const what = pending
+        ? pending.kind === 'approval'
+          ? `Pending approval ${pending.id}${pending.label ? ` (${pending.label})` : ''} — \`sepilot approve ${pending.id}\` / \`sepilot deny ${pending.id}\`.`
+          : `Pending question ${pending.id}${pending.label ? ` (${pending.label})` : ''} — \`sepilot answer ${pending.id} <text>\`.`
+        : undefined
+      const parts = [copy?.body, what].filter((part): part is string => Boolean(part))
+      return parts.length > 0 ? parts.join(' ') : fallback
+    }
     case 'AGENT_INACTIVITY':
       // Current daemons report *why* it stalled — no token/tool from the
       // provider (check provider health, switch model) vs. a stuck step —
@@ -352,9 +382,25 @@ function explainErrorCode(code: string | undefined, fallback: string): string {
   }
 }
 
-function formatErrorLine(message: string, code?: string): string {
-  const friendly = explainErrorCode(code, message)
+function formatErrorLine(
+  message: string,
+  code?: string,
+  context?: { stopReason?: RunStopReason; pendingDecision?: DaemonPendingDecision },
+): string {
+  const friendly = explainErrorCode(code, message, context)
   return code ? `Error [${code}]: ${friendly}` : `Error: ${friendly}`
+}
+
+/**
+ * Stop card lines for a terminal frame that ended a run with a
+ * non-completed structured stop reason. Empty when there is nothing to show.
+ */
+export function formatStopCardLines(
+  stopReason: RunStopReason | undefined,
+  hintMode: RunStopHintMode,
+): string[] {
+  if (!shouldRenderStopCard(stopReason)) return []
+  return formatRunStopCard(stopReason, { hintMode }).split('\n')
 }
 
 function createCliChatStreamPrinter(
@@ -386,6 +432,7 @@ export function createInteractiveCliChatStreamPrinter(
 ): CliChatStreamPrinter {
   const stdout = options.stdout ?? process.stdout
   const questionHintMode = options.questionHintMode ?? 'shell'
+  const hintMode: RunStopHintMode = options.approvalHintMode ?? 'shell'
   const showDiagnostics = options.showDiagnostics ?? true
   // The daemon re-emits run_contract mid-run (steering / re-plan). Repeat
   // the summary line so the operator knows the contract was refreshed.
@@ -594,7 +641,7 @@ export function createInteractiveCliChatStreamPrinter(
         stdout.write(chalk.cyan(`  [tool] ${redactTerminalPreview(frame.preview)}\n`))
         break
       case 'approval_request': {
-        if (frame.sessionId && frame.sessionId !== currentSessionId) {
+        if (!frame.subagentId && frame.sessionId && frame.sessionId !== currentSessionId) {
           currentSessionId = frame.sessionId
           options.onSessionId?.(frame.sessionId)
         }
@@ -605,7 +652,7 @@ export function createInteractiveCliChatStreamPrinter(
         stdout.write(chalk.yellow(`  [approval] ${redactTerminalPreview(frame.preview)}\n`))
         const approvalHint = formatApprovalDecisionHint(
           options.approvalHintMode,
-          currentSessionId,
+          frame.sessionId ?? currentSessionId,
           frame.requestId,
         )
         stdout.write(
@@ -613,7 +660,7 @@ export function createInteractiveCliChatStreamPrinter(
             `    decide with: ${approvalHint} (10m timeout)\n`,
           ),
         )
-        options.onApprovalRequested?.(frame.requestId, frame.toolName, currentSessionId)
+        options.onApprovalRequested?.(frame.requestId, frame.toolName, frame.sessionId ?? currentSessionId)
         break
       }
       case 'auto_approval':
@@ -642,9 +689,19 @@ export function createInteractiveCliChatStreamPrinter(
         stdout.write(
           chalk.gray(`  [tokens: ${frame.usage.inputTokens}→${frame.usage.outputTokens}]\n`),
         )
+        for (const line of formatStopCardLines(frame.stopReason, hintMode)) {
+          stdout.write(chalk.yellow(`  ${line}\n`))
+        }
         break
       case 'error':
-        stdout.write(chalk.red(`  ${formatErrorLine(frame.message, frame.code)}\n`))
+        stdout.write(
+          chalk.red(
+            `  ${formatErrorLine(frame.message, frame.code, { stopReason: frame.stopReason, pendingDecision: frame.pendingDecision })}\n`,
+          ),
+        )
+        for (const line of formatStopCardLines(frame.stopReason, hintMode)) {
+          stdout.write(chalk.yellow(`  ${line}\n`))
+        }
         break
       case 'state_change':
         if (options.showStateChanges) {
@@ -728,6 +785,7 @@ export function createAnswerOnlyCliChatStreamPrinter(
   const stdout = options.stdout ?? process.stdout
   const stderr = options.stderr ?? process.stderr
   const questionHintMode = options.questionHintMode ?? 'cli'
+  const answerHintMode: RunStopHintMode = options.approvalHintMode ?? 'cli'
   let needsTrailingNewline = false
   let pendingChunk = ''
   // The daemon re-emits run_contract mid-run (steering / re-plan). Repeat
@@ -977,7 +1035,7 @@ export function createAnswerOnlyCliChatStreamPrinter(
         }
         break
       case 'approval_request': {
-        if (frame.sessionId && frame.sessionId !== currentSessionId) {
+        if (!frame.subagentId && frame.sessionId && frame.sessionId !== currentSessionId) {
           currentSessionId = frame.sessionId
           options.onSessionId?.(frame.sessionId)
         }
@@ -991,14 +1049,14 @@ export function createAnswerOnlyCliChatStreamPrinter(
         stderr.write(chalk.yellow(`\n[approval: ${frame.preview}]\n`))
         const hint = `  decide with: ${
           options.approvalHintMode === 'cli'
-            ? formatApprovalDecisionHint('cli', currentSessionId, frame.requestId)
+            ? formatApprovalDecisionHint('cli', frame.sessionId ?? currentSessionId, frame.requestId)
                 .split(' or ')
                 .map((command) => `\`${command}\``)
                 .join(' or ')
-            : formatApprovalDecisionHint(options.approvalHintMode, currentSessionId, frame.requestId)
+            : formatApprovalDecisionHint(options.approvalHintMode, frame.sessionId ?? currentSessionId, frame.requestId)
         }`
         stderr.write(chalk.gray(`${hint}\n`))
-        options.onApprovalRequested?.(frame.requestId, frame.toolName, currentSessionId)
+        options.onApprovalRequested?.(frame.requestId, frame.toolName, frame.sessionId ?? currentSessionId)
         break
       }
       case 'auto_approval':
@@ -1026,6 +1084,11 @@ export function createAnswerOnlyCliChatStreamPrinter(
             chalk.gray(`\n[${frame.usage.inputTokens}→${frame.usage.outputTokens} tokens]\n`),
           )
         }
+        // Operational signal like the approval banner: shown even in quiet
+        // mode, on stderr so a piped stdout consumer never sees it.
+        for (const line of formatStopCardLines(frame.stopReason, answerHintMode)) {
+          stderr.write(chalk.yellow(`${line}\n`))
+        }
         break
       case 'error':
         if (pendingChunk.length > 0) {
@@ -1033,7 +1096,14 @@ export function createAnswerOnlyCliChatStreamPrinter(
           pendingChunk = ''
         }
         flushContentNewline()
-        stderr.write(chalk.red(`\n${formatErrorLine(frame.message, frame.code)}\n`))
+        stderr.write(
+          chalk.red(
+            `\n${formatErrorLine(frame.message, frame.code, { stopReason: frame.stopReason, pendingDecision: frame.pendingDecision })}\n`,
+          ),
+        )
+        for (const line of formatStopCardLines(frame.stopReason, answerHintMode)) {
+          stderr.write(chalk.yellow(`${line}\n`))
+        }
         break
       case 'context_compact':
         // Like the approval banner, this is operational signal the user

@@ -10,6 +10,11 @@ import { IrreducibleContextOverflowError } from '../context-manager.js'
 import type { RunResumeStage } from '../../server/runtime/runs.js'
 import { cloneGraphState, createGraphRunCheckpoint } from './checkpoints.js'
 import { buildStateBoard, type AgentSteeringNote } from './state-board.js'
+import {
+  captureContinuationProgress,
+  hasContinuationProgress,
+  resolveRunMaxWallMs,
+} from './continuation-progress.js'
 import type {
   AgentState,
   AgentSeedContract,
@@ -376,11 +381,51 @@ export class StateGraph<
     // terminal output is never lost, while preserving exactly-once delivery
     // when a streaming node already surfaced the same text.
     const emittedMessageContents = new Set<string>()
-    const wallDeadlineMs = (() => {
-      const raw = Number(process.env.SEPILOTD_RUN_MAX_WALL_MS ?? '')
-      return Number.isFinite(raw) && raw > 0 ? raw : undefined
-    })()
+    const wallDeadlineMs = resolveRunMaxWallMs()
     const wallStartedAt = Date.now()
+    // Progress-gated continuation: another continuation cycle is granted only
+    // when the cycle that just ended advanced the run (verified evidence,
+    // executed tool call, artifact mutation). The baseline is taken at run
+    // start so a first cycle that did nothing stops as no_progress too.
+    if (maxContinuationCycles > 0) {
+      const agentState = state as Partial<AgentState>
+      agentState.continuationProgressSnapshot = captureContinuationProgress(
+        agentState as AgentState,
+      )
+    }
+    const continuationProgressed = (): boolean => {
+      const agentState = state as Partial<AgentState>
+      const current = captureContinuationProgress(agentState as AgentState)
+      const progressed = hasContinuationProgress(
+        agentState.continuationProgressSnapshot,
+        current,
+      )
+      agentState.continuationProgressSnapshot = current
+      return progressed
+    }
+    const stopWithoutContinuationProgress = (
+      layerBudget: number,
+    ): string => {
+      const agentState = state as Partial<AgentState>
+      state.shouldStop = true
+      terminalStatus = 'incomplete'
+      agentState.budgetExhausted = true
+      agentState.stopReason = stopReasonNoProgress({
+        layer: 'continuation',
+        budget: maxContinuationCycles,
+        used: continuationCycle,
+        contract: agentState.seedContract,
+      })
+      const output = buildBudgetExhaustedMessage({
+        mode: isGraphExecutionContext(context) ? context.graphId : 'graph',
+        layer: 'continuation',
+        iterationBudget: layerBudget,
+        detail: `cycle ${continuationCycle + 1}/${maxContinuationCycles + 1}, ${layerBudget} steps, no new verified evidence, tool execution or artifact change`,
+        contract: agentState.seedContract,
+      })
+      agentState.output = output
+      return output
+    }
 
     if (context && isGraphExecutionContext(context)) {
       await logAgentDebugTrace({
@@ -417,7 +462,12 @@ export class StateGraph<
         agentState.budgetExhausted = true
         agentState.stopReason = stopReasonWallClock(wallDeadlineMs)
         agentState.output = agentState.output
-          || `Run stopped by wall-clock deadline (${wallDeadlineMs}ms). Partial progress is preserved in the session; resume from the checkpoint to continue.`
+          || buildBudgetExhaustedMessage({
+            mode: isGraphExecutionContext(context) ? context.graphId : 'graph',
+            layer: 'wall_clock',
+            iterationBudget: wallDeadlineMs,
+            contract: agentState.seedContract,
+          })
         emittedMessageContents.add(agentState.output)
         yield {
           type: 'message',
@@ -450,6 +500,12 @@ export class StateGraph<
 
       nodeExecutions++
       if (nodeExecutions > maxNodeExecutions) {
+        if (continuationCycle < maxContinuationCycles && !continuationProgressed()) {
+          const output = stopWithoutContinuationProgress(maxNodeExecutions)
+          emittedMessageContents.add(output)
+          yield { type: 'message', content: output }
+          break
+        }
         if (continuationCycle < maxContinuationCycles) {
           continuationCycle++
           const agentState = state as Partial<AgentState>
@@ -494,6 +550,7 @@ export class StateGraph<
         )
         const output = buildBudgetExhaustedMessage({
           mode: isGraphExecutionContext(context) ? context.graphId : 'graph',
+          layer: 'node',
           iterationBudget: maxNodeExecutions,
           contract: agentState.seedContract,
         })
@@ -875,6 +932,18 @@ export class StateGraph<
         && nextMeta?.lifecycleState === 'done'
       ) {
         terminalHandoffCommitted = true
+      }
+      if (
+        routedAgentState.budgetExhausted
+        && !terminalHandoffCommitted
+        && continuationCycle < maxContinuationCycles
+        && !continuationProgressed()
+      ) {
+        const output = stopWithoutContinuationProgress(state.maxIterations)
+        yield buildNodeTraceEvent(nodeName, nodeStartedAt)
+        emittedMessageContents.add(output)
+        yield { type: 'message', content: output }
+        break
       }
       if (
         routedAgentState.budgetExhausted

@@ -62,7 +62,7 @@ export interface PendingQuestionLike {
 
 export interface PendingApprovalLike {
   requestId: string
-  state: 'live' | 'stale'
+  state: 'live' | 'stale' | 'parked'
   resumeAvailable?: boolean
 }
 

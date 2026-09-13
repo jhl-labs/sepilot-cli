@@ -1,6 +1,6 @@
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { Command } from 'commander'
+import { Command, Option } from 'commander'
 import chalk from 'chalk'
 import { setOutputFormat, getOutputFormat } from './output/formatter.js'
 import { friendlyErrorMessage, printApiError } from './utils/error-message.js'
@@ -182,6 +182,7 @@ import {
   batchCommand,
   batchResumeCommand,
   batchStatusCommand,
+  jobsListCommand,
 } from './commands/batch.js'
 import { extensionCreateCommand } from './commands/extension-create.js'
 import { extensionInstallCommand } from './commands/extension-install.js'
@@ -199,6 +200,7 @@ import {
   hooksDisableCommand,
   hooksEnableCommand,
   hooksListCommand,
+  hooksCommandsCommand,
   hooksReplayCommand,
   hooksReplayFailedCommand,
   hooksRemoveCommand,
@@ -249,6 +251,8 @@ import {
 import { secretsSetCommand, secretsListCommand, secretsRemoveCommand } from './commands/secrets.js'
 import { authLoginCommand, authListCommand, authLogoutCommand } from './commands/auth.js'
 import { subagentCategoriesCommand, subagentDispatchCommand } from './commands/subagent.js'
+import { tasksCommand } from './commands/tasks.js'
+import { rewindCommand } from './commands/rewind.js'
 import {
   swarmRunCommand,
   swarmListCommand,
@@ -385,7 +389,7 @@ assistant
     '--autonomy <level>',
     perTurnAutonomyDescription,
   )
-  .option('--thinking-level <level>', 'Per-turn thinking level: off, low, medium, high, or max')
+  .option('--thinking-level <level>', 'Per-turn thinking level: auto, off, low, medium, high, or max')
   .option('--skill <id>', 'Select a daemon skill for this run (repeatable, maximum 8)', collectRepeatedOption, [])
   .option('--panel-preset <id>', 'Persona panel preset id')
   .option('--session <id>', 'Continue an existing session')
@@ -1565,7 +1569,7 @@ program
     '--autonomy <level>',
     perTurnAutonomyDescription,
   )
-  .option('--thinking-level <level>', 'Per-turn thinking level: off, low, medium, high, or max')
+  .option('--thinking-level <level>', 'Per-turn thinking level: auto, off, low, medium, high, or max')
   .option('--skill <id>', 'Select a daemon skill for this ask (repeatable, maximum 8)', collectRepeatedOption, [])
   .option('--panel-preset <id>', 'Persona panel preset id (e.g. architecture-qaw-atam)')
   .option(
@@ -1836,6 +1840,7 @@ mcpMp
 mcp.action(mcpListCommand)
 
 const hooks = program.command('hooks').description('Manage outbound webhooks')
+hooks.command('commands').description('Inspect loaded command hooks without exposing shell command secrets').option(...urlOption).action(hooksCommandsCommand)
 hooks
   .command('list')
   .description('List configured outbound webhooks')
@@ -2013,6 +2018,22 @@ program
   .action(batchStatusCommand)
 
 const jobs = program.command('jobs').description('Manage daemon background jobs')
+program.command('rewind <sessionId> [checkpointId]').description('Preview or apply safe file/conversation rewind; original conversations remain recoverable')
+  .option(...urlOption)
+  .addOption(new Option('--scope <scope>', 'Rewind scope').choices(['files', 'conversation', 'both']).default('files'))
+  .option('--apply', 'Apply the reviewed rewind; without this flag, only preview')
+  .option('--turns <n>', 'Conversation user turns to rewind', '1')
+  .action(rewindCommand)
+program.command('tasks [args...]').description('Unified jobs, agents, processes, schedules, services, approvals and inbox')
+  .allowUnknownOption(true).option(...urlOption).action(tasksCommand)
+jobs.command('list', { isDefault: true })
+  .description('List background jobs, including work needing approval')
+  .option(...urlOption)
+  .option('--status <status>', 'Filter by lifecycle state')
+  .option('--kind <kind>', 'Filter by job kind')
+  .option('--limit <n>', 'Page size (1-100)', '30')
+  .option('--offset <n>', 'Page offset', '0')
+  .action(jobsListCommand)
 jobs
   .command('resume <jobId>')
   .description('Resume polling an in-flight or completed daemon background job')
@@ -2048,6 +2069,7 @@ subagent
   .option('--model <id>', 'Provider model override')
   .option('--parent-session <id>', 'Tag the subagent session with this parent id')
   .option('--background', 'Queue the subagent as a daemon background job')
+  .addOption(new Option('--isolation <kind>', 'Use a clean HEAD checkout; retain changes for explicit merge').choices(['worktree']))
   .option(...urlOption)
   .action(subagentDispatchCommand)
 

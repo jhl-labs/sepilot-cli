@@ -4,6 +4,7 @@ import { throwIfAborted } from '../abort.js'
 import { buildUnifiedDiff } from './edit-diff.js'
 import { buildFileToolPosture, type FileToolPostureOptions } from './file-tool-posture.js'
 import { resolveToolPath } from './path-utils.js'
+import { contentEncodingSchema, decodeFileContent, normalizeFileContent } from './file-content.js'
 import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
 
 const EVIDENCE_TRUNCATION_MIN_BYTES = 1000
@@ -54,21 +55,29 @@ export function createFsWriteTool(postureOptions?: FileToolPostureOptions): Tool
     description:
       'Write `content` to `path`, creating parent directories as needed. fs.write OVERWRITES — use fs.edit (exact-match replace) or apply_patch for partial changes. A large existing file cannot be replaced with much shorter content unless overwrite=true explicitly confirms a deliberate complete-file replacement. Evidence ledgers remain protected even with confirmation. Supports absolute paths, ~/ paths, and relative paths resolved against the active session cwd. Will fail on policy-protected paths (~/.ssh/, /etc/, secrets, *.pem/*.key).',
     resumeSafety: 'replay-risky',
+    normalizeInput: normalizeFileContent,
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'File path to write' },
         content: { type: 'string', description: 'Content to write' },
+        contentEncoding: contentEncodingSchema,
         overwrite: {
           type: 'boolean',
           description: 'Confirm a deliberate complete replacement when an existing file would be substantially shortened. Not needed for new files or ordinary same-size rewrites.',
+        },
+        createOnly: {
+          type: 'boolean',
+          description: 'Create a new file exclusively. Use true when existing files must not be overwritten; atomically fails if the path already exists, including a concurrent creation.',
         },
       },
       required: ['path', 'content'],
     },
     async recoverInterruptedExecution(input, context): Promise<ToolResult | null> {
+      // Matching bytes alone cannot prove who exclusively created the file.
+      if (input.createOnly === true) return null
       const path = typeof input.path === 'string' ? resolveToolPath(input.path, context.cwd) : ''
-      const content = input.content as string
+      const content = decodeFileContent(input)
       if (!path || typeof content !== 'string') {
         return null
       }
@@ -83,7 +92,7 @@ export function createFsWriteTool(postureOptions?: FileToolPostureOptions): Tool
           && fileStat.mtime.getTime() >= new Date(context.startedAt).getTime()
         ) {
           return {
-            output: `Wrote ${content.length} bytes to ${path}`,
+            output: `Wrote ${Buffer.byteLength(content, 'utf-8')} bytes to ${path}`,
             status: 'success',
             durationMs: 0,
           }
@@ -96,7 +105,8 @@ export function createFsWriteTool(postureOptions?: FileToolPostureOptions): Tool
     },
     async execute(input: Record<string, unknown>, context): Promise<ToolResult> {
       const path = typeof input.path === 'string' ? resolveToolPath(input.path, context?.cwd) : ''
-      const content = input.content as string
+      const content = decodeFileContent(input)
+      if (content === undefined) return { status: 'error', code: 'INVALID_CONTENT_PERMANENT', output: 'content must be literal UTF-8 text or canonical base64 of UTF-8 text', durationMs: 0 }
       const overwrite = input.overwrite === true
       const start = Date.now()
       try {
@@ -117,13 +127,13 @@ export function createFsWriteTool(postureOptions?: FileToolPostureOptions): Tool
           }
         }
         const previousContent = await readFile(path, 'utf-8').catch(() => '')
-        await writeFile(path, content, 'utf-8')
+        await writeFile(path, content, { encoding: 'utf-8', flag: input.createOnly === true ? 'wx' : 'w' })
         await context?.workspaceMutation?.recordWrite(path)
         const warning = stale ? `[workspace warning] ${stale.description}\n` : ''
         const editDiff = buildUnifiedDiff(path, previousContent, content)
         const executionPosture = buildFileToolPosture(postureOptions, context?.cwd)
         return {
-          output: `${warning}Wrote ${content.length} bytes to ${path}`,
+          output: `${warning}Wrote ${Buffer.byteLength(content, 'utf-8')} bytes to ${path}`,
           status: 'success',
           durationMs: Date.now() - start,
           ...(editDiff ? { metadata: { editDiff, editPath: path } } : {}),
@@ -132,7 +142,9 @@ export function createFsWriteTool(postureOptions?: FileToolPostureOptions): Tool
       } catch (err: unknown) {
         const errCode = (err as { code?: string }).code
         const message = (err as { message?: string }).message ?? String(err)
-        const code = errCode === 'EACCES' || errCode === 'EPERM'
+        const code = errCode === 'EEXIST'
+          ? 'FILE_EXISTS_PERMANENT'
+          : errCode === 'EACCES' || errCode === 'EPERM'
           ? 'EACCES_PERMANENT'
           : errCode === 'ENOSPC'
             ? 'ENOSPC_PERMANENT'

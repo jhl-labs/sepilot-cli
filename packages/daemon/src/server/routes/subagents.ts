@@ -64,8 +64,13 @@ export function registerSubagentRoutes(app: FastifyInstance, deps: SubagentRoute
       })
     }
 
+    const controller = new AbortController()
+    const abort = () => controller.abort(new Error('subagent client disconnected'))
+    request.raw.once('aborted', abort)
+    reply.raw.once('close', abort)
     try {
-      const result = await dispatcher.dispatch(parsed.data)
+      if (request.raw.aborted || reply.raw.destroyed) abort()
+      const result = await dispatcher.dispatch({ ...parsed.data, signal: controller.signal })
       return reply.status(200).send(result)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -88,6 +93,9 @@ export function registerSubagentRoutes(app: FastifyInstance, deps: SubagentRoute
       return reply.status(500).send({
         error: { code: 'INTERNAL_ERROR', message },
       })
+    } finally {
+      request.raw.off('aborted', abort)
+      reply.raw.off('close', abort)
     }
   })
 }

@@ -9,6 +9,7 @@ import {
   type createStreamEventController,
   type AgentState as SurfaceAgentState,
   type Message as SurfaceMessage,
+  type RunStopReason,
   type StreamEventControllerBindings,
 } from '@sepilotd/api-client'
 import type { Message } from '../types.js'
@@ -20,6 +21,8 @@ export interface LiveStreamSlot {
   agentState: SurfaceAgentState
   messages: SurfaceMessage[]
   controller: ReturnType<typeof createStreamEventController>
+  /** Structured stop cause once the daemon's terminal frame arrived. */
+  stopReason?: RunStopReason | null
 }
 
 /**
@@ -104,7 +107,7 @@ export function createLiveStreamBindings(opts: {
   assistantId: string
   liveStreamRef: MutableRefObject<LiveStreamSlot | null>
   dispatch: Dispatch<ChatAction>
-  sanitizeAssistantContent?: (content: string) => string
+  sanitizeAssistantContent?: (content: string, stopReason: RunStopReason | null) => string
 }): StreamEventControllerBindings {
   const isCurrent = (): LiveStreamSlot | null => {
     const current = opts.liveStreamRef.current
@@ -117,7 +120,10 @@ export function createLiveStreamBindings(opts: {
       if (message.id !== opts.assistantId || message.role !== 'assistant') {
         return message
       }
-      const content = sanitizeAssistantContent(message.content)
+      const content = sanitizeAssistantContent(
+        message.content,
+        opts.liveStreamRef.current?.stopReason ?? null,
+      )
       return content === message.content ? message : { ...message, content }
     })
   }
@@ -154,6 +160,11 @@ export function createLiveStreamBindings(opts: {
     setError: (next) => {
       if (!next) return
       opts.dispatch({ type: 'ERROR', message: next })
+    },
+    setStopReason: (reason) => {
+      const current = isCurrent()
+      if (!current) return
+      current.stopReason = reason
     },
     setContextUsage: (context) => {
       if (!isCurrent()) return

@@ -4,6 +4,7 @@ import type { JobsClient } from '@sepilotd/api-client'
 import { DaemonClient } from '../client/http.js'
 import { ensureDaemon } from '../client/ensure-daemon.js'
 import { errorMessage } from '../utils/error-message.js'
+import { output } from '../output/formatter.js'
 
 interface BatchTask {
   message: string
@@ -32,7 +33,7 @@ export interface BatchFacadeInput {
   tasks: BatchTask[]
   concurrency: number
   failureMode: 'continue' | 'abort'
-  jobs: JobsClient
+  jobs: Pick<JobsClient, 'submitBatch' | 'get' | 'getItems' | 'cancel'>
   writer: { append(line: string): void | Promise<void> }
   pollMs?: number
   /**
@@ -151,6 +152,7 @@ export async function runBatchFacade(
   })
 
   let nextIdx = 0
+  const writtenIndices = new Set<number>()
   let ok = 0
   let totalTokens = 0
   let abandoned = false
@@ -177,7 +179,7 @@ export async function runBatchFacade(
         // Defensive: even though getItems is `since=nextIdx`, the
         // daemon may return idx<nextIdx if a previous result was
         // re-fetched on cursor reset. Skip already-written items.
-        if (it.idx < nextIdx) continue
+        if (it.idx < nextIdx || writtenIndices.has(it.idx)) continue
         const t = tasks[it.idx]
         if (!t) continue
         const r = unwrapJobResult(it.result)
@@ -204,7 +206,10 @@ export async function runBatchFacade(
         })
         if (!failed) ok++
         totalTokens += tokens
-        nextIdx = Math.max(nextIdx, it.idx + 1)
+        writtenIndices.add(it.idx)
+        // Advance only across a contiguous prefix. A fast item 3 must not
+        // hide the still-running item 1 on the next poll.
+        while (writtenIndices.delete(nextIdx)) nextIdx++
       }
       if (
         snap.status === 'completed' ||
@@ -412,6 +417,7 @@ export async function batchResumeCommand(
       }
 
   let nextIdx = 0
+  const writtenIndices = new Set<number>()
   let abandoned = false
   const onSigint = (): void => {
     abandoned = true
@@ -426,7 +432,7 @@ export async function batchResumeCommand(
       const snap = await client.jobs.get(jobId)
       const fetched = await client.jobs.getItems(jobId, nextIdx)
       for (const it of fetched.items) {
-        if (it.idx < nextIdx) continue
+        if (it.idx < nextIdx || writtenIndices.has(it.idx)) continue
         const r = unwrapJobResult(it.result)
         const tokens =
           (r.usage?.inputTokens ?? 0) + (r.usage?.outputTokens ?? 0)
@@ -442,7 +448,8 @@ export async function batchResumeCommand(
             ...(error ? { error } : {}),
           }),
         )
-        nextIdx = Math.max(nextIdx, it.idx + 1)
+        writtenIndices.add(it.idx)
+        while (writtenIndices.delete(nextIdx)) nextIdx++
       }
       if (
         snap.status === 'completed' ||
@@ -465,7 +472,8 @@ export async function batchCancelCommand(
   const client = new DaemonClient(options.url)
   try {
     await client.jobs.cancel(jobId)
-    console.log(chalk.gray(`canceled: ${jobId}`))
+    const snapshot = await client.jobs.get(jobId)
+    output({ jobId, status: snapshot.status }, () => chalk.gray(`${snapshot.status}: ${jobId}`))
   } catch (err) {
     console.error(chalk.red(`cancel failed: ${errorMessage(err)}`))
     process.exit(1)
@@ -487,11 +495,27 @@ export async function batchStatusCommand(
       if (firstError) detail = `\nerror: ${firstError}`
     }
     const jobError = snap.error ? `\nerror: ${snap.error}` : ''
-    console.log(
-      `${kind}${snap.status} ${snap.succeeded}/${snap.total} succeeded, ${snap.failed} failed${detail || jobError}`,
-    )
+    const activity = (snap.activity ?? []).map((item) =>
+      `\n  [${item.idx + 1}] ${item.status}: ${item.phase}${item.toolName ? ` ${item.toolName}` : ''} · session=${item.sessionId} · ${Math.max(0, Math.floor((Date.now() - item.updatedAt) / 1000))}s ago${item.status === 'running' && item.approvalRequestId ? `\n    approval: sepilot approve ${item.approvalRequestId}` : ''}`,
+    ).join('')
+    output(snap, () => `${kind}${snap.status} ${snap.succeeded}/${snap.total} succeeded, ${snap.failed} failed${snap.canceled ? `, ${snap.canceled} canceled` : ''}${detail || jobError}${activity}`)
   } catch (err) {
     console.error(chalk.red(`status failed: ${errorMessage(err)}`))
+    process.exit(1)
+  }
+}
+
+export async function jobsListCommand(options: { url?: string; status?: string; kind?: string; limit?: string; offset?: string }): Promise<void> {
+  const client = new DaemonClient(options.url)
+  try {
+    const page = await client.jobs.list({ status: options.status, kind: options.kind, limit: options.limit === undefined ? undefined : Number(options.limit), offset: options.offset === undefined ? undefined : Number(options.offset) })
+    output(page, (result) => result.jobs.length === 0 ? 'No background jobs.' : [
+      ...result.jobs.map((job) => `${job.id}  ${job.kind ?? 'job'}  ${job.status}  ${job.succeeded}/${job.total}${job.activity?.some((item) => item.status === 'running' && item.approvalRequestId) ? '  needs approval' : ''}`),
+      'Inspect: sepilot jobs status <id> · Collect: sepilot jobs resume <id> · Stop: sepilot jobs cancel <id>',
+      ...(result.nextOffset === null ? [] : [`More: sepilot jobs list --offset ${result.nextOffset}`]),
+    ].join('\n'))
+  } catch (err) {
+    console.error(chalk.red(`jobs list failed: ${errorMessage(err)}`))
     process.exit(1)
   }
 }

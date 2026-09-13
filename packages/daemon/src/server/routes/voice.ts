@@ -70,7 +70,7 @@ export const voiceTurnRequestSchema = z
     outputLanguage: z.string().min(1).optional(),
     language: z.string().min(1).optional(),
     transcriptionModel: z.string().min(1).optional(),
-    thinkingLevel: z.enum(['off', 'low', 'medium', 'high', 'max']).optional(),
+    thinkingLevel: z.enum(['auto', 'off', 'low', 'medium', 'high', 'max']).optional(),
     purpose: z.enum(['conversation', 'meeting_notes']).optional(),
     enqueue: z.boolean().optional(),
     tts: z.boolean().optional(),

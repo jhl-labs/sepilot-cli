@@ -638,6 +638,8 @@ export interface DaemonChatBackgroundStatusResult extends DaemonChatBackgroundSt
     code?: string
     message: string
   }
+  /** Structured stop cause of the finished run, when the daemon reports one. */
+  stopReason?: RunStopReason
   createdAt: string
   updatedAt: string
 }
@@ -2843,7 +2845,7 @@ export interface DaemonConfigUpdateInput {
   'agent.defaultProvider'?: string
   'agent.defaultModel'?: string
   'agent.autonomy'?: 'readonly' | 'accept-edits' | 'workspace-write' | 'supervised' | 'autonomous'
-  'agent.thinkingLevel'?: 'off' | 'low' | 'medium' | 'high' | 'max'
+  'agent.thinkingLevel'?: 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max'
   'agent.disabledTools'?: string[]
   'agent.graphNodeModelOverrides'?: DaemonGraphNodeModelOverrides
   'daemon.resumeArtifactRetentionDays'?: number
@@ -2931,7 +2933,7 @@ export interface DaemonConfig {
   providers: DaemonConfigProvider[]
   agent: {
     autonomy: 'readonly' | 'accept-edits' | 'workspace-write' | 'supervised' | 'autonomous'
-    thinkingLevel: 'off' | 'low' | 'medium' | 'high' | 'max'
+    thinkingLevel: 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max'
     defaultProvider?: string
     defaultModel?: string
     mode: DaemonAgentMode
@@ -2958,6 +2960,8 @@ export interface DaemonConfig {
     defaultWorkspaceRoot?: string
   }
   hooks: {
+    /** Inspection metadata only; shell commands may contain secrets and are omitted. */
+    commandHooks?: Array<{ event: string; enabled: boolean; async: boolean; timeoutMs: number; toolMatcher?: string }>
     outboundWebhooks: DaemonOutboundWebhookConfig[]
   }
   mcp: {

@@ -1,4 +1,5 @@
 // packages/daemon/src/scheduler/engine.ts
+import { isApprovalParkedError } from '../server/runtime/approvals.js'
 import { nextRetryAt, DEFAULT_RETRY_POLICY, type RunStopReason, type TokenUsage } from '@sepilotd/core'
 import { schedulerMisfirePolicyFromMetadata } from '@sepilotd/api-client'
 import { createLogger } from '../logger.js'
@@ -469,8 +470,21 @@ export class SchedulerEngine {
       })
       .catch((err) => {
         if (activeRun.interrupted) return
-        const duration = Date.now() - startedAt
         const reason = err instanceof Error ? err.message : String(err)
+        if (isApprovalParkedError(err)) {
+          // Paused for a human decision, not failed: release the run like a
+          // shutdown interruption so the attempt and consecutive-failure
+          // counters stay untouched and the job returns to pending. Answering
+          // the approval resumes the checkpointed run; the retry fires only if
+          // nobody does.
+          const retryAt = Date.now() + this.maxBackoffMs
+          activeRun.interrupted = true
+          if (this.opts.store.releaseInterruptedRun(job.id, runId, retryAt, reason)) {
+            this.emit({ type: 'interrupted', jobId: job.id, runId, reason, retryAt })
+          }
+          return
+        }
+        const duration = Date.now() - startedAt
         this.finishFailedRun({ job, runId, attemptNo, startedAt, duration, reason })
       })
       .finally(() => {

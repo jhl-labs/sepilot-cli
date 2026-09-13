@@ -113,7 +113,7 @@ export function formatTuiHookDeadLetter(deadLetter: DaemonOutboundWebhookDeadLet
 
 export function buildTuiHooksUsage(): string {
   return [
-    'Usage: /hooks [list]',
+    'Usage: /hooks [list|commands]',
     '       /hooks add <url> --event <event> [--event <event>] [--header KEY=VALUE] [--secret value] [--retry-attempts n] [--retry-backoff-ms ms] [--disabled]',
     '       /hooks remove <id> | enable <id> | disable <id>',
     '       /hooks deliveries [id] [--status success|error] [--limit n]',

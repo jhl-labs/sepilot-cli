@@ -36,6 +36,7 @@ import type {
   MigrationClient,
 } from '@sepilotd/api-client'
 import { hasPendingScheduledRun } from '../../utils/scheduler-state.js'
+import { runTasksCommand, type TasksClient } from '../../commands/tasks.js'
 import { maskSecretValue, truncateJsonOutput } from './admin-output.js'
 
 export interface DaemonAdminSlashClient {
@@ -463,8 +464,14 @@ export const DAEMON_ADMIN_SLASH_COMMANDS: DaemonAdminSlashCommandSpec[] = [
   },
   {
     name: '/jobs',
-    description: 'Inspect or cancel daemon jobs',
-    args: '[status|items|cancel]',
+    description: 'List, inspect, collect, or cancel background jobs',
+    args: '[list|status|items|cancel]',
+    destructiveActions: ['cancel'],
+  },
+  {
+    name: '/tasks',
+    description: 'Background jobs: list, inspect, collect, or cancel',
+    args: '[list|status|items|cancel]',
     destructiveActions: ['cancel'],
   },
   {
@@ -821,8 +828,9 @@ function usage(command: string): string {
       return 'Usage: /cron [list|add <name> --schedule <cron> --instruction <text> [--disabled]|remove <id>]'
     case '/image-gen':
       return 'Usage: /image-gen [providers|jobs [--limit n]|create <providerId> <prompt...> [--params json] [--wait [ms]] [--output dir] [--download dir]|cancel <id>]'
+    case '/tasks':
     case '/jobs':
-      return 'Usage: /jobs [status <id>|items <id> [--since n]|cancel <id>|submit <items-json-array>]'
+      return 'Usage: /jobs [list [--status state] [--kind kind] [--limit n] [--offset n]|status <id>|items <id> [--since n]|cancel <id>|submit <items-json-array>]'
     case '/migration':
       return 'Usage: /migration [run <sourcePath> [--step name] [--dry-run]|status <id>|report <id>|cancel <id>]'
     case '/observability':
@@ -917,6 +925,8 @@ export async function runDaemonAdminSlashCommand(
       return runExtensionsCommand(client, args)
     case '/image-gen':
       return runImageGenCommand(client, args)
+    case '/tasks':
+      return json(await runTasksCommand(client as unknown as TasksClient, args))
     case '/jobs':
       return runJobsCommand(client, args)
     case '/migration':
@@ -2814,8 +2824,17 @@ async function runImageGenCommand(client: DaemonAdminSlashClient, args: string[]
 }
 
 async function runJobsCommand(client: DaemonAdminSlashClient, args: string[]): Promise<string> {
-  const action = args[0]?.toLowerCase() ?? 'status'
+  const action = args[0]?.toLowerCase() ?? 'list'
   if (!client.jobs) return 'Jobs client is not available in this TUI build.'
+  if (action === 'list') {
+    const parsed = parseArgs(args.slice(1))
+    const page = await client.jobs.list({ status: flag(parsed, 'status'), kind: flag(parsed, 'kind'), limit: parseInteger(flag(parsed, 'limit'), 'limit'), offset: parseInteger(flag(parsed, 'offset'), 'offset') })
+    return page.jobs.length ? [
+      ...page.jobs.map((job) => `${job.id}  ${job.kind ?? 'job'}  ${job.status}  ${job.succeeded}/${job.total}${job.activity?.some((item) => item.status === 'running' && item.approvalRequestId) ? '  needs approval' : ''}`),
+      'Next: /tasks status <id> · /tasks items <id> · /tasks cancel <id>',
+      ...(page.nextOffset === null ? [] : [`More: /tasks list --offset ${page.nextOffset}`]),
+    ].join('\n') : 'No background jobs.'
+  }
   if (action === 'status') {
     const id = requireArg(args[1], usage('/jobs'))
     return json(await client.jobs.get(id))

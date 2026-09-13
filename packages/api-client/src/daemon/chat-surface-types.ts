@@ -265,6 +265,8 @@ export type TerminalChatStreamFrame =
   | { kind: 'tool_call'; toolName: string; preview: string }
   | {
       kind: 'approval_request'
+      /** Child consent must not switch the active parent conversation. */
+      subagentId?: string
       toolName: string
       requestId: string
       /** Pre-formatted `name(args-json)` so the cli can show what is actually

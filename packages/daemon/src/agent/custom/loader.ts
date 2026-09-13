@@ -9,6 +9,7 @@ export interface CustomDef {
   data: Record<string, unknown>
   body: string
   source: string
+  error?: string
 }
 
 export type CustomKind = 'agents' | 'commands'
@@ -104,8 +105,9 @@ export async function discoverCustomDefs(
         const fm = parseFrontmatter(raw)
         byId.set(id, { id, data: fm.data, body: fm.body, source })
       } catch {
-        // One unreadable or malformed definition must not break all commands
-        // and agents for the turn.
+        // Keep the id occupied: never fall back to a less restrictive same-name
+        // global definition when a project's policy file cannot be parsed.
+        byId.set(id, { id, source, body: '', data: {}, error: 'Unable to read or parse definition; check YAML frontmatter' })
       }
     }
   }

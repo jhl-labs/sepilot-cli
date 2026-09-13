@@ -44,7 +44,7 @@ export const chatRequestSchema = z.object({
    * meeting workflow with dynamic floor selection.
    */
   panelStrategy: z.enum(['sequential', 'moderated']).optional(),
-  thinkingLevel: z.enum(['off', 'low', 'medium', 'high', 'max']).optional(),
+  thinkingLevel: z.enum(['auto', 'off', 'low', 'medium', 'high', 'max']).optional(),
   maxTokens: z.number().int().positive().max(2_000_000).optional(),
   /**
    * Agent-loop iteration cap for this turn. One iteration is one LLM round
@@ -55,6 +55,13 @@ export const chatRequestSchema = z.object({
    * keeping a stop-the-bleeding hard cap on runaway loops.
    */
   maxIterations: z.number().int().min(1).max(500).optional(),
+  /**
+   * Treat `maxIterations` as an exact hard cap: no automatic continuation
+   * cycles and no contract-derived floor. Off by default — a client-supplied
+   * `maxIterations` is a requested budget, and interactive surfaces keep the
+   * repair/continuation headroom. Benches and automation opt in explicitly.
+   */
+  hardMaxIterations: z.boolean().optional(),
   temperature: z.number().min(0).max(2).optional(),
   mode: z.string().trim().min(1).optional(),
   writingDocId: safeIdSchema.optional(),
@@ -119,4 +126,11 @@ export function isDesktopExternalAgentMode(mode: unknown): boolean {
 
 export function resolveChatMaxIterations(body: Pick<ChatBody, 'maxIterations'>): number {
   return resolveAgentMaxIterations(body)
+}
+
+/** Hard cap only when the request says so; `maxIterations` alone never hardens the run. */
+export function resolveChatHardMaxIterations(
+  body: Pick<ChatBody, 'hardMaxIterations'>,
+): boolean {
+  return body.hardMaxIterations === true
 }

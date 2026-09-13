@@ -1,3 +1,4 @@
+import { MobilePairingTickets } from './mobile-pairing.js'
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
@@ -26,6 +27,7 @@ type AuthPluginApp = FastifyInstance & {
 }
 
 type AuthPluginRequest = FastifyRequest & {
+  mobilePairingToken?: string
   authContext?: RequestAuthContext
 }
 
@@ -356,6 +358,7 @@ export function createAuthPlugin(token: string | null, options: AuthPluginOption
     const masterTokenRequired = options.masterTokenRequired
       ?? Boolean(token || options.resolveMasterToken)
     let lastRefreshErrorLogAt = 0
+    const mobilePairing = new MobilePairingTickets()
 
     app.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
       const authRequest = request as AuthPluginRequest
@@ -442,6 +445,13 @@ export function createAuthPlugin(token: string | null, options: AuthPluginOption
           .status(401)
           .send({ error: { code: 'UNAUTHORIZED', message: 'Bearer token required' } })
       }
+      if (request.method === 'POST' && request.url.split('?')[0] === '/api/v1/mobile-pairing/redeem') {
+        if (!currentToken || !mobilePairing.consume(bearerToken, currentToken)) {
+          return reply.status(401).send({ error: 'Pairing code is invalid, expired, or already used.' })
+        }
+        authRequest.mobilePairingToken = currentToken
+        return
+      }
       if (currentToken && timingSafeTokenEqual(bearerToken, currentToken)) {
         authRequest.authContext = { kind: 'master' }
         return
@@ -495,6 +505,22 @@ export function createAuthPlugin(token: string | null, options: AuthPluginOption
 
       return reply.status(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid token' } })
     })
+    app.post('/api/v1/mobile-pairing', async (request, reply) => {
+      if ((request as AuthPluginRequest).authContext?.kind !== 'master') {
+        return reply.code(403).send({ error: 'Only the daemon owner can connect a mobile device.' })
+      }
+      const currentToken = runtimeApp.authToken ?? token
+      if (!currentToken) return reply.code(503).send({ error: 'Daemon token unavailable.' })
+      reply.header('Cache-Control', 'no-store')
+      return mobilePairing.issue(currentToken)
+    })
+    app.post('/api/v1/mobile-pairing/redeem', async (request, reply) => {
+      const pairedToken = (request as AuthPluginRequest).mobilePairingToken
+      if (!pairedToken) return reply.code(401).send({ error: 'Pairing code required.' })
+      reply.header('Cache-Control', 'no-store')
+      return { token: pairedToken }
+    })
+
   }
 
   skipOverride(authPlugin)

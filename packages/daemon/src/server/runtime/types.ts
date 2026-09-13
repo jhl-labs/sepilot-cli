@@ -53,6 +53,7 @@ import type { ManagedProcessRegistry } from '../../tools/process.js'
 import type { ServiceSupervisor } from '../../service-supervisor/supervisor.js'
 import type { PendingQuestionStore } from '../../tools/question.js'
 import type { SubagentDispatcher } from '../../agent/subagent-dispatcher.js'
+import type { BackgroundSubagents } from '../../jobs/subagent.js'
 import type { CustomDefsService } from '../../agent/custom/service.js'
 import type { PrimaryAgentStore } from '../../agent/primary-agent-store.js'
 import type { LspLayer } from '../../lsp/layer.js'
@@ -172,6 +173,7 @@ export interface RuntimeServices {
   installPipeline: InstallPipeline
   configMutationService: ConfigMutationService
   subagentDispatcher: SubagentDispatcher
+  backgroundSubagents?: BackgroundSubagents
   /** Null when the `acp` feature is disabled in this build. */
   externalAcpAgentDispatcher: ExternalAcpAgentDispatcher | null
   /** Null when the `a2a` feature is disabled in this build. */

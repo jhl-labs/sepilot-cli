@@ -1,14 +1,14 @@
-import { spawn } from 'node:child_process'
 import type {
   HookEvent,
   HookPayload,
   HookResult,
   IHookHandler,
-  IHookRegistry,
   ToolCall,
 } from '@sepilotd/core'
 import { createLogger } from '../logger.js'
 import type { HookRegistry } from '../hook/registry.js'
+import { runBoundedCommand } from '../utils/bounded-command.js'
+import { createHash } from 'node:crypto'
 
 const logger = createLogger('command-hook')
 
@@ -16,6 +16,7 @@ const DEFAULT_COMMAND_HOOK_TIMEOUT_MS = 10_000
 const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024
 
 export interface CommandHookConfig {
+  async?: boolean
   enabled?: boolean
   event: HookEvent
   /** Regex matched against the tool name for tool-scoped events. */
@@ -42,9 +43,10 @@ export class CommandHookHandler implements IHookHandler {
   private readonly config: CommandHookConfig
   private readonly matcher?: RegExp
 
-  constructor(config: CommandHookConfig) {
+  constructor(config: CommandHookConfig, private readonly background?: (payload: HookPayload, execute: (signal: AbortSignal) => Promise<unknown>) => void) {
+    if (config.async && !config.event.startsWith('post:')) throw new Error('Async command hooks cannot gate pre events')
     this.config = config
-    this.id = `command-hook:${config.event}:${config.command.slice(0, 40)}`
+    this.id = `command-hook:${config.event}:${createHash('sha256').update(JSON.stringify(config)).digest('hex').slice(0, 16)}`
     if (config.toolMatcher) {
       try {
         this.matcher = new RegExp(config.toolMatcher)
@@ -57,7 +59,8 @@ export class CommandHookHandler implements IHookHandler {
     }
   }
 
-  async handle(payload: HookPayload): Promise<HookResult> {
+  async handle(payload: HookPayload, signal?: AbortSignal): Promise<HookResult> {
+    signal?.throwIfAborted()
     if (this.matcher) {
       const toolName = resolveToolName(payload)
       if (!toolName || !this.matcher.test(toolName)) {
@@ -65,7 +68,24 @@ export class CommandHookHandler implements IHookHandler {
       }
     }
 
-    const run = await this.runCommand(payload)
+    if (this.config.async) {
+      if (!this.background) throw new Error('Background hook job service is unavailable')
+      const ownedPayload = JSON.parse(JSON.stringify(payload)) as HookPayload
+      this.background(ownedPayload, async (ownedSignal) => {
+        const result = await runBoundedCommand({
+          command: this.config.command, shell: true,
+          env: { ...process.env, SEPILOTD_HOOK_EVENT: ownedPayload.event },
+          stdin: `${JSON.stringify({ event: ownedPayload.event, data: ownedPayload.data })}\n`,
+          signal: ownedSignal, timeoutMs: this.config.timeoutMs ?? DEFAULT_COMMAND_HOOK_TIMEOUT_MS,
+          maxOutputBytes: MAX_CAPTURED_OUTPUT_BYTES,
+        })
+        if (result.exitCode !== 0) throw new Error(`Background hook exited ${result.exitCode ?? 'by signal'}: ${result.stderr.slice(0, 2000)}`)
+        // Observational output, never interpreted as a retroactive allow/abort decision.
+        return result
+      })
+      return { action: 'continue' }
+    }
+    const run = await this.runCommand(payload, signal)
     if (!run) return { action: 'continue' }
 
     if (run.exitCode === 2) {
@@ -125,79 +145,42 @@ export class CommandHookHandler implements IHookHandler {
     return { action: 'continue' }
   }
 
-  private runCommand(
+  private async runCommand(
     payload: HookPayload,
+    signal?: AbortSignal,
   ): Promise<{ exitCode: number; stdout: string; stderr: string } | null> {
     const timeoutMs = this.config.timeoutMs ?? DEFAULT_COMMAND_HOOK_TIMEOUT_MS
-    return new Promise((resolvePromise) => {
-      let settled = false
-      const settle = (value: { exitCode: number; stdout: string; stderr: string } | null) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolvePromise(value)
-      }
-
-      let child
-      try {
-        child = spawn(this.config.command, {
-          shell: true,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          env: { ...process.env, SEPILOTD_HOOK_EVENT: this.config.event },
-        })
-      } catch (error) {
-        logger.warn('command hook spawn failed; continuing', {
-          event: this.config.event,
-          error: error instanceof Error ? error.message : String(error),
-        })
-        settle(null)
-        return
-      }
-
-      const timer = setTimeout(() => {
-        logger.warn('command hook timed out; continuing', {
-          event: this.config.event,
-          timeoutMs,
-        })
-        child.kill('SIGKILL')
-        settle(null)
-      }, timeoutMs)
-
-      let stdout = ''
-      let stderr = ''
-      child.stdout.on('data', (chunk: Buffer) => {
-        if (stdout.length < MAX_CAPTURED_OUTPUT_BYTES) stdout += chunk.toString('utf8')
+    try {
+      const result = await runBoundedCommand({
+        command: this.config.command,
+        shell: true,
+        env: { ...process.env, SEPILOTD_HOOK_EVENT: this.config.event },
+        stdin: `${JSON.stringify({ event: payload.event, data: payload.data })}\n`,
+        signal,
+        timeoutMs,
+        maxOutputBytes: MAX_CAPTURED_OUTPUT_BYTES,
       })
-      child.stderr.on('data', (chunk: Buffer) => {
-        if (stderr.length < MAX_CAPTURED_OUTPUT_BYTES) stderr += chunk.toString('utf8')
+      // Signal termination is not exit 0: never interpret partial hook output.
+      return result.exitCode === null ? null : { ...result, exitCode: result.exitCode }
+    } catch (error) {
+      logger.warn('command hook interrupted; continuing', {
+        event: this.config.event,
+        error: error instanceof Error ? error.message : String(error),
       })
-      child.on('error', (error) => {
-        logger.warn('command hook process error; continuing', {
-          event: this.config.event,
-          error: error.message,
-        })
-        settle(null)
-      })
-      child.on('close', (code) => {
-        settle({ exitCode: code ?? 0, stdout, stderr })
-      })
-
-      child.stdin.on('error', () => {
-        // The command may exit without reading stdin; ignore EPIPE.
-      })
-      child.stdin.end(`${JSON.stringify({ event: payload.event, data: payload.data })}\n`)
-    })
+      return null
+    }
   }
 }
 
 /** Register command hooks from config. */
 export function registerCommandHooks(
-  hookRegistry: IHookRegistry,
+  hookRegistry: HookRegistry,
   hooks: readonly CommandHookConfig[],
 ): void {
   for (const config of hooks) {
     if (config.enabled === false) continue
-    hookRegistry.register(config.event, new CommandHookHandler(config))
+    const handler = new CommandHookHandler(config, (payload, execute) => hookRegistry.startBackground(handler.id, payload, execute))
+    hookRegistry.register(config.event, handler)
   }
 }
 

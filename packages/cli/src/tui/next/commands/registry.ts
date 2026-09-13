@@ -3,6 +3,8 @@ import type { CommandDef, SettingsCategory } from './types.js'
 export type { CommandContext, CommandDef, SettingsCategory } from './types.js'
 
 export const COMMANDS: CommandDef[] = [
+  slashCommand('work.tasks', 'Inspect background work and session inbox', 'agent', ['/tasks'], [], 'secondary'),
+  slashCommand('work.jobs', 'Manage durable jobs', 'agent', ['/jobs'], [], 'secondary'),
   dialogCommand('shell.help', 'Show help', 'session', ['/help', '/?'], ['leader ?'], 'help'),
   dialogCommand(
     'settings.open',

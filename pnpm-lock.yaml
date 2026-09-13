@@ -49,6 +49,9 @@ patchedDependencies:
   ssh2@1.17.0:
     hash: 414b9cbe8968fbb6e3f5be60d4dcdebcebd061707e754e7469a4a92366d0c9ea
     path: patches/ssh2@1.17.0.patch
+  vitest@3.2.7:
+    hash: 5a2b7f90f4d4a75c16278161f6cd9a6aac1f5f69ddcf3932e8a3f08a826096f5
+    path: patches/vitest@3.2.7.patch
 
 importers:
 

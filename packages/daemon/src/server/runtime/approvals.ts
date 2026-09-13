@@ -14,7 +14,30 @@ import { describeRuleFor, matchesRule } from './approval-rules.js'
 
 const RUN_AUTO_APPROVAL_TTL_MS = 60 * 60_000
 const APPROVAL_TIMEOUT_FLOOR_MS = 60_000
-const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60_000
+export const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60_000
+
+/**
+ * Thrown to the waiting run when an approval prompt reaches its parking
+ * delay. It is deliberately an `AbortError` so every engine treats it like
+ * the abort-without-cancel path: the run unwinds, releases its lease, and
+ * leaves the pending approval and its checkpoint standing for a later answer.
+ */
+export class ApprovalParkedError extends Error {
+  readonly name = 'AbortError'
+  readonly code = 'APPROVAL_PARKED'
+  constructor(
+    readonly requestId: string,
+    readonly tool: string,
+    readonly sessionId: string,
+  ) {
+    super(`Approval for '${tool}' is still pending (request ${requestId}); the run was parked until a decision arrives`)
+  }
+}
+
+export function isApprovalParkedError(error: unknown): error is ApprovalParkedError {
+  return error instanceof ApprovalParkedError
+    || (error instanceof Error && (error as { code?: unknown }).code === 'APPROVAL_PARKED')
+}
 
 export interface PendingApproval {
   requestId: string
@@ -24,19 +47,29 @@ export interface PendingApproval {
   tool: string
   input: Record<string, unknown>
   requestedAt: string
+  /** When the prompt parks its run (nobody answered in time). Informational after `state: 'parked'`. */
   expiresAt: string
-  state: 'live' | 'stale'
+  /**
+   * `live`: a run is blocked on this prompt right now. `parked`: the parking
+   * delay elapsed, the run was unwound, and answering resumes it from its
+   * checkpoint. `stale`: reconstructed from session history after a restart.
+   */
+  state: 'live' | 'stale' | 'parked'
+  parkedAt?: string
   resumeAvailable?: boolean
   suggestedRule?: ApprovalRule
 }
 
 interface PendingApprovalEntry extends PendingApproval {
   resolve: (decision: ApprovalDecision) => void
-  timeout: ReturnType<typeof setTimeout>
+  reject: (error: Error) => void
+  onParked?: (approval: PendingApproval) => void
+  timeout: ReturnType<typeof setTimeout> | null
 }
 
 export interface ApprovalRegistryHooks {
   onPending?: (approval: PendingApproval) => void
+  /** The parking delay elapsed: the request is still open, the run is paused. */
   onTimeout?: (approval: PendingApproval) => void
 }
 
@@ -87,6 +120,13 @@ export class ApprovalRegistry {
      * stops occupying the session while nobody is there to reply.
      */
     signal?: AbortSignal
+    /**
+     * Called when the parking delay elapses. A caller that owns the run's
+     * stop path (stream routes) uses it to abort the run through `signal`;
+     * without it the wait rejects with `ApprovalParkedError` so headless runs
+     * still unwind instead of blocking forever.
+     */
+    onParked?: (approval: PendingApproval) => void
   }): ApprovalDecision | Promise<ApprovalDecision> {
     const {
       sessionId,
@@ -96,6 +136,7 @@ export class ApprovalRegistry {
       timeoutMs = resolveApprovalTimeoutMs(),
       forcePrompt = false,
       signal,
+      onParked,
     } = params
 
     const autoDecision = forcePrompt ? null : this.tryAutoApproval({ sessionId, toolCall, runId })
@@ -124,19 +165,12 @@ export class ApprovalRegistry {
       }
       signal?.addEventListener('abort', onAbort, { once: true })
 
-      const timeout = setTimeout(() => {
-        const entry = this.pending.get(requestId)
-        if (entry) this.hooks.onTimeout?.(toPendingApproval(entry))
-        void this.respond(requestId, {
-          decision: 'denied',
-          approved: false,
-          note: 'Approval timed out',
-          // Distinguishes "nobody answered" from "the user said no" for every
-          // consumer downstream; without it an expired prompt is reported to
-          // the agent as a refusal and the action becomes unreachable.
-          timedOut: true,
-        }, { approvedBy: 'timeout' })
-      }, timeoutMs)
+      // Parking, not denial. The request stays answerable and the checkpoint
+      // written before this wait stays on disk; only the run stops occupying
+      // the session. `timeoutMs <= 0` means wait indefinitely.
+      const timeout = timeoutMs > 0
+        ? setTimeout(() => this.park(requestId), timeoutMs)
+        : null
 
       const entry: PendingApprovalEntry = {
         requestId,
@@ -153,11 +187,49 @@ export class ApprovalRegistry {
           signal?.removeEventListener('abort', onAbort)
           resolve(decision)
         },
+        reject: (error) => {
+          signal?.removeEventListener('abort', onAbort)
+          reject(error)
+        },
+        onParked,
         timeout,
       }
       this.pending.set(requestId, entry)
       this.hooks.onPending?.(toPendingApproval(entry))
     })
+  }
+
+  private park(requestId: string): void {
+    const entry = this.pending.get(requestId)
+    if (!entry || entry.state === 'parked') return
+    entry.timeout = null
+    entry.state = 'parked'
+    entry.parkedAt = new Date().toISOString()
+    entry.resumeAvailable = true
+    const approval = toPendingApproval(entry)
+    this.hooks.onTimeout?.(approval)
+    if (entry.onParked) {
+      entry.onParked(approval)
+      return
+    }
+    entry.reject(new ApprovalParkedError(entry.requestId, entry.tool, entry.sessionId))
+  }
+
+  /** The parked approval for a request, if the registry still holds one. */
+  getParked(requestId: string): PendingApproval | undefined {
+    const entry = this.pending.get(requestId)
+    return entry && entry.state === 'parked' ? toPendingApproval(entry) : undefined
+  }
+
+  /**
+   * Drop a parked entry without journaling a decision — for callers that
+   * resume the run from its checkpoint and record the decision themselves.
+   */
+  releaseParked(requestId: string): PendingApproval | undefined {
+    const entry = this.pending.get(requestId)
+    if (!entry || entry.state !== 'parked') return undefined
+    this.pending.delete(requestId)
+    return toPendingApproval(entry)
   }
 
   /**
@@ -244,13 +316,13 @@ export class ApprovalRegistry {
   listForSession(sessionId: string): PendingApproval[] {
     return [...this.pending.values()]
       .filter((entry) => entry.sessionId === sessionId)
-      .map(({ resolve: _resolve, timeout: _timeout, ...entry }) => ({ ...entry }))
+      .map((entry) => toPendingApproval(entry))
       .sort((left, right) => left.requestedAt.localeCompare(right.requestedAt))
   }
 
   listAll(): PendingApproval[] {
     return [...this.pending.values()]
-      .map(({ resolve: _resolve, timeout: _timeout, ...entry }) => ({ ...entry }))
+      .map((entry) => toPendingApproval(entry))
       .sort((left, right) => left.requestedAt.localeCompare(right.requestedAt))
   }
 
@@ -263,7 +335,7 @@ export class ApprovalRegistry {
       if (entry.sessionId !== sessionId) {
         continue
       }
-      clearTimeout(entry.timeout)
+      if (entry.timeout) clearTimeout(entry.timeout)
       this.pending.delete(entry.requestId)
       entry.resolve({
         decision: 'denied',
@@ -297,8 +369,9 @@ export class ApprovalRegistry {
       return { resolved: false }
     }
     const decision = normalizeApprovalDecision(approved)
+    const parked = entry.state === 'parked'
 
-    clearTimeout(entry.timeout)
+    if (entry.timeout) clearTimeout(entry.timeout)
 
     try {
       await this.sessions.appendEvent(entry.sessionId, {
@@ -366,7 +439,9 @@ export class ApprovalRegistry {
     this.pending.delete(requestId)
     entry.resolve(decision)
 
-    return { resolved: true, rule }
+    return parked
+      ? { resolved: true, rule, parked: toPendingApproval(entry) }
+      : { resolved: true, rule }
   }
 
   private evaluateBroadApproval(
@@ -432,7 +507,23 @@ export class ApprovalRegistry {
   }
 }
 
-function resolveApprovalTimeoutMs(): number {
+/**
+ * The single pending-decision bound. After this delay an unanswered approval
+ * parks its run (checkpoint kept, lease released, answer resumes it).
+ *
+ * `SEPILOTD_APPROVAL_TIMEOUT_MS` is the knob (default 10 min, floor 60 s).
+ * `SEPILOTD_PENDING_DECISION_TIMEOUT_MS` is the legacy stream-backstop name;
+ * when set it overrides, and `0` there keeps its old meaning of "wait
+ * indefinitely" (returns 0: no parking timer).
+ */
+export function resolveApprovalTimeoutMs(): number {
+  const legacy = process.env.SEPILOTD_PENDING_DECISION_TIMEOUT_MS
+  if (legacy !== undefined && legacy.trim() !== '') {
+    const parsed = Number.parseInt(legacy, 10)
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed === 0 ? 0 : Math.max(1000, parsed)
+    }
+  }
   const raw = Number(process.env.SEPILOTD_APPROVAL_TIMEOUT_MS ?? '')
   if (Number.isFinite(raw) && raw > 0) {
     return Math.max(APPROVAL_TIMEOUT_FLOOR_MS, raw)
@@ -441,7 +532,13 @@ function resolveApprovalTimeoutMs(): number {
 }
 
 function toPendingApproval(entry: PendingApprovalEntry): PendingApproval {
-  const { resolve: _resolve, timeout: _timeout, ...approval } = entry
+  const {
+    resolve: _resolve,
+    reject: _reject,
+    onParked: _onParked,
+    timeout: _timeout,
+    ...approval
+  } = entry
   return { ...approval }
 }
 
@@ -454,6 +551,12 @@ export interface ApprovalRespondResult {
    * once-scope, feedback, or unknown requestIds.
    */
   rule?: ApprovalRule
+  /**
+   * Set when the answered request had already parked its run. The caller
+   * owns resuming that run from its approval checkpoint; the decision is
+   * journaled here, so the resume must not record it again.
+   */
+  parked?: PendingApproval
 }
 
 function normalizeApprovalDecision(
@@ -475,6 +578,9 @@ function normalizeApprovalDecision(
     approved: decision === 'approved',
     note: input.note,
     ...(input.timedOut !== undefined ? { timedOut: input.timedOut } : {}),
+    // "deny & stop" is only meaningful on a denial; never let it ride along
+    // with an approval or feedback decision.
+    ...(decision === 'denied' && input.stop !== undefined ? { stop: input.stop } : {}),
   }
 }
 

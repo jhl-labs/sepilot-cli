@@ -344,7 +344,7 @@ export async function registerSchedulerCapabilityRoutes(
           const requestedMetadata = metadata === undefined ? existing?.metadata : metadata
           const hasScriptMonitor = Boolean(
             requestedMetadata
-            && Object.prototype.hasOwnProperty.call(requestedMetadata, 'scriptMonitor'),
+            && Object.hasOwn(requestedMetadata, 'scriptMonitor'),
           )
           void reply.status(400).send({
             code: hasScriptMonitor ? 'INVALID_SCRIPT_MONITOR' : 'INVALID_SKILL_REFS',

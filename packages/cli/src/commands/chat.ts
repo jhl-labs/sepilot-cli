@@ -1557,8 +1557,8 @@ Commands:
 
     case '/thinking': {
       const level = args[0]
-      if (!level || !['off', 'low', 'medium', 'high', 'max'].includes(level)) {
-        console.log(chalk.red('Usage: /thinking <off|low|medium|high|max>'))
+      if (!level || !['auto', 'off', 'low', 'medium', 'high', 'max'].includes(level)) {
+        console.log(chalk.red('Usage: /thinking <auto|off|low|medium|high|max>'))
         return {}
       }
       console.log(chalk.yellow(`Thinking level set to ${level}`))

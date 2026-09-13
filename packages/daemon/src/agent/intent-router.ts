@@ -23,6 +23,8 @@ import {
 import {
   AuxiliaryLlmBudgetExhaustedError,
   AuxiliaryLlmTimeoutError,
+  AuxiliaryStageCircuit,
+  getDefaultAuxiliaryStageCircuit,
   runAuxiliaryLlmChat,
   type AuxiliaryLlmTurnBudget,
 } from './auxiliary-llm.js'
@@ -62,6 +64,8 @@ export interface IntentRouterOptions {
   activeRunContract?: AgentRunContract
   /** Canonical names currently enabled in the runtime tool registry. */
   availableToolNames?: readonly string[]
+  /** Transient stage backoff, never a persisted model compatibility override. */
+  stageCircuit?: AuxiliaryStageCircuit
 }
 
 export interface IntentHints {
@@ -128,6 +132,12 @@ export class IntentRouter {
     previousMessages: ReadonlyArray<Message>,
     hints: IntentHints,
   ): Promise<IntentDecision> {
+    if (this.opts.signal?.aborted) throw this.opts.signal.reason ?? new Error('Intent router aborted')
+    const circuit = this.opts.stageCircuit ?? getDefaultAuxiliaryStageCircuit()
+    const circuitKey = AuxiliaryStageCircuit.key('intent-router', this.opts.provider.id, this.opts.model)
+    if (circuit.isOpen(circuitKey)) {
+      return makeDefaultDecision(hints, 'router temporarily backed off after repeated timeouts, using defaults')
+    }
     const candidateModes = this.collectCandidateModes()
     const candidatePersonas = this.collectCandidatePersonas()
     const candidateSkills = await this.collectCandidateSkills()
@@ -165,6 +175,7 @@ export class IntentRouter {
       }
       const message = (err as Error).message || String(err)
       const timedOut = err instanceof AuxiliaryLlmTimeoutError
+      if (timedOut) circuit.recordTimeout(circuitKey)
       const budgetExhausted = err instanceof AuxiliaryLlmBudgetExhaustedError
       this.opts.logger?.warn?.('intent_router.provider_error', {
         err: message,
@@ -183,6 +194,7 @@ export class IntentRouter {
       )
     }
     const latencyMs = Date.now() - started
+    circuit.recordSuccess(circuitKey)
 
     const raw = this.extractText(response.message.content).trim()
     // Models frequently wrap the JSON in a ```json fence or prefix it with

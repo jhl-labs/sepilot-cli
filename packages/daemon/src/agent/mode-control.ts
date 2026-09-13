@@ -4,6 +4,7 @@ import type { AgentState } from './graph/types.js'
 import type { ToolRegistry } from '../tools/registry.js'
 import { toolExposureGroupForTool } from '../tools/role-filter.js'
 import { INSTANT_MEMORY_TOOL_NAMES } from './instant-mode-tool-intent.js'
+import { consumeToolCallActionProgress } from './action-progress.js'
 
 export const MODE_TRANSFER_TOOL = 'agent.transfer'
 export const TOOL_CATALOG_TOOL = 'agent.tools'
@@ -58,6 +59,8 @@ export function mergeModeTransferContract(
 }
 
 export interface ModeControl {
+  /** Policy-filtered authority, independent of the current mode's schema visibility. */
+  readonly delegationToolNames: readonly string[]
   state: NonNullable<import('@sepilotd/core').AgentContext['modeControlState']>
   tools: ToolDefinition[]
   prompt: string
@@ -132,6 +135,7 @@ export function createModeControl(options: {
     inputSchema: { type: 'object', properties: { query: { type: 'string', maxLength: 200, description: 'Case-insensitive literal term in an authorized tool name or description; searches all groups when group is omitted.' }, group: { type: 'string', enum: groups }, offset: { type: 'integer', minimum: 0 } }, additionalProperties: false },
   }] : []
   return {
+    delegationToolNames: Object.freeze(catalog.map(tool => tool.name)),
     state: { mode: options.currentMode, transferCount: options.transferCount ?? 0,
       turnMaxIterations: options.turnMaxIterations ?? 50, visibleToolNames: [...(options.activeToolNames ?? [])] },
     tools,
@@ -153,6 +157,11 @@ export function createModeControl(options: {
     handle(response, snapshot) {
       let calls = response.toolCalls ?? []
       if (!calls.some((call) => tools.some((tool) => tool.name === call.name))) return 'unhandled'
+      // Control calls bypass the ordinary executor, but carry the same
+      // framework-owned progress field. Consume it before strict validation.
+      const controlCalls = calls.filter((call) => tools.some((tool) => tool.name === call.name))
+      const progress = consumeToolCallActionProgress(controlCalls, tools)
+      if (progress) events.push({ type: 'action_progress', ...progress, toolNames: [...new Set(controlCalls.map((call) => call.name))] })
       const transferBatch = calls.some((call) => call.name === MODE_TRANSFER_TOOL)
       const normalCalls = transferBatch ? [] : calls.filter((call) => call.name !== TOOL_CATALOG_TOOL)
       if (normalCalls.length > 0) {
