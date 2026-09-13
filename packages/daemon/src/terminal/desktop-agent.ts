@@ -41,6 +41,16 @@ export class DesktopAgentSessions {
       )
     return live
   }
+  async screen(id: string) {
+    const live = this.require(id)
+    await live.tail
+    const buffer = live.terminal.buffer.active
+    const lines: string[] = []
+    for (let i = Math.max(0, buffer.length - 500); i < buffer.length; i++) {
+      lines.push(buffer.getLine(i)?.translateToString(true) ?? '')
+    }
+    return { text: lines.join('\n'), cols: live.info.cols, rows: live.info.rows, seq: live.seq }
+  }
   get(id: string): DesktopAgentSession {
     return { ...this.require(id).info }
   }

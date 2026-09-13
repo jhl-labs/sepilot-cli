@@ -3932,12 +3932,58 @@ const BUDGET_EXHAUSTED_CHECKPOINT_NOTICE =
   'A resumable checkpoint has been preserved so the run can continue instead of pretending the task is finished.'
 const BUDGET_EXHAUSTED_NEXT_STEP =
   'Next step: resume this session and continue from the latest checkpoint, updating any partial artifacts before final synthesis.'
+/**
+ * One budget layer, one first sentence. The `INCOMPLETE:` prefix, checkpoint
+ * notice and next-step sentence are shared so `isBudgetExhaustedMessage`
+ * recognises every layer without parsing which one fired.
+ */
+export type BudgetExhaustedMessageLayer =
+  | 'iteration'
+  | 'node'
+  | 'observation'
+  | 'no_progress'
+  | 'stuck_repeat'
+  | 'wall_clock'
+  | 'continuation'
+
 const BUDGET_EXHAUSTED_HEADER_PATTERN =
-  /^INCOMPLETE: [^\r\n]+ reached its iteration budget \([^()\r\n]+\)\./
+  /^INCOMPLETE: [^\r\n]+ (?:reached its (?:iteration|node execution|tool observation) budget|stopped after [^\r\n()]+ without progress|stopped after repeating the same tool call past the repair limit|reached its wall-clock deadline|stopped because the last continuation cycle made no progress) \([^()\r\n]+\)\./
+
+function buildBudgetExhaustedHeader(input: {
+  mode: string
+  layer: BudgetExhaustedMessageLayer
+  iterationBudget?: number
+  detail?: string
+}): string {
+  const budget = input.iterationBudget
+  const detail = input.detail
+  switch (input.layer) {
+    case 'node':
+      return `INCOMPLETE: ${input.mode} reached its node execution budget (${budget ?? '?'}).`
+    case 'observation':
+      return `INCOMPLETE: ${input.mode} reached its tool observation budget (${budget ?? '?'}).`
+    case 'no_progress':
+      return `INCOMPLETE: ${input.mode} stopped after ${budget ?? '?'} consecutive iterations without progress (${detail ?? 'no new tool execution or accepted answer'}).`
+    case 'stuck_repeat':
+      return `INCOMPLETE: ${input.mode} stopped after repeating the same tool call past the repair limit (${detail ?? 'tool'}).`
+    case 'wall_clock':
+      return `INCOMPLETE: ${input.mode} reached its wall-clock deadline (${budget ?? '?'}ms).`
+    case 'continuation':
+      return `INCOMPLETE: ${input.mode} stopped because the last continuation cycle made no progress (${detail ?? `cycle ${budget ?? '?'}`}).`
+    case 'iteration':
+    default:
+      return `INCOMPLETE: ${input.mode} reached its iteration budget (${budget ?? '?'}).`
+  }
+}
 
 export function buildBudgetExhaustedMessage(input: {
   mode: string
-  iterationBudget: number
+  /** Numeric budget of the layer (iterations, nodes, calls, ms, cycles). */
+  iterationBudget?: number
+  /** Which bounded layer fired. Defaults to the iteration layer. */
+  layer?: BudgetExhaustedMessageLayer
+  /** Layer-specific detail such as the repeated tool signature. */
+  detail?: string
   contract?: AgentRunContract
 }): string {
   const criteria = input.contract?.acceptanceCriteria
@@ -3947,7 +3993,12 @@ export function buildBudgetExhaustedMessage(input: {
     ? `Acceptance criteria still need explicit closure: ${criteria}.`
     : ''
   return [
-    `INCOMPLETE: ${input.mode} reached its iteration budget (${input.iterationBudget}).`,
+    buildBudgetExhaustedHeader({
+      mode: input.mode,
+      layer: input.layer ?? 'iteration',
+      iterationBudget: input.iterationBudget,
+      detail: input.detail?.replace(/[()\r\n]+/g, ' ').trim(),
+    }),
     BUDGET_EXHAUSTED_CHECKPOINT_NOTICE,
     contractLine,
     BUDGET_EXHAUSTED_NEXT_STEP,
@@ -3956,8 +4007,9 @@ export function buildBudgetExhaustedMessage(input: {
 
 /**
  * Identifies the synthetic incomplete result emitted by the agent engines when
- * their iteration budget is exhausted. Keep this beside the message builder so
- * downstream consumers do not duplicate a user-visible sentence as a sentinel.
+ * one of their bounded budget layers is exhausted. Keep this beside the
+ * message builder so downstream consumers do not duplicate a user-visible
+ * sentence as a sentinel; structured consumers should prefer `stopReason`.
  */
 export function isBudgetExhaustedMessage(content: string): boolean {
   const normalized = content.trim()

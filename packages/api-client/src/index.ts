@@ -83,6 +83,7 @@ export type {
   DesktopAgentId,
   DesktopAgentState,
   DesktopAgentEvent,
+  DesktopAgentReview,
   DesktopAgentSession,
   DesktopAgentSshTarget,
 } from './daemon/desktop-agent.js'

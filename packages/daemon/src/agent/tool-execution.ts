@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, relative, resolve } from 'node:path'
 import { AutonomyLevel } from '@sepilotd/core'
+import { streamToolProgress } from './tool-progress-stream.js'
 import type {
   ApprovalDecision,
   AgentEvent,
@@ -1368,6 +1369,8 @@ interface ToolExecutionCallbacks {
 }
 
 export interface ToolExecutionOptions extends ToolExecutionCallbacks {
+  /** Trusted mode-controller ceiling, never model arguments. Absent means visible registry only. */
+  delegationToolNames?: readonly string[]
   messages: Message[]
   toolCalls: ToolCall[]
   sessionId: string
@@ -1412,6 +1415,7 @@ export interface ToolExecutionOptions extends ToolExecutionCallbacks {
 
 export async function* runToolExecution(options: ToolExecutionOptions): AsyncGenerator<AgentEvent> {
   const {
+    delegationToolNames,
     messages,
     toolCalls,
     sessionId,
@@ -1592,6 +1596,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     throwIfAborted(signal, `Tool ${toolCall.name} aborted`)
 
     const preHook = await emitPreToolExecuteHook({
+      signal,
       hookRegistry,
       sessionId,
       provider,
@@ -1701,6 +1706,38 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     const timeoutMs = resolveToolTimeoutMs()
     let timedOut = false
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+    let rejectTimeout: ((error: Error) => void) | undefined
+    let remainingMs = timeoutMs
+    let armedAt = 0
+    let executionFinished = false
+    const pendingChildApprovals = new Map<string, string>()
+    const armTimeout = () => {
+      if (executionFinished || timeoutMs <= 0 || pendingChildApprovals.size || !rejectTimeout || timedOut) return
+      armedAt = Date.now()
+      timeoutHandle = setTimeout(() => {
+        timedOut = true
+        toolController.abort()
+        rejectTimeout?.(new Error(`Tool ${toolCall.name} timed out after ${timeoutMs}ms`))
+      }, Math.max(0, remainingMs))
+    }
+    const onProgress = (event: AgentEvent) => {
+      if (executionFinished) return
+      // Human consent is not tool execution time. Pause the remaining budget,
+      // not reset it; sibling activity and replay cannot buy more execution.
+      if (event.type === 'subagent_progress') {
+        const wasPaused = pendingChildApprovals.size > 0
+        const inner = event.inner
+        if (inner.type === 'approval_request') pendingChildApprovals.set(event.subagentId, inner.requestId)
+        else if ((inner.type === 'approval_response' && pendingChildApprovals.get(event.subagentId) === inner.requestId)
+          || inner.type === 'tool_call' || inner.type === 'tool_result') pendingChildApprovals.delete(event.subagentId)
+        if (!wasPaused && pendingChildApprovals.size && timeoutHandle) {
+          remainingMs -= Date.now() - armedAt
+          clearTimeout(timeoutHandle)
+          timeoutHandle = undefined
+        } else if (wasPaused && !pendingChildApprovals.size) armTimeout()
+      }
+      options?.onProgress?.(event)
+    }
     const durationSince = () => Date.now() - Date.parse(startedAt)
     try {
       const executePromise = tool.execute(toolCall.arguments, {
@@ -1719,9 +1756,9 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
         delegatedAgentPolicy: {
           autonomy,
           requireToolApproval: requireToolApproval === true,
-          allowedToolNames: tools.list().map((registeredTool) => registeredTool.name),
+          allowedToolNames: [...(delegationToolNames ?? tools.list().map((registeredTool) => registeredTool.name))],
         },
-        ...(options?.onProgress ? { emitEvent: options.onProgress } : {}),
+        ...(options?.onProgress ? { emitEvent: onProgress } : {}),
       })
       if (timeoutMs > 0) {
         // If the tool hangs, a late rejection would surface as an unhandled
@@ -1730,11 +1767,8 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
         result = await Promise.race([
           executePromise,
           new Promise<never>((_, reject) => {
-            timeoutHandle = setTimeout(() => {
-              timedOut = true
-              toolController.abort()
-              reject(new Error(`Tool ${toolCall.name} timed out after ${timeoutMs}ms`))
-            }, timeoutMs)
+            rejectTimeout = reject
+            armTimeout()
           }),
         ])
         void guarded
@@ -1765,6 +1799,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
             code: 'TOOL_THREW',
           }
     } finally {
+      executionFinished = true
       if (timeoutHandle) clearTimeout(timeoutHandle)
       signal?.removeEventListener('abort', onRunAbort)
     }
@@ -2762,16 +2797,13 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       // discard the successful siblings' results, which would orphan their
       // matching assistant tool_calls and hard-error the next turn.
       const parallelExecutionStarted = new Set<string>()
-      const settled = await Promise.allSettled(
+      const settled = yield* streamToolProgress(emit => Promise.allSettled(
         parallelBatch.map(async ({ toolCall: currentToolCall, tool: currentTool }) => {
           await logToolExecution(currentToolCall)
           parallelExecutionStarted.add(currentToolCall.id)
-          // Buffer per-tool so concurrent subagents' progress events stay
-          // grouped with their own result when yielded below.
-          const nested: AgentEvent[] = []
           const result = await executeTool(currentToolCall, currentTool, randomUUID(), {
             persistExecution: false,
-            onProgress: (event) => nested.push(event),
+            onProgress: emit,
           })
           await emitPostToolExecute(
             currentToolCall,
@@ -2787,11 +2819,10 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
           return {
             toolCall: currentToolCall,
             result,
-            nested,
             executionObserved: true,
           }
         }),
-      )
+      ))
       const abortRejection = settled.find(
         (entry): entry is PromiseRejectedResult =>
           entry.status === 'rejected' && (isAbortError(entry.reason) || Boolean(signal?.aborted)),
@@ -2812,7 +2843,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
         return {
           toolCall: failedToolCall,
           result,
-          nested: [] as AgentEvent[],
           executionObserved: parallelExecutionStarted.has(failedToolCall.id),
         }
       })
@@ -2820,12 +2850,8 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       for (const {
         toolCall: completedToolCall,
         result,
-        nested,
         executionObserved,
       } of batchResults) {
-        for (const event of nested) {
-          yield event
-        }
         const decorated = decorateErrorOutput(result)
         const clientContentParts = clientContentPartsFromToolResult(result)
         const eventMetadata = {
@@ -2889,17 +2915,10 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
 
     await logToolExecution(toolCall)
 
-    // Buffer nested events (e.g. a subagent's progress) emitted during the
-    // tool run, then yield them before the tool result so surfaces can show
-    // the nested activity instead of a long silent gap.
-    const nestedEvents: AgentEvent[] = []
-    const result = await executeTool(toolCall, tool, sequentialExecutionId, {
-      onProgress: (event) => nestedEvents.push(event),
-    })
+    const result = yield* streamToolProgress(emit => executeTool(toolCall, tool, sequentialExecutionId, {
+      onProgress: emit,
+    }))
     rememberFailureCoupling(toolCall, tool, result)
-    for (const nested of nestedEvents) {
-      yield nested
-    }
     const decoratedSequential = decorateErrorOutput(result)
     const contentParts = contentPartsFromToolResult(result)
     const clientContentParts = clientContentPartsFromToolResult(result)

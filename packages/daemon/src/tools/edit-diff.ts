@@ -1,4 +1,5 @@
-import { readFile } from 'node:fs/promises'
+import { lstat, readFile } from 'node:fs/promises'
+import { decodeFileContent } from './file-content.js'
 import { createTwoFilesPatch } from 'diff'
 import type { ToolCall } from '@sepilotd/core'
 import { resolveToolPath } from './path-utils.js'
@@ -51,14 +52,18 @@ export async function buildApprovalPreviewDiff(
     switch (toolCall.name) {
       case 'fs.write': {
         const path = typeof args.path === 'string' ? resolveToolPath(args.path, cwd) : ''
-        const content = typeof args.content === 'string' ? args.content : undefined
+        const content = decodeFileContent(args)
         if (!path || content === undefined || !readGuarded(path)) return undefined
+        if (args.createOnly === true) {
+          try { await lstat(path); return undefined }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return undefined }
+        }
         const before = await readFile(path, 'utf-8').catch(() => '')
         return buildUnifiedDiff(path, before, content)
       }
       case 'fs.append': {
         const path = typeof args.path === 'string' ? resolveToolPath(args.path, cwd) : ''
-        const content = typeof args.content === 'string' ? args.content : undefined
+        const content = decodeFileContent(args)
         if (!path || content === undefined || !readGuarded(path)) return undefined
         const before = await readFile(path, 'utf-8').catch(() => '')
         return buildUnifiedDiff(path, before, before + content)

@@ -51,6 +51,16 @@ export interface PolicyEngineConfig {
   elevated?: Record<string, Partial<PolicyEngineRule>>
 }
 
+/** Static per-tool rule posture returned by `PolicyEngine.ruleModeFor`. */
+export interface ToolRulePosture {
+  mode: ToolRuleMode
+  hasRule: boolean
+  unmatchedPolicy: PolicyConfig['defaults']['unmatched_policy']
+  honorsSupervisedUnderAutonomous: boolean
+  userMemoryWrite: boolean
+  workspaceWriteFastPath: boolean
+}
+
 export const AUTONOMOUS_SUPERVISED_RULE_REASON =
   'Autonomous mode runs supervised-rule tools without prompting'
 import { lstatSync, readlinkSync } from 'node:fs'
@@ -882,6 +892,7 @@ const STRICT_WORKSPACE_AUDITED_TOOLS = new Set([
   'skill',
   'skillhub.search',
   'subagent.dispatch',
+  'subagent.job',
   'todowrite',
   'usage.report',
   'web.search',
@@ -1337,6 +1348,27 @@ export class PolicyEngine implements IToolPolicy {
    * mutate engine state by holding the reference. */
   describe(): PolicyEngineConfig {
     return JSON.parse(JSON.stringify(this.config)) as PolicyEngineConfig
+  }
+
+  /**
+   * Static rule posture for one tool name, without evaluating any input.
+   * Used to describe up front which tools will prompt or are unavailable.
+   * Mirrors the rule/default resolution inside `check` (mcp.* fallback,
+   * user-memory write default) but performs no deny_* or path matching.
+   */
+  ruleModeFor(tool: string): ToolRulePosture {
+    const isMcpTool = tool.startsWith('mcp.')
+    const toolRule = this.config.tools[tool] ?? (isMcpTool ? this.config.tools['mcp.*'] : undefined)
+    return {
+      mode: toolRule?.mode
+        ?? (USER_MEMORY_WRITE_TOOLS.has(tool) ? 'autonomous' : this.config.defaults.mode),
+      hasRule: toolRule !== undefined,
+      unmatchedPolicy: this.config.defaults.unmatched_policy,
+      honorsSupervisedUnderAutonomous:
+        this.config.defaults.autonomous_honors_supervised_rules === true,
+      userMemoryWrite: USER_MEMORY_WRITE_TOOLS.has(tool),
+      workspaceWriteFastPath: WORKSPACE_WRITE_FAST_PATH_TOOLS.has(tool),
+    }
   }
 
   check(
@@ -2026,6 +2058,9 @@ export function createDefaultPolicy(): PolicyConfig {
         mode: 'supervised',
       },
       'process.stop': {
+        mode: 'supervised',
+      },
+      'process.write': {
         mode: 'supervised',
       },
       'process.signal': {

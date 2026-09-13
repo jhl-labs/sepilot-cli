@@ -16,6 +16,17 @@ function resolveHookHandlerTimeoutMs(): number {
 
 export class HookRegistry implements IHookRegistry {
   private handlers = new Map<HookEvent, IHookHandler[]>()
+  private backgroundExecutor?: (id: string, payload: HookPayload, execute: (signal: AbortSignal) => Promise<unknown>) => void
+
+  setBackgroundExecutor(executor: NonNullable<HookRegistry['backgroundExecutor']>): void {
+    this.backgroundExecutor = executor
+  }
+
+  startBackground(id: string, payload: HookPayload, execute: (signal: AbortSignal) => Promise<unknown>): void {
+    if (!payload.event.startsWith('post:')) throw new Error('Background hooks cannot gate pre events')
+    if (!this.backgroundExecutor) throw new Error('Background hook job service is unavailable')
+    this.backgroundExecutor(id, payload, execute)
+  }
 
   register(event: HookEvent, handler: IHookHandler): Disposable {
     if (!this.handlers.has(event)) {
@@ -28,19 +39,21 @@ export class HookRegistry implements IHookRegistry {
 
     return {
       dispose: () => {
-        const idx = list.indexOf(handler)
-        if (idx >= 0) list.splice(idx, 1)
+        const current = this.handlers.get(event)
+        const idx = current?.indexOf(handler) ?? -1
+        if (idx >= 0) current!.splice(idx, 1)
       },
     }
   }
 
-  async trigger(payload: HookPayload): Promise<HookResult> {
-    const handlers = this.handlers.get(payload.event) ?? []
+  async trigger(payload: HookPayload, signal?: AbortSignal): Promise<HookResult> {
+    if (signal?.aborted) return { action: 'abort', reason: 'hook execution canceled' }
+    const handlers = [...(this.handlers.get(payload.event) ?? [])]
     let currentPayload = payload
     const timeoutMs = resolveHookHandlerTimeoutMs()
 
     for (const handler of handlers) {
-      const result = await this.runHandlerWithTimeout(handler, currentPayload, timeoutMs)
+      const result = await this.runHandlerWithTimeout(handler, currentPayload, timeoutMs, signal)
       if (result.action === 'abort') return result
       if (result.action === 'skip') return result
       if (result.modifiedPayload) currentPayload = result.modifiedPayload
@@ -58,22 +71,36 @@ export class HookRegistry implements IHookRegistry {
     handler: IHookHandler,
     payload: HookPayload,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<HookResult> {
     let timer: ReturnType<typeof setTimeout> | undefined
+    const controller = new AbortController()
+    let abort: (() => void) | undefined
+    const canceled = new Promise<HookResult>((resolve) => {
+      abort = () => {
+        resolve({ action: 'abort', reason: 'hook execution canceled' })
+        controller.abort(signal?.reason)
+      }
+      signal?.addEventListener('abort', abort, { once: true })
+      if (signal?.aborted) abort()
+    })
     const timeout = new Promise<HookResult>((resolve) => {
       timer = setTimeout(() => {
         console.warn(
           `hook handler '${handler.id}' for event '${payload.event}' timed out after ${timeoutMs}ms; continuing`,
         )
         resolve({ action: 'continue' })
+        controller.abort(new Error(`hook handler timed out after ${timeoutMs}ms`))
       }, timeoutMs)
       // Do not keep the process alive solely for this timer.
       if (typeof timer.unref === 'function') timer.unref()
     })
     try {
-      return await Promise.race([handler.handle(payload), timeout])
+      if (signal?.aborted) return await canceled
+      return await Promise.race([handler.handle(payload, controller.signal), timeout, canceled])
     } finally {
       if (timer) clearTimeout(timer)
+      if (abort) signal?.removeEventListener('abort', abort)
     }
   }
 

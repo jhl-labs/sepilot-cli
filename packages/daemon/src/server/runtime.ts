@@ -128,7 +128,8 @@ import { assembleApprovalsLayer } from './runtime/approvals-layer.js'
 import { DelegationWorker } from '../agent/delegation-worker.js'
 import { AgentEngine } from '../agent/engine.js'
 import { SubagentDispatcher } from '../agent/subagent-dispatcher.js'
-import { createSubagentDispatchTool } from '../tools/subagent-dispatch.js'
+import { createSubagentDispatchTool, createSubagentJobTool } from '../tools/subagent-dispatch.js'
+import { assertCustomAgentUsable } from '../agent/custom/agents.js'
 import {
   createSelfInfoTool,
   createSkillHubInstallTool,
@@ -1127,24 +1128,58 @@ export async function buildRuntime(
   // engine factory closure can read live providerRegistry/autonomy state.
   const subagentDispatcher = new SubagentDispatcher({
     sessions: runtime.sessions,
-    engineFactory: ({ tools, maxIterations, executionPolicy }) => {
+    onLifecycle: async (event, data) => {
+      try {
+        await runtime.hookRegistry.trigger({ event: event === 'started' ? 'post:subagent:start' : 'post:subagent:stop', data })
+      } catch (error) {
+        // Observational hooks cannot change the child's completion classification.
+        log.warn('subagent lifecycle hook failed', { error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+    onRunFinished: (sessionId, options) => {
+      runtime.approvalRegistry.cancelForSession(sessionId, 'Subagent run ended', options)
+      runtime.activeRuns.finish(sessionId)
+    },
+    engineFactory: ({ tools, maxIterations, executionPolicy, sessionId, onEvent }) => {
       const provider = runtime.providerRegistry.getDefault()
       if (!provider) {
         throw new Error('SUBAGENT_NO_PROVIDER: no LLM provider configured')
       }
-      return new AgentEngine({
+      const engine = new AgentEngine({
         provider,
         tools,
         policy: runtime.policyEngine,
         autonomy: executionPolicy?.autonomy ?? resolveAutonomy(runtime.config),
         maxIterations,
+        hardMaxIterations: true,
+        saveRunCheckpoint: checkpoint => runtime.runCheckpoints.save(checkpoint),
+        clearRunCheckpoint: id => runtime.runCheckpoints.delete(id),
+        saveApprovalCheckpoint: checkpoint => runtime.approvalCheckpoints.save(checkpoint),
+        clearApprovalCheckpoint: id => runtime.approvalCheckpoints.delete(id),
+        loadToolExecution: id => runtime.toolExecutions.get(id),
+        saveToolExecution: record => runtime.toolExecutions.save(record),
+        clearToolExecution: id => runtime.toolExecutions.clearActive(id),
+        editSnapshotStore: runtime.editSnapshotStore,
+        workspaceMutationTracker: runtime.workspaceMutationTracker,
         auditLogger: runtime.auditLogger,
         usageTracker: runtime.usageTracker,
         hookRegistry: runtime.hookRegistry,
         deviceName: runtime.config.device.name,
         llmCache: runtime.llmCache,
         providerCircuitBreaker: runtime.providerCircuitBreaker,
+        activeRuns: runtime.activeRuns,
+        approvalCallback: async (toolCall, requestId, options) => {
+          const decision = await runtime.approvalRegistry.waitForApproval({
+            sessionId, toolCall, requestId, runId: sessionId,
+            forcePrompt: options?.forcePrompt, signal: options?.signal,
+          })
+          onEvent?.({ type: 'approval_response', requestId, decision: decision.decision, approved: decision.approved, note: decision.note })
+          return decision
+        },
+        evaluateAutoApproval: (toolCall) => runtime.approvalRegistry.tryAutoApproval({ sessionId, toolCall, runId: sessionId }),
       })
+      runtime.activeRuns.registerCanceller(sessionId, () => engine.stop())
+      return engine
     },
     toolRegistry: runtime.toolRegistry,
     parentAllowedTools: () => runtime.toolRegistry.list().map((t) => t.name),
@@ -1156,7 +1191,12 @@ export async function buildRuntime(
         defaultModel: runtime.config.agent.defaultModel ?? provider.models[0]?.id ?? 'default',
       }
     },
-    resolveUserAgent: (id) => {
+    resolveUserAgent: async (id, cwd, workspaceRoot) => {
+      const custom = (await runtime.customDefs.agentsForCwd(cwd, workspaceRoot)).find((agent) => agent.id === id)
+      if (custom) {
+        assertCustomAgentUsable(custom)
+        return { id: custom.id, name: custom.description ?? custom.id, systemPrompt: custom.systemPrompt, model: custom.model, allowedTools: custom.allowedTools, deniedTools: custom.deniedTools, isolation: custom.isolation }
+      }
       const record = runtime.userAgentLoader?.get(id)
       if (!record) return null
       return {
@@ -1172,8 +1212,10 @@ export async function buildRuntime(
   runtime.toolRegistry.register(
     createSubagentDispatchTool(subagentDispatcher, () =>
       runtime.toolRegistry.list().map((t) => t.name),
+      () => runtime.backgroundSubagents,
     ),
   )
+  runtime.toolRegistry.register(createSubagentJobTool(() => runtime.backgroundSubagents))
   runtime.toolRegistry.register(
     createSelfInfoTool({
       config: () => runtime.config,

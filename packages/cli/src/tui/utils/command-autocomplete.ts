@@ -650,7 +650,7 @@ function buildArgumentItems(
         },
       ]
     case '/thinking':
-      return ['off', 'low', 'medium', 'high', 'max'].map((level) => ({
+      return ['auto', 'off', 'low', 'medium', 'high', 'max'].map((level) => ({
         label: `/thinking ${level}`,
         description: `Set thinking level to ${level}`,
         insertValue: `/thinking ${level}`,

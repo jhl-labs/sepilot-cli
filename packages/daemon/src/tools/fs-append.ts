@@ -3,6 +3,7 @@ import { dirname } from 'node:path'
 import { throwIfAborted } from '../abort.js'
 import { buildFileToolPosture, type FileToolPostureOptions } from './file-tool-posture.js'
 import { resolveToolPath } from './path-utils.js'
+import { contentEncodingSchema, decodeFileContent, normalizeFileContent } from './file-content.js'
 import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
 
 export function createFsAppendTool(postureOptions?: FileToolPostureOptions): ToolDefinitionRuntime {
@@ -11,6 +12,7 @@ export function createFsAppendTool(postureOptions?: FileToolPostureOptions): Too
     description:
       'Append `content` to `path`, creating parent directories as needed. Use this for growing large generated artifacts section-by-section instead of rewriting the whole file. Supports absolute paths, ~/ paths, and relative paths resolved against the active session cwd. Will fail on policy-protected paths (~/.ssh/, /etc/, secrets, *.pem/*.key).',
     resumeSafety: 'replay-risky',
+    normalizeInput: normalizeFileContent,
     scheduling: {
       mode: 'parallel-safe',
       resource: 'filesystem',
@@ -20,13 +22,14 @@ export function createFsAppendTool(postureOptions?: FileToolPostureOptions): Too
       type: 'object',
       properties: {
         path: { type: 'string', description: 'File path to append to' },
-        content: { type: 'string', description: 'Content to append' },
+        content: { type: 'string', minLength: 1, description: 'Content to append; whitespace is significant' },
+        contentEncoding: contentEncodingSchema,
       },
       required: ['path', 'content'],
     },
     async recoverInterruptedExecution(input, context): Promise<ToolResult | null> {
       const path = typeof input.path === 'string' ? resolveToolPath(input.path, context.cwd) : ''
-      const content = typeof input.content === 'string' ? input.content : ''
+      const content = decodeFileContent(input)
       if (!path || !content) {
         return null
       }
@@ -41,7 +44,7 @@ export function createFsAppendTool(postureOptions?: FileToolPostureOptions): Too
           && fileStat.mtime.getTime() >= new Date(context.startedAt).getTime()
         ) {
           return {
-            output: `Appended ${content.length} bytes to ${path}`,
+            output: `Appended ${Buffer.byteLength(content, 'utf8')} bytes to ${path}`,
             status: 'success',
             durationMs: 0,
           }
@@ -55,7 +58,7 @@ export function createFsAppendTool(postureOptions?: FileToolPostureOptions): Too
     async execute(input: Record<string, unknown>, context): Promise<ToolResult> {
       const start = Date.now()
       const path = typeof input.path === 'string' ? resolveToolPath(input.path, context?.cwd) : ''
-      const content = typeof input.content === 'string' ? input.content : ''
+      const content = decodeFileContent(input)
       if (!path) {
         return {
           output: 'path is required',
@@ -65,7 +68,7 @@ export function createFsAppendTool(postureOptions?: FileToolPostureOptions): Too
       }
       if (!content) {
         return {
-          output: 'content is required',
+          output: 'Non-empty UTF-8 content is required (literal or canonical base64 with contentEncoding: base64)',
           status: 'error',
           durationMs: Date.now() - start,
         }
@@ -82,7 +85,7 @@ export function createFsAppendTool(postureOptions?: FileToolPostureOptions): Too
         const warning = stale ? `[workspace warning] ${stale.description}\n` : ''
         const executionPosture = buildFileToolPosture(postureOptions, context?.cwd)
         return {
-          output: `${warning}Appended ${content.length} bytes to ${path}`,
+          output: `${warning}Appended ${Buffer.byteLength(content, 'utf8')} bytes to ${path}`,
           status: 'success',
           durationMs: Date.now() - start,
           ...(executionPosture ? { executionPosture } : {}),

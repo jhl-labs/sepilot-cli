@@ -105,13 +105,17 @@ export function createWikiRepo(): WikiRepo {
       ).map(rowToNode)
     },
     upsert(input) {
+      return db.transaction(() => {
       const id = input.id ?? crypto.randomUUID()
-      const now = Date.now()
       const parentId = input.parentId ?? null
       let order: number
       const existing = db
-        .prepare('SELECT "order", body FROM wiki_nodes WHERE id=?')
-        .get(id) as { order: number; body: string } | undefined
+        .prepare('SELECT "order", body, updated_at FROM wiki_nodes WHERE id=?')
+        .get(id) as { order: number; body: string; updated_at: number } | undefined
+      if (input.expectedUpdatedAt !== undefined && existing?.updated_at !== input.expectedUpdatedAt) {
+        throw Object.assign(new Error('Document changed on another device. Reload before saving; your draft is preserved.'), { statusCode: 409 })
+      }
+      const now = Math.max(Date.now(), (existing?.updated_at ?? 0) + 1)
       if (existing) {
         order = existing.order
       } else {
@@ -148,6 +152,7 @@ export function createWikiRepo(): WikiRepo {
           )
           .get(id) as Row,
       )
+      })()
     },
     remove(id) {
       db.prepare('DELETE FROM wiki_nodes WHERE id=?').run(id)

@@ -9,6 +9,11 @@ import { DaemonClient } from '../client/http.js'
 import { output } from '../output/formatter.js'
 import { detectCliLocale } from '../utils/locale.js'
 
+export async function hooksCommandsCommand(options: { url?: string }): Promise<void> {
+  const hooks = (await new DaemonClient(options.url).config()).hooks.commandHooks ?? []
+  output(hooks, (items) => items.length ? items.map((hook, index) => `${index + 1}. ${hook.event}  ${hook.enabled ? 'enabled' : 'disabled'}  ${hook.async ? 'background job' : 'blocking'}  timeout=${hook.timeoutMs}ms${hook.toolMatcher ? `  matcher=${hook.toolMatcher}` : ''}`).join('\n') : 'No command hooks configured. Configure hooks.commandHooks; inspect background runs with sepilot jobs list --kind hook.')
+}
+
 const OUTBOUND_WEBHOOK_EVENTS = [
   'post:agent:run',
   'post:tool:execute',

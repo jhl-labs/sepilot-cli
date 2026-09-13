@@ -22,7 +22,23 @@ import {
 import { schedulerSessionIdForJob } from '../../scheduler/session-id.js'
 import { normalizeSurfaceLabel, resolveRequestSurface } from '../request-surface.js'
 import { validateScheduledSkillRefs } from '../../scheduler/skill-selection.js'
+import { scriptMonitorConfigFromMetadata } from '../../scheduler/script-monitor.js'
 import { createSchedulerDeliveryOutbox } from '../../scheduler/delivery-outbox.js'
+
+function taskExecutionError(instruction: string, metadata: Record<string, unknown> | null): string | null {
+  try {
+    const monitor = scriptMonitorConfigFromMetadata(metadata)
+    if (monitor) {
+      if (scheduledAgentSkillRefsFromMetadata(metadata).length > 0) {
+        return 'Script monitors execute without an LLM and cannot select agent skills'
+      }
+      return null
+    }
+    return instruction.trim() ? null : 'An agent task requires an instruction'
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error)
+  }
+}
 
 const scheduledSkillRefsSchema = z.array(z.object({
   name: z.string().min(1).max(MAX_SCHEDULED_AGENT_SKILL_ID_CHARS),
@@ -30,7 +46,7 @@ const scheduledSkillRefsSchema = z.array(z.object({
 
 const createSchema = z.object({
   when: z.string().min(1),
-  instruction: z.string().min(1),
+  instruction: z.string(),
   name: z.string().optional(),
   timezone: z.string().optional(),
   maxAttempts: z.number().int().min(1).max(20).optional(),
@@ -47,7 +63,7 @@ const createSchema = z.object({
 const updateSchema = z
   .object({
     when: z.string().min(1).optional(),
-    instruction: z.string().min(1).optional(),
+    instruction: z.string().optional(),
     name: z.string().min(1).optional(),
     timezone: z.string().min(1).optional(),
     maxAttempts: z.number().int().min(1).max(20).optional(),
@@ -207,6 +223,9 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
       })
     }
 
+    const executionError = taskExecutionError(body.instruction, metadata)
+    if (executionError) return reply.status(400).send({ error: { code: 'INVALID_TASK_EXECUTION', message: executionError } })
+
     const timezone = body.timezone ?? app.runtime?.schedulerDefaultTimezone
 
     let parsed
@@ -218,7 +237,7 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     }
 
     const job = store.create({
-      name: body.name ?? body.instruction.slice(0, 60),
+      name: body.name || body.instruction.slice(0, 60) || scriptMonitorConfigFromMetadata(metadata)!.monitorId,
       kind: parsed.kind,
       cron: parsed.kind === 'recurring' ? parsed.cron : null,
       runAt: parsed.kind === 'oneshot' ? parsed.runAt : null,
@@ -331,6 +350,9 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
         error: { code: 'INVALID_SKILL_REFS', message },
       })
     }
+    const executionError = taskExecutionError(instruction, metadata)
+    if (executionError) return reply.status(400).send({ error: { code: 'INVALID_TASK_EXECUTION', message: executionError } })
+
     // Display, delivery, authority, and retry-policy edits must not erase the
     // current execution evidence or silently re-arm a terminal task. Only a
     // replacement schedule/timezone/instruction changes what will execute.

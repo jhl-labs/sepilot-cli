@@ -151,6 +151,11 @@ import { registerJobsRoutes, type JobsBatchExecutor } from './routes/jobs.js'
 import { registerPlanRoutes } from './routes/plans.js'
 import { createJobsRepo } from '../jobs/repo.js'
 import { createJobRunner } from '../jobs/runner.js'
+import { createBackgroundHooks } from '../jobs/hooks.js'
+import { executeSubagentJob, createBackgroundSubagents } from '../jobs/subagent.js'
+import { publishStoredNotification } from '../notifications/publish.js'
+import { SessionInbox } from './runtime/session-inbox.js'
+import { registerWorkRoutes } from './routes/work.js'
 import { JsonWorkPlanStore } from '../plans/store.js'
 import { registerMigrationRoutes } from './routes/migration.js'
 import { createMigrationRepo } from '../migration/repo.js'
@@ -516,6 +521,8 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
 
   // Jobs infrastructure (batch + future migration runner).
   const jobsRepo = createJobsRepo()
+  const sessionInbox = new SessionInbox()
+  app.runtime?.activeRuns?.setBackgroundEvidenceReader(id => sessionInbox.evidence(id))
   // Startup recovery: any job left in pending/running from a previous process
   // can never resume — mark them failed so the API surfaces a terminal status.
   const recoveredJobs = jobsRepo.markInProgressFailed()
@@ -526,6 +533,27 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
     repo: jobsRepo,
     globalMax: parseInt(process.env.JOBS_GLOBAL_MAX ?? '16', 10),
   })
+  app.addHook('preClose', async () => { jobRunner.shutdown() })
+  app.runtime?.hookRegistry?.setBackgroundExecutor(createBackgroundHooks({ repo: jobsRepo, runner: jobRunner,
+    onFinished: (jobId, sessionId, status) => { sessionInbox.tryPublish({ sessionId, source: 'hook', sourceId: jobId,
+      eventKey: jobId, title: `Background hook ${status}`, body: `Collect retained evidence with sepilot jobs resume ${jobId}; this does not rerun the hook.` }) },
+  }))
+  const onSubagentFinished: NonNullable<Parameters<typeof createBackgroundSubagents>[0]['onFinished']> = (job, parentSessionId) => {
+        sessionInbox.tryPublish({ sessionId: parentSessionId, source: 'subagent', sourceId: job.id,
+          eventKey: job.id, title: `Background subagent ${job.status}`,
+          body: `Job ${job.id}. Collect retained results with subagent.job or sepilot jobs resume ${job.id} (no re-execution). For interrupted work inspect the child session in job activity and use sepilot sessions resume <child-session-id> only when a safe checkpoint is available.` })
+        publishStoredNotification({
+          id: `subagent-job:${job.id}`, title: `Background subagent ${job.status}`,
+          body: `Job ${job.id} · parent session ${parentSessionId}. Inspect with sepilot jobs status ${job.id}.`,
+          topic: 'subagent-job', audience: ['cli', 'desktop', 'web'],
+        })
+  }
+  if (app.runtime?.subagentDispatcher) {
+    app.runtime.backgroundSubagents = createBackgroundSubagents({
+      dispatcher: app.runtime.subagentDispatcher, repo: jobsRepo, runner: jobRunner,
+      onFinished: onSubagentFinished,
+    })
+  }
   const planStore = new JsonWorkPlanStore(join(options.runtime?.dataDir ?? sepilotdHome(), 'plans'))
   await planStore.init()
   const startSubagentPlan = async (input: {
@@ -553,7 +581,11 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
         jobId: job.id,
         concurrency: 1,
         failureMode: 'abort',
-        execute: (item) => dispatcher.dispatch(item.request as typeof input),
+        execute: (item, signal) => executeSubagentJob(dispatcher, jobsRepo, item, signal),
+      })
+      .then(() => {
+        const final = jobsRepo.get(job.id)
+        if (final && input.parentSessionId) onSubagentFinished(final, input.parentSessionId)
       })
       .catch(() => {
         /* runner persists error itself */
@@ -566,12 +598,13 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
     }
   }
   const batchExecutor: JobsBatchExecutor = {
-    async executeItem({ request }) {
+    async executeItem({ request }, signal) {
       // Re-enter the daemon's own /chat route in-process so the batch executor
       // benefits from the existing handler (sessions, providers, agent loop).
       const res = await app.inject({
         method: 'POST',
         url: '/api/v1/chat',
+        signal,
         payload: request as Record<string, unknown>,
       })
       if (res.statusCode >= 400) {
@@ -594,8 +627,10 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
         runner: jobRunner,
         executor: batchExecutor,
         subagentDispatcher: () => app.runtime?.subagentDispatcher ?? null,
+        onSubagentFinished,
         jobMaxConcurrency: parseInt(process.env.JOBS_MAX_CONCURRENCY ?? '8', 10),
       })
+      registerWorkRoutes(instance, jobsRepo)
     },
     { prefix: '/api/v1' },
   )

@@ -80,7 +80,7 @@ export type ChatAction =
   | { type: 'SET_MODE'; mode: DaemonAgentMode }
   | {
       type: 'SET_THINKING_LEVEL'
-      thinkingLevel: 'off' | 'low' | 'medium' | 'high' | 'max'
+      thinkingLevel: 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max'
     }
   | { type: 'SET_MAX_TOKENS'; maxTokens: number | null }
   | {

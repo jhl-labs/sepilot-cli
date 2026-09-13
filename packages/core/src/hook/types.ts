@@ -13,6 +13,7 @@ export type HookEvent =
   | 'pre:user:prompt'
   | 'pre:context:compact'
   | 'post:context:compact'
+  | 'post:subagent:start' | 'post:subagent:stop'
 
 export interface HookPayload {
   event: HookEvent
@@ -29,5 +30,6 @@ export interface HookResult {
 export interface IHookHandler {
   id: string
   priority: number
-  handle(payload: HookPayload): Promise<HookResult>
+  /** Cooperatively cancel external work when the registry's budget expires. */
+  handle(payload: HookPayload, signal?: AbortSignal): Promise<HookResult>
 }

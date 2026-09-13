@@ -55,6 +55,8 @@ export function buildLlmRequestDigest(
 
   const digest: LlmRequestDigest = {
     model: request.model,
+    maxOutputTokens: request.maxTokens,
+    thinkingLevel: request.thinkingLevel,
     messageCount: request.messages.length,
     systemPromptChars,
     ...(toolSchemaChars > 0 ? { toolSchemaChars } : {}),

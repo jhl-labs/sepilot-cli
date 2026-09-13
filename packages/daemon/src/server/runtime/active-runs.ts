@@ -78,6 +78,9 @@ export interface LiveRunState {
 }
 
 export class ActiveRunRegistry {
+  private evidenceReader?: (sessionId: string) => string
+  setBackgroundEvidenceReader(reader: (sessionId: string) => string): void { this.evidenceReader = reader }
+  backgroundEvidence(sessionId: string): string { return this.evidenceReader?.(sessionId) ?? '' }
   private readonly runs = new Map<string, ActiveRunRecord>()
   private readonly cancellers = new Map<string, ActiveRunCanceller>()
 
@@ -113,7 +116,8 @@ export class ActiveRunRegistry {
     this.liveStates.set(sessionId, state)
   }
 
-  registerCanceller(sessionId: string, cancel: ActiveRunCanceller): () => void {
+  registerCanceller(sessionId: string, cancel: ActiveRunCanceller, options?: { ifAbsent?: boolean }): () => void {
+    if (options?.ifAbsent && this.cancellers.has(sessionId)) return () => {}
     this.cancellers.set(sessionId, cancel)
     return () => {
       if (this.cancellers.get(sessionId) === cancel) {

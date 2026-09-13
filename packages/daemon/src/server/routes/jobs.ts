@@ -5,10 +5,14 @@ import type {
 } from '../../agent/subagent-dispatcher.js'
 import type { JobsRepo } from '../../jobs/repo.js'
 import type { JobRunner } from '../../jobs/runner.js'
+import type { Job } from '../../jobs/types.js'
+import { executeSubagentJob } from '../../jobs/subagent.js'
+import { subagentDispatchRequestSchema } from './subagents-schema.js'
+import { z } from 'zod'
 
 export interface JobsBatchExecutor {
   // Batch item executor — production wires this to the chat service.
-  executeItem(item: { idx: number; request: unknown }): Promise<unknown>
+  executeItem(item: { idx: number; request: unknown }, signal?: AbortSignal): Promise<unknown>
 }
 
 export interface RegisterJobsRoutesDeps {
@@ -17,12 +21,25 @@ export interface RegisterJobsRoutesDeps {
   executor: JobsBatchExecutor
   subagentDispatcher?: () => SubagentDispatcher | null
   jobMaxConcurrency: number
+  onSubagentFinished?: (job: Job, parentSessionId: string) => void
 }
 
 export function registerJobsRoutes(
   app: FastifyInstance,
   deps: RegisterJobsRoutesDeps,
 ): void {
+  app.get('/jobs', async (req, reply) => {
+    const parsed = z.object({
+      status: z.enum(['pending', 'running', 'completed', 'failed', 'canceled']).optional(),
+      kind: z.enum(['batch', 'subagent', 'migration', 'meeting_voice', 'hook']).optional(),
+      limit: z.coerce.number().int().min(1).max(100).default(30),
+      offset: z.coerce.number().int().min(0).default(0),
+    }).strict().safeParse(req.query)
+    if (!parsed.success) return reply.status(400).send({ error: { code: 'INVALID_QUERY', message: parsed.error.message } })
+    const jobs = deps.repo.list(parsed.data).map((job) => ({ ...job, activity: deps.repo.listActivity(job.id) }))
+    return { jobs, nextOffset: jobs.length === parsed.data.limit ? parsed.data.offset + jobs.length : null }
+  })
+
   app.post<{
     Body: {
       items: unknown[]
@@ -59,8 +76,8 @@ export function registerJobsRoutes(
         jobId: job.id,
         concurrency: cap,
         failureMode,
-        execute: (item) =>
-          deps.executor.executeItem({ idx: item.idx, request: item.request }),
+        execute: (item, signal) =>
+          deps.executor.executeItem({ idx: item.idx, request: item.request }, signal),
       })
       .catch(() => {
         /* runner persists error itself */
@@ -84,13 +101,14 @@ export function registerJobsRoutes(
       throw err
     }
 
-    const input = req.body
-    if (!input || typeof input.prompt !== 'string' || input.prompt.trim().length === 0) {
-      const err = new Error('prompt required') as Error & { statusCode?: number }
+    const parsed = subagentDispatchRequestSchema.safeParse(req.body)
+    if (!parsed.success) {
+      const err = new Error(parsed.error.issues.map((issue) => issue.message).join('; ')) as Error & { statusCode?: number }
       err.statusCode = 400
       throw err
     }
 
+    const input = parsed.data
     const job = deps.repo.create({
       kind: 'subagent',
       total: 1,
@@ -103,13 +121,11 @@ export function registerJobsRoutes(
         jobId: job.id,
         concurrency: 1,
         failureMode: 'abort',
-        execute: async (item) => {
-          const result = await dispatcher.dispatch(item.request as SubagentDispatchInput)
-          if (result.status === 'failed') {
-            throw new Error(result.error ?? 'subagent failed')
-          }
-          return result
-        },
+        execute: (item, signal) => executeSubagentJob(dispatcher, deps.repo, item, signal),
+      })
+      .then(() => {
+        const final = deps.repo.get(job.id)
+        if (final && input.parentSessionId) deps.onSubagentFinished?.(final, input.parentSessionId)
       })
       .catch(() => {
         /* runner persists error itself */
@@ -130,7 +146,10 @@ export function registerJobsRoutes(
       err.statusCode = 404
       throw err
     }
-    return job
+    return {
+      ...job,
+      activity: deps.repo.listActivity(job.id),
+    }
   })
 
   app.get<{

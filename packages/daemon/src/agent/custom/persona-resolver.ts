@@ -1,4 +1,4 @@
-import type { CustomAgentRecord } from './agents.js'
+import { assertCustomAgentUsable, type CustomAgentRecord } from './agents.js'
 import type { Persona } from '../personas.js'
 import { getPersona, listPersonas } from '../personas.js'
 
@@ -10,6 +10,9 @@ export interface PersistedPersonaRecord {
 }
 
 export function customAgentToPersona(record: CustomAgentRecord): Persona {
+  assertCustomAgentUsable(record)
+  if (record.isolation)
+    throw new Error(`Agent "${record.id}" requires worktree isolation; use subagent dispatch, not a primary persona`)
   return {
     id: record.id,
     name: record.description ?? record.id,
@@ -57,7 +60,8 @@ export function resolvePersonaCatalog(
     catalog.set(persisted.id, persistedPersonaToPersona(persisted))
   }
   for (const custom of customAgents) {
-    catalog.set(custom.id, customAgentToPersona(custom))
+    if (custom.issues?.length || custom.isolation) catalog.delete(custom.id)
+    else catalog.set(custom.id, customAgentToPersona(custom))
   }
   // Automatic routing cannot enter another memory identity mid-turn.
   const isolatedIds = new Set(persistedPersonas.filter(persona => persona.memoryScope === 'isolated').map(persona => persona.id))

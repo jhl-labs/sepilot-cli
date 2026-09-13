@@ -136,6 +136,7 @@ register('internal-state', 'Mutates bounded agent-owned control metadata only', 
   'question',
   'monitor.evaluate',
   'subagent.dispatch',
+  'subagent.job',
   'doc.diff_preview',
   'process.stop',
   'memory.access.hot',
@@ -218,6 +219,7 @@ register('external-write', 'Changes durable agent, application, browser, or remo
 ])
 
 register('process-lifecycle', 'Starts, stops, signals, or reconfigures a managed execution', [
+  'process.write',
   'external_acp.run',
   'image_gen.cancel',
   'process.signal',

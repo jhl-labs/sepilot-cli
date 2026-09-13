@@ -190,6 +190,15 @@ export interface AgentEvidenceLedgerEntry {
   origin?: { sessionId: string; category: string }
 }
 
+/** Structural progress counters compared across continuation cycles. */
+export interface ContinuationProgressSnapshot {
+  semanticRevision?: number
+  verifiedEvidence: number
+  executedToolCalls: number
+  evidenceOrder: number
+  artifactMutations: number
+}
+
 export interface AgentEvidenceLedger {
   sourceReads: AgentEvidenceLedgerEntry[]
   sourceSearches: AgentEvidenceLedgerEntry[]
@@ -313,6 +322,25 @@ export interface AgentState extends GraphRuntimeState {
     toolCallId: string
     toolName?: string
   }
+  /**
+   * A plain (non-stop) denial granted the model one side-effect-free turn:
+   * the tool catalog is filtered to policy read-only tools and any
+   * side-effecting call ends the run as `approval_denied`. `toolTurnsRemaining`
+   * bounds how many read-only tool turns the grace may spend before the model
+   * must answer.
+   */
+  approvalDenialGrace?: {
+    toolCallId: string
+    toolName?: string
+    toolTurnsRemaining: number
+  }
+  /**
+   * Number of tool calls refused by policy or approval this run. Friction,
+   * not failure: it never feeds stuck-repeat/failed-attempt accounting. Past
+   * the threshold the model is told once to stop probing for the permission.
+   */
+  frictionCount?: number
+  frictionWarningIssued?: boolean
   /** Bounded retry count for turns that explicitly require fresh tool evidence. */
   currentTurnEvidenceRetryCount?: number
   /** Shared across graph-node re-entry; fresh executor results renew the budget. */
@@ -344,6 +372,26 @@ export interface AgentState extends GraphRuntimeState {
    * completion-gate diagnostics.
    */
   stopReason?: RunStopReason
+  /**
+   * Progress snapshot taken when the current continuation cycle started (or
+   * at run start). The graph runner only grants another continuation cycle
+   * when verified evidence, executed (non-blocked) tool calls or artifact
+   * mutations advanced past this snapshot; otherwise the run stops as
+   * `no_progress` even with cycles left.
+   */
+  continuationProgressSnapshot?: ContinuationProgressSnapshot
+  /**
+   * Loop-control questions already asked this run (stuck-repeat and
+   * no-progress doom loops). Bounded by MAX_LOOP_CONTROL_QUESTIONS; past the
+   * bound the run falls back to the forced final synthesis.
+   */
+  loopControlQuestionCount?: number
+  /**
+   * One-shot grace granted by a loop-control answer (`continue` /
+   * `different_approach`): the stuck-repeat exhaustion check skips this many
+   * agent turns before it may force a final synthesis again.
+   */
+  loopControlGraceTurns?: number
   codebaseExploration?: string
   codebaseMap?: AgentCodebaseMap
   evidenceLedger?: AgentEvidenceLedger
@@ -579,6 +627,8 @@ export interface AgentState extends GraphRuntimeState {
    * forever; past the budget the run passes and reports honestly.
    */
   completionGateBlocks?: number
+  /** Run-scoped observation novelty; preserved across graph phases/children. */
+  workProgress?: import('../work-progress.js').WorkProgress
   /**
    * Latest final-answer draft the completion gate rejected (protocol stems
    * stripped). Surfaced as an explicitly-unverified draft when the gate's
@@ -915,6 +965,8 @@ export interface AgentState extends GraphRuntimeState {
     executionPosture?: ToolExecutionPosture
     /** Stable tool-protocol failure class retained separately from human-readable output. */
     failureCode?: string
+    /** Refused before execution by policy or approval (friction, not failure). */
+    blocked?: boolean
     ts: number
     /** SHA-256 of the complete bounded tool result before history text clipping. */
     outputFingerprint?: string

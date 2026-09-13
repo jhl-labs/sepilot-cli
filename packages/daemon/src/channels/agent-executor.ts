@@ -10,7 +10,7 @@ import {
 } from '../server/runtime/mode-router-options.js'
 import { resolvePersona } from '../agent/custom/persona-resolver.js'
 import { createAgentOutputTracker } from '../agent/event-output.js'
-import { resolveAgentMaxIterations } from '../agent/iteration-budget.js'
+import { resolveRunIterationBudget } from '../agent/iteration-budget.js'
 import { buildRetrievalQuery } from '../agent/query-context.js'
 import { buildSystemPrompt } from '../agent/system-prompt.js'
 import {
@@ -428,6 +428,7 @@ export class ChannelAgentExecutor {
     const watchdog = new ChannelAgentInactivityWatchdog(inactivityMs, () => {
       void modeRouterRef.current?.stop().catch(() => {})
     })
+    const channelBudget = resolveRunIterationBudget({ surface: 'channel' })
     const modeRouter = new AgentModeRouter({
       provider,
       tools: visibleTools,
@@ -441,7 +442,9 @@ export class ChannelAgentExecutor {
       hookRegistry: this.runtime.hookRegistry,
       systemPrompt,
       previousMessages,
-      maxIterations: resolveAgentMaxIterations(),
+      maxIterations: channelBudget.maxIterations,
+      maxContinuationCycles: channelBudget.maxContinuationCycles,
+      budgetSurface: 'channel',
       deviceName: this.runtime.config.device.name,
       providerCircuitBreaker: this.runtime.providerCircuitBreaker,
       defaultMode: defaultMode ?? 'instant',

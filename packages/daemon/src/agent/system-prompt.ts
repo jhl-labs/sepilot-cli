@@ -11,6 +11,10 @@ import {
   type EnvironmentInfo,
 } from './environment.js'
 import { ACTION_PROGRESS_SYSTEM_PROMPT } from './action-progress.js'
+import {
+  partitionToolApprovalPosture,
+  type ToolApprovalPostureEntry,
+} from './tool-approval-catalog.js'
 import { ANSWER_PROTOCOL_SYSTEM_PROMPT } from './interim-progress.js'
 import { swarmSystemPromptExtension } from './swarm/system-prompt.js'
 import {
@@ -80,6 +84,44 @@ export interface SystemPromptOptions {
    * explicit prompt-inspection and non-interactive callers.
    */
   includeDailyNotes?: boolean
+  /**
+   * Static per-tool approval posture for this run (see
+   * `describeToolApprovalPosture`). When present, one compact paragraph names
+   * the tools that will pause for approval and the ones that are unavailable.
+   */
+  toolApprovalPosture?: ReadonlyMap<string, ToolApprovalPostureEntry>
+}
+
+export const TOOL_APPROVAL_POSTURE_PROMPT_PREFIX = 'Tool approval posture:'
+export const TOOL_APPROVAL_POSTURE_MAX_NAMES = 40
+
+/**
+ * One paragraph listing only `ask` and `blocked` tools by name so the model
+ * can plan around approvals and unavailable capabilities from the start.
+ * Returns null when both lists are empty. Bounded to ~40 names in total.
+ */
+export function buildToolApprovalPostureParagraph(
+  posture: ReadonlyMap<string, ToolApprovalPostureEntry> | undefined,
+  maxNames: number = TOOL_APPROVAL_POSTURE_MAX_NAMES,
+): string | null {
+  if (!posture || posture.size === 0) return null
+  const { ask, blocked } = partitionToolApprovalPosture(posture)
+  if (ask.length === 0 && blocked.length === 0) return null
+  const budget = Math.max(1, Math.floor(maxNames))
+  const render = (names: string[], share: number): string => {
+    if (names.length <= share) return names.join(', ')
+    return `${names.slice(0, share).join(', ')} (+${names.length - share} more)`
+  }
+  const askShare = Math.min(ask.length, Math.max(1, Math.floor(budget / 2)))
+  const blockedShare = Math.min(blocked.length, Math.max(1, budget - askShare))
+  const clauses: string[] = []
+  if (ask.length > 0) {
+    clauses.push(`these tools will pause for user approval: ${render(ask, askShare)}`)
+  }
+  if (blocked.length > 0) {
+    clauses.push(`these tools are unavailable in this mode: ${render(blocked, blockedShare)}`)
+  }
+  return `${TOOL_APPROVAL_POSTURE_PROMPT_PREFIX} ${clauses.join('; ')}. Plan around unavailable tools instead of retrying them.`
 }
 
 /**
@@ -102,6 +144,8 @@ export async function buildSystemPrompt(options: SystemPromptOptions): Promise<s
   // Core identity
   parts.push(`You are sepilotd, an AI agent daemon running on device "${config.device.name}" (${config.device.role}).`)
   parts.push(`Your autonomy level is: ${config.agent.autonomy}.`)
+  const postureParagraph = buildToolApprovalPostureParagraph(options.toolApprovalPosture)
+  if (postureParagraph) parts.push(postureParagraph)
   parts.push(outputLanguageDirective(config.agent.outputLanguage))
   parts.push(ANSWER_PROTOCOL_SYSTEM_PROMPT)
   parts.push(TASK_DISCOVERY_GUIDANCE)
@@ -461,7 +505,8 @@ export async function buildSystemPrompt(options: SystemPromptOptions): Promise<s
     workspaceRoot: options.workspaceRoot,
     now,
   })
-  parts.push(`\n${formatEnvironmentBlock(envInfo, options.cwd)}`)
+  // The clock changes every turn; keep it after the cacheable instruction prefix.
+  turnContextParts.push(`\n${formatEnvironmentBlock(envInfo, options.cwd)}`)
   if (
     envInfo.platform === 'win32'
     && toolList.some((tool) => tool.name === 'terminal.run')

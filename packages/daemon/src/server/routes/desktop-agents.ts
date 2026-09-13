@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+import { readWorkspaceReview } from '../../terminal/workspace-review.js'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { DesktopAgentSessions, DESKTOP_AGENT_PRESETS } from '../../terminal/desktop-agent.js'
@@ -20,7 +22,7 @@ const createSchema = z
     rows: sizeSchema.shape.rows.default(36),
   })
   .strict()
-const inputSchema = z.object({ data: z.string().min(1).max(65536) }).strict()
+const inputSchema = z.object({ data: z.string().min(1).max(65536), requestId: z.string().uuid().optional() }).strict()
 
 /** Protected by the daemon's normal authenticated API; never by a token in a URL. */
 export function registerDesktopAgentRoutes(
@@ -28,6 +30,7 @@ export function registerDesktopAgentRoutes(
   sessions = new DesktopAgentSessions(),
   probe = probeDesktopAgent,
 ): void {
+  const receipts = new Map<string, Map<string, string>>()
   app.addHook('preClose', async () => {
     sessions.closeAll()
   })
@@ -36,6 +39,7 @@ export function registerDesktopAgentRoutes(
       id, ...preset, ...await probe(id as keyof typeof DESKTOP_AGENT_PRESETS),
     }))),
     sessions: sessions.list(),
+    features: { inputReceipts: true, screen: true, review: true },
     executionHost: 'daemon',
     transport: 'pty',
     executionPolicy: 'external-cli',
@@ -123,13 +127,40 @@ export function registerDesktopAgentRoutes(
       reply.raw.end()
     }
   })
+  app.get('/desktop-agents/sessions/:id/screen', async (request, reply) => {
+    const params = idSchema.safeParse(request.params)
+    if (!params.success) return reply.code(400).send({ error: 'Invalid session id.' })
+    try { return await sessions.screen(params.data.id) }
+    catch { return reply.code(404).send({ error: 'Session not found.' }) }
+  })
+  app.get('/desktop-agents/sessions/:id/review', async (request, reply) => {
+    const params = idSchema.safeParse(request.params)
+    if (!params.success) return reply.code(400).send({ error: 'Invalid session id.' })
+    try { return await readWorkspaceReview(sessions.get(params.data.id)) }
+    catch { return reply.code(404).send({ error: 'Session not found.' }) }
+  })
+  app.get('/desktop-agents/sessions/:id/input/:requestId', async (request, reply) => {
+    const params = z.object({ id: z.string().uuid(), requestId: z.string().uuid() }).safeParse(request.params)
+    if (!params.success) return reply.code(400).send({ error: 'Invalid receipt id.' })
+    return { accepted: receipts.get(params.data.id)?.has(params.data.requestId) ?? false }
+  })
   app.post('/desktop-agents/sessions/:id/input', async (request, reply) => {
     const params = idSchema.safeParse(request.params)
     const body = inputSchema.safeParse(request.body)
     if (!params.success || !body.success)
       return reply.code(400).send({ error: 'Invalid terminal input.' })
     try {
+      const digest = createHash('sha256').update(body.data.data).digest('hex')
+      const prior = body.data.requestId ? receipts.get(params.data.id)?.get(body.data.requestId) : undefined
+      if (prior && prior !== digest) return reply.code(409).send({ error: 'Input id already used for different data.' })
+      if (prior) return { accepted: true, duplicate: true }
       sessions.write(params.data.id, body.data.data)
+      if (body.data.requestId) {
+        const sessionReceipts = receipts.get(params.data.id) ?? new Map<string, string>()
+        sessionReceipts.set(body.data.requestId, digest)
+        if (sessionReceipts.size > 256) sessionReceipts.delete(sessionReceipts.keys().next().value!)
+        receipts.set(params.data.id, sessionReceipts)
+      }
       return { accepted: true }
     } catch (error) {
       return reply.code(409).send({ error: (error as Error).message })
@@ -152,6 +183,7 @@ export function registerDesktopAgentRoutes(
     if (!params.success) return reply.code(400).send({ error: 'Invalid session id.' })
     try {
       sessions.close(params.data.id)
+      receipts.delete(params.data.id)
       return { closed: true }
     } catch (error) {
       return reply.code(404).send({ error: (error as Error).message })

@@ -53,7 +53,8 @@ export async function assembleApprovalsLayer(args: {
       publishApprovalPendingNotification(config, { approval, outcome: 'pending' })
     },
     onTimeout: (approval) => {
-      publishApprovalPendingNotification(config, { approval, outcome: 'expired' })
+      // The prompt did not expire: the run parked and resumes once answered.
+      publishApprovalPendingNotification(config, { approval, outcome: 'parked' })
     },
   })
   const approvalCheckpoints = new ApprovalCheckpointStore(

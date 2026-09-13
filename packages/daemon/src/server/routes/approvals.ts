@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto'
-import type { AgentEvent, ApprovalDecision } from '@sepilotd/core'
+import type { AgentEvent, ApprovalDecision, ILLMProvider } from '@sepilotd/core'
+import { createLogger } from '../../logger.js'
+import type { ToolRegistry } from '../../tools/registry.js'
+import type { ApprovalRunCheckpoint } from '../runtime/checkpoints.js'
+import type { PendingApproval } from '../runtime/approvals.js'
+import { resolveResumeAutonomy } from '../runtime/resume-autonomy.js'
+import type { RuntimeServices } from '../runtime/types.js'
 import type { FastifyInstance } from 'fastify'
 import '../fastify-types.js'
 import { AgentModeRouter } from '../../agent/mode-router.js'
@@ -42,6 +48,100 @@ export {
   approvalOpenApiComponents,
   approvalOpenApiOverrides,
 } from './approvals-schema.js'
+
+const log = createLogger('approvals')
+
+function validatedParkedApprovalTools(
+  runtime: RuntimeServices,
+  checkpoint: ApprovalRunCheckpoint,
+  pending: PendingApproval,
+): ToolRegistry {
+  if (checkpoint.requestId !== pending.requestId || checkpoint.sessionId !== pending.sessionId) {
+    throw new CheckpointToolScopeError('Approval checkpoint request/session identity changed')
+  }
+  const tools = resolveCheckpointToolRegistry(runtime.toolRegistry, checkpoint)
+  assertApprovalCheckpointIdentity(checkpoint.toolCalls[checkpoint.currentToolIndex], pending)
+  assertCheckpointPendingToolCalls(checkpoint, checkpoint.toolCalls, checkpoint.currentToolIndex)
+  return tools
+}
+
+/**
+ * A parked approval was just answered: its run already unwound and released
+ * its lease, so continue it from the checkpoint the way `/approvals/resume`
+ * does — without a client holding a stream. Events persist into the session
+ * journal, where every surface watching it picks them up. Returns whether a
+ * resume was actually started.
+ */
+async function resumeParkedApproval(input: {
+  runtime: RuntimeServices
+  requestId: string
+  decision: ApprovalDecision
+  requestActor: string
+  pending: PendingApproval
+}): Promise<{ resumed: boolean; reason?: string }> {
+  const { runtime, requestId, decision, requestActor } = input
+  const checkpoint = await runtime.approvalCheckpoints.get(requestId)
+  if (!checkpoint) return { resumed: false, reason: 'no resumable checkpoint' }
+  const session = await runtime.sessions.get(checkpoint.sessionId)
+  if (!session || !checkpointMatchesSessionWorkspace(session, checkpoint)) {
+    return { resumed: false, reason: 'session workspace changed' }
+  }
+  const provider = runtime.providerRegistry.get(checkpoint.provider)
+  if (!provider) return { resumed: false, reason: `provider ${checkpoint.provider} unavailable` }
+
+  let checkpointTools: ToolRegistry
+  try {
+    // respond() has already durably journaled the answer, so this request is
+    // intentionally no longer "pending" in the journal. Bind the checkpoint
+    // to the exact registry-owned request returned by that successful respond.
+    checkpointTools = validatedParkedApprovalTools(runtime, checkpoint, input.pending)
+  } catch (error) {
+    return {
+      resumed: false,
+      reason: error instanceof Error ? error.message : 'checkpoint tool scope invalid',
+    }
+  }
+
+  const sessionLease = runtime.sessionBusy
+    ? await runtime.sessionBusy.acquireLeaseWithGrace(checkpoint.sessionId)
+    : undefined
+  if (runtime.sessionBusy && !sessionLease) {
+    return { resumed: false, reason: 'session busy' }
+  }
+  let runLease: RunLease | undefined
+  try {
+    runLease = await runtime.runLimiter?.acquire()
+  } catch (error) {
+    sessionLease?.release()
+    return { resumed: false, reason: error instanceof Error ? error.message : 'run limit' }
+  }
+
+  void (async () => {
+    try {
+      await executeApprovalResume({
+        runtime,
+        checkpoint,
+        checkpointTools,
+        provider,
+        decision,
+        requestId,
+        requestActor,
+        send: () => undefined,
+        recordDecision: false,
+      })
+    } catch (error) {
+      log.warn('background resume of a parked approval failed', {
+        requestId,
+        sessionId: checkpoint.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    } finally {
+      runLease?.release()
+      sessionLease?.release()
+    }
+  })()
+  return { resumed: true }
+}
 
 export async function approvalRoutes(app: FastifyInstance) {
   app.post<{ Body: ApprovalResponseBody }>('/approvals/respond', {
@@ -88,6 +188,16 @@ export async function approvalRoutes(app: FastifyInstance) {
           },
         })
       }
+      if (checkpoint && livePending.state === 'parked') {
+        try {
+          // Reject a changed checkpoint before consuming/journaling consent.
+          validatedParkedApprovalTools(runtime, checkpoint, livePending)
+        } catch (error) {
+          return reply.status(409).send({
+            error: { code: 'RESUME_TOOL_SCOPE_INVALID', message: error instanceof Error ? error.message : 'Invalid checkpoint' },
+          })
+        }
+      }
     }
 
     const respondResult = await runtime.approvalRegistry.respond(
@@ -97,6 +207,12 @@ export async function approvalRoutes(app: FastifyInstance) {
     )
 
     if (respondResult.resolved) {
+      const parkedState = respondResult.parked ? 'parked' : 'live'
+      // The prompt outlived its run: the decision is journaled, now continue
+      // the parked run from its checkpoint. Nothing else is waiting on it.
+      const resume = respondResult.parked
+        ? await resumeParkedApproval({ runtime, requestId, decision, requestActor, pending: respondResult.parked })
+        : undefined
       await runtime.auditLogger?.log?.({
         timestamp: new Date().toISOString(),
         event: 'approval.respond.live',
@@ -107,7 +223,8 @@ export async function approvalRoutes(app: FastifyInstance) {
         approved: decision.approved,
         decision: decision.decision,
         note: decision.note,
-        state: 'live',
+        state: parkedState,
+        ...(resume ? { resumed: resume.resumed, resumeReason: resume.reason } : {}),
       })
       return {
         data: {
@@ -116,7 +233,8 @@ export async function approvalRoutes(app: FastifyInstance) {
           approved: decision.approved,
           note: decision.note,
           resolved: respondResult.resolved,
-          state: 'live',
+          state: parkedState,
+          ...(resume ? { resumed: resume.resumed, ...(resume.reason ? { resumeReason: resume.reason } : {}) } : {}),
           // Surface the derived rule when this respond persisted a
           // session/always decision — the cli prints it as part of
           // the success line so the operator sees the exact pattern
@@ -380,139 +498,17 @@ export async function approvalRoutes(app: FastifyInstance) {
         reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
       }
 
-      await runtime.sessions.appendEvent(checkpoint.sessionId, {
-        type: 'approval_response',
-        id: randomUUID(),
-        timestamp: new Date().toISOString(),
-        requestId,
-        decision: decision.decision,
-        approved: decision.approved,
-        note: decision.note,
-        approvedBy: requestActor,
-      })
-
-      const approvalCallback: ApprovalCallback = (toolCall, nextRequestId, options) =>
-        runtime.approvalRegistry.waitForApproval({
-          sessionId: checkpoint.sessionId,
-          toolCall,
-          requestId: nextRequestId,
-          forcePrompt: options?.forcePrompt,
-            signal: options?.signal,
-        })
-      const requestQuestion = createQuestionRequester(runtime.questions)
-
-      const modeRouter = new AgentModeRouter({
+      await executeApprovalResume({
+        runtime,
+        checkpoint,
+        checkpointTools,
         provider,
-        tools: checkpointTools,
-        policy: runtime.policyEngine,
-        autonomy: runtime.autonomy,
-        maxIterations: checkpoint.maxIterations,
-        systemPrompt: checkpoint.systemPrompt,
-        auditLogger: runtime.auditLogger,
-        usageTracker: runtime.usageTracker,
-        spendBudget: runtime.config.limits,
-        hookRegistry: runtime.hookRegistry,
-        deviceName: runtime.config.device.name,
-        thinkingLevel: checkpoint.thinkingLevel,
-        textDeltaMode: checkpoint.textDeltaMode,
-        llmCache: runtime.llmCache,
-        providerCircuitBreaker: runtime.providerCircuitBreaker,
-        graphRegistry: runtime.graphRegistry,
-        approvalCallback,
-        evaluateAutoApproval: (toolCall) =>
-          runtime.approvalRegistry.tryAutoApproval({
-            sessionId: checkpoint.sessionId,
-            toolCall,
-          }),
-        requestQuestion,
-        saveApprovalCheckpoint: (nextCheckpoint) =>
-          runtime.approvalCheckpoints.save(nextCheckpoint),
-        clearApprovalCheckpoint: (nextRequestId) =>
-          runtime.approvalCheckpoints.delete(nextRequestId),
-        saveRunCheckpoint: (nextCheckpoint) =>
-          runtime.runCheckpoints?.save(nextCheckpoint) ?? Promise.resolve(),
-        clearRunCheckpoint: (nextSessionId) =>
-          runtime.runCheckpoints?.delete(nextSessionId) ?? Promise.resolve(),
-        loadToolExecution: (nextSessionId) =>
-          runtime.toolExecutions?.get(nextSessionId) ?? Promise.resolve(null),
-        saveToolExecution: (record) =>
-          runtime.toolExecutions?.save(record) ?? Promise.resolve(),
-        clearToolExecution: (nextSessionId) =>
-          runtime.toolExecutions?.clearActive(nextSessionId) ?? Promise.resolve(),
-        editSnapshotStore: runtime.editSnapshotStore,
-        toolStatsStore: runtime.toolStatsStore,
-        workspaceMutationTracker: runtime.workspaceMutationTracker,
-        pluginEvents: runtime.pluginEvents,
-        journalStateBoard: createJournalStateBoard(runtime.sessions),
-        journalSteeringConsumed: createJournalSteeringConsumed(runtime.sessions, runtime.sessionWatchBroker),
-        reviewToollessFinals: true,
-      })
-
-      send('session', { sessionId: checkpoint.sessionId })
-
-      const outputTracker = createAgentStreamOutputTracker()
-      let terminalDoneEvent: Extract<AgentEvent, { type: 'done' }> | null = null
-      let terminalStateChangeEvent: Extract<AgentEvent, { type: 'state_change' }> | null = null
-      for await (const event of modeRouter.resumeFromApprovalCheckpoint(checkpoint, decision)) {
-        outputTracker.consume(event)
-        if (event.type === 'done') {
-          terminalDoneEvent = event
-          continue
-        }
-        if (event.type === 'state_change' && event.state === 'done') {
-          terminalStateChangeEvent = event
-          continue
-        }
-        send(event.type, event)
-        await persistAgentSessionEvent(runtime.sessions, checkpoint.sessionId, event)
-      }
-
-      let finalContent = outputTracker.finalContent()
-      const syntheticMessage = outputTracker.syntheticMessageEvent()
-      if (syntheticMessage) {
-        send(syntheticMessage.type, syntheticMessage)
-        await persistAgentSessionEvent(runtime.sessions, checkpoint.sessionId, syntheticMessage)
-        finalContent = syntheticMessage.content
-      }
-
-      if (finalContent) {
-        await runtime.sessions.appendEvent(checkpoint.sessionId, {
-          type: 'assistant_message',
-          id: randomUUID(),
-          timestamp: new Date().toISOString(),
-          content: finalContent,
-        })
-      }
-      if (terminalDoneEvent && terminalStateChangeEvent) {
-        send(terminalStateChangeEvent.type, terminalStateChangeEvent)
-        await persistAgentSessionEvent(
-          runtime.sessions,
-          checkpoint.sessionId,
-          terminalStateChangeEvent,
-        )
-      }
-      if (terminalDoneEvent) {
-        send(terminalDoneEvent.type, terminalDoneEvent)
-        await persistAgentSessionEvent(runtime.sessions, checkpoint.sessionId, terminalDoneEvent)
-      }
-
-      await runtime.auditLogger?.log?.({
-        timestamp: new Date().toISOString(),
-        event: 'approval.resume.completed',
-        device: runtime.config.device.name,
-        session: checkpoint.sessionId,
-        actor: requestActor,
+        decision,
         requestId,
-        approved: decision.approved,
-        decision: decision.decision,
-        note: decision.note,
-        checkpointCreatedAt: checkpoint.createdAt,
-        toolCallId: checkpoint.toolCalls[checkpoint.currentToolIndex]?.id,
-        tool: checkpoint.toolCalls[checkpoint.currentToolIndex]?.name,
-        finalContentPresent: Boolean(finalContent),
+        requestActor,
+        send,
+        recordDecision: true,
       })
-
-      send('close', {})
       reply.raw.end()
     } finally {
       runLease?.release()
@@ -698,6 +694,171 @@ export async function approvalRoutes(app: FastifyInstance) {
   })
 }
 
+interface ApprovalResumeRuntime {
+  runtime: RuntimeServices
+  checkpoint: ApprovalRunCheckpoint
+  checkpointTools: ToolRegistry
+  provider: ILLMProvider
+  decision: ApprovalDecision
+  requestId: string
+  requestActor: string
+  /** Emit a stream event; a background resume passes a no-op. */
+  send: (event: string, data: unknown) => void
+  /**
+   * False when the decision was already journaled (a parked prompt answered
+   * through `/approvals/respond`), so the resume does not record it twice.
+   */
+  recordDecision: boolean
+}
+
+/**
+ * Drive a run from its approval checkpoint to completion. Shared by the SSE
+ * `/approvals/resume` route and the background resume that a parked approval
+ * triggers when it is finally answered.
+ */
+async function executeApprovalResume(input: ApprovalResumeRuntime): Promise<void> {
+  const { runtime, checkpoint, checkpointTools, provider, decision, requestId, requestActor, send } = input
+  if (input.recordDecision) {
+    await runtime.sessions.appendEvent(checkpoint.sessionId, {
+      type: 'approval_response',
+      id: randomUUID(),
+      timestamp: new Date().toISOString(),
+      requestId,
+      decision: decision.decision,
+      approved: decision.approved,
+      note: decision.note,
+      approvedBy: requestActor,
+    })
+    // Keep a parked request answerable if validation, admission, or durable
+    // consent recording fails. Only the successful resume consumes it.
+    runtime.approvalRegistry.releaseParked?.(requestId)
+  }
+
+  const approvalCallback: ApprovalCallback = (toolCall, nextRequestId, options) =>
+    runtime.approvalRegistry.waitForApproval({
+      sessionId: checkpoint.sessionId,
+      toolCall,
+      requestId: nextRequestId,
+      forcePrompt: options?.forcePrompt,
+        signal: options?.signal,
+    })
+  const requestQuestion = createQuestionRequester(runtime.questions)
+  if (checkpoint.autonomy !== undefined && checkpoint.autonomy !== runtime.autonomy) checkpoint.requireToolApproval = true
+
+  const modeRouter = new AgentModeRouter({
+    provider,
+    tools: checkpointTools,
+    policy: runtime.policyEngine,
+    autonomy: resolveResumeAutonomy(checkpoint.autonomy, runtime.autonomy),
+    maxIterations: checkpoint.maxIterations,
+    systemPrompt: checkpoint.systemPrompt,
+    auditLogger: runtime.auditLogger,
+    usageTracker: runtime.usageTracker,
+    spendBudget: runtime.config.limits,
+    hookRegistry: runtime.hookRegistry,
+    deviceName: runtime.config.device.name,
+    thinkingLevel: checkpoint.thinkingLevel,
+    textDeltaMode: checkpoint.textDeltaMode,
+    llmCache: runtime.llmCache,
+    providerCircuitBreaker: runtime.providerCircuitBreaker,
+    graphRegistry: runtime.graphRegistry,
+    approvalCallback,
+    evaluateAutoApproval: (toolCall) =>
+      runtime.approvalRegistry.tryAutoApproval({
+        sessionId: checkpoint.sessionId,
+        toolCall,
+      }),
+    requestQuestion,
+    saveApprovalCheckpoint: (nextCheckpoint) =>
+      runtime.approvalCheckpoints.save(nextCheckpoint),
+    clearApprovalCheckpoint: (nextRequestId) =>
+      runtime.approvalCheckpoints.delete(nextRequestId),
+    saveRunCheckpoint: (nextCheckpoint) =>
+      runtime.runCheckpoints?.save(nextCheckpoint) ?? Promise.resolve(),
+    clearRunCheckpoint: (nextSessionId) =>
+      runtime.runCheckpoints?.delete(nextSessionId) ?? Promise.resolve(),
+    loadToolExecution: (nextSessionId) =>
+      runtime.toolExecutions?.get(nextSessionId) ?? Promise.resolve(null),
+    saveToolExecution: (record) =>
+      runtime.toolExecutions?.save(record) ?? Promise.resolve(),
+    clearToolExecution: (nextSessionId) =>
+      runtime.toolExecutions?.clearActive(nextSessionId) ?? Promise.resolve(),
+    editSnapshotStore: runtime.editSnapshotStore,
+    toolStatsStore: runtime.toolStatsStore,
+    workspaceMutationTracker: runtime.workspaceMutationTracker,
+    pluginEvents: runtime.pluginEvents,
+    journalStateBoard: createJournalStateBoard(runtime.sessions),
+    journalSteeringConsumed: createJournalSteeringConsumed(runtime.sessions, runtime.sessionWatchBroker),
+    reviewToollessFinals: true,
+  })
+
+  send('session', { sessionId: checkpoint.sessionId })
+
+  const outputTracker = createAgentStreamOutputTracker()
+  let terminalDoneEvent: Extract<AgentEvent, { type: 'done' }> | null = null
+  let terminalStateChangeEvent: Extract<AgentEvent, { type: 'state_change' }> | null = null
+  for await (const event of modeRouter.resumeFromApprovalCheckpoint(checkpoint, decision)) {
+    outputTracker.consume(event)
+    if (event.type === 'done') {
+      terminalDoneEvent = event
+      continue
+    }
+    if (event.type === 'state_change' && event.state === 'done') {
+      terminalStateChangeEvent = event
+      continue
+    }
+    send(event.type, event)
+    await persistAgentSessionEvent(runtime.sessions, checkpoint.sessionId, event)
+  }
+
+  let finalContent = outputTracker.finalContent()
+  const syntheticMessage = outputTracker.syntheticMessageEvent()
+  if (syntheticMessage) {
+    send(syntheticMessage.type, syntheticMessage)
+    await persistAgentSessionEvent(runtime.sessions, checkpoint.sessionId, syntheticMessage)
+    finalContent = syntheticMessage.content
+  }
+
+  if (finalContent) {
+    await runtime.sessions.appendEvent(checkpoint.sessionId, {
+      type: 'assistant_message',
+      id: randomUUID(),
+      timestamp: new Date().toISOString(),
+      content: finalContent,
+    })
+  }
+  if (terminalDoneEvent && terminalStateChangeEvent) {
+    send(terminalStateChangeEvent.type, terminalStateChangeEvent)
+    await persistAgentSessionEvent(
+      runtime.sessions,
+      checkpoint.sessionId,
+      terminalStateChangeEvent,
+    )
+  }
+  if (terminalDoneEvent) {
+    send(terminalDoneEvent.type, terminalDoneEvent)
+    await persistAgentSessionEvent(runtime.sessions, checkpoint.sessionId, terminalDoneEvent)
+  }
+
+  await runtime.auditLogger?.log?.({
+    timestamp: new Date().toISOString(),
+    event: 'approval.resume.completed',
+    device: runtime.config.device.name,
+    session: checkpoint.sessionId,
+    actor: requestActor,
+    requestId,
+    approved: decision.approved,
+    decision: decision.decision,
+    note: decision.note,
+    checkpointCreatedAt: checkpoint.createdAt,
+    toolCallId: checkpoint.toolCalls[checkpoint.currentToolIndex]?.id,
+    tool: checkpoint.toolCalls[checkpoint.currentToolIndex]?.name,
+    finalContentPresent: Boolean(finalContent),
+  })
+
+  send('close', {})
+}
+
 function normalizeApprovalInput(input: ApprovalResponseBody): ApprovalDecision {
   const decision = input.decision
     ?? (input.approved ? 'approved' : 'denied')
@@ -705,6 +866,7 @@ function normalizeApprovalInput(input: ApprovalResponseBody): ApprovalDecision {
     decision,
     approved: decision === 'approved',
     note: input.note,
+    ...(decision === 'denied' && input.stop !== undefined ? { stop: input.stop } : {}),
   }
 }
 

@@ -28,7 +28,8 @@
   "pnpm": {
     "patchedDependencies": {
       "image-size@1.2.1": "patches/image-size@1.2.1.patch",
-      "ssh2@1.17.0": "patches/ssh2@1.17.0.patch"
+      "ssh2@1.17.0": "patches/ssh2@1.17.0.patch",
+      "vitest@3.2.7": "patches/vitest@3.2.7.patch"
     },
     "allowUnusedPatches": true,
     "onlyBuiltDependencies": [

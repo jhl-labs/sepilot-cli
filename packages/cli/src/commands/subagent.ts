@@ -42,6 +42,7 @@ function subagentCopy() {
 }
 
 export interface SubagentDispatchOptions {
+  isolation?: 'worktree'
   url?: string
   system?: string
   systemFile?: string
@@ -100,7 +101,8 @@ function defaultEmit(result: SubagentDispatchResult): void {
   const copy = subagentCopy()
   output(result, (r) => {
     const head = `${chalk.cyan(`[subagent ${r.sessionId}]`)} status=${r.status} iterations=${r.iterations} tokens=${r.usage.inputTokens}+${r.usage.outputTokens}${r.truncated ? copy.truncated : ''}`
-    return r.output ? `${head}\n\n${r.output}` : head
+    const isolation = r.worktree ? `\nWorktree ${r.worktree.retained ? 'retained' : 'cleaned'}: ${r.worktree.path}\n${r.worktree.reason}` : ''
+    return r.output ? `${head}${isolation}\n\n${r.output}` : `${head}${isolation}`
   })
 }
 
@@ -145,6 +147,8 @@ export async function runSubagentDispatch(
   }
 
   const request: SubagentDispatchInput = {
+    isolation: options.isolation,
+    cwd: process.cwd(),
     prompt,
     system,
     category: options.category,

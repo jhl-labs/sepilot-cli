@@ -1,7 +1,7 @@
 import { createWikiRepo } from '../wiki/repo.js'
 import { createKnowledgeRepo } from '../knowledge/repo.js'
 import { openDomainDb } from '../storage/domain-db.js'
-import { Entry, encode, keyOf } from './model.js'
+import { type Entry, encode, keyOf } from './model.js'
 
 export function createDocsGitStore() {
   const docs = createWikiRepo()

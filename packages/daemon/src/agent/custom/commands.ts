@@ -10,7 +10,7 @@ export interface CustomCommand {
 }
 
 export function compileCustomCommands(defs: CustomDef[]): CustomCommand[] {
-  return defs.map((d) => ({
+  return defs.filter((d) => !d.error).map((d) => ({
     id: d.id,
     description: typeof d.data.description === 'string' ? d.data.description : undefined,
     agent: typeof d.data.agent === 'string' ? d.data.agent : undefined,

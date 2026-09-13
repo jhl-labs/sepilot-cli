@@ -122,6 +122,11 @@ function latestToolResultIsFailure(messages: Message[]): boolean {
   if (!latestToolMessage) {
     return false
   }
+  // A trusted operator denial is a human decision the model was already told
+  // to finish around (grace turn), not a failed execution to recover from.
+  if (recordedApprovalFailureStatus(latestToolMessage) === 'denied') {
+    return false
+  }
   const text = extractMessageText(latestToolMessage)
   return TOOL_FAILURE_PATTERNS.some((pattern) => pattern.test(text))
 }

@@ -258,6 +258,7 @@ import {
 import { syncProjectSessionRegistry } from './state/project-session-sync.js'
 import { decideSessionProjectAttach } from './state/session-project-attach.js'
 import { loadSessionPickerItems } from './state/session-picker-fetch.js'
+import { runRewind } from '../commands/rewind.js'
 import {
   sessionBelongsToWorkspace,
   sessionWorkspaceLoadError,
@@ -4415,10 +4416,20 @@ export function App({ config }: AppProps) {
     })
     registry.register({
       name: '/hooks',
-      description: 'Manage outbound delivery hooks',
+      description: 'Inspect command hooks and manage outbound delivery hooks',
       handler: async ({ args }) => {
         const subcommand = (args[0] ?? 'list').toLowerCase()
         try {
+          if (subcommand === 'commands') {
+            const hooks = (await httpClient.config()).hooks.commandHooks ?? []
+            dispatch({
+              type: 'SYSTEM_MESSAGE',
+              content: hooks.length
+                ? hooks.map((hook, index) => `${index + 1}. ${hook.event} · ${hook.enabled ? 'enabled' : 'disabled'} · ${hook.async ? 'background job' : 'blocking'} · ${hook.timeoutMs}ms${hook.toolMatcher ? ` · ${hook.toolMatcher}` : ''}`).join('\n')
+                : 'No command hooks configured. Configure hooks.commandHooks. Inspect async results with /tasks list --kind hook.',
+            })
+            return
+          }
           if (['list', 'ls', 'current', 'info'].includes(subcommand)) {
             const webhooks = await httpClient.outboundWebhooks()
             dispatch({
@@ -4823,19 +4834,19 @@ export function App({ config }: AppProps) {
     })
     registry.register({
       name: '/thinking',
-      description: 'Set the thinking budget (off|low|medium|high|max)',
+      description: 'Set the thinking budget (auto|off|low|medium|high|max)',
       handler: ({ args }) => {
         const level = args[0]
-        if (!level || !['off', 'low', 'medium', 'high', 'max'].includes(level)) {
+        if (!level || !['auto', 'off', 'low', 'medium', 'high', 'max'].includes(level)) {
           dispatch({
             type: 'SYSTEM_MESSAGE',
-            content: 'Usage: /thinking <off|low|medium|high|max>',
+            content: 'Usage: /thinking <auto|off|low|medium|high|max>',
           })
           return
         }
         dispatch({
           type: 'SET_THINKING_LEVEL',
-          thinkingLevel: level as 'off' | 'low' | 'medium' | 'high' | 'max',
+          thinkingLevel: level as 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max',
         })
         dispatch({
           type: 'SYSTEM_MESSAGE',
@@ -5059,8 +5070,21 @@ export function App({ config }: AppProps) {
     })
     registry.register({
       name: '/rewind',
-      description: 'Rewind the current session by N user turns (default 1)',
+      description: 'Rewind turns, or preview files/conversation/both with --apply to confirm',
       handler: async ({ args }) => {
+        if (['files', 'conversation', 'both'].includes(args[0] ?? '')) {
+          if (!state.sessionId || state.isStreaming || state.pendingApproval) {
+            dispatch({ type: 'SYSTEM_MESSAGE', content: 'Rewind requires an idle session without a pending approval.' })
+            return
+          }
+          try {
+            const result = await runRewind(httpClient, state.sessionId, args.slice(1).find(part => !part.startsWith('--')), { scope: args[0] as 'files' | 'conversation' | 'both', apply: args.includes('--apply') })
+            const branchId = (result as { branch?: { branchId: string } })?.branch?.branchId
+            if (branchId) await loadSessionById(branchId)
+            dispatch({ type: 'SYSTEM_MESSAGE', content: JSON.stringify(result, null, 2) })
+          } catch (error) { dispatch({ type: 'SYSTEM_MESSAGE', content: String(error) }) }
+          return
+        }
         const turnsArg = args[0]?.trim()
         const turns = turnsArg ? Number.parseInt(turnsArg, 10) : 1
         if (turnsArg && turnsArg.length > 0 && (!Number.isInteger(turns) || turns <= 0)) {

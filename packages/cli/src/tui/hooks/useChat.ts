@@ -5,6 +5,7 @@ import {
   createTimedOutChatRunError,
   createTokenSpeedTracker,
   createStreamEventController,
+  shouldRenderStopCard,
   forwardDaemonStream,
   isTerminalDaemonChatPayload,
   resolveDaemonChatRunAbortReason,
@@ -47,6 +48,8 @@ import { formatJudgmentFeedLine } from '../state/judgment-feed.js'
 import { isTuiDebugLevel, logPreview, tuiLog, tuiLogError } from '../utils/debug-log.js'
 import { useActiveRunController } from './useActiveRunController.js'
 import { sanitizeTuiAgentResponse } from '../utils/agent-response-safety.js'
+import { formatRunStopCard } from '../utils/run-stop-card.js'
+import { detectCliLocale } from '../../utils/locale.js'
 import {
   openChatStreamWithConnectTimeout,
   resolveCliStreamConnectMs,
@@ -232,10 +235,32 @@ export type ChatHttpClient = Pick<
   | 'resumeSessionStream'
   | 'undoSession'
   | 'uploadFiles'
->
+> & Partial<Pick<DaemonClient, 'listSessionInbox'>>
 
 export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpClient) {
   const [state, dispatch] = useReducer(chatReducer, initialState)
+  useEffect(() => {
+    const sessionId = state.sessionId
+    if (!sessionId || !httpClient.listSessionInbox) return
+    let stopped = false
+    let cursor = 0
+    let retryMs = 2000
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const poll = async () => {
+      try {
+        const page = await httpClient.listSessionInbox!(sessionId, { after: cursor, limit: 30, unreadOnly: true })
+        if (stopped) return
+        for (const item of page.items) {
+          dispatch({ type: 'SYSTEM_MESSAGE', content: `[${item.source}] ${item.title}\n${item.body}\nReceipt ${item.seq} · acknowledge: /tasks ack ${sessionId} ${item.seq}` })
+          cursor = Math.max(cursor, item.seq)
+        }
+        retryMs = page.nextCursor === null ? 2000 : 100
+      } catch { retryMs = Math.min(30_000, Math.max(2000, retryMs * 2)) }
+      if (!stopped) timer = setTimeout(() => { void poll() }, retryMs)
+    }
+    void poll()
+    return () => { stopped = true; if (timer) clearTimeout(timer) }
+  }, [httpClient, state.sessionId])
   const cancellationBarrierRef = useRef<Promise<void>>(Promise.resolve())
   const pendingApprovalRef = useRef<ApprovalRequest | null>(null)
   const liveStreamRef = useRef<LiveStreamSlot | null>(null)
@@ -393,7 +418,8 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
             assistantId,
             liveStreamRef,
             dispatch,
-            sanitizeAssistantContent: (content) => sanitizeTuiAgentResponse(content).text,
+            sanitizeAssistantContent: (content, stopReason) =>
+              sanitizeTuiAgentResponse(content, { stopReason }).text,
           }),
           {
             assistantId,
@@ -654,6 +680,15 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
         liveStream.controller.handleEvent(safePayload)
         if (payload.type === 'done' || payload.type === 'error') {
           liveStreamRef.current = null
+          // Structured stop cause wins over any prose the model left: render
+          // the compact stop card right below the assistant reply.
+          const stopReason = liveStream.controller.getStopReason()
+          if (shouldRenderStopCard(stopReason)) {
+            dispatch({
+              type: 'SYSTEM_MESSAGE',
+              content: formatRunStopCard(stopReason, { locale: detectCliLocale() }),
+            })
+          }
         }
         return
       }

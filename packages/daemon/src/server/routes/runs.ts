@@ -67,6 +67,9 @@ export async function runsRoutes(app: FastifyInstance) {
       }
       const { sessionId } = request.params
       const cancelled = await activeRuns.cancel(sessionId)
+      if (!cancelled && activeRuns.get(sessionId)) {
+        return reply.status(409).send({ error: { code: 'RUN_CANCEL_UNAVAILABLE', message: 'This active run has no registered cancellation owner. No cancellation was performed; use its originating task controls.' } })
+      }
       // A cancellation acknowledgment is a completion boundary, not merely a
       // signal-delivery receipt. Waiting for the session lease prevents a
       // client that immediately submits its next turn from racing cleanup and

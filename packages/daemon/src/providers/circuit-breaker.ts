@@ -13,6 +13,7 @@ import {
 } from '../abort.js'
 import { messageChars, tokenCalibration } from './token-calibration.js'
 import { extractContent } from './utils.js'
+import { resolveRequestThinking } from './thinking-policy.js'
 
 export interface ProviderCircuitBreakerOptions {
   failureThreshold?: number
@@ -653,6 +654,7 @@ export class ProviderCircuitBreaker {
 export async function guardedProviderChat(
   options: GuardedProviderChatOptions,
 ): Promise<ChatResponse> {
+  options = { ...options, request: resolveRequestThinking(options.request) }
   const {
     provider,
     request,
@@ -726,6 +728,7 @@ export async function guardedProviderChat(
 export async function* guardedProviderStream(
   options: GuardedProviderStreamOptions,
 ): AsyncGenerator<StreamChunk, void, void> {
+  options = { ...options, request: resolveRequestThinking(options.request) }
   const {
     provider,
     request,

@@ -156,6 +156,9 @@ import { runModeCommand, runModelCommand } from './commands/runtime-selection.js
 import { runProjectCommand, runUsageCommand } from './commands/workspace.js'
 import { runSessionCommand } from './commands/session.js'
 import { ChoiceDialog } from './dialogs/ChoiceDialog.js'
+import { TasksDialog } from './dialogs/TasksDialog.js'
+import { runTasksCommand } from '../../commands/tasks.js'
+import { runRewind } from '../../commands/rewind.js'
 import { ArtifactDialog } from './dialogs/ArtifactDialog.js'
 import { DialogStack, type DialogEntry } from './dialogs/DialogStack.js'
 import { InfoDialog } from './dialogs/InfoDialog.js'
@@ -211,7 +214,7 @@ const MODE_FALLBACKS = [
   { id: 'plan', name: 'Plan', description: 'Analyze and prepare a plan' },
 ] satisfies Array<{ id: DaemonAgentMode; name: string; description: string }>
 
-const THINKING_OPTIONS = ['off', 'low', 'medium', 'high', 'max'].map((value) => ({
+const THINKING_OPTIONS = ['auto', 'off', 'low', 'medium', 'high', 'max'].map((value) => ({
   value,
   label: value,
 }))
@@ -1272,6 +1275,17 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const runCommand = useCallback(async (command: CommandDef, args = '') => {
     setStatusError(null)
     switch (command.id) {
+      case 'work.tasks': {
+        if (!args.trim()) { openDialog('tasks'); return }
+        try { showNotice(JSON.stringify(await runTasksCommand(client, splitSlashCommandInput(args)), null, 2)) }
+        catch (error) { setStatusError(errorMessage(error)) }
+        return
+      }
+      case 'work.jobs': {
+        try { showNotice(await runDaemonAdminSlashCommand(client, '/jobs', splitSlashCommandInput(args))) }
+        catch (error) { setStatusError(errorMessage(error)) }
+        return
+      }
       case 'shell.help':
         setInfo({
           title: 'Help',
@@ -1658,6 +1672,22 @@ export function NextApp({ config, runtime }: NextAppProps) {
         return
       }
       case 'session.rewind': {
+        if (/^(files|both|conversation)(?:\s|$)/.test(args)) {
+          if (!state.sessionId) { setStatusError('No active session to rewind.'); return }
+          if (state.isStreaming || state.pendingApproval) { setStatusError('Finish or cancel the active run before rewind.'); return }
+          const [scope, ...parts] = splitSlashCommandInput(args)
+          try {
+            const result = await runRewind(client, state.sessionId, parts.find(part => !part.startsWith('--')), { scope: scope as 'files' | 'both' | 'conversation', apply: parts.includes('--apply') })
+            const branchId = (result as { branch?: { branchId: string } })?.branch?.branchId
+            if (branchId) {
+              const [session, artifacts] = await Promise.all([client.session(branchId), client.sessionArtifacts(branchId).catch(() => [])])
+              loadSession(session, artifacts)
+              setClearedMessageCount(0)
+            }
+            showNotice(JSON.stringify(result, null, 2))
+          } catch (error) { setStatusError(errorMessage(error)) }
+          return
+        }
         const turns = args ? Number.parseInt(args, 10) : 1
         if (!Number.isInteger(turns) || turns <= 0) { setStatusError('Usage: /rewind [positive turn count]'); return }
         if (!state.sessionId) { setStatusError('No active session to rewind.'); return }
@@ -1882,6 +1912,12 @@ export function NextApp({ config, runtime }: NextAppProps) {
         const parts = args.split(/\s+/).filter(Boolean)
         const action = parts[0]?.toLowerCase() ?? 'list'
         try {
+          if (action === 'commands') {
+            const hooks = (await client.config()).hooks.commandHooks ?? []
+            setInfo({ title: 'Command hooks', body: hooks.length ? hooks.map((hook, index) => `${index + 1}. ${hook.event} · ${hook.enabled ? 'enabled' : 'disabled'} · ${hook.async ? 'background job' : 'blocking'} · ${hook.timeoutMs}ms${hook.toolMatcher ? ` · ${hook.toolMatcher}` : ''}`).join('\n') : 'No command hooks configured. Configure hooks.commandHooks. Async results are retained in /tasks list --kind hook.' })
+            openDialog('info')
+            return
+          }
           if (['list', 'ls', 'current', 'info'].includes(action)) {
             const hooks = await client.outboundWebhooks()
             setInfo({ title: 'Outbound hooks', body: hooks.length > 0 ? hooks.map(formatTuiHookSummary).join('\n') : `No outbound hooks configured.\n${buildTuiHooksUsage()}` })
@@ -3110,6 +3146,8 @@ export function NextApp({ config, runtime }: NextAppProps) {
         width={width}
         onClose={closeTopDialog}
       />
+    ) : id === 'tasks' ? (
+      <TasksDialog key={id} client={client} width={width} onClose={closeTopDialog} />
     ) : id === 'theme' ? (
       <ChoiceDialog
         key={id}

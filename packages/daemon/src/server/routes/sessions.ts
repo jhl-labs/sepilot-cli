@@ -41,6 +41,7 @@ import { registerSessionResumeRoute } from './session-resume.js'
 import { registerSessionUndoRoutes } from './session-undo.js'
 import { registerSessionSteerRoute } from './session-steer.js'
 import { registerSessionCheckpointRoutes } from './session-checkpoints.js'
+import { registerSessionInboxRoutes } from './session-inbox.js'
 import {
   buildSseResponseHeaders,
   registerSseDisconnectHandler,
@@ -60,6 +61,7 @@ export async function sessionsRoutes(app: FastifyInstance) {
   registerSessionResumeRoute(app)
   registerSessionUndoRoutes(app)
   registerSessionCheckpointRoutes(app)
+  registerSessionInboxRoutes(app)
   registerSessionSteerRoute(app)
 
   const invalidateWorkspaceExecutionState = async (sessionId: string): Promise<void> => {

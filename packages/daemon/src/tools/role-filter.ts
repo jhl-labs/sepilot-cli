@@ -130,6 +130,9 @@ const CLI_REACT_GROUPS: readonly ToolExposureGroup[] = ['files', 'code', 'proces
 const CLI_REACT_TOOL_NAMES = new Set([
   'question', 'skill', 'todowrite', 'system.info',
   'memory.search', 'memory.list', 'knowledge.search', 'knowledge.read',
+  // Native delegation is a core CLI capability, not a specialist integration.
+  // Avoid discovery/transfer model turns just to submit or collect a child.
+  'subagent.dispatch', 'subagent.job',
 ])
 
 export function toolExposureGroupForTool(name: string): ToolExposureGroup | null {
@@ -160,7 +163,7 @@ export function toolExposureGroupForTool(name: string): ToolExposureGroup | null
   if (name.startsWith('monitor.')) return 'scheduler-advanced'
   if (name.startsWith('swarm.')) return 'swarm'
   if (
-    name === 'subagent.dispatch'
+    name.startsWith('subagent.')
     || name === 'device.delegate'
     || name === 'external_acp.run'
     || name.startsWith('a2a.')
@@ -285,12 +288,14 @@ export function withContextualToolExposure(
   }
 
   const cliReact = options.surface === 'cli' && options.semanticRouting === true && options.routedMode === 'react'
+  const workspaceReact = options.semanticRouting === true && options.routedMode === 'react'
+    && ['cli', 'desktop', 'web'].includes(options.surface ?? '')
   const groups = new Set<ToolExposureGroup>(options.selectedGroups ?? [])
-  if (cliReact) for (const group of CLI_REACT_GROUPS) groups.add(group)
+  if (workspaceReact) for (const group of CLI_REACT_GROUPS) groups.add(group)
   if (options.routedMode) {
     for (const group of MODE_EXPOSURE_GROUPS[options.routedMode] ?? []) groups.add(group)
   }
-  if (options.routingFallback && !cliReact) {
+  if (options.routingFallback && !workspaceReact) {
     // The intent router is an advisory first pass, not the final graph/capability
     // decision.  In particular, a local or otherwise slower provider can time
     // out here and the graph router can still correctly select coder/cowork
@@ -305,6 +310,10 @@ export function withContextualToolExposure(
   if (options.swarmSession) groups.add('swarm')
 
   const allowed = new Set(cliReact ? CLI_REACT_TOOL_NAMES : DEFAULT_PERSONAL_TOOL_NAMES)
+  if (options.routedMode === 'coder') {
+    allowed.add('subagent.dispatch')
+    allowed.add('subagent.job')
+  }
   for (const tool of source.list()) {
     const group = toolExposureGroupForTool(tool.name)
     // Semantic mode control discovers ungrouped integrations through the

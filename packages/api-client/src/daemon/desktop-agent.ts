@@ -28,3 +28,15 @@ export interface DesktopAgentSession {
   createdAt: string
   exitCode?: number
 }
+
+export interface DesktopAgentReview {
+  observedAt: string
+  cwd: string
+  host: string
+  files: Array<{ status: string; path: string; previousPath?: string }>
+  diff: string
+  statusError: string | null
+  diffError: string | null
+  scope: 'working-tree-against-head'
+  tests: 'not-observed'
+}

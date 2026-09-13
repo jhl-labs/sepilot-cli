@@ -36,6 +36,11 @@ export function mergeChildInto(
   parent.recentToolResults = childClone.recentToolResults
   parent.toolCallHistory = (childClone.toolCallHistory ?? []).slice(-200)
   parent.evidenceLedger = childClone.evidenceLedger
+  parent.workProgress = childClone.workProgress ?? parent.workProgress
+  // These are run-wide costs, not phase-local allowances.
+  parent.recoveryProviderCallTotal = Math.max(parent.recoveryProviderCallTotal ?? 0, childClone.recoveryProviderCallTotal ?? 0)
+  parent.recoveryControllerFailureTotal = Math.max(parent.recoveryControllerFailureTotal ?? 0, childClone.recoveryControllerFailureTotal ?? 0)
+  parent.recoveryExhaustedFinalCount = Math.max(parent.recoveryExhaustedFinalCount ?? 0, childClone.recoveryExhaustedFinalCount ?? 0)
   parent.backtrackCount = childClone.backtrackCount
   parent.backtrackReason = childClone.backtrackReason
   parent.backtrackReasons = childClone.backtrackReasons

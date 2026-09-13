@@ -6,11 +6,11 @@ import type { FastifyInstance } from 'fastify'
 import { buildDaemonCorsHeaders } from './cors.js'
 import { resolveClientLabel, resolveRequestSurface } from './request-surface.js'
 import { writeSseComment } from './sse-write.js'
+import { resolveApprovalTimeoutMs } from './runtime/approvals.js'
 import './fastify-types.js'
 
 const DEFAULT_KEEPALIVE_MS = 15000
 const DEFAULT_INACTIVITY_MS = 5 * 60_000
-const DEFAULT_PENDING_DECISION_TIMEOUT_MS = 30 * 60_000
 export const MODEL_STREAM_WAITING_THINKING = 'Still waiting for the model stream...'
 
 export interface SseLifecycleOptions {
@@ -150,17 +150,14 @@ export function resolveAgentInactivityMs(): number {
 
 /**
  * Bound on how long a run may stay blocked waiting for a human approval or
- * answer, from `SEPILOTD_PENDING_DECISION_TIMEOUT_MS`. `0` means "wait
- * indefinitely". Kept separate from `SEPILOTD_AGENT_INACTIVITY_MS` because the
- * two describe different run states and deserve different bounds.
+ * answer. This is the same delay the approval registry uses to park a run
+ * (`SEPILOTD_APPROVAL_TIMEOUT_MS`, default 10 min; legacy
+ * `SEPILOTD_PENDING_DECISION_TIMEOUT_MS` overrides when set, `0` = wait
+ * indefinitely). Kept separate from `SEPILOTD_AGENT_INACTIVITY_MS` because a
+ * blocked run is not a stalled run.
  */
 export function resolvePendingDecisionTimeoutMs(): number {
-  const raw = process.env.SEPILOTD_PENDING_DECISION_TIMEOUT_MS
-  if (raw === undefined || raw.trim() === '') return DEFAULT_PENDING_DECISION_TIMEOUT_MS
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_PENDING_DECISION_TIMEOUT_MS
-  if (parsed === 0) return 0
-  return Math.max(1000, parsed)
+  return resolveApprovalTimeoutMs()
 }
 
 export interface PendingDecisionTimeoutFrame {
@@ -212,10 +209,10 @@ export function describePendingDecisionTimeout(input: {
       code: 'APPROVAL_TIMEOUT',
       reason: 'awaiting_approval',
       message:
-        `${label} is blocked on a pending approval (id ${input.pending.id})${tool} and no decision arrived${waited}. `
-        + `Nothing stalled — approve or deny it (\`sepilot approve ${input.pending.id}\` / \`sepilot deny ${input.pending.id}\`), `
-        + 'or re-run on a surface that can answer approval prompts. '
-        + 'Raise SEPILOTD_PENDING_DECISION_TIMEOUT_MS (0 = wait indefinitely) if you need a longer window.',
+        `${label} is paused on a pending approval (id ${input.pending.id})${tool}: no decision arrived${waited}. `
+        + `Nothing stalled and nothing was denied — the run is parked with its checkpoint. Approve or deny it (\`sepilot approve ${input.pending.id}\` / \`sepilot deny ${input.pending.id}\`) `
+        + 'and the run continues from where it stopped. '
+        + 'Raise SEPILOTD_APPROVAL_TIMEOUT_MS (legacy SEPILOTD_PENDING_DECISION_TIMEOUT_MS; 0 = wait indefinitely) if you need a longer window.',
       provider: input.provider,
       model: input.model,
       lastEventType: input.lastEventType,
@@ -234,7 +231,7 @@ export function describePendingDecisionTimeout(input: {
     message:
       `${label} is blocked on a pending question (id ${input.pending.id})${prompt} and no answer arrived${waited}. `
       + `Nothing stalled — answer it (\`sepilot answer ${input.pending.id} <reply>\`), or re-run on a surface that can answer questions. `
-      + 'Raise SEPILOTD_PENDING_DECISION_TIMEOUT_MS (0 = wait indefinitely) if you need a longer window.',
+      + 'Raise SEPILOTD_APPROVAL_TIMEOUT_MS (legacy SEPILOTD_PENDING_DECISION_TIMEOUT_MS; 0 = wait indefinitely) if you need a longer window.',
     provider: input.provider,
     model: input.model,
     lastEventType: input.lastEventType,
@@ -330,6 +327,7 @@ export interface AgentInactivityProbe {
  * as activity would let a dead model request refresh the watchdog forever.
  */
 export function isSubstantiveAgentActivity(event: AgentEvent): boolean {
+  if (event.type === 'subagent_progress') return isSubstantiveAgentActivity(event.inner)
   return !(
     event.type === 'thinking'
     && event.content === MODEL_STREAM_WAITING_THINKING
@@ -339,14 +337,32 @@ export function isSubstantiveAgentActivity(event: AgentEvent): boolean {
 export function createAgentInactivityProbe(): AgentInactivityProbe {
   let sawModelOutput = false
   let lastEventType: string | undefined
-  // Pending-decision state machine: an approval/question request blocks the
-  // run, and *any* later event proves the run moved on again (an approval
-  // response, the tool result, the next token). No event can arrive while the
-  // run is genuinely blocked, so "next event clears" is exact, not heuristic.
+  // Parent and child consent are separate. A sibling's activity must not clear
+  // another child's pending approval, nor may keepalives extend its deadline.
   let pending: PendingDecision | null = null
+  const children = new Map<string, PendingDecision>()
+  const currentPending = () => pending ?? children.values().next().value ?? null
   return {
     note(event) {
       lastEventType = event.type
+      if (event.type === 'subagent_progress') {
+        const inner = event.inner
+        const prior = children.get(event.subagentId)
+        if (inner.type === 'approval_request') {
+          if (prior?.id !== inner.requestId) children.set(event.subagentId, {
+            kind: 'approval', id: inner.requestId, label: inner.toolCall.name, since: Date.now(),
+          })
+          sawModelOutput = true
+        } else if ((inner.type === 'approval_response' && inner.requestId === prior?.id)
+          || inner.type === 'tool_result' || inner.type === 'tool_call') {
+          children.delete(event.subagentId)
+          sawModelOutput = true
+        }
+        return
+      }
+      // Root tool results are emitted only after the owned execution/batch
+      // settles. This also releases a child canceled without a response event.
+      if (event.type === 'tool_result' || event.type === 'done' || event.type === 'error') children.clear()
       if (event.type === 'approval_request') {
         pending = {
           kind: 'approval',
@@ -377,12 +393,13 @@ export function createAgentInactivityProbe(): AgentInactivityProbe {
         sawModelOutput = true
       }
     },
-    pendingDecision() { return pending },
+    pendingDecision() { return currentPending() },
     describe(opts) {
-      if (pending) {
+      const decision = currentPending()
+      if (decision) {
         return describePendingDecisionTimeout({
           decisionTimeoutMs: opts.decisionTimeoutMs ?? resolvePendingDecisionTimeoutMs(),
-          pending,
+          pending: decision,
           activityLabel: opts.activityLabel,
           provider: opts.provider,
           model: opts.model,

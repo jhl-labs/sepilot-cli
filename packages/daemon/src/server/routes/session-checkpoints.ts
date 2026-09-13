@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import '../fastify-types.js'
 import { zodRequestValidation } from './utils.js'
+import { RewindConflictError } from '../../agent/edit-rollback/store.js'
 
 interface IdParams {
   id: string
@@ -9,10 +10,11 @@ interface IdParams {
 
 interface RewindBody {
   checkpointId: string
+  expectedCheckpointIds?: string[]
 }
 
 const idParamsSchema = z.object({ id: z.string().min(1) })
-const rewindBodySchema = z.object({ checkpointId: z.string().min(1) })
+const rewindBodySchema = z.object({ checkpointId: z.string().min(1), expectedCheckpointIds: z.array(z.string().min(1)).max(100).optional() })
 
 /**
  * Durable edit-checkpoint listing and file rewind (time travel). Every
@@ -23,6 +25,19 @@ const rewindBodySchema = z.object({ checkpointId: z.string().min(1) })
  * POST /sessions/:id/branch and /undo.
  */
 export function registerSessionCheckpointRoutes(app: FastifyInstance): void {
+  app.get<{ Params: { id: string; checkpointId: string } }>('/sessions/:id/checkpoints/:checkpointId/preview', {
+    preValidation: zodRequestValidation({ params: { schema: idParamsSchema.extend({ checkpointId: z.string().min(1) }), message: 'Invalid checkpoint' } }),
+  }, async (request, reply) => {
+    const runtime = app.runtime
+    const params = request.params
+    if (!runtime?.sessions || !runtime.editSnapshotStore) return reply.status(503).send({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Edit checkpoints not available' } })
+    if (!await runtime.sessions.get(params.id)) return reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Session not found' } })
+    try { return { data: await runtime.editSnapshotStore.previewRewind(params.id, params.checkpointId) } }
+    catch (error) {
+      if (error instanceof Error && error.message.includes('not found')) return reply.status(404).send({ error: { code: 'NOT_FOUND', message: error.message } })
+      throw error
+    }
+  })
   app.get<{ Params: IdParams }>('/sessions/:id/checkpoints', {
     preValidation: zodRequestValidation({
       params: { schema: idParamsSchema, message: 'Invalid session id' },
@@ -66,12 +81,19 @@ export function registerSessionCheckpointRoutes(app: FastifyInstance): void {
       })
     }
     try {
+      if (runtime.activeRuns?.get(params.id)) {
+        return reply.status(409).send({ error: { code: 'REWIND_CONFLICT', message: 'Wait for the active run to finish before rewinding files.' } })
+      }
       const result = await runtime.editSnapshotStore.rewindFiles(
         params.id,
         body.checkpointId,
+        body.expectedCheckpointIds,
       )
       return { data: result }
     } catch (err) {
+      if (err instanceof RewindConflictError) {
+        return reply.status(409).send({ error: { code: 'REWIND_CONFLICT', message: err.message, paths: err.paths } })
+      }
       const message = err instanceof Error ? err.message : String(err)
       if (message.includes('not found')) {
         return reply.status(404).send({ error: { code: 'NOT_FOUND', message } })

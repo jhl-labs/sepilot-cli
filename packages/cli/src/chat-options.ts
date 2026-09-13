@@ -46,7 +46,7 @@ const CLI_AUTONOMY_LEVELS = new Set([
   'autonomous',
 ])
 
-const CLI_THINKING_LEVELS = new Set(['off', 'low', 'medium', 'high', 'max'])
+const CLI_THINKING_LEVELS = new Set(['auto', 'off', 'low', 'medium', 'high', 'max'])
 
 function normalizeAutonomy(
   value?: string,
@@ -71,7 +71,7 @@ function normalizeThinkingLevel(value?: string): string | undefined {
   if (!trimmed) return undefined
   if (!CLI_THINKING_LEVELS.has(trimmed)) {
     throw new Error(
-      `--thinking-level must be one of off, low, medium, high, max (got: ${value})`,
+      `--thinking-level must be one of auto, off, low, medium, high, max (got: ${value})`,
     )
   }
   return trimmed

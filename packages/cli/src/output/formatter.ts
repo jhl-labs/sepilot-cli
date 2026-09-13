@@ -20,6 +20,8 @@ export function getOutputFormat(): OutputFormat {
 export function output<T>(data: T, textFormatter?: (data: T) => string): void {
   if (format === 'json') {
     writeJson(data)
+  } else if (format === 'stream-json') {
+    writeOutputText(JSON.stringify(data))
   } else if (textFormatter) {
     console.log(textFormatter(data))
   } else {
@@ -35,6 +37,8 @@ export function output<T>(data: T, textFormatter?: (data: T) => string): void {
 export function outputError<T>(data: T, textFormatter: (data: T) => string): void {
   if (format === 'json') {
     writeJson(data)
+  } else if (format === 'stream-json') {
+    writeOutputText(JSON.stringify(data))
   } else {
     console.error(textFormatter(data))
   }

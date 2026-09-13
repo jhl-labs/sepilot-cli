@@ -791,6 +791,18 @@ export function createStreamEventController(
         // Nested activity from a dispatched subagent. Surface it as its own
         // activity row so a long (or parallel) subagent isn't a silent gap.
         const inner = event.inner
+        // Keep consent actionable in the parent view, but route the response
+        // to the child session. Namespace display ids (providers may reuse
+        // tool-call ids across isolated engines); never change requestId.
+        if (inner.type === 'approval_request') {
+          handleEvent({ ...inner, sessionId: event.subagentId, toolCall: {
+            ...inner.toolCall, id: `${event.subagentId}:${inner.toolCall.id}`,
+          } })
+        } else if (inner.type === 'approval_response' || inner.type === 'auto_approval') {
+          handleEvent(inner)
+        } else if (inner.type === 'tool_result' && toolNamesById.has(`${event.subagentId}:${inner.toolCallId}`)) {
+          handleEvent({ ...inner, toolCallId: `${event.subagentId}:${inner.toolCallId}` })
+        }
         const label = event.label ? `subagent · ${event.label}` : 'subagent'
         let detail: string = inner.type
         if (inner.type === 'reasoning_step') detail = inner.label

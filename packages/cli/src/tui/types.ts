@@ -105,7 +105,7 @@ export interface ChatState {
   model: string
   provider: string
   mode: DaemonAgentMode
-  thinkingLevel: 'off' | 'low' | 'medium' | 'high' | 'max'
+  thinkingLevel: 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max'
   maxTokens: number | null
   autonomy: 'readonly' | 'accept-edits' | 'workspace-write' | 'supervised' | 'autonomous'
   usage: { input: number; output: number; cost: number }

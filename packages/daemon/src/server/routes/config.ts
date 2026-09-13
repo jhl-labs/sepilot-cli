@@ -191,6 +191,10 @@ export async function configRoutes(app: FastifyInstance) {
       client: runtime.config.mcp?.client,
     }
     const hooks = {
+      commandHooks: (runtime.config.hooks?.commandHooks ?? []).map((hook) => ({
+        event: hook.event, enabled: hook.enabled !== false, async: hook.async === true,
+        timeoutMs: hook.timeoutMs ?? 10_000, toolMatcher: hook.toolMatcher,
+      })),
       outboundWebhooks: (runtime.config.hooks?.outboundWebhooks ?? []).map((webhook) => ({
         ...webhook,
         secret: webhook.secret ? '***redacted***' : undefined,
