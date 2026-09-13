@@ -1799,9 +1799,12 @@ function resolveMainTurnMaxTokens(
 ): number | undefined {
   if (context?.maxTokens !== undefined) return context.maxTokens
   const modelInfo = resolveModelInfo(deps, context)
-  const contextShare = modelInfo?.contextWindow === undefined
-    ? DEFAULT_MAIN_TOOL_TURN_MAX_TOKENS
-    : Math.max(256, Math.floor(modelInfo.contextWindow / 2))
+  const contextWindow = modelInfo?.contextWindow ?? DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW
+  // Start conservatively. A demonstrated truncation may use more of the
+  // context; fitGraphMainRequest still reserves the actual input and tools.
+  const contextShare = state?.adaptiveMainToolTurnMaxTokens === undefined
+    ? Math.max(256, Math.floor(contextWindow / 2))
+    : contextWindow
   return Math.min(
     state?.adaptiveMainToolTurnMaxTokens ?? DEFAULT_MAIN_TOOL_TURN_MAX_TOKENS,
     contextShare,
@@ -16003,9 +16006,9 @@ export const agent = (deps: Deps, options: AgentNodeOptions = {}) => async funct
         // explicit user limits, provider-observed ceilings, or context fit.
         s.adaptiveMainToolTurnMaxTokens = Math.min(
           priorAllowance * 2,
-          model?.maxOutputTokens ?? priorAllowance,
+          model?.maxOutputTokens ?? Number.POSITIVE_INFINITY,
           s.effectiveMaxOutputTokens ?? Number.POSITIVE_INFINITY,
-          Math.max(256, Math.floor((model?.contextWindow ?? priorAllowance * 2) / 2)),
+          model?.contextWindow ?? DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW,
         )
       }
       const truncatedToolCall = s.pendingLengthContinuationIsToolCall === true

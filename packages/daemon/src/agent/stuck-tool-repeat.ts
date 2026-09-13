@@ -31,7 +31,7 @@ export interface StuckToolRepeatEntry {
   blocked?: boolean
   /** Executor evidence, when available. Different results are not an exact loop. */
   output?: string
-  outputHash?: string
+  outputFingerprint?: string
   executionObserved?: boolean
   securityEffect?: ToolSecurityEffect
   ts: number
@@ -261,7 +261,7 @@ export function detectStuckToolRepeat(
     // copies of one unchanged result. Prefer the executor's full-result hash;
     // legacy/checkpoint entries fall back to their retained output or status.
     const sig = signatureOf(entry)
-    const outcome = JSON.stringify([entry.status, entry.failureCode, entry.outputHash ?? entry.output])
+    const outcome = JSON.stringify([entry.status, entry.failureCode, entry.outputFingerprint ?? entry.output])
     const existing = counts.get(sig)
     if (existing?.outcome === outcome) existing.count += 1
     else counts.set(sig, { count: 1, tool: entry.tool, outcome })
@@ -297,7 +297,7 @@ export function detectStuckToolRepeat(
     const scope = failureScopeOf(entry)
     const key = `${scope}:${entry.failureCode}`
     const outcome = entry.failureCode === 'EXIT_NONZERO_PERMANENT'
-      ? entry.outputHash ?? entry.output
+      ? entry.outputFingerprint ?? entry.output
       : undefined
     const existing = failureCounts.get(key)
     if (existing && existing.outcome === outcome) existing.count += 1
@@ -593,7 +593,7 @@ export function findStuckRepeatEntry(
     if (entry.tool !== result.tool) continue
     const sig = signatureOf(entry)
     const outcome = result.kind === 'exact'
-      ? JSON.stringify([entry.status, entry.failureCode, entry.outputHash ?? entry.output])
+      ? JSON.stringify([entry.status, entry.failureCode, entry.outputFingerprint ?? entry.output])
       : undefined
     const existing = counts.get(sig)
     if (existing && existing.outcome === outcome) {
