@@ -1,7 +1,7 @@
 import { mkdir, readdir, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
-import { lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs'
 import type { EditCheckpointFile, EditCheckpointSummary } from '@sepilotd/core'
 import { createLogger } from '../../logger.js'
 import { buildUnifiedDiff } from '../../tools/edit-diff.js'
@@ -53,15 +53,34 @@ export class RewindConflictError extends Error {
   }
 }
 
-function currentHash(path: string): string | null {
+function readCurrentContent(path: string): Buffer | null {
+  let fd: number | undefined
   try {
-    // Never follow a replacement symlink while verifying a rewind target.
-    if (!lstatSync(path).isFile()) throw new Error(`Not a regular file: ${path}`)
-    return createHash('sha256').update(readFileSync(path)).digest('hex')
+    // Pin the object before inspecting/reading it. Opening by path again after
+    // lstat lets a replacement symlink change which bytes establish trust.
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
+    const opened = fstatSync(fd)
+    const named = lstatSync(path)
+    // The inode check also rejects replacement/reparse points on platforms
+    // without O_NOFOLLOW. No bytes are read until the opened object is checked.
+    if (!opened.isFile() || !named.isFile() || opened.dev !== named.dev || opened.ino !== named.ino) {
+      throw new Error(`Not the same regular file: ${path}`)
+    }
+    return readFileSync(fd)
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    if (fd === undefined && (error as NodeJS.ErrnoException).code === 'ENOENT') return null
     throw error
+  } finally {
+    if (fd !== undefined) closeSync(fd)
   }
+}
+
+function contentHash(content: Buffer | null): string | null {
+  return content === null ? null : createHash('sha256').update(content).digest('hex')
+}
+
+function currentHash(path: string): string | null {
+  return contentHash(readCurrentContent(path))
 }
 
 export interface EditSnapshotStoreOptions {
@@ -307,12 +326,12 @@ export class EditSnapshotStore {
       let conflict = true
       let diff: string | undefined
       try {
-        conflict = expected.postHash === undefined || currentHash(path) !== expected.postHash
+        const before = readCurrentContent(path)
+        conflict = expected.postHash === undefined || contentHash(before) !== expected.postHash
           || realpathSync(dirname(path)) !== expected.postParent
         // A mismatched path may be a replacement symlink. Never follow it for
         // display. Old snapshots without postimages are deliberately not safe.
         if (!conflict && diffBudget > 0) {
-          const before = expected.postHash === null ? null : await readFile(path)
           const after = file.hadFileBefore && file.blob
             ? await readFile(join(this.checkpointDir(sessionId, manifest.checkpointId), file.blob)) : null
           if (isTextBuffer(before) && isTextBuffer(after)) {

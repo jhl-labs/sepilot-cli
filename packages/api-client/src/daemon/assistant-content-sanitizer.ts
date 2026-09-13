@@ -50,7 +50,32 @@ function formatDetail(label: string, value: string): string[] {
 }
 
 function stripThinkingArtifacts(text: string): string {
-  let remaining = text.replace(/<(think|thinking)>[\s\S]*?<\/\1>/gi, '')
+  // Match only fixed-size tags, then pair them in linear passes. Retrying a
+  // wildcard block regex at every unclosed opener makes model output quadratic.
+  // Preserve the old non-nesting semantics and unmatched literal tags.
+  const tags = [...text.matchAll(/<\/?(?:think|thinking)>/gi)]
+  const closingForOpening = new Map<number, number>()
+  const nextClosing = new Map<string, number>()
+  for (let index = tags.length - 1; index >= 0; index -= 1) {
+    const tag = tags[index]![0].toLowerCase()
+    if (tag.startsWith('</')) {
+      nextClosing.set(tag.slice(2, -1), index)
+    } else {
+      const closing = nextClosing.get(tag.slice(1, -1))
+      if (closing !== undefined) closingForOpening.set(index, closing)
+    }
+  }
+  const parts: string[] = []
+  let cursor = 0
+  for (let index = 0; index < tags.length; index += 1) {
+    const closing = closingForOpening.get(index)
+    if (closing === undefined) continue
+    parts.push(text.slice(cursor, tags[index]!.index))
+    cursor = tags[closing]!.index + tags[closing]![0].length
+    index = closing
+  }
+  parts.push(text.slice(cursor))
+  let remaining = parts.join('')
   const trimmedLeading = remaining.trimStart()
   if (/^<\/(think|thinking)>/i.test(trimmedLeading)) {
     remaining = trimmedLeading.replace(/^<\/(?:think|thinking)>/i, '')
