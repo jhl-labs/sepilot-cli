@@ -2009,13 +2009,12 @@ function auxMaxTokens(
   // heuristic fallback. Sizing off the main model missed this whenever the
   // aux model reasons but the main model does not.
   const modelInfo = resolveModelInfo(deps, context, requestPolicy?.modelRole ?? 'aux')
-  // A declared off dialect is a request capability, not a model-name guess.
-  // Do not allocate hidden-reasoning headroom when this very request disables
-  // it. Unknown/uncontrollable endpoints keep the compatibility headroom.
-  const thinkingDisabled = requestPolicy?.thinkingLevel === ThinkingLevel.Off
-    && (modelInfo?.capabilities.thinkingControl === 'reasoning-effort'
-      || modelInfo?.capabilities.thinkingControl === 'chat-template-kwargs')
-  const thinking = (modelInfo?.capabilities.thinking ?? false) && !thinkingDisabled
+  // A configured wire dialect does not prove that this endpoint/model can
+  // disable reasoning. Keep its bounded output headroom even when the request
+  // asks for Off; otherwise ignored/unsupported Off consumes the whole budget
+  // before the required control payload can be emitted. This does not change
+  // the requested reasoning level or force a model to spend the allowance.
+  const thinking = modelInfo?.capabilities.thinking ?? false
   const requested = thinking ? Math.max(base * 12, 8000) : base
   // Auxiliary graph calls return bounded plans, judgments, or small JSON
   // envelopes. They need reasoning headroom, but never a main-answer-sized
@@ -20056,6 +20055,25 @@ export const validationEvidenceHandoff = (deps: Deps) => async (
   return s
 }
 
+function applyValidationConclusion(
+  state: AgentState,
+  conclusion: Awaited<ReturnType<typeof requestQualityConclusion>>,
+): void {
+  state.output = conclusion
+    ? `${conclusion.decision}: ${conclusion.summary}`
+    : 'UNVERIFIED: The bounded validation conclusion controller did not return the required structured decision; collected checks remain available, but semantic acceptance is unresolved.'
+  // Both a valid verdict and a fail-closed controller outcome finish this
+  // normalization attempt. Re-capturing our own unavailable marker as raw
+  // validator prose would recurse forever without new evidence or a budget.
+  state.qualityConclusionResolvedPhase = 'validation'
+  state.qualityConclusionRecoveryRequested = undefined
+  state.qualityConclusionRetryTarget = conclusion
+    ? conclusion.nextPhase === 'none' ? undefined : conclusion.nextPhase
+    : 'blocked'
+  state.toolCalls = []
+  state.shouldStop = false
+}
+
 export const validationCompletionGuard = (deps?: Deps) => async (
   s: AgentState,
   context?: GraphExecutionContext,
@@ -20083,19 +20101,7 @@ export const validationCompletionGuard = (deps?: Deps) => async (
     s.qualityConclusionRecoveryRequested = undefined
     s.validationConvergenceNudgeCount = MAX_VALIDATION_CONVERGENCE_NUDGES + 1
     const conclusion = await requestQualityConclusion(deps, s, 'validation', context)
-    if (conclusion) {
-      s.output = `${conclusion.decision}: ${conclusion.summary}`
-      s.qualityConclusionResolvedPhase = 'validation'
-      s.qualityConclusionRetryTarget = conclusion.nextPhase === 'none'
-        ? undefined
-        : conclusion.nextPhase
-      s.toolCalls = []
-      s.shouldStop = false
-    } else {
-      s.output = 'UNVERIFIED: The bounded validation conclusion controller did not return the required structured decision; collected checks remain available, but semantic acceptance is unresolved.'
-      s.toolCalls = []
-      s.shouldStop = false
-    }
+    applyValidationConclusion(s, conclusion)
     return s
   }
 
@@ -20108,14 +20114,7 @@ export const validationCompletionGuard = (deps?: Deps) => async (
       // expires. Increment first so provider failure remains bounded.
       s.validationConvergenceNudgeCount = MAX_VALIDATION_CONVERGENCE_NUDGES + 1
       const conclusion = await requestQualityConclusion(deps, s, 'validation', context)
-      if (conclusion) {
-        s.output = `${conclusion.decision}: ${conclusion.summary}`
-        s.qualityConclusionResolvedPhase = 'validation'
-        s.qualityConclusionRetryTarget = conclusion.nextPhase === 'none'
-          ? undefined
-          : conclusion.nextPhase
-        s.toolCalls = []
-      }
+      applyValidationConclusion(s, conclusion)
     }
     return s
   }
@@ -20158,8 +20157,9 @@ export const captureValidationSummary = () => async (
   // Free-form validator prose is evidence input, never the control-plane
   // decision itself. Even a syntactically valid stem may be a copied example,
   // placeholder, or unsupported claim. Route every raw validator conclusion
-  // through the bounded required-tool LLM controller; only its own immediately
-  // following capture is accepted without recursive normalization.
+  // through the bounded required-tool LLM controller. Its own immediately
+  // following verdict OR fail-closed unavailable marker must not recursively
+  // normalize itself. Unavailable never grants semantic acceptance or retry.
   if (s.qualityConclusionResolvedPhase === 'validation') {
     s.qualityConclusionResolvedPhase = undefined
     s.qualityConclusionRecoveryRequested = undefined

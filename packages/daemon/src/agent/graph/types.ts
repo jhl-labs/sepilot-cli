@@ -846,13 +846,14 @@ export interface AgentState extends GraphRuntimeState {
    */
   qualityConclusionRecoveryRequested?: 'validation' | 'review'
   /**
-   * Marks the next capture as the output of the required-tool quality
-   * controller rather than another free-form validator response. This avoids
-   * recursively normalizing the controller's own structured decision and is
-   * persisted so cancellation between graph nodes remains resumable.
+   * Marks the next capture as the outcome of the required-tool quality
+   * controller: a structured decision or its fail-closed unavailable marker,
+   * never another free-form validator response. This prevents recursive
+   * normalization and persists across cancellation between graph nodes.
+   * An unavailable outcome remains UNVERIFIED with retry target blocked.
    */
   qualityConclusionResolvedPhase?: 'validation' | 'review'
-  /** LLM-selected phase that can actually resolve the latest quality gap. */
+  /** LLM-selected recovery phase, or blocked when the required controller is unavailable. */
   qualityConclusionRetryTarget?: 'implementation' | 'validation' | 'blocked'
   /** Executed tool-call count observed at the last iteration boundary. */
   lastIterationToolCallCount?: number
