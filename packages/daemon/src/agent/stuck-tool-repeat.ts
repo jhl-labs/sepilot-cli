@@ -1,4 +1,4 @@
-import type { Message } from '@sepilotd/core'
+import type { Message, ToolSecurityEffect } from '@sepilotd/core'
 
 /**
  * Detect a stuck agent loop: the same tool called with the same
@@ -29,6 +29,11 @@ export interface StuckToolRepeatEntry {
    * so an identical blocked call issued over and over is caught there.
    */
   blocked?: boolean
+  /** Executor evidence, when available. Different results are not an exact loop. */
+  output?: string
+  outputFingerprint?: string
+  executionObserved?: boolean
+  securityEffect?: ToolSecurityEffect
   ts: number
 }
 
@@ -162,6 +167,9 @@ function terminalFailureScope(input: Record<string, unknown>): string {
 
 function failureScopeOf(entry: StuckToolRepeatEntry): string {
   if (entry.tool === 'terminal.run') {
+    // A program/test exiting nonzero does not mean its interpreter or shell
+    // is unavailable. Different commands can fail for unrelated assertions.
+    if (entry.failureCode === 'EXIT_NONZERO_PERMANENT') return signatureOf(entry)
     return `${entry.tool}:${terminalFailureScope(entry.input)}`
   }
   if (entry.tool.startsWith('memory.')) return entry.tool
@@ -247,27 +255,53 @@ export function detectStuckToolRepeat(
     return { stuck: false }
   }
   const recent = history.slice(-window)
-  const counts = new Map<string, { count: number; tool: string }>()
+  const counts = new Map<string, { count: number; tool: string; outcome: string }>()
   for (const entry of recent) {
     // An error followed by a successful retry is a changed outcome, not four
-    // copies of one unchanged result. Keep status in the exact-repeat bucket;
-    // output-level equality is unavailable in the bounded history record.
-    const sig = `${entry.status}:${signatureOf(entry)}`
+    // copies of one unchanged result. Prefer the executor's full-result hash;
+    // legacy/checkpoint entries fall back to their retained output or status.
+    const sig = signatureOf(entry)
+    const outcome = JSON.stringify([entry.status, entry.failureCode, entry.outputFingerprint ?? entry.output])
     const existing = counts.get(sig)
-    if (existing) existing.count += 1
-    else counts.set(sig, { count: 1, tool: entry.tool })
+    if (existing?.outcome === outcome) existing.count += 1
+    else counts.set(sig, { count: 1, tool: entry.tool, outcome })
   }
   for (const { count, tool } of counts.values()) {
     if (count >= threshold) return { stuck: true, tool, count, kind: 'exact' }
   }
 
-  const failureCounts = new Map<string, { count: number; tool: string }>()
+  const failureCounts = new Map<string, { count: number; tool: string; scope: string; code: string; outcome?: string }>()
+  const seenMutations = new Set<string>()
   for (const entry of recent) {
+    if (entry.status === 'success' && entry.executionObserved !== false && !entry.blocked) {
+      const mutation = entry.securityEffect === 'workspace-write'
+        || options.lowNoveltyBarrierTools?.has(entry.tool)
+      const signature = signatureOf(entry)
+      if (mutation && !seenMutations.has(signature)) {
+        // A real edit invalidates old command outcomes, not authentication,
+        // policy, missing-executable, or remote-service failures.
+        for (const [key, failure] of failureCounts) {
+          if (failure.tool === 'terminal.run' && failure.code === 'EXIT_NONZERO_PERMANENT') {
+            failureCounts.delete(key)
+          }
+        }
+        seenMutations.add(signature)
+      }
+      for (const [key, failure] of failureCounts) {
+        const scope = failureScopeOf({ ...entry, failureCode: failure.code })
+        if (failure.scope === scope) failureCounts.delete(key)
+      }
+      continue
+    }
     if (entry.status !== 'error' || !entry.failureCode || entry.blocked) continue
-    const key = `${failureScopeOf(entry)}:${entry.failureCode}`
+    const scope = failureScopeOf(entry)
+    const key = `${scope}:${entry.failureCode}`
+    const outcome = entry.failureCode === 'EXIT_NONZERO_PERMANENT'
+      ? entry.outputFingerprint ?? entry.output
+      : undefined
     const existing = failureCounts.get(key)
-    if (existing) existing.count += 1
-    else failureCounts.set(key, { count: 1, tool: entry.tool })
+    if (existing && existing.outcome === outcome) existing.count += 1
+    else failureCounts.set(key, { count: 1, tool: entry.tool, scope, code: entry.failureCode, outcome })
   }
   for (const { count, tool } of failureCounts.values()) {
     if (count >= failureRepeatThreshold) {
@@ -284,6 +318,9 @@ export function detectStuckToolRepeat(
       entry.status === 'error'
       && !entry.blocked
       && entry.failureCode?.endsWith('_PERMANENT') === true
+      // Executed tests/programs with nonzero status are task evidence, not
+      // permanent loss of a capability (even inside a read-only reviewer).
+      && entry.failureCode !== 'EXIT_NONZERO_PERMANENT'
     ))
     if (permanentFailures.length >= permanentFailureChurnThreshold) {
       const toolCounts = new Map<string, number>()
@@ -551,16 +588,19 @@ export function findStuckRepeatEntry(
   // A no-op mutation cycle is detected across the whole run precisely because
   // it is longer than the exact-repeat window, so scan the whole run for it.
   const recent = result.kind === 'no_op_mutation' ? (history ?? []) : (history ?? []).slice(-window)
-  const counts = new Map<string, { count: number; entry: StuckToolRepeatEntry }>()
+  const counts = new Map<string, { count: number; entry: StuckToolRepeatEntry; outcome?: string }>()
   for (const entry of recent) {
     if (entry.tool !== result.tool) continue
     const sig = signatureOf(entry)
+    const outcome = result.kind === 'exact'
+      ? JSON.stringify([entry.status, entry.failureCode, entry.outputFingerprint ?? entry.output])
+      : undefined
     const existing = counts.get(sig)
-    if (existing) {
+    if (existing && existing.outcome === outcome) {
       existing.count += 1
       existing.entry = entry
     } else {
-      counts.set(sig, { count: 1, entry })
+      counts.set(sig, { count: 1, entry, outcome })
     }
   }
   let best: { count: number; entry: StuckToolRepeatEntry } | undefined

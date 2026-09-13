@@ -1,4 +1,5 @@
 import type { AgentState, GraphExecutionContext } from './types.js'
+import { AutonomyLevel } from '@sepilotd/core'
 import { isAbortError, raceWithAbort, throwIfAborted } from '../../abort.js'
 
 /**
@@ -8,7 +9,9 @@ import { isAbortError, raceWithAbort, throwIfAborted } from '../../abort.js'
  * question is a fixed, code-driven template (no model prose), the answer is a
  * closed choice set, and the number of questions per run is bounded so the
  * loop can never turn into an endless prompt cycle. Headless runs (no HITL
- * `requestQuestion` channel) keep the forced-final behaviour unchanged.
+ * `requestQuestion` channel) and explicitly autonomous runs keep the bounded
+ * forced-final behaviour. A registered transport alone does not imply a human
+ * is present to make optional continuation decisions.
  */
 export const MAX_LOOP_CONTROL_QUESTIONS = 2
 
@@ -71,9 +74,13 @@ export function parseLoopControlAnswer(raw: string | undefined): LoopControlAnsw
 
 export function canAskLoopControlQuestion(
   state: Pick<AgentState, 'loopControlQuestionCount'>,
-  context: Pick<GraphExecutionContext, 'requestQuestion'> | undefined,
+  context: (Pick<GraphExecutionContext, 'requestQuestion'> & Partial<Pick<GraphExecutionContext, 'autonomy'>>) | undefined,
 ): boolean {
   return Boolean(context?.requestQuestion)
+    // Autonomy does not grant permission for a risky action. It does make
+    // optional "keep trying?" decisions the bounded supervisor's job. Real
+    // missing-input questions and tool approvals retain their own semantics.
+    && context?.autonomy !== AutonomyLevel.Autonomous
     && (state.loopControlQuestionCount ?? 0) < MAX_LOOP_CONTROL_QUESTIONS
 }
 
@@ -86,7 +93,7 @@ export function canAskLoopControlQuestion(
  */
 export async function askLoopControlQuestion(
   state: Pick<AgentState, 'loopControlQuestionCount' | 'input'>,
-  context: Pick<GraphExecutionContext, 'requestQuestion' | 'signal'> & { sessionId: string },
+  context: Pick<GraphExecutionContext, 'requestQuestion' | 'signal'> & Partial<Pick<GraphExecutionContext, 'autonomy'>> & { sessionId: string },
   input: LoopControlQuestionInput,
 ): Promise<LoopControlAnswer | undefined> {
   if (!canAskLoopControlQuestion(state, context) || !context.requestQuestion) return undefined

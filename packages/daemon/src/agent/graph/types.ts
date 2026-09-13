@@ -500,6 +500,10 @@ export interface AgentState extends GraphRuntimeState {
   emptyNativeTurnsCount?: number
   /** Provider-observed per-run output ceiling when the configured catalog is stale. */
   effectiveMaxOutputTokens?: number
+  /** Run-local allowance learned only from a length-truncated main response. */
+  adaptiveMainToolTurnMaxTokens?: number
+  /** Actual fitted allowance of the last main request, not a catalog estimate. */
+  lastMainToolTurnMaxTokens?: number
   /**
    * Set when the stuck-tool-repeat guard exhausted its repair budget and the
    * loop persisted anyway. The next LLM turn is the run's final evidence turn:

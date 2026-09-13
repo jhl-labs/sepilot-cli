@@ -1795,14 +1795,18 @@ const DEFAULT_MAIN_TOOL_TURN_MAX_TOKENS = 8_192
 function resolveMainTurnMaxTokens(
   deps: Deps,
   context: GraphExecutionContext | undefined,
+  state?: AgentState,
 ): number | undefined {
   if (context?.maxTokens !== undefined) return context.maxTokens
   const modelInfo = resolveModelInfo(deps, context)
-  const contextShare = modelInfo?.contextWindow === undefined
-    ? DEFAULT_MAIN_TOOL_TURN_MAX_TOKENS
-    : Math.max(256, Math.floor(modelInfo.contextWindow / 2))
+  const contextWindow = modelInfo?.contextWindow ?? DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW
+  // Start conservatively. A demonstrated truncation may use more of the
+  // context; fitGraphMainRequest still reserves the actual input and tools.
+  const contextShare = state?.adaptiveMainToolTurnMaxTokens === undefined
+    ? Math.max(256, Math.floor(contextWindow / 2))
+    : contextWindow
   return Math.min(
-    DEFAULT_MAIN_TOOL_TURN_MAX_TOKENS,
+    state?.adaptiveMainToolTurnMaxTokens ?? DEFAULT_MAIN_TOOL_TURN_MAX_TOKENS,
     contextShare,
     modelInfo?.maxOutputTokens ?? Number.POSITIVE_INFINITY,
   )
@@ -13361,6 +13365,7 @@ export const iterationGuard = (
         const answer = await askLoopControlQuestion(s, {
           sessionId: context!.agentContext.sessionId,
           requestQuestion: context!.requestQuestion,
+          autonomy: context!.autonomy,
           signal: context!.signal,
         }, { kind: 'no_progress', count: s.noProgressIterations })
         if (answer?.decision === 'continue') {
@@ -13621,7 +13626,7 @@ export const contextManager = (deps: Deps) => async (
     }
   }
 
-  const requestedOutputTokens = resolveMainTurnMaxTokens(deps, context) ?? 4096
+  const requestedOutputTokens = resolveMainTurnMaxTokens(deps, context, s) ?? 4096
   const contextFit = fitProviderContext(s.messages, {
     contextWindowTokens: cw,
     requestedOutputTokens,
@@ -14049,7 +14054,7 @@ export const nativeToolAgent = (deps: Deps) => async function* (
     ]
   }
   const artifactCadenceMaxTokens = resolveArtifactCadenceMaxTokens(
-    resolveMainTurnMaxTokens(deps, context),
+    resolveMainTurnMaxTokens(deps, context, s),
     restrictToBlockedArtifactDraftRetryTools
       ? { ...artifactWriteCadence, shouldForceFileEdit: true }
       : restrictToFileEditTools
@@ -14060,7 +14065,7 @@ export const nativeToolAgent = (deps: Deps) => async function* (
   const requestedMaxTokens = boundedImplementationDecisionTurn
     ? Math.min(
         artifactCadenceMaxTokens ?? FOCUSED_IMPLEMENTATION_RECOVERY_MAX_TOKENS,
-        FOCUSED_IMPLEMENTATION_RECOVERY_MAX_TOKENS,
+        Math.max(FOCUSED_IMPLEMENTATION_RECOVERY_MAX_TOKENS, s.adaptiveMainToolTurnMaxTokens ?? 0),
       )
     : artifactCadenceMaxTokens
   const requestFit = fitGraphMainRequest(
@@ -14095,6 +14100,7 @@ export const nativeToolAgent = (deps: Deps) => async function* (
         }),
     maxTokens: resolveFittedGraphMaxTokens(requestedMaxTokens, requestFit),
   }
+  s.lastMainToolTurnMaxTokens = request.maxTokens
   yield buildEstimatedGraphContextUsage(s, context, requestFit)
   const toolCalls: ToolCall[] = []
   const toolCallArgs = new Map<string, string>()
@@ -14901,7 +14907,7 @@ export const promptReActAgent = (deps: Deps) => async function* (
   }
 
   const artifactCadenceMaxTokens = resolveArtifactCadenceMaxTokens(
-    resolveMainTurnMaxTokens(deps, context),
+    resolveMainTurnMaxTokens(deps, context, s),
     restrictToBlockedArtifactDraftRetryTools
       ? { ...artifactWriteCadence, shouldForceFileEdit: true }
       : restrictToFileEditTools
@@ -14912,7 +14918,7 @@ export const promptReActAgent = (deps: Deps) => async function* (
   const requestedMaxTokens = focusedImplementationRecovery || adaptiveTransportRepair
     ? Math.min(
         artifactCadenceMaxTokens ?? FOCUSED_IMPLEMENTATION_RECOVERY_MAX_TOKENS,
-        FOCUSED_IMPLEMENTATION_RECOVERY_MAX_TOKENS,
+        Math.max(FOCUSED_IMPLEMENTATION_RECOVERY_MAX_TOKENS, s.adaptiveMainToolTurnMaxTokens ?? 0),
       )
     : artifactCadenceMaxTokens
 
@@ -14961,6 +14967,7 @@ export const promptReActAgent = (deps: Deps) => async function* (
           }),
       maxTokens: resolveFittedGraphMaxTokens(requestedMaxTokens, requestFit),
     }
+    s.lastMainToolTurnMaxTokens = request.maxTokens
     yield buildEstimatedGraphContextUsage(s, context, requestFit)
     const textChunks: string[] = []
     const bufferedLiveTextDeltas: string[] = []
@@ -15648,6 +15655,7 @@ export const agent = (deps: Deps, options: AgentNodeOptions = {}) => async funct
       const answer = await askLoopControlQuestion(s, {
         sessionId: context!.agentContext.sessionId,
         requestQuestion: context!.requestQuestion,
+        autonomy: context!.autonomy,
         signal: context!.signal,
       }, { kind: 'stuck_repeat', tool: stuck.tool, count: stuck.count ?? 0 })
       if (answer?.decision === 'continue') {
@@ -15976,6 +15984,52 @@ export const agent = (deps: Deps, options: AgentNodeOptions = {}) => async funct
       yield {
         type: 'thinking',
         content: '[supervisor] Provider rejected the prompt as too large; compacted context and retrying once.',
+      }
+      continue
+    }
+    // Truncation is transport evidence, not a semantic failure to solve the
+    // task. Recover it before the empty-reply/convergence controllers, even
+    // when the provider spent the entire response on hidden reasoning.
+    if (s.lastTurnFinishReason !== 'length' && (s.lengthContinuationCount ?? 0) > 0) {
+      s.lengthContinuationCount = 0
+    }
+    if (
+      s.toolCalls.length === 0
+      && s.lastTurnFinishReason === 'length'
+      && (s.lengthContinuationCount ?? 0) < readLengthContinuationMax()
+    ) {
+      s.lengthContinuationCount = (s.lengthContinuationCount ?? 0) + 1
+      const priorAllowance = s.lastMainToolTurnMaxTokens
+      if (context?.maxTokens === undefined && priorAllowance !== undefined) {
+        const model = resolveModelInfo(deps, context)
+        // Adapt only this run after an observed length finish. Never exceed
+        // explicit user limits, provider-observed ceilings, or context fit.
+        s.adaptiveMainToolTurnMaxTokens = Math.min(
+          priorAllowance * 2,
+          model?.maxOutputTokens ?? Number.POSITIVE_INFINITY,
+          s.effectiveMaxOutputTokens ?? Number.POSITIVE_INFINITY,
+          model?.contextWindow ?? DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW,
+        )
+      }
+      const truncatedToolCall = s.pendingLengthContinuationIsToolCall === true
+      const partialOutput = s.pendingLengthContinuationText ?? ''
+      s.lengthContinuationPrefix = truncatedToolCall
+        ? undefined
+        : `${s.lengthContinuationPrefix ?? ''}${partialOutput}`
+      s.pendingLengthContinuationText = undefined
+      s.pendingLengthContinuationIsToolCall = false
+      s.output = ''
+      if (truncatedToolCall) {
+        const recovery = buildTruncatedPromptToolCallRecoveryMessage()
+        appendUniqueSystemMessage(s, String(recovery.content), 'truncated_tool_call_recovery')
+      } else {
+        appendUniqueSystemMessage(s, lengthRecoveryInstruction(partialOutput), 'length_continuation')
+      }
+      yield {
+        type: 'thinking',
+        content: truncatedToolCall
+          ? `[continuation] Discarded a truncated tool call and requested a fresh bounded call (${s.lengthContinuationCount}/${readLengthContinuationMax()}).`
+          : `[continuation] Previous turn was length-truncated; continuing (${s.lengthContinuationCount}/${readLengthContinuationMax()}).`,
       }
       continue
     }
@@ -16426,54 +16480,6 @@ export const agent = (deps: Deps, options: AgentNodeOptions = {}) => async funct
         s.contentOnlyNativeTurnsCount = 0
       }
     }
-    // The continuation budget is per truncation event, not per run. A turn
-    // that finished normally proves the previous truncation was recovered, so
-    // a later, unrelated truncation gets its own budget — otherwise the first
-    // truncation anywhere in a long run permanently disarms the repair (the
-    // react engine already resets it this way).
-    if (s.lastTurnFinishReason !== 'length' && (s.lengthContinuationCount ?? 0) > 0) {
-      s.lengthContinuationCount = 0
-    }
-    // Length-truncation continuation: the turn hit the output cap with no
-    // usable tool call (pure text truncation, or a tool call whose args were
-    // cut off and dropped). Do not finalize this partial turn as complete —
-    // keep the partial assistant message the runner already appended and ask
-    // the model to continue, bounded by SEPILOTD_LENGTH_CONTINUE_MAX.
-    if (
-      s.toolCalls.length === 0
-      && s.lastTurnFinishReason === 'length'
-      && (s.lengthContinuationCount ?? 0) < readLengthContinuationMax()
-    ) {
-      s.lengthContinuationCount = (s.lengthContinuationCount ?? 0) + 1
-      const truncatedToolCall = s.pendingLengthContinuationIsToolCall === true
-      const partialOutput = s.pendingLengthContinuationText ?? ''
-      if (truncatedToolCall) {
-        s.lengthContinuationPrefix = undefined
-      } else {
-        s.lengthContinuationPrefix = `${s.lengthContinuationPrefix ?? ''}${s.pendingLengthContinuationText ?? ''}`
-      }
-      s.pendingLengthContinuationText = undefined
-      s.pendingLengthContinuationIsToolCall = false
-      s.output = ''
-      if (truncatedToolCall) {
-        const recovery = buildTruncatedPromptToolCallRecoveryMessage()
-        appendUniqueSystemMessage(s, String(recovery.content), 'truncated_tool_call_recovery')
-      } else {
-        appendUniqueSystemMessage(
-          s,
-          lengthRecoveryInstruction(partialOutput),
-          'length_continuation',
-        )
-      }
-      yield {
-        type: 'thinking',
-        content: truncatedToolCall
-          ? `[continuation] Discarded a truncated tool call and requested a fresh bounded call (${s.lengthContinuationCount}/${readLengthContinuationMax()}).`
-          : `[continuation] Previous turn was length-truncated; continuing (${s.lengthContinuationCount}/${readLengthContinuationMax()}).`,
-      }
-      continue
-    }
-
     const evidenceLedgerMessage = formatEvidenceLedgerForPrompt(s, context)
     const currentTurnMessages: Message[] = [
       ...ensureCurrentAgentTurnUserMessage(s.messages, s.input),
