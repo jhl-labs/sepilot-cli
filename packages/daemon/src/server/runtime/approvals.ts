@@ -329,10 +329,11 @@ export class ApprovalRegistry {
   cancelForSession(
     sessionId: string,
     note = 'Session was deleted before approval was answered',
+    options: { preserveParked?: boolean } = {},
   ): number {
     let cancelled = 0
     for (const entry of [...this.pending.values()]) {
-      if (entry.sessionId !== sessionId) {
+      if (entry.sessionId !== sessionId || (options.preserveParked && entry.state === 'parked')) {
         continue
       }
       if (entry.timeout) clearTimeout(entry.timeout)

@@ -3,6 +3,7 @@ import type { AgentEvent, ApprovalDecision, ILLMProvider } from '@sepilotd/core'
 import { createLogger } from '../../logger.js'
 import type { ToolRegistry } from '../../tools/registry.js'
 import type { ApprovalRunCheckpoint } from '../runtime/checkpoints.js'
+import type { PendingApproval } from '../runtime/approvals.js'
 import { resolveResumeAutonomy } from '../runtime/resume-autonomy.js'
 import type { RuntimeServices } from '../runtime/types.js'
 import type { FastifyInstance } from 'fastify'
@@ -50,6 +51,20 @@ export {
 
 const log = createLogger('approvals')
 
+function validatedParkedApprovalTools(
+  runtime: RuntimeServices,
+  checkpoint: ApprovalRunCheckpoint,
+  pending: PendingApproval,
+): ToolRegistry {
+  if (checkpoint.requestId !== pending.requestId || checkpoint.sessionId !== pending.sessionId) {
+    throw new CheckpointToolScopeError('Approval checkpoint request/session identity changed')
+  }
+  const tools = resolveCheckpointToolRegistry(runtime.toolRegistry, checkpoint)
+  assertApprovalCheckpointIdentity(checkpoint.toolCalls[checkpoint.currentToolIndex], pending)
+  assertCheckpointPendingToolCalls(checkpoint, checkpoint.toolCalls, checkpoint.currentToolIndex)
+  return tools
+}
+
 /**
  * A parked approval was just answered: its run already unwound and released
  * its lease, so continue it from the checkpoint the way `/approvals/resume`
@@ -62,6 +77,7 @@ async function resumeParkedApproval(input: {
   requestId: string
   decision: ApprovalDecision
   requestActor: string
+  pending: PendingApproval
 }): Promise<{ resumed: boolean; reason?: string }> {
   const { runtime, requestId, decision, requestActor } = input
   const checkpoint = await runtime.approvalCheckpoints.get(requestId)
@@ -75,13 +91,10 @@ async function resumeParkedApproval(input: {
 
   let checkpointTools: ToolRegistry
   try {
-    checkpointTools = resolveCheckpointToolRegistry(runtime.toolRegistry, checkpoint)
-    const events = await runtime.sessions.getEvents(checkpoint.sessionId)
-    assertApprovalCheckpointIdentity(
-      checkpoint.toolCalls[checkpoint.currentToolIndex],
-      findPendingApproval(checkpoint.sessionId, events, requestId),
-    )
-    assertCheckpointPendingToolCalls(checkpoint, checkpoint.toolCalls, checkpoint.currentToolIndex)
+    // respond() has already durably journaled the answer, so this request is
+    // intentionally no longer "pending" in the journal. Bind the checkpoint
+    // to the exact registry-owned request returned by that successful respond.
+    checkpointTools = validatedParkedApprovalTools(runtime, checkpoint, input.pending)
   } catch (error) {
     return {
       resumed: false,
@@ -175,6 +188,16 @@ export async function approvalRoutes(app: FastifyInstance) {
           },
         })
       }
+      if (checkpoint && livePending.state === 'parked') {
+        try {
+          // Reject a changed checkpoint before consuming/journaling consent.
+          validatedParkedApprovalTools(runtime, checkpoint, livePending)
+        } catch (error) {
+          return reply.status(409).send({
+            error: { code: 'RESUME_TOOL_SCOPE_INVALID', message: error instanceof Error ? error.message : 'Invalid checkpoint' },
+          })
+        }
+      }
     }
 
     const respondResult = await runtime.approvalRegistry.respond(
@@ -188,7 +211,7 @@ export async function approvalRoutes(app: FastifyInstance) {
       // The prompt outlived its run: the decision is journaled, now continue
       // the parked run from its checkpoint. Nothing else is waiting on it.
       const resume = respondResult.parked
-        ? await resumeParkedApproval({ runtime, requestId, decision, requestActor })
+        ? await resumeParkedApproval({ runtime, requestId, decision, requestActor, pending: respondResult.parked })
         : undefined
       await runtime.auditLogger?.log?.({
         timestamp: new Date().toISOString(),
@@ -409,10 +432,6 @@ export async function approvalRoutes(app: FastifyInstance) {
         },
       })
     }
-
-    // A parked prompt still sits in the registry; the resume records the
-    // decision itself, so drop the entry without journaling a second one.
-    runtime.approvalRegistry.releaseParked?.(requestId)
 
     let checkpointTools
     try {
@@ -710,6 +729,9 @@ async function executeApprovalResume(input: ApprovalResumeRuntime): Promise<void
       note: decision.note,
       approvedBy: requestActor,
     })
+    // Keep a parked request answerable if validation, admission, or durable
+    // consent recording fails. Only the successful resume consumes it.
+    runtime.approvalRegistry.releaseParked?.(requestId)
   }
 
   const approvalCallback: ApprovalCallback = (toolCall, nextRequestId, options) =>

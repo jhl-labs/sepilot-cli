@@ -4,6 +4,7 @@ import type {
   AgentState,
   GraphExecutionContext,
 } from './types.js'
+import { raceWithAbort, throwIfAborted } from '../../abort.js'
 
 /**
  * Open-question escalation: when the agent has surfaced a blocking unresolved
@@ -69,19 +70,20 @@ export function shouldEscalateOpenQuestions(
 export async function escalateOpenQuestion(
   state: Pick<AgentState, 'messages' | 'escalationCount'>,
   question: AgentOpenQuestion,
-  context: Pick<GraphExecutionContext, 'requestQuestion'> & {
+  context: Pick<GraphExecutionContext, 'requestQuestion' | 'signal'> & {
     sessionId: string
   },
   now: () => number = () => Date.now(),
 ): Promise<string | undefined> {
   if (!context.requestQuestion) return undefined
-  const answer = await context.requestQuestion({
+  throwIfAborted(context.signal, 'Open question aborted')
+  const answer = await raceWithAbort(context.requestQuestion({
     sessionId: context.sessionId,
     prompt: [
       'The agent is blocked on an unresolved question and needs your input to continue without guessing.',
       `Question ${question.id}: ${question.text}`,
     ].join('\n'),
-  })
+  }), context.signal, 'Open question aborted')
   question.askedAt = now()
   state.escalationCount = (state.escalationCount ?? 0) + 1
   state.messages.push({

@@ -1,4 +1,5 @@
 import type { AgentState, GraphExecutionContext } from './types.js'
+import { isAbortError, raceWithAbort, throwIfAborted } from '../../abort.js'
 
 /**
  * Doom-loop questions (plan P2-4): when the stuck-repeat repair budget or the
@@ -85,20 +86,21 @@ export function canAskLoopControlQuestion(
  */
 export async function askLoopControlQuestion(
   state: Pick<AgentState, 'loopControlQuestionCount' | 'input'>,
-  context: Pick<GraphExecutionContext, 'requestQuestion'> & { sessionId: string },
+  context: Pick<GraphExecutionContext, 'requestQuestion' | 'signal'> & { sessionId: string },
   input: LoopControlQuestionInput,
 ): Promise<LoopControlAnswer | undefined> {
   if (!canAskLoopControlQuestion(state, context) || !context.requestQuestion) return undefined
+  throwIfAborted(context.signal, 'Loop-control question aborted')
   state.loopControlQuestionCount = (state.loopControlQuestionCount ?? 0) + 1
   let raw: string | undefined
   try {
-    raw = await context.requestQuestion({
+    raw = await raceWithAbort(context.requestQuestion({
       sessionId: context.sessionId,
       prompt: buildLoopControlQuestionPrompt(input, state.input),
       choices: [...LOOP_CONTROL_CHOICES],
-    })
+    }), context.signal, 'Loop-control question aborted')
   } catch (error) {
-    if (isParkedDecisionError(error)) throw error
+    if (context.signal?.aborted || isAbortError(error) || isParkedDecisionError(error)) throw error
     return { decision: 'stop' }
   }
   return parseLoopControlAnswer(raw)

@@ -17,7 +17,8 @@ import type { AgentState } from './graph/types.js'
 import { emptyEvidenceLedger, updateEvidenceLedgerFromToolResult } from './graph/evidence-ledger.js'
 import { extractSubagentFindings, type SubagentFindings } from './subagent-findings.js'
 import { isBudgetExhaustedMessage } from './task-contract.js'
-import { isTruncatedStopReason } from './stop-reason.js'
+import { isTruncatedStopReason, stopReasonApprovalTimeout } from './stop-reason.js'
+import { isApprovalParkedError } from '../server/runtime/approvals.js'
 import type { RunStopReason } from '@sepilotd/core'
 import { hasIncompleteAnswerStem } from './interim-progress.js'
 import { TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY } from './policy-failure.js'
@@ -131,6 +132,7 @@ export interface SubagentDispatchResult {
   truncated: boolean
   status: 'completed' | 'failed' | 'truncated'
   error?: string
+  stopReason?: RunStopReason
   /**
    * Structured board findings reconstructed from the subagent's tool activity
    * (evidence ledger, failed-attempts, open-questions) so the parent can roll
@@ -169,7 +171,7 @@ export interface SubagentDispatcherDeps {
     event: 'started' | 'stopped',
     data: { sessionId: string; parentSessionId?: string; agentId?: string; status?: string },
   ) => Promise<void>
-  onRunFinished?: (sessionId: string) => void
+  onRunFinished?: (sessionId: string, options: { preserveParked?: boolean }) => void
   sessions: ISessionStore
   /** Construct a fresh AgentEngine for each dispatch. The factory is responsible for
    * wiring provider/policy/etc; the dispatcher only supplies the per-run overrides
@@ -330,6 +332,7 @@ export class SubagentDispatcher {
       ...(cwd ? { cwd } : {}),
     })
     let lifecycleStatus = 'failed'
+    let preserveParkedApproval = false
     try {
       if ((input.isolation ?? userAgent?.isolation) === 'worktree') {
         if (!cwd) throw new Error('Worktree isolation requires an explicit parent working directory')
@@ -487,8 +490,15 @@ export class SubagentDispatcher {
           }
         }
       } catch (err) {
-        status = 'failed'
-        error = err instanceof Error ? err.message : String(err)
+        if (isApprovalParkedError(err) && err.sessionId === sessionId && !input.signal?.aborted) {
+          preserveParkedApproval = true
+          status = 'truncated'
+          stopReason = stopReasonApprovalTimeout({ requestId: err.requestId, tool: err.tool })
+          lastAssistantText ||= stopReason.summary ?? err.message
+        } else {
+          status = 'failed'
+          error = err instanceof Error ? err.message : String(err)
+        }
       } finally {
         input.signal?.removeEventListener('abort', stopOnAbort)
       }
@@ -502,7 +512,7 @@ export class SubagentDispatcher {
       ) {
         status = 'failed'
         error = stopReason.summary ?? `subagent stopped: ${stopReason.code}`
-      } else if (status !== 'failed' && !sawDone) {
+      } else if (status !== 'failed' && !sawDone && !preserveParkedApproval) {
         status = 'failed'
         error = 'subagent stream ended without completion evidence'
       }
@@ -583,11 +593,14 @@ export class SubagentDispatcher {
         truncated,
         status,
         error,
+        ...(stopReason ? { stopReason } : {}),
         findings,
       }
     } finally {
       await worktree?.finish(lifecycleStatus !== 'completed')
-      this.deps.onRunFinished?.(sessionId)
+      this.deps.onRunFinished?.(sessionId, {
+        preserveParked: preserveParkedApproval && !input.signal?.aborted,
+      })
       if (lifecycleStatus === 'failed') {
         await this.deps.sessions.updateMeta?.(sessionId, { status: 'abandoned' })
       }

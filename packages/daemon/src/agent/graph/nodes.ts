@@ -13362,6 +13362,7 @@ export const iterationGuard = (
         const answer = await askLoopControlQuestion(s, {
           sessionId: context!.agentContext.sessionId,
           requestQuestion: context!.requestQuestion,
+          signal: context!.signal,
         }, { kind: 'no_progress', count: s.noProgressIterations })
         if (answer?.decision === 'continue') {
           // One more full no-progress cycle; the counter resets once.
@@ -13508,6 +13509,7 @@ export const iterationGuard = (
     await escalateOpenQuestion(s, questionToEscalate, {
       sessionId: context.agentContext.sessionId,
       requestQuestion: context.requestQuestion,
+      signal: context.signal,
     })
   }
   return s
@@ -15647,6 +15649,7 @@ export const agent = (deps: Deps, options: AgentNodeOptions = {}) => async funct
       const answer = await askLoopControlQuestion(s, {
         sessionId: context!.agentContext.sessionId,
         requestQuestion: context!.requestQuestion,
+        signal: context!.signal,
       }, { kind: 'stuck_repeat', tool: stuck.tool, count: stuck.count ?? 0 })
       if (answer?.decision === 'continue') {
         // Reset the repair counter once and grant one more repair cycle.

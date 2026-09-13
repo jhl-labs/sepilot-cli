@@ -1136,8 +1136,8 @@ export async function buildRuntime(
         log.warn('subagent lifecycle hook failed', { error: error instanceof Error ? error.message : String(error) })
       }
     },
-    onRunFinished: (sessionId) => {
-      runtime.approvalRegistry.cancelForSession(sessionId, 'Subagent run ended')
+    onRunFinished: (sessionId, options) => {
+      runtime.approvalRegistry.cancelForSession(sessionId, 'Subagent run ended', options)
       runtime.activeRuns.finish(sessionId)
     },
     engineFactory: ({ tools, maxIterations, executionPolicy, sessionId, onEvent }) => {
