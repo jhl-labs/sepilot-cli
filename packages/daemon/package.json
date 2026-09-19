@@ -57,7 +57,7 @@
     "@xterm/addon-serialize": "0.14.0",
     "@xterm/headless": "6.0.0",
     "better-sqlite3": "12.11.1",
-    "diff": "8.0.4",
+    "diff": "9.0.0",
     "dockerode": "4.0.10",
     "node-pty": "1.1.0",
     "node-telegram-bot-api": "0.67.0",
