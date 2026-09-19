@@ -58,7 +58,7 @@
     "@xterm/headless": "6.0.0",
     "better-sqlite3": "12.11.1",
     "diff": "8.0.4",
-    "dockerode": "4.0.10",
+    "dockerode": "5.0.1",
     "node-pty": "1.1.0",
     "node-telegram-bot-api": "0.67.0",
     "pdf-parse": "2.4.5",
