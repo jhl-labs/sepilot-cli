@@ -16,11 +16,6 @@ const realDeps: LeftoverDeps = {
 
 const MAX_NAMED = 3
 
-/**
- * Returns 0–3 banner lines describing sepilot-managed Docker containers left
- * over from previous sessions. Empty when Docker is unavailable, when there
- * are none, or on any error — querying Docker must never block the TUI.
- */
 export async function buildLeftoverContainerBanner(deps: LeftoverDeps = realDeps): Promise<string[]> {
   try {
     if (!(await deps.dockerAvailable())) return []

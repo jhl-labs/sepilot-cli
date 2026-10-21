@@ -69,23 +69,18 @@ export class SwarmRunRegistry {
   }
 
   async shutdownAll(): Promise<void> {
-    // Clear the map FIRST so concurrent get/list callers don't observe runs
-    // that we're about to terminate.
     const all = [...this.runs.values()]
     this.runs.clear()
     for (const run of all) {
       try {
         run.finish('interrupted')
       } catch {
-        /* ignore */
       }
-      // Stop all launched agents so SIGTERM doesn't leak detached children.
       if (this.shutdownRuntime) {
         for (const agent of run.snapshot().agents) {
           try {
             await stopAgent(this.shutdownRuntime, agent)
           } catch {
-            /* ignore */
           }
         }
       }
@@ -94,12 +89,9 @@ export class SwarmRunRegistry {
         try {
           await this.shutdownWorktree(worktree)
         } catch {
-          /* ignore */
         }
       }
     }
-    // Wait for any pending jsonl appends to flush before returning so the
-    // daemon doesn't exit and lose the run.ended tail.
     if (this.pendingAppends.size > 0) {
       await Promise.allSettled([...this.pendingAppends])
     }

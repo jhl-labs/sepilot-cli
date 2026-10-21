@@ -73,10 +73,6 @@ export type {
   PlannerHierarchicalStep,
   PlannerStepStatus,
 } from '@sepilotd/core'
-// Surfaces can't import @sepilotd/core directly (CLAUDE.md
-// dependency rule 7), so re-export the staleness predicate the cli
-// formatter and chat shell both rely on. Keeps cleanup logic in
-// lockstep with the daemon's clear({stale}) implementation.
 export { STALE_RULE_THRESHOLD_DAYS, isStaleRememberedDecision } from '@sepilotd/core'
 export * from './daemon/swarm.js'
 export type {
@@ -87,3 +83,11 @@ export type {
   DesktopAgentSession,
   DesktopAgentSshTarget,
 } from './daemon/desktop-agent.js'
+export * from './daemon/views.js'
+export type {
+  LiveView,
+  LiveViewController,
+  LiveViewKind,
+  LiveViewRecord,
+  LiveViewStill,
+} from '@sepilotd/core'

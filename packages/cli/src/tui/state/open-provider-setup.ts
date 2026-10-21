@@ -1,14 +1,3 @@
-// Pulled out of App.tsx so the guard returns at the top of the
-// openProviderSetup / openProviderDeleteConfirmation callbacks
-// ("don't open while streaming", "resolve pending approval first",
-// "don't open over an incompatible overlay", and friends) sit behind
-// one named decision per operation rather than a stack of
-// if/early-return inside the callback.
-//
-// The decisions are pure: callers translate `block` outcomes into a
-// SYSTEM_MESSAGE dispatch and an early return, `noop` into a silent
-// early return, and `proceed` into the work that follows.
-
 import type { DaemonProviderInfo } from '@sepilotd/api-client'
 import type { OverlayStateSnapshot } from '../utils/overlay-state.js'
 import { getOverlayOpenBlockMessage } from '../utils/overlay-state.js'
@@ -238,12 +227,6 @@ export function decideAutoOpenProviderSetup(opts: {
   return { kind: 'noop' }
 }
 
-// First-run auto-open of the provider setup wizard is one reason among
-// several `decideAutoOpenProviderSetup` can return (provider missing,
-// provider unready, model missing/unavailable, ...). Only the true
-// "no provider configured at all" case reads as a first-run welcome —
-// the others are follow-up nudges about an already-started setup, so
-// they should not repeat the "초기 설정을 시작합니다" framing.
 export function getAutoProviderSetupBannerMessage(
   reason: AutoOpenProviderSetupReason,
 ): string | null {
@@ -266,8 +249,6 @@ type OpenProviderDeleteBlockReason =
 
 export type OpenProviderDeleteDecision =
   | { kind: 'block'; reason: OpenProviderDeleteBlockReason; message: string }
-  // Already showing the delete confirmation — silent no-op so spamming
-  // the trigger doesn't surface a noisy "already open" toast.
   | { kind: 'noop' }
   | { kind: 'proceed' }
 

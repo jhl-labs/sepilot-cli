@@ -11,8 +11,8 @@ import {
   getAbortError,
   isAbortError,
 } from '../abort.js'
-import { messageChars, tokenCalibration } from './token-calibration.js'
-import { extractContent } from './utils.js'
+import { tokenCalibration } from './token-calibration.js'
+import { extractContent, isRetryableProviderHttpStatus } from './utils.js'
 import { resolveRequestThinking } from './thinking-policy.js'
 
 export interface ProviderCircuitBreakerOptions {
@@ -61,11 +61,46 @@ export interface GuardedProviderStreamOptions {
   signal?: AbortSignal
   breaker?: ProviderCircuitBreaker
   maxRetries?: number
+  allowEmptyStreamFallback?: boolean
 }
 
 export const PROVIDER_STREAM_HEARTBEAT_MS = 30_000
 export const DEFAULT_PROVIDER_STREAM_IDLE_MS = 15 * 60_000
 export const DEFAULT_PROVIDER_STREAM_FIRST_TOKEN_MS = 90_000
+export const DEFAULT_BUFFERED_PROVIDER_FIRST_TOKEN_MS = 240_000
+
+const bufferedStreamProfiles = new Map<string, boolean>()
+
+function streamProfileKey(providerId: string, model: string): string {
+  return `${providerId}|${model}`
+}
+
+export function classifyBufferedStream(input: {
+  startedAt: number
+  firstContentAt: number
+  lastContentAt: number
+  contentChunks: number
+}): boolean | null {
+  const silenceMs = input.firstContentAt - input.startedAt
+  const spanMs = input.lastContentAt - input.firstContentAt
+  if (input.contentChunks < 3) return null
+  if (silenceMs < 3_000) return false
+  return spanMs <= silenceMs * 0.1
+}
+
+export function recordStreamProfile(providerId: string, model: string, buffered: boolean | null): void {
+  if (buffered === null) return
+  bufferedStreamProfiles.set(streamProfileKey(providerId, model), buffered)
+}
+
+export function isBufferedStreamProfile(providerId: string, model: string): boolean {
+  return bufferedStreamProfiles.get(streamProfileKey(providerId, model)) === true
+}
+
+export function resolveBufferedProviderFirstTokenMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number.parseInt(env.SEPILOTD_PROVIDER_BUFFERED_FIRST_TOKEN_MS ?? '', 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_BUFFERED_PROVIDER_FIRST_TOKEN_MS
+}
 export const DEFAULT_PROVIDER_STREAM_ACTIVE_IDLE_MS = 60_000
 export const DEFAULT_PROVIDER_STREAM_MAX_RETRIES = 1
 export const DEFAULT_PROVIDER_CHAT_MAX_RETRIES = 1
@@ -192,11 +227,6 @@ function getProviderStreamIdleMs(): number | null {
 }
 
 function getProviderStreamActiveIdleMs(globalIdleMs: number | null): number | null {
-  // A completely disabled stream-idle guard remains disabled. Otherwise keep
-  // the generous first-token budget for slow local models, but use a much
-  // tighter inter-token budget once the provider has demonstrated that
-  // generation started. Operators running unusually bursty models can widen
-  // this independently without weakening the initial-response policy.
   if (globalIdleMs === null) return null
   const raw = process.env.SEPILOTD_PROVIDER_STREAM_ACTIVE_IDLE_MS
   if (raw === undefined) {
@@ -257,6 +287,10 @@ function getProviderChatMaxRetries(): number {
   const parsed = Number(raw)
   if (Number.isFinite(parsed) && parsed >= 0) return Math.min(5, Math.floor(parsed))
   return DEFAULT_PROVIDER_CHAT_MAX_RETRIES
+}
+
+function providerRetryDelayMs(attempt: number): number {
+  return Math.pow(2, attempt) * 1_000
 }
 
 export class ProviderUnavailableError extends Error {
@@ -320,9 +354,6 @@ export function toProviderApiError(
     const classification = error.providerCode ? ` [${error.providerCode}]` : ''
     return {
       code: error.code,
-      // Preserve provider provenance in both structured details and the
-      // message. Some older surfaces only retain ApiError.message when they
-      // convert a terminal stream event into UI state.
       message: `Provider ${error.providerId}/${error.model}${classification}: ${error.message}`,
       details: {
         source: 'provider',
@@ -382,7 +413,6 @@ export function isContextLengthProviderError(error: unknown): boolean {
   return CONTEXT_LENGTH_PATTERNS.some((pattern) => message.includes(pattern))
 }
 
-const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504, 529])
 const RETRYABLE_NETWORK_PATTERNS = [
   'econnreset',
   'econnrefused',
@@ -392,7 +422,22 @@ const RETRYABLE_NETWORK_PATTERNS = [
   'socket hang up',
   'fetch failed',
   'und_err',
+  'connection error',
+  'other side closed',
 ]
+
+function hasRetryableNetworkCauseCode(error: unknown): boolean {
+  let current: unknown = error
+  for (let depth = 0; depth < 4 && current && typeof current === 'object'; depth += 1) {
+    const code = (current as { code?: unknown }).code
+    if (typeof code === 'string') {
+      const normalized = code.toLowerCase()
+      if (RETRYABLE_NETWORK_PATTERNS.some((pattern) => normalized.startsWith(pattern))) return true
+    }
+    current = (current as { cause?: unknown }).cause
+  }
+  return false
+}
 
 export function extractProviderErrorStatusCode(error: unknown): number | undefined {
   if (error && typeof error === 'object') {
@@ -400,9 +445,11 @@ export function extractProviderErrorStatusCode(error: unknown): number | undefin
       (error as { status?: unknown }).status,
       (error as { statusCode?: unknown }).statusCode,
       (error as { response?: { status?: unknown } }).response?.status,
+      (error as { apiError?: { details?: { status?: unknown } } }).apiError?.details?.status,
+      ...(error instanceof ProviderExecutionError ? [error.providerStatus] : []),
     ]
     for (const candidate of candidates) {
-      if (typeof candidate === 'number' && candidate >= 100 && candidate < 600) {
+      if (typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= 100 && candidate < 600) {
         return candidate
       }
     }
@@ -412,6 +459,7 @@ export function extractProviderErrorStatusCode(error: unknown): number | undefin
 }
 
 function structuredApiErrorCode(error: unknown): string | undefined {
+  if (error instanceof ProviderExecutionError) return error.providerCode
   if (error && typeof error === 'object') {
     const apiError = (error as { apiError?: { code?: unknown } }).apiError
     if (apiError && typeof apiError.code === 'string') return apiError.code
@@ -420,9 +468,7 @@ function structuredApiErrorCode(error: unknown): string | undefined {
 }
 
 function isRetryableProviderError(error: unknown): boolean {
-  // Prefer the structured code a provider adapter already classified over
-  // re-parsing the message string — the SDK status/code was preserved by
-  // toApiError and is more reliable than substring matching.
+  if (error instanceof ProviderExecutionError && error.providerCode === 'STREAM_INCOMPLETE') return true
   const structured = structuredApiErrorCode(error)
   if (structured) {
     if (structured === 'RATE_LIMITED' || structured === 'SERVICE_UNAVAILABLE' || structured === 'TIMEOUT') {
@@ -441,7 +487,8 @@ function isRetryableProviderError(error: unknown): boolean {
   }
   if (isContextLengthProviderError(error)) return false
   const statusCode = extractProviderErrorStatusCode(error)
-  if (statusCode != null) return RETRYABLE_STATUS_CODES.has(statusCode)
+  if (statusCode != null) return isRetryableProviderHttpStatus(statusCode)
+  if (hasRetryableNetworkCauseCode(error)) return true
   const message = normalizeProviderErrorMessage(error).toLowerCase()
   return RETRYABLE_NETWORK_PATTERNS.some((pattern) => message.includes(pattern))
     || message.includes('rate')
@@ -563,20 +610,6 @@ export class ProviderCircuitBreaker {
     state.status = 'closed'
   }
 
-  /**
-   * Record a failure for `(providerId, model)` without a pre-acquired token.
-   *
-   * Use this for failures that originate *outside* `guardedProviderChat` —
-   * the canonical case is a client-side timeout: `guardedProviderChat` sees
-   * the request as aborted (signal.aborted=true) and calls `cancel()` rather
-   * than `recordFailure()`, so a flaky-but-slow provider that times out on
-   * every call would never trip the breaker. The router catch path can call
-   * this helper to make the breaker observe the real failure cadence.
-   *
-   * Closed → consecutive_failures += 1 (open at threshold).
-   * Open  → no-op (already open).
-   * Half-open → reopen immediately (one timed-out probe is enough).
-   */
   noteExternalFailure(
     providerId: string,
     model: string,
@@ -679,12 +712,7 @@ export async function guardedProviderChat(
           breaker?.recordSuccess(token)
         }
         if (response.usage?.inputTokens) {
-          tokenCalibration.observe(
-            provider.id,
-            request.model,
-            messageChars(request.messages),
-            response.usage.inputTokens,
-          )
+          tokenCalibration.observeRequest(provider.id, request.model, request, response.usage.inputTokens)
         }
         cache?.set(request, response)
         return response
@@ -695,6 +723,7 @@ export async function guardedProviderChat(
             provider.id,
             request.model,
             `provider-request-timeout after ${request.timeoutMs}ms`,
+            'REQUEST_TIMEOUT',
           )
         }
         if ((signal?.aborted ?? false) || isAbortError(error)) {
@@ -709,8 +738,7 @@ export async function guardedProviderChat(
 
         const retryable = isRetryableProviderError(error)
         if (retryable && attempt < maxRetries) {
-          const delayMs = Math.pow(2, attempt) * 1_000
-          await abortableDelay(delayMs, requestScope.signal)
+          await abortableDelay(providerRetryDelayMs(attempt), requestScope.signal)
           continue
         }
 
@@ -739,11 +767,6 @@ export async function* guardedProviderStream(
 
   const model = provider.models.find((candidate) => candidate.id === request.model)
   if (model?.capabilities.streaming === false) {
-    // A model that explicitly declares no streaming support has one complete
-    // response boundary. Adapt that response here instead of asking every
-    // provider to emulate an async iterator. This keeps retry, timeout, circuit
-    // and terminal-event ownership in one layer and avoids waiting for a
-    // synthetic iterator EOF after the upstream HTTP response has completed.
     const fallbackTimeoutMs = resolveProviderStreamFirstTokenMs()
     const adaptedRequest = request.timeoutMs === undefined && fallbackTimeoutMs !== null
       ? { ...request, timeoutMs: fallbackTimeoutMs }
@@ -780,9 +803,13 @@ export async function* guardedProviderStream(
   }
 
   const idleTimeoutMs = getProviderStreamIdleMs()
-  const firstTokenTimeoutMs = resolveProviderStreamFirstTokenMs(idleTimeoutMs)
+  const baseFirstTokenTimeoutMs = resolveProviderStreamFirstTokenMs(idleTimeoutMs)
+  const firstTokenTimeoutMs = baseFirstTokenTimeoutMs !== null
+    && process.env.SEPILOTD_PROVIDER_STREAM_FIRST_TOKEN_MS === undefined
+    && isBufferedStreamProfile(provider.id, request.model)
+    ? Math.max(baseFirstTokenTimeoutMs, resolveBufferedProviderFirstTokenMs())
+    : baseFirstTokenTimeoutMs
   const activeIdleTimeoutMs = getProviderStreamActiveIdleMs(idleTimeoutMs)
-  const requestChars = messageChars(request.messages)
   const requestScope = createRequestAbortScope(signal, request.timeoutMs)
 
   try {
@@ -791,6 +818,12 @@ export async function* guardedProviderStream(
     let failureRecorded = false
     let emittedProviderChunk = false
     let emittedActionableChunk = false
+    const attemptStartedAt = Date.now()
+    let generatedAnything = false
+    let firstContentAt: number | null = null
+    let lastContentAt = 0
+    let contentChunks = 0
+    let retryDelayMs = 0
     const iterator = provider.stream(request, { signal: requestScope.signal })[Symbol.asyncIterator]()
 
     try {
@@ -815,9 +848,6 @@ export async function* guardedProviderStream(
           )
           switch (waitResult.kind) {
             case 'heartbeat':
-              // One status update is enough for a single pending iterator
-              // read. SSE keepalive comments own connection liveness; repeated
-              // synthetic thinking events only bloat logs and the UI.
               if (!waitingNoticeEmitted) {
                 waitingNoticeEmitted = true
                 yield {
@@ -841,7 +871,16 @@ export async function* guardedProviderStream(
               throw waitResult.error
             case 'next':
               if (waitResult.result.done) {
-                done = true
+                if (!emittedProviderChunk && options.allowEmptyStreamFallback) {
+                  if (token) breaker?.cancel(token)
+                  return
+                }
+                throw new ProviderExecutionError(
+                  provider.id,
+                  request.model,
+                  'Provider stream ended before its terminal completion event',
+                  'STREAM_INCOMPLETE',
+                )
               } else {
                 nextChunk = waitResult.result.value
               }
@@ -855,7 +894,7 @@ export async function* guardedProviderStream(
 
         const chunk = nextChunk
         if (chunk.type === 'usage' && chunk.usage.inputTokens) {
-          tokenCalibration.observe(provider.id, request.model, requestChars, chunk.usage.inputTokens)
+          tokenCalibration.observeRequest(provider.id, request.model, request, chunk.usage.inputTokens)
         }
         if (chunk.type === 'error') {
           throw new ProviderExecutionError(
@@ -863,6 +902,7 @@ export async function* guardedProviderStream(
             request.model,
             chunk.error.message,
             chunk.error.code,
+            extractProviderErrorStatusCode({ apiError: chunk.error }),
           )
         }
 
@@ -875,13 +915,25 @@ export async function* guardedProviderStream(
         ) {
           emittedActionableChunk = true
         }
-        yield chunk
-        // `done` is the provider contract's terminal event. Every built-in
-        // adapter emits usage before it. Waiting for an additional iterator
-        // EOF after `done` can hang indefinitely in compiled Bun even though
-        // Ollama already closed the HTTP response.
+        if (chunk.type === 'text' || chunk.type === 'thinking' || chunk.type === 'tool_call_start') {
+          generatedAnything = true
+        }
+        if (chunk.type === 'text' || chunk.type === 'thinking' || chunk.type === 'tool_call_start' || chunk.type === 'tool_call_delta') {
+          const now = Date.now()
+          firstContentAt ??= now
+          lastContentAt = now
+          contentChunks += 1
+        }
+        yield chunk.type === 'usage' && generatedAnything && !chunk.usage.generationMs
+          ? { ...chunk, usage: { ...chunk.usage, generationMs: Math.max(1, Date.now() - attemptStartedAt) } }
+          : chunk
         if (chunk.type === 'done') {
           done = true
+          if (firstContentAt !== null) {
+            recordStreamProfile(provider.id, request.model, classifyBufferedStream({
+              startedAt: attemptStartedAt, firstContentAt, lastContentAt, contentChunks,
+            }))
+          }
         }
       }
 
@@ -896,6 +948,7 @@ export async function* guardedProviderStream(
           provider.id,
           request.model,
           `provider-request-timeout after ${request.timeoutMs}ms`,
+          'REQUEST_TIMEOUT',
         )
       }
       if ((signal?.aborted ?? false) || isAbortError(error)) {
@@ -908,20 +961,41 @@ export async function* guardedProviderStream(
       const retryable = isRetryableProviderError(error)
       const firstTokenTimedOut = error instanceof ProviderExecutionError
         && error.providerCode === 'FIRST_TOKEN_TIMEOUT'
-      if (!emittedActionableChunk && !firstTokenTimedOut && retryable && attempt < maxRetries) {
+      if (
+        token?.phase !== 'half_open'
+        && !emittedActionableChunk
+        && !firstTokenTimedOut
+        && retryable
+        && attempt < maxRetries
+      ) {
         if (token) {
           breaker?.cancel(token)
         }
-        continue
+        retryDelayMs = providerRetryDelayMs(attempt)
+      } else {
+        if (token && !failureRecorded) {
+          breaker?.recordFailure(token, error)
+          failureRecorded = true
+        }
+        throw wrapProviderExecutionError(provider.id, request.model, error)
       }
-
-      if (token && !failureRecorded) {
-        breaker?.recordFailure(token, error)
-        failureRecorded = true
-      }
-      throw wrapProviderExecutionError(provider.id, request.model, error)
     } finally {
       void iterator.return?.()
+    }
+    try {
+      await abortableDelay(retryDelayMs, requestScope.signal)
+    } catch (error) {
+      if (requestScope.timedOut()) {
+        if (token) breaker?.recordFailure(token, error)
+        throw new ProviderExecutionError(
+          provider.id,
+          request.model,
+          `provider-request-timeout after ${request.timeoutMs}ms`,
+          'REQUEST_TIMEOUT',
+        )
+      }
+      if (token) breaker?.cancel(token)
+      throw getAbortError(signal, 'Provider request aborted')
     }
     }
 

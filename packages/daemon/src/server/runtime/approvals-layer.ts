@@ -27,12 +27,6 @@ export interface ApprovalsLayer {
   toolExecutions: ToolExecutionStore
 }
 
-/**
- * Approval + tool-execution persistence stack. Needs the session
- * store to scope approval requests. Every sub-store owns its own
- * directory under dataDir, so init() is awaited inside the
- * assembler to keep the caller single-shot.
- */
 export async function assembleApprovalsLayer(args: {
   dataDir: string
   sessions: WatchedSessionStore
@@ -53,7 +47,6 @@ export async function assembleApprovalsLayer(args: {
       publishApprovalPendingNotification(config, { approval, outcome: 'pending' })
     },
     onTimeout: (approval) => {
-      // The prompt did not expire: the run parked and resumes once answered.
       publishApprovalPendingNotification(config, { approval, outcome: 'parked' })
     },
   })

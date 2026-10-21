@@ -8,56 +8,16 @@ import { deterministicFocusedActionResult } from '../../focused-action-result.js
 
 export interface FocusedLoopOptions {
   systemPrompt: string
-  /**
-   * Domain tool allowlist for this preset. Patterns support a trailing `.*`
-   * wildcard (e.g. `code.*`, `browser.*`). When set, the loop rebuilds
-   * `deps.tools` so the agent node only *sees* these tools and the tool
-   * executor only *runs* them — this is what makes an operational preset an
-   * actual capability boundary rather than a prompt-only "specialization".
-   * Global policy/autonomy still gates every call on top of this. Set
-   * `SEPILOTD_PRESET_TOOL_SCOPING=0` to disable scoping (backward compat).
-   */
+  executionControl?: 'model-directed'
   toolAllowlist?: readonly string[]
-  /**
-   * When true, a `post_edit_analysis` node runs immediately after each
-   * `tools` step. It directly invokes `code.dependencies`,
-   * `code.diagnostics`, and `code.symbols` for any file edited in the
-   * batch and folds the impact radius + outstanding diagnostics into
-   * `reflectionMemo` for the next agent turn.
-   *
-   * Off by default — turn it on for editing-heavy wrappers like
-   * `editor-agent` where the extra analytic round-trip is worth it.
-   */
   enablePostEditAnalysis?: boolean
-  /**
-   * When true, an `auto_decompose` node sits at the start of the loop.
-   * On long inputs (and only when `SEPILOTD_AUTO_DECOMPOSE=1` is set),
-   * it asks the LLM for sub-tasks and pushes one `subagent.dispatch`
-   * tool call per sub-task. The downstream tools node executes the
-   * subagents in isolation and the parent agent then synthesises a
-   * final answer from their results.
-   *
-   * Off by default — graphs that genuinely benefit from long-horizon
-   * fan-out (e.g. complex multi-component refactors) opt in.
-   */
   enableAutoDecompose?: boolean
-  /** Require at least one tool result after the active user-turn boundary. */
   requireCurrentTurnToolEvidence?: boolean
-  /**
-   * Optional deterministic first action derived from trusted structured run
-   * state. This is used for an explicit single argv command: the graph runs
-   * exactly what the user supplied before asking the model to summarize it,
-   * avoiding speculative inventory calls or argument mutation.
-   */
+  enableReflectionCritique?: boolean
   initialToolCall?: (
     state: AgentState,
     context?: GraphExecutionContext,
   ) => ToolCall | undefined
-  /**
-   * Treat the deterministic initial action as the only authorized execution.
-   * Once its result is present, format grounded evidence without another
-   * provider turn, discard any pending follow-up calls, and finish.
-   */
   completeAfterInitialToolResult?: boolean
 }
 
@@ -69,16 +29,9 @@ function toolNameMatchesAllowlist(name: string, patterns: readonly string[]): bo
   ))
 }
 
-/**
- * Rebuild `deps.tools` to the preset's domain allowlist. Returns `deps`
- * unchanged when no allowlist is declared or scoping is disabled, so callers
- * that opt out keep the full registry. Exported for preset-scope tests.
- */
 export function scopeDepsToolset(deps: Deps, allowlist?: readonly string[]): Deps {
   if (allowlist === undefined) return deps
   if (process.env.SEPILOTD_PRESET_TOOL_SCOPING === '0') return deps
-  // Only a real ToolRegistry can be re-scoped; loosely-typed callers that hand a
-  // partial tools object keep it untouched.
   if (typeof (deps.tools as { list?: unknown }).list !== 'function') return deps
   const allowedNames = new Set<string>()
   for (const tool of deps.tools.list()) {
@@ -161,14 +114,24 @@ export function buildFocusedLoopGraph(
       systemPrompt: [deps.systemPrompt ?? '', options.systemPrompt]
         .filter(Boolean)
         .join('\n\n'),
-    }), {
+    }, { executionControl: options.executionControl }), {
       lifecycleState: 'thinking',
     })
-    .addNode('tools', N.toolExecutor(deps), {
+    .addNode('tools', N.toolExecutor(deps, { executionControl: options.executionControl }), {
       lifecycleState: 'acting',
       resumeStage: 'acting',
       pendingToolExecutionNode: true,
     })
+
+  if (options.executionControl === 'model-directed') {
+    graph
+      .addNode('reporter', N.reporter(), { lifecycleState: 'done' })
+      .addEdge('context_manager', 'agent')
+      .addConditionalEdge('agent', (s) => s.toolCalls.length > 0 ? 'tools' : 'reporter', ['tools', 'reporter'])
+      .addConditionalEdge('tools', (s) => s.shouldStop ? 'reporter' : 'agent', ['reporter', 'agent'])
+      .addEdge('reporter', '__end__')
+    return graph
+  }
 
   if (options.enablePostEditAnalysis) {
     graph.addNode('post_edit_analysis', N.postEditAnalysis(deps), {
@@ -177,7 +140,9 @@ export function buildFocusedLoopGraph(
   }
 
   graph
-    .addNode('reflection', N.reflection({ critiqueDeps: deps }), {
+    .addNode('reflection', N.reflection(
+      options.enableReflectionCritique === false ? {} : { critiqueDeps: deps },
+    ), {
       lifecycleState: 'observing',
       resumeStage: 'observing',
     })

@@ -24,21 +24,12 @@ interface KeybindingHandlers {
   onApproveSession?: () => void
   onApproveAlways?: () => void
   onDeny?: () => void
-  // Ctrl+O terminal transcript mode handlers. When `copyViewActive` is true,
-  // ONLY close handling fires; normal-mode handlers are skipped so opening
-  // transcript copy mode doesn't accidentally trigger pickers, autonomy
-  // cycling, etc.
-  // Kept on the same `useInput` so the raw-mode + stdin-listener registration
-  // stays single-source (previously a separate `useInput` toggled via
-  // `isActive` raced with this one and silently dropped keys on some
-  // terminals).
   copyViewActive?: boolean
   onCopyClose?: () => void
 }
 
 export function useKeybindings(handlers: KeybindingHandlers, enabled = true) {
   useInput((input, key) => {
-    // Terminal transcript mode owns the keymap exclusively while it's up.
     if (handlers.copyViewActive) {
       if (key.escape || (input === 'o' && key.ctrl)) {
         handlers.onCopyClose?.()

@@ -468,8 +468,6 @@ export async function memoryStatusCommand(options: { url?: string }) {
     if (detailParts.length > 0) {
       console.log(chalk.gray(`Details: ${detailParts.join(', ')}`))
     }
-    // Only surface the indexed model when it differs from the configured
-    // model — otherwise it's just noise duplicating the Details line.
     if (
       data.indexedProviderId
       && data.indexedModel

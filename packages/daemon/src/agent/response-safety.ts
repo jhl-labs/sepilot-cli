@@ -24,11 +24,6 @@ function compactRetainedToolResult(value: string | undefined): string {
     : compact
 }
 
-/**
- * Preserve daemon-owned current-turn execution evidence when the provider's
- * final prose cannot be published. This never reuses the partial provider
- * stream and never presents tool results as a completed answer.
- */
 export function interruptedUserFacingResponse(
   toolResults: readonly RetainedToolResult[],
 ): string {

@@ -1,9 +1,5 @@
 import type { AgentEvent } from '@sepilotd/core'
 
-/** Bridge callback progress to the owning generator without waiting for the
- * tool's result. Approval requests must reach the client while the tool waits.
- * No polling timer or Promise.race listener accumulation on long silent tools.
- */
 export async function* streamToolProgress<T>(
   execute: (emit: (event: AgentEvent) => void) => Promise<T>,
 ): AsyncGenerator<AgentEvent, T> {
@@ -19,7 +15,6 @@ export async function* streamToolProgress<T>(
     if (overflow) throw overflow
     const size = Buffer.byteLength(JSON.stringify(event))
     if (pending.length >= 256 || pendingBytes + size > 2 * 1024 * 1024) {
-      // Fail visibly, never silently drop an approval or grow without bound.
       overflow = new Error('Tool progress buffer exceeded its bounded capacity')
       wake()
       throw overflow

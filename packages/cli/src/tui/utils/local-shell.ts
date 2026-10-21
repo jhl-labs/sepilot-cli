@@ -35,9 +35,6 @@ export function resolveLocalShellGate(input: {
 }): LocalShellGate {
   const autonomy = input.autonomy?.toLowerCase() ?? ''
   if (autonomy === 'readonly') return 'block'
-  // `!command` is typed directly by the user, so entering it is already the
-  // human approval. Autonomy controls agent-initiated tools; requiring `!!`
-  // here would ask the same human to confirm the same command twice.
   return 'run'
 }
 

@@ -5,6 +5,7 @@ import {
   cloneCheckpointScopeTags,
   cloneCheckpointSkillExecutionPolicies,
   cloneCheckpointSkillToolNames,
+  cloneCheckpointMemoryPolicy,
   cloneCheckpointToolAllowlist,
   type ApprovalRunCheckpoint,
 } from '../../server/runtime/checkpoints.js'
@@ -17,19 +18,8 @@ function cloneToolHistoryInput(input: Record<string, unknown>): Record<string, u
   return JSON.parse(JSON.stringify(input)) as Record<string, unknown>
 }
 
-/**
- * Default subgraph recursion depth kept verbatim when serializing a checkpoint.
- * Beyond this depth the nested subgraph's message bodies are elided to count
- * stubs so a deeply-nested orchestration doesn't embed many full message
- * histories. Overridable via `SEPILOTD_CHECKPOINT_SUBGRAPH_DEPTH`.
- */
 export const MAX_SUBGRAPH_DEPTH = 2
 
-/**
- * Resolve the effective checkpoint subgraph depth. Defaults to
- * `MAX_SUBGRAPH_DEPTH`; `SEPILOTD_CHECKPOINT_SUBGRAPH_DEPTH` overrides it
- * (clamped to a safe range). General knob — no model/dataset/graphId branching.
- */
 export function resolveCheckpointSubgraphDepth(): number {
   const raw = process.env.SEPILOTD_CHECKPOINT_SUBGRAPH_DEPTH
   if (!raw) return MAX_SUBGRAPH_DEPTH
@@ -39,22 +29,10 @@ export function resolveCheckpointSubgraphDepth(): number {
 }
 
 export interface CloneGraphStateOptions {
-  /**
-   * Slim the clone for durable checkpoint serialization: bound subgraph
-   * recursion depth (elide deeper nested message bodies to count stubs).
-   * Omit (live clone) to keep the result byte-identical to the input.
-   */
   forCheckpoint?: boolean
-  /** Internal recursion depth. Callers should not set this. */
   depth?: number
 }
 
-/**
- * Elide a message body for checkpoint serialization: keep the structural
- * envelope (role, toolCallId) but drop the (potentially large) content,
- * recording the original character length so a reader knows the body was
- * compressed here — this is a bounded stub, not a silent deletion.
- */
 function elideMessageBody(message: Message): Message {
   const chars = typeof message.content === 'string'
     ? message.content.length
@@ -206,12 +184,16 @@ export function cloneGraphState(
       : undefined,
     qualityConclusionRecoveryRequested: state.qualityConclusionRecoveryRequested,
     qualityConclusionResolvedPhase: state.qualityConclusionResolvedPhase,
+    reviewConclusionReceipt: options?.forCheckpoint || !state.reviewConclusionReceipt
+      ? undefined
+      : { ...state.reviewConclusionReceipt },
     qualityConclusionRetryTarget: state.qualityConclusionRetryTarget,
     implementationToolHistoryStartIndex: state.implementationToolHistoryStartIndex,
     internalGraphContinuation: state.internalGraphContinuation,
     lastRejectedToolCallNames: state.lastRejectedToolCallNames
       ? [...state.lastRejectedToolCallNames]
       : undefined,
+    unexecutedToolSelections: state.unexecutedToolSelections?.map(entry => ({ ...entry })),
     implementationConvergenceNudgeCount: state.implementationConvergenceNudgeCount,
     implementationPreActionStallCount: state.implementationPreActionStallCount,
     implementationPostActionStallCount: state.implementationPostActionStallCount,
@@ -303,6 +285,9 @@ export function cloneGraphState(
         }
       : undefined,
     reflectionMemo: state.reflectionMemo ? [...state.reflectionMemo] : undefined,
+    validationRetryEvidenceBaseline: state.validationRetryEvidenceBaseline
+      ? [...state.validationRetryEvidenceBaseline]
+      : undefined,
     toolCallHistory: state.toolCallHistory
       ? state.toolCallHistory.map((entry) => ({
           ...(entry.toolCallId ? { toolCallId: entry.toolCallId } : {}),
@@ -356,6 +341,8 @@ export function createGraphApprovalCheckpoint(
     skillToolNames: cloneCheckpointSkillToolNames(
       context.agentContext.skillToolNames,
     ),
+    deadlineAt: context.agentContext.deadlineAt,
+    memoryPolicy: cloneCheckpointMemoryPolicy(context.agentContext.memoryPolicy),
     toolAllowlist: cloneCheckpointToolAllowlist(context.agentContext.toolAllowlist),
     skillExecutionPolicies: cloneCheckpointSkillExecutionPolicies(
       context.agentContext.skillExecutionPolicies,
@@ -370,6 +357,7 @@ export function createGraphApprovalCheckpoint(
     iteration: state.iteration,
     maxIterations: state.maxIterations,
     thinkingLevel: context.thinkingLevel,
+    ...(context.thinkingLevelSource ? { thinkingLevelSource: context.thinkingLevelSource } : {}),
     ...(context.textDeltaMode === 'live' ? { textDeltaMode: 'live' as const } : {}),
     graphState: cloneGraphState(state, { forCheckpoint: true }),
     createdAt: new Date().toISOString(),
@@ -399,6 +387,8 @@ export function createGraphRunCheckpoint(
     skillToolNames: cloneCheckpointSkillToolNames(
       context.agentContext.skillToolNames,
     ),
+    deadlineAt: context.agentContext.deadlineAt,
+    memoryPolicy: cloneCheckpointMemoryPolicy(context.agentContext.memoryPolicy),
     toolAllowlist: cloneCheckpointToolAllowlist(context.agentContext.toolAllowlist),
     skillExecutionPolicies: cloneCheckpointSkillExecutionPolicies(
       context.agentContext.skillExecutionPolicies,
@@ -411,6 +401,7 @@ export function createGraphRunCheckpoint(
     iteration: state.iteration,
     maxIterations: state.maxIterations,
     thinkingLevel: context.thinkingLevel,
+    ...(context.thinkingLevelSource ? { thinkingLevelSource: context.thinkingLevelSource } : {}),
     ...(context.textDeltaMode === 'live' ? { textDeltaMode: 'live' as const } : {}),
     stage,
     checkpointedAt: new Date().toISOString(),

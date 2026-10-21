@@ -1,23 +1,29 @@
-import { ExternalAcpAgentDispatcher } from '../../acp/external-agent.js'
+import { ExternalAcpAgentDispatcher, type ExternalAgentRuntime } from '../../acp/external-agent.js'
 import { createExternalAcpRunTool } from '../../tools/external-acp-run.js'
+import { createExternalCliRunTool } from '../../tools/external-cli-run.js'
+import { ExternalCliDispatcher } from '../../external-cli/dispatcher.js'
+import { createLogger } from '../../logger.js'
 import type { ToolRegistry } from '../../tools/registry.js'
 import type { FeatureRuntimeToolDeps } from '../types.js'
 
-/**
- * Creates the external ACP agent dispatcher, registers the `external_acp.run`
- * tool, and returns the dispatcher so buildRuntime can expose it on the runtime
- * object. Only imported (and thus only bundled) when the `acp` feature is
- * enabled.
- */
+const log = createLogger('external-cli')
+
 export function createAcpRuntime(
   registry: ToolRegistry,
   deps: FeatureRuntimeToolDeps,
-): ExternalAcpAgentDispatcher {
+): ExternalAgentRuntime {
   const dispatcher = new ExternalAcpAgentDispatcher({
     sessions: deps.sessions,
     deviceName: deps.deviceName,
     dreaming: deps.dreaming,
   })
   registry.register(createExternalAcpRunTool(dispatcher))
-  return dispatcher
+  const cli = new ExternalCliDispatcher({
+    sessions: deps.sessions,
+    deviceName: deps.deviceName,
+    usageTracker: deps.usageTracker,
+    runOptions: { log: (event, fields) => log.info(event, fields) },
+  })
+  registry.register(createExternalCliRunTool(cli))
+  return { acp: dispatcher, cli }
 }

@@ -4,31 +4,22 @@ import type { GraphAgentRegistry } from '../../agent/graph/registry.js'
 import type { IntentDecision, IntentHints } from '../../agent/intent-router.js'
 import type { IntentRouter } from '../../agent/intent-router.js'
 import { makeDefaultDecision } from '../../agent/intent-router.js'
+import { resolveAutoFallbackMode } from '../../agent/mode-catalog.js'
 import { ProviderCircuitBreaker } from '../../providers/circuit-breaker.js'
 
-/**
- * Shared circuit breaker for the intent router provider. Imported by both
- * chat.ts and chat-stream.ts so failure state accumulates across all routing
- * turns in the daemon process — not per-handler. Spec §7.2: dedicated
- * breaker, 5 consecutive failures trip a 5-minute cool-down.
- */
 export const INTENT_ROUTER_CIRCUIT_BREAKER = new ProviderCircuitBreaker({
   failureThreshold: 5,
   openDurationMs: 5 * 60_000,
 })
 
-/** Minimal structural logger shape used by the helpers in this module. */
 export interface MinimalLogger {
   info: (msg: string, data?: Record<string, unknown>) => void
 }
 
-/** Logger shape with warn support, used by router-init helpers. */
 export interface MinimalWarnLogger extends MinimalLogger {
   warn: (msg: string, data?: Record<string, unknown>) => void
 }
 
-// One-shot warn flags so misconfiguration surfaces once per daemon process
-// instead of on every chat turn.
 const routerWarnState = {
   noProvider: false,
   noModel: false,
@@ -47,7 +38,6 @@ export function resolveIntentRouterModel(args: {
     | undefined
   configuredModel: string | undefined
   configuredProviderId: string | undefined
-  /** Active turn model, used only when no dedicated router model is configured. */
   activeModel?: string | undefined
   logger: MinimalWarnLogger
 }): string | undefined {
@@ -94,7 +84,6 @@ export function resolveIntentRouterModel(args: {
   return undefined
 }
 
-/** Test-only: reset the one-shot warn state so a fresh process can be simulated. */
 export function __resetIntentRouterWarnState(): void {
   routerWarnState.noProvider = false
   routerWarnState.noModel = false
@@ -113,28 +102,26 @@ export interface ApplyIntentRoutingDeps {
     skillRefs?: ReadonlyArray<{ name: string }>
     intentRouting?: { enabled?: boolean }
   }
-  /**
-   * True only when the turn carries provider-native image/audio/binary
-   * document parts and the router must not classify on the plain-text portion.
-   * Extracted text attachments remain eligible for graph-backed routing.
-   */
   isMultimodal?: boolean
 }
 
 export interface IntentRoutingResult {
-  /** Resolved agent mode. `undefined` means "use the runtime default". */
   effectiveMode: string | undefined
   effectivePersona: string | undefined
   effectiveSkillRefs: Array<{ name: string }>
   decision: IntentDecision
 }
 
-/** Match the dispatcher without reclassifying natural-language input. */
-export function resolveInitialExecutionMode(routing: IntentRoutingResult, defaultMode: string, activeRemoteBrowser = false): string {
+export function resolveInitialExecutionMode(
+  routing: IntentRoutingResult,
+  defaultMode: string,
+  activeRemoteBrowser = false,
+  surface?: string,
+): string {
   const selected = routing.effectiveMode ?? defaultMode
   if (selected !== 'auto') return selected
   return !routing.decision.fallback && routing.decision.confidence === 'high'
-    ? routing.decision.mode : activeRemoteBrowser ? 'react' : 'instant'
+    ? routing.decision.mode : resolveAutoFallbackMode({ surface, activeRemoteBrowser })
 }
 
 export async function applyIntentRouting(deps: ApplyIntentRoutingDeps): Promise<IntentRoutingResult> {
@@ -144,9 +131,6 @@ export async function applyIntentRouting(deps: ApplyIntentRoutingDeps): Promise<
     skillRefs: deps.body.skillRefs,
   }
 
-  // An explicit command selects a capability surface without paying for an
-  // intent classifier. The main agent still judges read/create/update/clarify.
-  // Preserve concrete specialist mode choices and all caller tool boundaries.
   const taskSelected = isTaskInvocation(deps.message) || hints.skillRefs?.some(ref => ref.name === 'task')
   if (taskSelected && (!hints.mode || hints.mode === 'instant' || hints.mode === 'auto')) {
     const decision = makeDefaultDecision({ ...hints, mode: 'react' }, 'explicit task management command')
@@ -167,13 +151,7 @@ export async function applyIntentRouting(deps: ApplyIntentRoutingDeps): Promise<
 
   const explicitMode = hints.mode?.trim()
 
-  // A concrete mode selects the starting strategy. Skip the classifier so
-  // lightweight turns do not
-  // pay for an irrelevant routing-model call.
   if (explicitMode && explicitMode !== 'auto') {
-    // Not a fallback: the caller chose. Labelling it low-confidence/fallback
-    // widened the tool surface as if classification had failed and showed
-    // operators a "router failed" row for every explicit-mode turn.
     const decision = makeDefaultDecision(
       { ...hints, mode: explicitMode },
       'explicit caller mode selected',
@@ -217,11 +195,6 @@ export async function applyIntentRouting(deps: ApplyIntentRoutingDeps): Promise<
       ? 'auto'
       : hintedMode
   return {
-    // The intent router is intentionally cheap and does not see the durable
-    // run contract. For default/auto turns, let AgentModeRouter perform the
-    // contract-aware graph selection; keep the intent decision for persona and
-    // skills. A concrete caller mode is an execution boundary, not a hint the
-    // cheap classifier may replace.
     effectiveMode,
     effectivePersona: effectiveDecision.persona,
     effectiveSkillRefs: explicitlySelectedSkills
@@ -230,13 +203,6 @@ export async function applyIntentRouting(deps: ApplyIntentRoutingDeps): Promise<
   }
 }
 
-/**
- * Emit the structured `intent_router.decision` log entry.
- *
- * Extracted to avoid the ~26-line duplication between chat.ts and
- * chat-stream.ts — both handlers call this with slightly different `hints`
- * (body.persona vs. the destructured `persona` variable).
- */
 export function logIntentRouterDecision(
   logger: MinimalLogger,
   routing: IntentRoutingResult,
@@ -245,9 +211,6 @@ export function logIntentRouterDecision(
   sessionId: string,
   routerModel: string | undefined,
 ): void {
-  // An explicit caller mode or a disabled router never invoked the classifier.
-  // Logging that as a `fallback: true` decision inflates router-failure
-  // metrics with turns the router was never asked about.
   if (routing.decision.skipped || (routing.decision.fallback && ROUTER_NOT_INVOKED_REASONS.has(routing.decision.reason))) {
     logger.info('intent_router.skipped', {
       event: 'intent_router.skipped',
@@ -277,17 +240,19 @@ export function logIntentRouterDecision(
   })
 }
 
-/** Synthetic decision reasons produced in this module when the router is not consulted. */
 const ROUTER_NOT_INVOKED_REASONS: ReadonlySet<string> = new Set([
   'router disabled',
 ])
 
+export function routingLeavesMemoryIntentUnresolved(decision: Pick<IntentDecision, 'fallback' | 'skipped' | 'reason'>): boolean {
+  return decision.fallback === true
+    && decision.skipped !== true
+    && !ROUTER_NOT_INVOKED_REASONS.has(decision.reason)
+}
+
 function disabledPath(hints: IntentHints, reason: string): IntentRoutingResult {
   const decision = makeDefaultDecision(hints, reason)
   return {
-    // Preserve concrete caller mode hints, but keep unhinted/default turns in
-    // AgentModeRouter's contract-aware auto path instead of silently falling
-    // back to a static runtime default.
     effectiveMode: hints.mode ?? 'auto',
     effectivePersona: hints.persona,
     effectiveSkillRefs: decision.skillIds.map(name => ({ name })),

@@ -1,7 +1,3 @@
-// Bundles the two pieces of state and the close handler that the autonomy
-// picker overlay needs. Smallest of the picker hooks — autonomy options
-// come from a static enum, so there's no items / loading / error to track.
-
 import { useCallback, useState } from 'react'
 
 export interface UseAutonomyPickerResult {

@@ -28,9 +28,6 @@ export class AgentLauncher {
       args.push(...(cfg.autoApproveArgs ?? (cfg.autoApproveFlag ? [cfg.autoApproveFlag] : [])))
     }
     const command = [cfg.command, ...args]
-    // Run the agent as the pane's process (NOT via shell+send-keys) so its
-    // TUI takes the PTY directly. Otherwise claude/codex see no terminal
-    // and fail to render their UI.
     await this.pool.create({
       name: tmuxName,
       cwd: opts.cwd,
@@ -71,7 +68,6 @@ export class AgentLauncher {
     try {
       await this.pool.sendKeys(handle.tmuxSessionName, cfg.exitCommand)
     } catch {
-      /* ignore */
     }
     await this.sleep(500)
     await this.pool.destroy(handle.tmuxSessionName)

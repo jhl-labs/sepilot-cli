@@ -602,11 +602,6 @@ function countSeverity(
   return row.count
 }
 
-// Count crash-class events in a SINGLE OR pass so an event that is both a
-// crash-typed event AND severity=fatal is counted once. Summing three separate
-// counts (LIKE '%.crash' + LIKE '%.renderer_crash' + severity fatal) double-
-// counted the overlap and inflated the CRITICAL crash alert. Mirrors the
-// per-session crash predicate used elsewhere in this module.
 function countCrashReports(db: SqliteDatabase, fromMs: number, toMs: number): number {
   const row = db.prepare(
     `SELECT COUNT(*) AS count FROM events
@@ -1129,10 +1124,6 @@ export interface ObservabilityRepo {
 export function createObservabilityRepo(): ObservabilityRepo {
   const db = openDomainDb({ name: 'observability', filename: 'events.db' })
   ensureSchema(db)
-  // INSERT OR IGNORE (not REPLACE): the id is client-supplied, so REPLACE let a
-  // caller overwrite/clobber an already-stored event or feedback row by reusing
-  // its id. IGNORE makes re-delivery idempotent and keeps the first-written row
-  // authoritative.
   const insertEvent = db.prepare(
     `INSERT OR IGNORE INTO events (
       id, schema_version, timestamp_ms, timestamp_iso, source, surface,
@@ -1303,8 +1294,6 @@ export function createObservabilityRepo(): ObservabilityRepo {
       const id = input.id ?? randomUUID()
       const source = input.source ?? 'daemon'
       const privacy = getPrivacySettings()
-      // note_redacted must actually be redacted, not merely truncated: run the
-      // note through the shared secret redactor before persisting/exporting.
       const noteRedacted =
         input.note && privacy.diagnosticCollectionEnabled
           ? truncate(redactSensitiveText(input.note), 2_000)
@@ -1476,12 +1465,6 @@ export function createObservabilityRepo(): ObservabilityRepo {
       const feedback = input.includeFeedback === false
         ? []
         : feedbackRowsInRange(fromMs, toMs, limit)
-      // Direct /export previously emitted event messages, attributes, snapshot
-      // recents, and feedback notes verbatim to the caller AND to a file on
-      // disk. Redact the whole bundle with the same secret-key redactor the
-      // support bundle uses (idempotent, so the support-bundle path that
-      // re-redacts is unaffected) so credentials cannot leak through a direct
-      // export or its persisted artifact.
       const bundle = redactSecretKeys(
         {
           generatedAt: new Date(toMs).toISOString(),

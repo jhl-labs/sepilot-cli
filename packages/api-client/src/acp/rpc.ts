@@ -37,7 +37,6 @@ export class JsonRpcFramer implements JsonRpcCodec {
       try {
         out.push(JSON.parse(body) as JsonRpcMessage)
       } catch {
-        // Invalid JSON in frame body - skip and continue parsing.
       }
     }
   }
@@ -66,7 +65,6 @@ export class NdjsonRpcFramer implements JsonRpcCodec {
       try {
         out.push(JSON.parse(line) as JsonRpcMessage)
       } catch {
-        // Invalid JSON line - skip and continue parsing.
       }
     }
   }

@@ -240,7 +240,6 @@ export function createRagStore(): RagStore {
     )
   }
 
-  // Rebuild in-memory index from DB on startup.
   const bootstrap = db.prepare('SELECT id, body FROM documents').all() as {
     id: string
     body: string

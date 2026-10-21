@@ -11,15 +11,6 @@ export interface IntegrationLayer {
   updater: ReturnType<typeof buildUpdater>
 }
 
-/**
- * Passive integrations: OpenTelemetry exporter, mDNS discovery,
- * auto-updater. Construction is pure; all three are activated
- * later by startRuntime().
- *
- * The SQLite-backed SchedulerStack is built in startRuntime() instead
- * (lifecycle.ts), where all deps — channels, ChannelPipelineCapabilities,
- * providerRegistry, etc. — are fully assembled.
- */
 export async function assembleIntegrationLayer(args: {
   config: SepilotdConfig
 }): Promise<IntegrationLayer> {

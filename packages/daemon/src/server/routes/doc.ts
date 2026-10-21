@@ -1,21 +1,3 @@
-// 글쓰기 모드 (writing canvas) REST + SSE endpoints.
-//
-// REST:
-//   POST   /api/v1/doc/open           { path? , initialContent? } → DocSession
-//   GET    /api/v1/doc/:id            → DocSession (latest)
-//   POST   /api/v1/doc/:id/user_edit  { changes: DocChange[], expectedVersion? } → { version }
-//   POST   /api/v1/doc/:id/save       { path? } → { path, mtimeMs }
-//   POST   /api/v1/doc/:id/reload     → { version }
-//   DELETE /api/v1/doc/:id            → { ok }
-//   POST   /api/v1/doc/:id/diff/:previewId/accept  → { version }
-//   POST   /api/v1/doc/:id/diff/:previewId/cancel  → { ok }
-//   GET    /api/v1/doc/:id/previews   → DocDiffPreview[]
-//
-// SSE:
-//   GET    /api/v1/doc/events?token=<daemon_token> → text/event-stream
-//          event: doc.updated | doc.diff_pending | doc.diff_resolved | doc.closed
-//          data:  JSON payload (DocEvent 그대로)
-
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import '../fastify-types.js'
@@ -272,8 +254,6 @@ export async function registerDocRoutes(app: FastifyInstance): Promise<void> {
     }
   })
 
-  // SSE event stream — registry의 모든 doc event를 connected client에 fanout.
-  // token은 query param으로 받음(EventSource는 custom header 불가).
   app.get('/doc/events', async (request, reply) => {
     reply.hijack()
     reply.raw.writeHead(200, buildSseResponseHeaders(request, {
@@ -287,7 +267,6 @@ export async function registerDocRoutes(app: FastifyInstance): Promise<void> {
       try {
         reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
       } catch {
-        // socket closed
       }
     }
 
@@ -301,12 +280,10 @@ export async function registerDocRoutes(app: FastifyInstance): Promise<void> {
     registry.events.on('diffResolved', onDiffResolved)
     registry.events.on('closed', onClosed)
 
-    // keepalive every 15s
     const ka = setInterval(() => {
       try {
         reply.raw.write(`: keepalive\n\n`)
       } catch {
-        // noop
       }
     }, 15_000)
 
@@ -325,7 +302,6 @@ export async function registerDocRoutes(app: FastifyInstance): Promise<void> {
     request.raw.once('aborted', cleanup)
     request.raw.once('error', cleanup)
 
-    // 첫 ping
     send('doc.hello', { ts: Date.now() })
 
     await closed

@@ -11,20 +11,17 @@ export interface AgentsMdFile {
 export interface CollectAgentsMdOptions {
   home?: string
   cwd?: string | null
-  /** Optional strict root that parent traversal must never cross. */
   boundaryRoot?: string | null
   perFileCharLimit?: number
   totalCharLimit?: number
   maxParentHops?: number
+  includeUserLevel?: boolean
 }
 
 const DEFAULT_PER_FILE_LIMIT = 4000
 const DEFAULT_TOTAL_LIMIT = 12000
 const DEFAULT_MAX_PARENT_HOPS = 10
 const TRUNCATED_SUFFIX = '\n… [truncated]'
-// Both instruction filenames are read and merged (P022-T9). The system prompt
-// already claims both AGENTS.md and CLAUDE.md are honored; this makes reality
-// match. AGENTS.md is listed first so it wins ordering ties within a directory.
 const AGENTS_FILENAMES = ['AGENTS.md', 'CLAUDE.md'] as const
 const GLOBAL_SUBDIR = '.sepilotd'
 const RULE_DIRS = [
@@ -63,8 +60,6 @@ function truncate(content: string, limit: number): string {
 }
 
 function boundedReadBytes(charLimit: number): number {
-  // UTF-8 uses at most four bytes per Unicode scalar. One extra character is
-  // enough to detect truncation without reading a multi-megabyte rule file.
   return Math.max(4, (Math.max(0, charLimit) + 1) * 4)
 }
 
@@ -96,7 +91,6 @@ function compactMetadataValue(value: unknown, limit = 240): string {
   return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact
 }
 
-/** Preserve Cursor-compatible .mdc applicability instead of applying it universally. */
 function formatScopedMdcRule(content: string, perFileLimit: number): string {
   const parsed = parseFrontmatter(content)
   if (parsed.body === content) return content
@@ -202,10 +196,6 @@ export async function collectAgentsMd(
           || budget.remainingFiles <= 0
           || budget.remainingChars <= 0
         ) return
-        // Do not follow symlinked directories or files. Local rule roots are
-        // untrusted project content and recursive symlinks can escape a strict
-        // workspace or create loops. Global control-plane roots do not need
-        // symlink compatibility either.
         if (entry.isSymbolicLink()) continue
         const candidate = join(current, entry.name)
         if (entry.isDirectory()) {
@@ -231,7 +221,6 @@ export async function collectAgentsMd(
     return files
   }
 
-  // Read every instruction filename present in a directory, in filename order.
   const readDir = async (
     dir: string,
     boundaryRoot?: string | null,
@@ -248,11 +237,9 @@ export async function collectAgentsMd(
     return files
   }
 
-  // 1. Global control-plane instructions. These are user-level agent config,
-  // not workspace files, and therefore remain active inside a strict
-  // workspace without widening any tool filesystem capability.
+  const includeUserLevel = options.includeUserLevel !== false
   const globalDir = join(home, GLOBAL_SUBDIR)
-  for (const filename of AGENTS_FILENAMES) {
+  for (const filename of includeUserLevel ? AGENTS_FILENAMES : []) {
     const candidate = join(globalDir, filename)
     const content = await readIfPresent(candidate, perFileLimit)
     if (content !== null) {
@@ -260,7 +247,7 @@ export async function collectAgentsMd(
       globalPaths.add(candidate)
     }
   }
-  for (const relativeRuleDir of GLOBAL_RULE_DIRS) {
+  for (const relativeRuleDir of includeUserLevel ? GLOBAL_RULE_DIRS : []) {
     const rules = await readRulesDir(join(home, relativeRuleDir), undefined, globalRuleBudget)
     for (const rule of rules) {
       collected.push(rule)
@@ -268,13 +255,13 @@ export async function collectAgentsMd(
     }
   }
 
-  // 2. Walk-up from cwd to home, reading both filenames at each level.
   const resolvedCwd = await resolveCwd(options.cwd)
   const stableCwd = !boundaryRequested || (
     resolvedCwd !== null
     && resolvedCwd === resolve(options.cwd as string)
   )
-  if (resolvedCwd && stableBoundary && stableCwd && (!boundaryRequested || resolvedBoundary)) {
+  const walkUpAllowed = includeUserLevel || resolvedBoundary !== null
+  if (walkUpAllowed && resolvedCwd && stableBoundary && stableCwd && (!boundaryRequested || resolvedBoundary)) {
     const resolvedHome = resolve(home)
     const walkUpLevels: AgentsMdFile[][] = []
     let current = resolvedCwd
@@ -290,15 +277,10 @@ export async function collectAgentsMd(
       current = parent
       hops += 1
     }
-    // Collected deepest-first; emit least-specific → most-specific by reversing
-    // the levels (filename order within each level is preserved).
     walkUpLevels.reverse()
     for (const level of walkUpLevels) collected.push(...level)
   }
 
-  // 2b. Dedupe by normalized content — a CLAUDE.md that is a copy/symlink of an
-  // AGENTS.md (common) must not be injected twice. First occurrence (the
-  // least-specific / AGENTS.md-first) wins.
   const seenContent = new Set<string>()
   const deduped: AgentsMdFile[] = []
   for (const file of collected) {
@@ -309,8 +291,6 @@ export async function collectAgentsMd(
   collected.length = 0
   collected.push(...deduped)
 
-  // 3. Enforce total budget. Workspace rules may displace less-specific
-  // workspace rules, but never evict user-level global control-plane files.
   let total = collected.reduce((sum, f) => sum + f.content.length, 0)
   while (total > totalLimit) {
     const workspaceIndexes = collected.flatMap((file, index) =>
@@ -341,8 +321,6 @@ export async function collectAgentsMd(
     }
   }
   if (total > totalLimit && collected.length > 0) {
-    // Global-only overflow is shared fairly so every control-plane source
-    // remains represented rather than silently deleting the earliest file.
     const perFileBudget = Math.max(1, Math.floor(totalLimit / collected.length))
     for (let index = 0; index < collected.length; index += 1) {
       const file = collected[index]!

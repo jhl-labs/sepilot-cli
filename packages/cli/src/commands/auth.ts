@@ -36,7 +36,6 @@ function loginPresetChoices(): ProviderWizardPreset[] {
   return [...PROVIDER_WIZARD_PRESETS, OLLAMA_PRESET]
 }
 
-/** Mask a raw provider apiKey for display — never echo the plaintext value. */
 function describeKeySource(apiKey: string | undefined): string | null {
   if (!apiKey) return null
   const envVar = extractEnvVarReference(apiKey)

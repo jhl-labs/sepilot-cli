@@ -1,12 +1,5 @@
 import type { AgentRunContract, AgentStateBoardSnapshot } from '@sepilotd/core'
 
-/**
- * Shared, dependency-light text renderer for the agent state board. Lives in
- * `presentation` (core-only) so cli and web render the same board the same way
- * without importing daemon. Mirrors the daemon's prompt-side formatter but
- * operates on the serializable `AgentStateBoardSnapshot`.
- */
-
 const MAX_PLAN_STEPS = 20
 const MAX_TODO_ITEMS = 20
 const MAX_OPEN_QUESTIONS = 10
@@ -44,10 +37,6 @@ function formatContract(contract: AgentRunContract | undefined): string[] {
   return lines
 }
 
-/**
- * Render the board as human-readable text. Returns `null` for an empty board so
- * callers can show an explicit "no state board" message.
- */
 export function formatStateBoardText(board: AgentStateBoardSnapshot): string | null {
   if (stateBoardIsEmpty(board)) return null
   const lines: string[] = ['Agent state board']

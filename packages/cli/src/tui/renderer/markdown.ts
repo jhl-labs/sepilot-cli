@@ -22,12 +22,6 @@ export interface MarkdownCodeBlock {
 }
 
 export interface RenderMarkdownOptions {
-  /**
-   * Target terminal column budget. When provided every block is wrapped to
-   * fit (string-width aware, so CJK/Hangul count as 2 columns) with hanging
-   * indents for lists and blockquotes. When omitted no wrapping is applied
-   * and the caller (e.g. Ink) is responsible for it.
-   */
   width?: number
 }
 
@@ -55,11 +49,6 @@ function lexMarkdown(text: string): Token[] {
   return new Lexer().lex(text)
 }
 
-/**
- * Blocks are rendered as arrays of physical lines and joined with exactly one
- * blank line, so paragraph/space token combinations can never stack up
- * irregular vertical gaps.
- */
 function joinBlocks(blocks: string[][]): string {
   return blocks
     .filter((block) => block.length > 0)
@@ -103,7 +92,6 @@ function renderBlockToken(token: Token, context: RenderContext): string[] | null
       return renderList(t, context.listDepth, context.width)
     }
     case 'space':
-      // Vertical rhythm is owned by joinBlocks; explicit blank runs collapse.
       return null
     case 'hr': {
       const ruleWidth = Math.min(context.width ?? DEFAULT_RULE_WIDTH, DEFAULT_RULE_WIDTH)
@@ -158,11 +146,6 @@ function renderList(list: Tokens.List, depth: number, width: number | undefined)
   return lines
 }
 
-/**
- * Render one list item's blocks. The first line is returned bare (the caller
- * attaches the bullet); every following line is already indented — nested
- * lists carry their own absolute indent, other blocks get the hanging indent.
- */
 function renderListItemLines(
   item: Tokens.ListItem,
   depth: number,
@@ -184,7 +167,6 @@ function renderListItemLines(
   const out: string[] = []
   let isFirstLine = true
   blocks.forEach((block, index) => {
-    // Loose items keep a blank line between their paragraphs; tight items pack.
     if (index > 0 && item.loose) out.push('')
     for (const line of block.lines) {
       if (isFirstLine) {
@@ -230,7 +212,6 @@ function shrinkColumnsToFit(colWidths: number[], width: number): number[] {
   if (total <= available) return colWidths
 
   const result = [...colWidths]
-  // Repeatedly trim the widest column until the table fits (or nothing can shrink).
   while (total > available) {
     let widest = 0
     for (let i = 1; i < result.length; i += 1) {
@@ -243,7 +224,6 @@ function shrinkColumnsToFit(colWidths: number[], width: number): number[] {
   return result
 }
 
-/** Pad or truncate a cell to an exact display width (string-width aware). */
 function fitCell(cell: string, width: number): string {
   const visible = stringWidth(stripAnsi(cell))
   if (visible <= width) {

@@ -27,12 +27,10 @@ export class TelemetryManager {
 
   async init(): Promise<void> {
     if (!this.enabled) return
-    // OTel SDK init would go here when @opentelemetry packages are installed
   }
 
   startSpan(name: string, _attributes?: Record<string, string | number>): Span {
     if (!this.enabled) return new NoopSpan()
-    // In real impl, this would create an OTel span
     const start = Date.now()
     return {
       end: () => { this.recordHistogram(`${name}.duration`, Date.now() - start) },

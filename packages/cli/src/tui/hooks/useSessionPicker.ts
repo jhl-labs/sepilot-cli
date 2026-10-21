@@ -1,12 +1,3 @@
-// Bundles the six pieces of state and the close handler that the session
-// picker overlay needs. Same shape as useUsageDashboard / useMemorySearch
-// / useFilePicker so a future overlay coordinator can speak to all of
-// them uniformly.
-//
-// projectSessionIds and recentSessionIds stay in App.tsx for now —
-// they're populated by the cli-state hydration path on startup, not by
-// opening the picker, so they don't share the picker's lifecycle.
-
 import { useCallback, useState } from 'react'
 import type { DaemonSessionMeta } from '@sepilotd/api-client'
 
@@ -34,9 +25,6 @@ export function useSessionPicker(): UseSessionPickerResult {
   const [sessionsLoading, setSessionsLoading] = useState(false)
   const [sessionsError, setSessionsError] = useState<string | null>(null)
 
-  // Closing also resets the search query and cursor so a re-open starts
-  // fresh — sessions accumulate over time, so a stale query/cursor would
-  // surprise the operator.
   const closeSessionPicker = useCallback(() => {
     setSessionPickerOpen(false)
     setSessionQuery('')

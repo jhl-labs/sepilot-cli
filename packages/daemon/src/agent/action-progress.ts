@@ -6,9 +6,7 @@ export const ACTION_PROGRESS_ARGUMENT = '__sepilot_action_progress'
 const MAX_ACTION_PROGRESS_FIELD_CHARS = 180
 
 export interface AgentActionProgress {
-  /** Why the selected tool action is useful at this point in the run. */
   summary: string
-  /** What the agent expects to decide or do after the tool result arrives. */
   nextStep: string
 }
 
@@ -25,12 +23,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 
-/**
- * Add a transport-neutral, model-authored progress field to each tool schema.
- * Keeping it in the ordinary argument object works for native function calls
- * and prompt-serialized tool calls without a second model request or a
- * special-purpose narration tool.
- */
 export function withAgentActionProgressSchemas<T extends ToolDefinition>(
   tools: readonly T[],
 ): T[] {
@@ -71,12 +63,6 @@ function normalizeField(value: unknown): string | null {
   return `${normalized.slice(0, MAX_ACTION_PROGRESS_FIELD_CHARS - 1)}…`
 }
 
-/**
- * Parse only the explicit model-authored action annotation. Untagged prose is
- * deliberately ignored: inferring intent from a tool name or arguments would
- * replace the model's judgment with a surface heuristic and could mislead the
- * operator about why the action was selected.
- */
 export function extractAgentActionProgress(text: string): AgentActionProgress | null {
   const match = text.match(
     /<(?:[A-Za-z][\w.-]*:)?sepilot_action_progress\b[^>]*>\s*([\s\S]*?)\s*<\/(?:[A-Za-z][\w.-]*:)?sepilot_action_progress>/iu,
@@ -98,11 +84,6 @@ export function extractAgentActionProgress(text: string): AgentActionProgress | 
   return { summary, nextStep }
 }
 
-/**
- * Consume progress metadata authored inside tool arguments. The reserved
- * field is always removed so validators, approval previews, signatures and
- * the actual tool implementation continue to see only the tool's real input.
- */
 export function consumeToolCallActionProgress(
   toolCalls: ToolCall[],
   exposedTools: readonly ToolDefinition[] = [],
@@ -112,8 +93,6 @@ export function consumeToolCallActionProgress(
   for (const toolCall of toolCalls) {
     let rawProgress: unknown = toolCall.arguments[ACTION_PROGRESS_ARGUMENT]
     delete toolCall.arguments[ACTION_PROGRESS_ARGUMENT]
-    // Accept an explicitly serialized annotation, never infer one from prose
-    // or reinterpret ordinary tool arguments. Bound parsing and discard invalid data.
     if (typeof rawProgress === 'string' && rawProgress.length <= 4096) {
       try { rawProgress = JSON.parse(rawProgress) } catch { rawProgress = null }
     }
@@ -123,11 +102,6 @@ export function consumeToolCallActionProgress(
       if (summary && nextStep) firstProgress = { summary, nextStep }
     }
 
-    // Some structured-output transports flatten the reserved object into
-    // sibling `summary`/`nextStep` fields and may emit its property name as an
-    // empty-key sentinel. Recover only when the exposed source schema proves
-    // those sibling names are framework-only. Legitimate tool fields with the
-    // same names remain untouched.
     const flattenedMarker = toolCall.arguments[''] === ACTION_PROGRESS_ARGUMENT
     if (flattenedMarker) delete toolCall.arguments['']
     const exposedSchema = exposedToolByName.get(toolCall.name)?.inputSchema

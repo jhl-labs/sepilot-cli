@@ -4,24 +4,12 @@ import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 
 export interface PidAcquireOptions {
-  /**
-   * If the PID file is held by a live process, retry this many extra times
-   * before giving up. Lets a freshly-spawned instance wait out a predecessor
-   * that is still mid-shutdown (e.g. `tsup --watch` restarts in dev). Default 0.
-   */
   retries?: number
-  /** Delay between retry attempts, in milliseconds. Default 500. */
   retryDelayMs?: number
 }
 
 type PidFileState = 'missing' | 'live' | 'dead' | 'indeterminate'
 
-// Multiple PidManager instances can exist inside one daemon process (tests,
-// embedded startup probes). A numeric PID file alone cannot distinguish that
-// legitimate in-process owner from a stale file whose PID was reused after a
-// container/host restart. Track ownership in-process so an unowned file that
-// points back to the current PID can be safely reclaimed, while a second
-// manager in the same process still fails closed.
 const ownedPidPaths = new Set<string>()
 
 interface ReclaimMarkerState {
@@ -32,17 +20,10 @@ interface ReclaimMarkerState {
 
 export interface PidHolder {
   pid: number
-  /** How long the pid file has existed, in milliseconds. */
   ageMs: number
   alive: boolean
 }
 
-/**
- * Build the error a failed single-instance acquisition reports. The bare
- * "Another sepilotd instance is already running" left an operator with no way
- * to tell a genuinely running daemon from a wedged one, so name the holder,
- * its age, and the concrete next step.
- */
 export function formatPidConflictMessage(
   pidPath: string,
   holder: PidHolder | null,
@@ -84,10 +65,6 @@ export class PidManager {
     let reclaimMarker: string | undefined
     try {
       for (let attempt = 0; ; attempt++) {
-        // Atomic create-exclusive: open(2) with O_CREAT|O_EXCL. If two daemons
-        // race to boot, exactly one open succeeds; the other gets EEXIST. This
-        // closes the check->write TOCTOU window that let both pass and briefly
-        // share the SQLite files.
         try {
           const handle = await open(this.pidPath, 'wx')
           ownedPidPaths.add(this.pidPath)
@@ -108,10 +85,6 @@ export class PidManager {
           }
         }
 
-        // The file already exists. Only a strict PID whose process is confirmed
-        // absent is safe to reclaim. Empty/partial/malformed files can be a
-        // concurrent winner that has created the inode but not written yet, so
-        // those states fail closed instead of being unlinked.
         const state = await this.inspectPidFile()
         if (state === 'missing') {
           continue
@@ -124,10 +97,6 @@ export class PidManager {
           return false
         }
 
-        // Serialize stale-file reclamation across processes. The exclusive
-        // marker stays held until one contender has installed the replacement
-        // PID, and the winner revalidates the PID state inside the critical
-        // section before unlinking anything.
         reclaimMarker = await this.tryAcquireReclaimLock()
         if (!reclaimMarker) {
           if (attempt < retries) {
@@ -164,10 +133,6 @@ export class PidManager {
     }
   }
 
-  /**
-   * Describe whoever currently holds the pid file, for diagnostics. Returns
-   * null when the file is absent or unparseable.
-   */
   async readHolder(): Promise<PidHolder | null> {
     let raw: string
     try {
@@ -212,11 +177,6 @@ export class PidManager {
     }
   }
 
-  /**
-   * Synchronous PID removal for the `process.on('exit')` last-resort hook.
-   * The exit event runs with a stopped event loop, so an async unlink there
-   * never completes and the stale PID file blocks the next daemon start.
-   */
   releaseSync(): void {
     if (!this.acquired) return
     try {
@@ -232,9 +192,6 @@ export class PidManager {
   }
 
   private async tryAcquireReclaimLock(): Promise<string | undefined> {
-    // Publish a complete marker with an exclusive hard link. Unlike opening
-    // the final path and then writing it, this never exposes an empty/partial
-    // marker if the process is interrupted between those two operations.
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = randomUUID()
       const raw = JSON.stringify({ version: 1, pid: process.pid, token })
@@ -328,10 +285,6 @@ export class PidManager {
     const { raw, token } = marker
     if (!raw || !token) return false
 
-    // A prepared, non-empty directory is renamed to a deterministic token
-    // path. Directory replacement cannot overwrite this tombstone, so exactly
-    // one contender claims cleanup and late contenders cannot remove a newer
-    // marker through an ABA race.
     const quarantinePath = `${this.reclaimPath}.quarantine.${token}`
     const preparedPath = `${quarantinePath}.${randomUUID()}.tmp`
     const recordPath = join(quarantinePath, 'record.json')
@@ -391,7 +344,7 @@ export class PidManager {
     }
 
     try {
-      process.kill(pid, 0) // Signal 0 = check if process exists
+      process.kill(pid, 0)
       return 'live'
     } catch (error) {
       return (error as NodeJS.ErrnoException)?.code === 'ESRCH'

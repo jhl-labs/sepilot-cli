@@ -159,7 +159,6 @@ function parseJsonObject(value: string, label: string): Record<string, unknown> 
       return parsed as Record<string, unknown>
     }
   } catch {
-    // Return a user-facing usage string below.
   }
   return `Invalid ${label}: expected a JSON object.`
 }

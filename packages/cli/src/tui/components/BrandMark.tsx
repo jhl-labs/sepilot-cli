@@ -11,7 +11,6 @@ const LARGE_MARK = [
   '╚══════╝╚══════╝╚═╝     ╚═╝╚══════╝ ╚═════╝    ╚═╝   ',
 ]
 
-/** A terminal wordmark that remains usable in narrow terminal windows. */
 export function BrandMark({ width }: { width: number }) {
   const useLargeMark = width >= 64
   const version = loadCliVersion()

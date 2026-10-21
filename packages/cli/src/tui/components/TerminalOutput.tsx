@@ -4,6 +4,7 @@ import {
   previewTextLines,
   splitTerminalOutput,
   terminalCommandLabel,
+  toolExecutionPostureMeta,
   truncatePreviewItems,
 } from '../utils/tooling.js'
 import type { ToolCallState } from '../types.js'
@@ -19,9 +20,18 @@ interface TerminalPreviewLine {
   color?: string
 }
 
+const COMMAND_PREVIEW_CHARS = 320
+
+function boundedCommandText(command: string): string {
+  return command.length <= COMMAND_PREVIEW_CHARS
+    ? command
+    : `${command.slice(0, COMMAND_PREVIEW_CHARS).trimEnd()}… (+${command.length - COMMAND_PREVIEW_CHARS} chars)`
+}
+
 export function TerminalOutput({ tool, maxLines }: TerminalOutputProps) {
   const { stdout, stderr } = splitTerminalOutput(tool.output)
   const cwd = typeof tool.input.cwd === 'string' ? tool.input.cwd : undefined
+  const posture = toolExecutionPostureMeta(tool.meta)
   const timeoutMs = typeof tool.input.timeoutMs === 'number'
     ? tool.input.timeoutMs
     : undefined
@@ -58,10 +68,13 @@ export function TerminalOutput({ tool, maxLines }: TerminalOutputProps) {
   return (
     <Box flexDirection="column">
       <Text color={colors.info}>
-        $ {terminalCommandLabel(tool.input)}
+        $ {boundedCommandText(terminalCommandLabel(tool.input))}
       </Text>
       {cwd && (
         <Text color={colors.dimText} wrap="truncate-end">cwd {cwd}</Text>
+      )}
+      {posture && (
+        <Text color={colors.dimText} wrap="truncate-end">{posture}</Text>
       )}
       {timeoutMs && (
         <Text color={colors.dimText} wrap="truncate-end">timeout {timeoutMs}ms</Text>

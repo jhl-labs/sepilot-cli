@@ -11,7 +11,6 @@ import { subagentDispatchRequestSchema } from './subagents-schema.js'
 import { z } from 'zod'
 
 export interface JobsBatchExecutor {
-  // Batch item executor — production wires this to the chat service.
   executeItem(item: { idx: number; request: unknown }, signal?: AbortSignal): Promise<unknown>
 }
 
@@ -70,7 +69,6 @@ export function registerJobsRoutes(
       items.map((request, idx) => ({ idx, request })),
     )
 
-    // Fire and forget — runner persists state via repo.
     void deps.runner
       .run({
         jobId: job.id,
@@ -80,7 +78,6 @@ export function registerJobsRoutes(
           deps.executor.executeItem({ idx: item.idx, request: item.request }, signal),
       })
       .catch(() => {
-        /* runner persists error itself */
       })
 
     return {
@@ -128,7 +125,6 @@ export function registerJobsRoutes(
         if (final && input.parentSessionId) deps.onSubagentFinished?.(final, input.parentSessionId)
       })
       .catch(() => {
-        /* runner persists error itself */
       })
 
     return reply.status(202).send({

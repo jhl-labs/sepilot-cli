@@ -5,22 +5,15 @@ import { sepilotdHome } from '../../storage/home.js'
 import { DAEMON_VERSION } from '../../version.js'
 
 interface EnvKnob {
-  /** Environment variable name. */
   name: string
-  /** Currently effective value (env or default). */
   effective: string | null
-  /** Whether the value comes from the env (true) or from the default (false). */
   fromEnv: boolean
-  /** Documented default applied when env is unset, or null if there is none. */
   default: string | null
-  /** Human-readable purpose for the System tab. */
   purpose: string
 }
 
 interface PathEntry {
-  /** Display label, e.g. "sessions". */
   label: string
-  /** Absolute path on disk. */
   path: string
 }
 
@@ -40,10 +33,6 @@ interface BootInfo {
   env: EnvKnob[]
 }
 
-/**
- * Capture the current value of an env knob, treating an empty string as
- * unset (Unix convention).
- */
 function readEnv(name: string, fallback: string | null, purpose: string): EnvKnob {
   const raw = process.env[name]
   const set = typeof raw === 'string' && raw.length > 0
@@ -58,12 +47,6 @@ function readEnv(name: string, fallback: string | null, purpose: string): EnvKno
 
 const startedAtEpoch = Date.now()
 
-/**
- * `GET /system/boot-info` — read-only snapshot of values that are set at
- * daemon boot via env vars / config. The desktop's System tab uses this
- * so users can see what is actually applied even when the GUI cannot
- * change it (port, storage path, streaming knobs).
- */
 export async function registerSystemBootInfoRoutes(
   app: FastifyInstance,
 ): Promise<void> {

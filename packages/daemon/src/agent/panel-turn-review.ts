@@ -29,6 +29,6 @@ export async function reviewPanelTurn(input: {
       && typeof verdict.accepted === 'boolean' && typeof verdict.reason === 'string' && verdict.reason.trim()) {
       return { accepted: verdict.accepted, reason: verdict.reason.slice(0, 1200), request, response }
     }
-  } catch { /* An invalid review is not successful validation. */ }
+  } catch {}
   return { accepted: false, reason: 'The intervention review did not return a complete valid verdict.', request, response }
 }

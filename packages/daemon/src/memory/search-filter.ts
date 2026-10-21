@@ -1,7 +1,6 @@
 import type { SemanticSearchOptions } from '@sepilotd/core'
 import { canReadLegacyGlobalMemory } from './scope.js'
 
-/** SQL ownership is the same ACL as isMemoryVisibleInScope, before LIMIT. */
 export function buildMemorySearchFilter(alias: string, options?: SemanticSearchOptions): {
   clause: string; params: Record<string, unknown>
 } {
@@ -14,9 +13,6 @@ export function buildMemorySearchFilter(alias: string, options?: SemanticSearchO
   if (options?.scopeTags !== undefined) {
     params.memoryScope = JSON.stringify(options.scopeTags.map((tag) => tag.toLowerCase()))
     const match = (prefix: string) => exists(`lower(t.value) LIKE '${prefix}%' AND lower(t.value) IN (SELECT value FROM json_each(@memoryScope))`)
-    // Namespace isolation is an additional boundary, including for public entries.
-    // Count tags (not DISTINCT): malformed multi-namespace records fail closed,
-    // matching the in-memory ACL before ranking and LIMIT can discard valid hits.
     const namespaces = options.scopeTags.filter((tag) => tag.toLowerCase().startsWith('scope:persona:'))
     if (namespaces.length === 0) conditions.push(`NOT ${has('scope:persona:')}`)
     else if (namespaces.length === 1) {

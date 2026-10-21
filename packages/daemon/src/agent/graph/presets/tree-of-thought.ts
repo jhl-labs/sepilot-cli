@@ -10,15 +10,6 @@ const treeOfThoughtPrompt = [
   'Do not reveal private chain-of-thought; surface only compact branch summaries, selection rationale, and the final answer.',
 ].join(' ')
 
-/**
- * Real Tree-of-Thought:
- * 1. `treeOfThought` node generates N branches in parallel, judges them,
- *    and pushes the winning branch into the message history as a system note.
- * 2. The downstream agent loop carries out that approach (with tool access).
- *
- * If branching produces nothing usable the agent simply runs as normal,
- * so this graph is robust against provider hiccups.
- */
 export function buildTreeOfThoughtGraph(deps: Deps): AgentGraph {
   return new AgentGraph()
     .setStart('context_manager')

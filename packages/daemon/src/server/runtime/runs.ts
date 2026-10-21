@@ -24,6 +24,7 @@ export interface PendingToolExecutionSnapshot {
 }
 
 export interface SessionRunCheckpoint {
+  deadlineAt?: number
   autonomy?: import('@sepilotd/core').AutonomyLevel
   sessionId: string
   provider: string
@@ -34,22 +35,20 @@ export interface SessionRunCheckpoint {
   cwd?: string
   workspaceRoot?: string
   workspaceIsolation?: 'policy' | 'strict'
-  /** Caller memory scope preserved across crash/cancellation resumes. */
   scopeTags?: string[]
-  /** Structured skill execution invariants preserved across crash/cancellation resumes. */
   executionSkillIds?: string[]
-  /** Immutable loaded-skill runtime profile preserved across crash resumes. */
   skillToolNames?: string[]
-  /** Exact tool registry surface used before the run was checkpointed. */
+  memoryPolicy?: { read: boolean; write: boolean; automaticRead?: boolean; automaticWrite?: boolean }
   toolAllowlist?: string[]
+  delegationToolAllowlist?: string[]
   skillExecutionPolicies?: ActiveSkillExecutionPolicy[]
-  /** Preserve the per-turn explicit tool-approval guard across resumes. */
   requireToolApproval?: boolean
   messages: Message[]
   totalUsage: TokenUsage
   iteration: number
   maxIterations: number
   thinkingLevel?: string
+  thinkingLevelSource?: import('../../providers/thinking-policy.js').ThinkingLevelSource
   textDeltaMode?: 'buffered' | 'live'
   stage: RunResumeStage
   checkpointedAt: string
@@ -174,9 +173,6 @@ export class RunCheckpointStore {
         checkpoint: JSON.parse(raw) as SessionRunCheckpoint,
       }
     } catch (err) {
-      // A user-facing run that vanishes after a daemon restart is
-      // confusing if there's no diagnostic. Log so the operator can
-      // correlate with whatever caused the partial write.
       log.warn('run checkpoint unparseable; treating as no resume available', {
         sessionId,
         path,

@@ -127,11 +127,6 @@ function recoveryOutputPreview(text: string): string {
   return normalized.length <= 500 ? normalized : normalized.slice(-500)
 }
 
-/**
- * Hard cap on agents per swarm run. A misbehaving supervisor LLM can otherwise
- * loop on swarm.spawn_agent and exhaust file descriptors / tmux server memory.
- * Override with `SEPILOTD_SWARM_MAX_AGENTS_PER_RUN` env var if needed.
- */
 const MAX_AGENTS_PER_RUN = (() => {
   const raw = process.env.SEPILOTD_SWARM_MAX_AGENTS_PER_RUN
   const n = raw ? Number(raw) : NaN
@@ -146,9 +141,6 @@ function emitToolCall(
 ): void {
   const run = ctx.registry.get(runId)
   if (!run) return
-  // SwarmRun extends EventEmitter and only the registry's own listener is
-  // wired through `run.on('event', ...)`. Emit directly so the event reaches
-  // the jsonl store + any active SSE listeners.
   run.emit('event', { type: 'tool.call', runId, tool, input, ts: Date.now() })
 }
 
@@ -589,7 +581,7 @@ export function createRecoverTool(ctx: SwarmToolContext): ToolDefinitionRuntime 
           outputPreview = recoveryOutputPreview(snap)
           blocker = recordOutputEvidence(run, handle, snap)
           emitPaneSnapshot(ctx, runId, handle.handle, snap)
-        } catch { /* best-effort */ }
+        } catch {}
         if (blocker) {
           run.recordRecoveryEvent({
             handle: handle.handle,
@@ -776,7 +768,7 @@ export function createRecoverTool(ctx: SwarmToolContext): ToolDefinitionRuntime 
       const wasActive = run.snapshot().activeHandle === handle.handle
       run.addAgent(replacement)
       if (wasActive) run.setActive(replacement.handle)
-      try { await runtime.stop(handle) } catch { /* best-effort; replacement is already live */ }
+      try { await runtime.stop(handle) } catch {}
       run.removeAgent(handle.handle)
       const activeHandle = run.snapshot().activeHandle ?? null
       const replacementStartup = replacement.startupEvidence?.lifecycleState
@@ -919,12 +911,11 @@ export function createSendTool(ctx: SwarmToolContext): ToolDefinitionRuntime {
       )
       run.setStatus(handle.handle, 'busy')
       run.recordStartupEvidence(handle.handle, createSwarmPromptSentEvidence(handle))
-      // Capture pane snapshot right after send so attach clients see the prompt land.
       try {
         const snap = await runtime.capture(handle)
         recordOutputEvidence(run, handle, snap)
         emitPaneSnapshot(ctx, runId, handle.handle, snap)
-      } catch { /* best-effort */ }
+      } catch {}
       emitToolResult(ctx, runId, 'swarm.send', 'sent')
       return { output: 'sent', status: 'success', durationMs: durationSince(start) }
     },

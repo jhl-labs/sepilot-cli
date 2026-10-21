@@ -1,7 +1,6 @@
 import type { SqliteDatabase } from '../db/sqlite.js'
 import { canonicalFileMemoryScopeKey } from './scoped-file-memory.js'
 
-/** Conservative transitive invalidation of inferred dependents, including cycles. */
 export function retractDerivedMemories(db: SqliteDatabase): void {
   db.transaction(() => {
     for (;;) {

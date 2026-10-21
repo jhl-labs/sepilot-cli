@@ -1,13 +1,5 @@
 export type Resolvable<T> = T | (() => T | Promise<T>)
 
-/**
- * Error thrown by {@link ApiHttpClient.request} when the server returns
- * a non-OK status with a recognisable nested error envelope or legacy
- * top-level `{ error: code, message, ...details }` contract. Carries the
- * structured fields so callers (cli printers, daemon error mappers, gateway
- * tool wrappers) can route by code without parsing prose. Callers that do not
- * `instanceof`-check still get the contract message instead of raw JSON.
- */
 export class ApiHttpError extends Error {
   readonly status: number
   readonly code: string | undefined
@@ -80,13 +72,6 @@ function tryExtractErrorEnvelope(text: string): ParsedErrorEnvelope | null {
   }
 }
 
-/**
- * Memory scope identity attached to every outgoing request as
- * `X-Memory-Scope-*` headers. The daemon uses this to isolate memory
- * reads/writes per user / channel / session. All fields optional —
- * surfaces typically set `userId` only, channel adapters set
- * channelType/channelId.
- */
 export interface MemoryScope {
   userId?: string
   channelType?: string
@@ -95,11 +80,6 @@ export interface MemoryScope {
   groupIds?: string[]
 }
 
-/**
- * Build the daemon's memory-scope request headers from a resolved scope.
- * HTTP and WebSocket transports share this mapping so memory isolation
- * cannot drift between otherwise equivalent chat paths.
- */
 export function buildMemoryScopeHeaders(
   scope: MemoryScope | null | undefined,
 ): Record<string, string> {
@@ -130,13 +110,7 @@ export interface ApiHttpClientOptions {
   defaultHeaders?: Resolvable<HeadersInit | undefined>
   fetch?: typeof fetch
   timeoutMs?: Resolvable<number | null | undefined>
-  /** Optional UI/client surface label advertised as X-Sepilotd-Surface. */
   surface?: Resolvable<string | null | undefined>
-  /**
-   * Memory scope to advertise to the daemon. The client merges these
-   * into the X-Memory-Scope-* headers automatically; per-call headers
-   * still win when explicitly passed.
-   */
   memoryScope?: Resolvable<MemoryScope | null | undefined>
 }
 
@@ -144,12 +118,6 @@ export interface ApiRequestInit extends Omit<RequestInit, 'body' | 'headers'> {
   body?: BodyInit | object | unknown[] | null
   headers?: HeadersInit
   timeoutMs?: number
-  /**
-   * Optional transport for this one request. This is deliberately separate
-   * from RequestInit: Node/Bun callers can align a long-lived JSON request's
-   * dispatcher timeout without changing streaming fetches or every request
-   * made by the client.
-   */
   fetch?: typeof fetch
   idempotent?: boolean
   retry?: {
@@ -283,8 +251,6 @@ export class ApiHttpClient {
       headers.set('X-Sepilotd-Surface', normalizedSurface)
     }
 
-    // Apply memoryScope before the per-call extras so explicit per-call
-    // headers (X-Memory-Scope-*) still override.
     const scope = await resolve(this.options.memoryScope)
     for (const [header, value] of Object.entries(buildMemoryScopeHeaders(scope))) {
       if (!headers.has(header)) headers.set(header, value)
@@ -387,10 +353,6 @@ export class ApiHttpClient {
           details: envelope.details,
         })
       }
-      // No envelope: keep the legacy `<status>: <body>` shape on
-      // `Error.message` so callers that string-match (older surfaces)
-      // keep working, but expose the structured status/rawBody on the
-      // new ApiHttpError fields for everyone else.
       throw new ApiHttpError({
         status: res.status,
         message: `${res.status}: ${text || res.statusText}`,

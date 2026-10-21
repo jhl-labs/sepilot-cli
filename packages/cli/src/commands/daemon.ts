@@ -104,27 +104,18 @@ async function startCommandWithEnvironment(
   const copy = DAEMON_COPY[detectCliLocale()] ?? DAEMON_COPY.en
   const client = new DaemonClient(options.url)
 
-  // Check if already running
   try {
     await client.health()
     console.log(chalk.yellow(copy.alreadyRunning))
     return
   } catch {
-    /* not running — good */
   }
 
   const listenTarget = resolveLocalDaemonListenTarget(options.url)
   if (!listenTarget) throw new Error(LOCAL_DAEMON_START_ERROR)
 
-  // In the standalone single-file build there is no separate `sepilotd` entry;
-  // re-enter ourselves with `__daemon`. Falls back to the module/PATH resolver
-  // for the npm-installed CLI.
   const standalone = resolveStandaloneDaemonInvocation()
   if (options.foreground && standalone) {
-    // `launchDaemon` returns a handle, not a promise that resolves on the
-    // child's exit, so we can't truly "run in the foreground and wait" from
-    // here without importing @sepilotd/daemon (forbidden by the architecture
-    // boundary). Point the user at the dedicated subcommand instead.
     console.log(chalk.gray(copy.standaloneForegroundHint))
     return
   }
@@ -167,7 +158,6 @@ async function startCommandWithEnvironment(
     return
   }
 
-  // Background mode
   console.log(chalk.gray(copy.startingBackground))
   const proc = launchDaemon(daemon, {
     detached: true,
@@ -189,23 +179,14 @@ async function startCommandWithEnvironment(
 }
 
 export async function startCommand(options: DaemonStartOptions): Promise<void> {
-  // Commander appends its Command instance after declared positional
-  // arguments. Keep that framework-owned callback context outside the
-  // internal prepared-environment slot so only validated lifecycle state can
-  // bypass prepareDaemonEnvironment().
   await startCommandWithEnvironment(options)
 }
 
 async function stopDaemon(_options: { url?: string }): Promise<boolean> {
   const copy = DAEMON_COPY[detectCliLocale()] ?? DAEMON_COPY.en
   const client = new DaemonClient(_options.url)
-  // Honor SEPILOTD_DATA_DIR so `sepilot stop` finds the daemon that the
-  // matching `sepilot start` / standalone-binary `__daemon` child actually
-  // launched (which writes <dataDir>/sepilotd.pid). With the env unset this is
-  // exactly ~/.sepilotd/sepilotd.pid as before.
   const dataDir = resolveDaemonDataDir()
 
-  // Try graceful shutdown via PID file
   try {
     const pidStr = await readFile(join(dataDir, 'sepilotd.pid'), 'utf-8')
     const pid = parseInt(pidStr.trim(), 10)
@@ -216,7 +197,6 @@ async function stopDaemon(_options: { url?: string }): Promise<boolean> {
     if (!stopped) console.log(chalk.yellow(copy.stillRunning))
     return stopped
   } catch {
-    /* Fall back to the daemon's own shutdown endpoint below. */
   }
 
   try {
@@ -236,10 +216,6 @@ export async function stopCommand(options: { url?: string }): Promise<void> {
 }
 
 export async function restartCommand(options: DaemonStartOptions) {
-  // Validate both the local lifecycle target and named forwarding before
-  // stopping the current daemon. Invalid reconfiguration must not become an
-  // outage, and a remote/operator-owned target must never trigger local
-  // process lifecycle actions.
   const listenTarget = resolveLocalDaemonListenTarget(options.url)
   if (!listenTarget) throw new Error(LOCAL_DAEMON_START_ERROR)
   const prepared = await prepareDaemonEnvironment({

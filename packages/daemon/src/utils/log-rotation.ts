@@ -14,11 +14,6 @@ export const DEFAULT_LOG_ROTATION: LogRotationOptions = {
   maxFiles: 3,
 }
 
-// copy + truncate preserves the file's inode and offset for whatever
-// process is currently writing into it. `appendFile` in Node opens a fresh
-// handle per call, so a plain rename would still be safe — but copy+truncate
-// is the same pattern service-supervisor uses for its managed services, and
-// matching it keeps the rotation behaviour predictable across both layers.
 export async function rotateLogFileIfNeeded(
   path: string,
   options: LogRotationOptions,
@@ -43,7 +38,6 @@ export async function rotateLogFileIfNeeded(
     const { chmod } = await import('node:fs/promises')
     await chmod(`${path}.1`, ROTATED_FILE_MODE).catch(() => {})
   } catch {
-    // chmod is best-effort; Windows ignores POSIX modes anyway.
   }
   await truncate(path, 0)
   return true

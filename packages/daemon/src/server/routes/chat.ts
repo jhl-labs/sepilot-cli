@@ -1,3 +1,4 @@
+import { resolveTurnMemoryPolicy, memoryToolAllowed } from '../../memory/turn-policy.js'
 import { resolvePersonaMemoryScope } from '../../memory/persona-scope.js'
 import { withSelectedBrowserTarget } from '../../tools/browser-target.js'
 import { remoteBrowserBridge } from '../../tools/browser-remote.js'
@@ -13,14 +14,19 @@ import type { ApprovalCallback } from '../../agent/engine.js'
 import { resolveInstantModeToolNames } from '../../agent/instant-mode-tool-intent.js'
 import { resolveSkillExecutionContext } from '../../skills/execution-policy.js'
 import {
-  loadAutoCompactedSessionContext,
+  loadAutoCompactedSessionContextWithinBudget,
+  loadLatestRoutedPersona,
   loadLatestRunContract,
   resolveSessionContextMaxMessages,
 } from '../../agent/auto-compaction.js'
-import { fallbackSessionTitle, updateSessionTitleFromFirstTurn } from '../../agent/session-title.js'
+import { fallbackSessionTitle } from '../../agent/session-title.js'
+import { stopReasonProviderError } from '../../agent/stop-reason.js'
+import { DEFAULT_LIVE_VIEW_STILLS, createLiveViewTap, type LiveViewTap } from '../../views/live-view-event-tap.js'
+import { liveViewRegistry } from '../../views/live-view-registry.js'
 import { createLogger } from '../../logger.js'
 import { resolveApiActor } from '../request-actor.js'
-import { registerSseDisconnectHandler } from '../sse-response.js'
+import { buildSseResponseHeaders, registerSseDisconnectHandler, trackSseConnection } from '../sse-response.js'
+import { BackgroundChatEventHub } from '../background-chat-events.js'
 import { triggerDreamingTurn } from '../../memory/dreaming.js'
 import { createAgentOutputTracker } from '../../agent/event-output.js'
 import { persistAgentSessionEvent } from '../session-events.js'
@@ -30,6 +36,7 @@ import { createSessionBusyLeaseLifecycle } from '../runtime/session-busy.js'
 import { createRuntimeBackedModeRouterOptions } from '../runtime/mode-router-options.js'
 import {
   chatRequestSchema,
+  excludesLocalContext,
   isDesktopExternalAgentMode,
   resolveChatHardMaxIterations,
   resolveChatMaxIterations,
@@ -39,6 +46,7 @@ import {
   resolveImageGeneratorAutoSkillContent,
   resolveOfficeAutoSkillContent,
   resolveSkillRefsContent,
+  filterLoadableSkillRefs,
   shouldDeferPptxAttachmentText,
   sendSkillNotFoundReply,
   sendSkillUnavailableReply,
@@ -68,11 +76,22 @@ import {
 import { IntentRouter, type IntentRouterOptions } from '../../agent/intent-router.js'
 import { createAuxiliaryLlmTurnBudget } from '../../agent/auxiliary-llm.js'
 import {
+  applyRoleBotRequestDefaults,
+  applyRoutedRoleBot,
+  keepContinuingRoleBot,
+  roleBotLongTermInjectKb,
+  roleBotModeRouterOptions,
+  withRoleBotPersonas,
+  routerPersonaCandidates,
+  roleBotSkillRefs,
+} from '../chat-bots.js'
+import {
   applyIntentRouting,
   resolveInitialExecutionMode,
   logIntentRouterDecision,
   resolveIntentRouterModel,
   INTENT_ROUTER_CIRCUIT_BREAKER,
+  routingLeavesMemoryIntentUnresolved,
 } from './chat-intent.js'
 import {
   resolvePersona,
@@ -80,7 +99,8 @@ import {
   resolvePersonas,
 } from '../../agent/custom/persona-resolver.js'
 import { createPersonaRepo } from '../../persona/repo.js'
-import { publishChatCompletionNotification } from '../../notifications/publish.js'
+import { publishChatCompletionNotification, publishStoredNotification } from '../../notifications/publish.js'
+import { SessionInbox } from '../runtime/session-inbox.js'
 import { resolveRequestSurface } from '../request-surface.js'
 import { isExtensionSessionReuseDenied, readChatMemoryScope } from '../chat-memory-context.js'
 import { resolveScopedFileMemoryReadView } from '../../memory/scoped-file-memory-read-view.js'
@@ -145,7 +165,6 @@ const chatResponseSchema = z.object({
     toolCalls: z.array(toolCallSchema).optional(),
     usage: tokenUsageSchema,
     routerDecision: routerDecisionSchema.optional(),
-    /** Structured termination reason; absent on legacy daemons. */
     stopReason: runStopReasonSchema.optional(),
   }),
 })
@@ -327,6 +346,16 @@ const backgroundChatAuthHeaderNames = [
 const BACKGROUND_CHAT_HEARTBEAT_MS = 10_000
 
 const backgroundChatStores = new WeakMap<FastifyInstance, BackgroundChatJobStore>()
+const backgroundChatEventHubs = new WeakMap<FastifyInstance, BackgroundChatEventHub>()
+
+function getBackgroundChatEventHub(app: FastifyInstance): BackgroundChatEventHub {
+  let hub = backgroundChatEventHubs.get(app)
+  if (!hub) {
+    hub = new BackgroundChatEventHub()
+    backgroundChatEventHubs.set(app, hub)
+  }
+  return hub
+}
 const backgroundChatRuns = new WeakMap<
   FastifyInstance,
   {
@@ -725,12 +754,6 @@ function parseBackgroundChatError(payload: Record<string, unknown> | null, fallb
       message: typeof message === 'string' && message.trim() ? message : fallback,
     }
   }
-  // Some established route contracts use a flat error envelope such as
-  // `{ error: 'SKILL_AUTONOMY_REQUIRED', message: '...', ...details }`.
-  // Background chat calls the foreground route internally, so discarding that
-  // shape here turns an actionable preflight rejection into only
-  // `403: Forbidden`. Preserve the bounded public contract without copying
-  // arbitrary detail fields into the durable background-job record.
   if (typeof error === 'string' && error.trim()) {
     const code = /^[A-Z][A-Z0-9_]{1,79}$/.test(error.trim())
       ? error.trim()
@@ -828,7 +851,6 @@ async function runBackgroundChatJob(
           errorMessage: error.message,
         })
       } catch {
-        // best-effort notification only
       }
       return
     }
@@ -853,7 +875,6 @@ async function runBackgroundChatJob(
           errorMessage: 'Background chat returned an invalid response envelope.',
         })
       } catch {
-        // best-effort notification only
       }
       return
     }
@@ -882,7 +903,6 @@ async function runBackgroundChatJob(
         surface,
       })
     } catch {
-      // best-effort notification only
     }
   } catch (error) {
     const current = await store.get(jobId)
@@ -909,15 +929,49 @@ async function runBackgroundChatJob(
         errorMessage: message,
       })
     } catch {
-      // best-effort notification only
     }
   } finally {
     stopHeartbeat()
     clearBackgroundChatRunCancellation(app, jobId)
+    const final = await store.get(jobId).catch(() => undefined)
+    getBackgroundChatEventHub(app).end(jobId, final?.status ?? 'failed')
   }
 }
 
+const backgroundChatEventsQuerySchema = z.object({
+  after: z.preprocess((value) => {
+    const parsed = Number(value ?? 0)
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : 0
+  }, z.number().int().min(0)),
+})
+type BackgroundChatEventsQuery = z.infer<typeof backgroundChatEventsQuerySchema>
+
 export async function chatRoutes(app: FastifyInstance) {
+  app.addHook('onReady', async () => {
+    const store = getBackgroundChatStore(app)
+    try { await store.init() } catch { return }
+    for (const job of store.takeInterruptedOnLoad?.() ?? []) {
+      try {
+        publishStoredNotification({
+          id: `background-chat-interrupted:${job.jobId}`,
+          title: 'Background chat interrupted by daemon restart',
+          body: `Session ${job.sessionId}. Continue it with sepilot sessions resume ${job.sessionId}.`,
+          url: `sepilotd://chat?sessionId=${encodeURIComponent(job.sessionId)}`,
+          topic: 'chat-completion',
+          audience: ['cli', 'desktop', 'web', 'mobile'],
+        })
+      } catch {
+      }
+      new SessionInbox().tryPublish({
+        sessionId: job.sessionId,
+        source: 'scheduler',
+        sourceId: job.jobId,
+        eventKey: `interrupted:${job.jobId}`,
+        title: 'Background turn interrupted by daemon restart',
+        body: `The detached turn ${job.jobId} stopped when the daemon restarted. Completed steps are in this conversation; unfinished work was not retried automatically. Resume from the last checkpoint with sepilot sessions resume ${job.sessionId}.`,
+      })
+    }
+  })
   app.post<{ Body: ChatBody }>(
     '/chat/background',
     {
@@ -989,6 +1043,75 @@ export async function chatRoutes(app: FastifyInstance) {
     return { data: { jobs } }
   })
 
+  app.get<{ Params: { jobId: string }; Querystring: BackgroundChatEventsQuery }>(
+    '/chat/background/:jobId/events',
+    {
+      preValidation: zodRequestValidation({
+        query: { schema: backgroundChatEventsQuerySchema, message: 'Invalid background chat events query' },
+      }),
+    },
+    async (request, reply) => {
+      const store = getBackgroundChatStore(app)
+      const { jobId } = request.params
+      const job = await store.get(jobId)
+      if (!job) {
+        return reply.status(404).send({
+          error: { code: 'BACKGROUND_CHAT_NOT_FOUND', message: 'Background chat job not found' },
+        })
+      }
+      const { after } = request.query
+      reply.hijack()
+      reply.raw.writeHead(200, buildSseResponseHeaders(request, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      }))
+      trackSseConnection(app, request, reply, { label: 'background-chat-events' })
+      let closed = false
+      let unsubscribe = () => {}
+      const keepalive = setInterval(() => {
+        if (!closed) reply.raw.write(': keepalive\n\n')
+      }, 15_000)
+      keepalive.unref?.()
+      const close = () => {
+        if (closed) return
+        closed = true
+        clearInterval(keepalive)
+        unsubscribe()
+        if (!reply.raw.writableEnded) reply.raw.end()
+      }
+      const write = (event: string, data: unknown, id?: number) => {
+        if (closed || reply.raw.writableEnded) return
+        reply.raw.write(`${id ? `id: ${id}\n` : ''}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+      }
+      registerSseDisconnectHandler(request, reply, close)
+      write('background_status', {
+        jobId: job.jobId, sessionId: job.sessionId, status: job.status,
+        ...(job.progress ? { progress: { label: job.progress.label, eventType: job.progress.eventType } } : {}),
+      })
+      const hub = getBackgroundChatEventHub(app)
+      if (job.status !== 'running' && !hub.has(jobId)) {
+        write('background_end', { jobId, status: job.status, sessionId: job.sessionId, replayAvailable: false })
+        close()
+        return
+      }
+      const subscription = hub.subscribe(jobId, after, (item) => {
+        if (item.kind === 'event') write(item.record.event.type, item.record.event, item.record.seq)
+        else {
+          write('background_end', { jobId, status: item.status, sessionId: job.sessionId })
+          close()
+        }
+      })
+      unsubscribe = subscription.unsubscribe
+      if (subscription.gap) write('background_gap', { jobId, message: 'Earlier events are no longer retained; read the session transcript for them.' })
+      for (const record of subscription.replay) write(record.event.type, record.event, record.seq)
+      if (subscription.ended !== undefined) {
+        write('background_end', { jobId, status: subscription.ended, sessionId: job.sessionId })
+        close()
+      }
+    },
+  )
+
   app.get<{ Params: { jobId: string } }>('/chat/background/:jobId', async (request, reply) => {
     const store = getBackgroundChatStore(app)
     await store.cleanup()
@@ -1058,7 +1181,12 @@ export async function chatRoutes(app: FastifyInstance) {
     },
     async (request, reply) => {
       const runtime = app.runtime
-      const body = request.body
+      const roleBotRequest = applyRoleBotRequestDefaults(request.body, runtime?.roleBots)
+      if (roleBotRequest.error) {
+        return reply.status(400).send({ error: { code: roleBotRequest.error.code, message: roleBotRequest.error.message, details: { unknownIds: roleBotRequest.error.unknownIds } } })
+      }
+      const body = roleBotRequest.body
+      const explicitRoleBot = roleBotRequest.bot
       const { message: rawMessage, sessionId: reqSessionId, model } = body
       const chatStartedAt = Date.now()
       const backgroundChatRequest =
@@ -1088,7 +1216,6 @@ export async function chatRoutes(app: FastifyInstance) {
         })
       }
 
-      // No runtime available (daemon still starting up)
       if (!runtime) {
         return {
           data: {
@@ -1119,11 +1246,6 @@ export async function chatRoutes(app: FastifyInstance) {
       const idempotencyRunKey = idempotencyKey ? `${sessionId}:${messageId}` : undefined
       const idempotencyRuns = idempotencyRunKey ? getChatIdempotencyRunRegistry(app) : undefined
 
-      // Own the session before reading its workspace binding. Workspace PATCH,
-      // JSON chat, SSE, and WS all share this lease, so a turn can never load
-      // definitions from workspace A while the session is concurrently rebound
-      // to workspace B. Response lifecycle cleanup covers every pre-flight
-      // return before the main run-level finally is entered.
       const sessionLeaseLifecycle = createSessionBusyLeaseLifecycle()
       request.raw.once('aborted', sessionLeaseLifecycle.releasePreflight)
       reply.raw.once('finish', sessionLeaseLifecycle.releasePreflight)
@@ -1214,9 +1336,6 @@ export async function chatRoutes(app: FastifyInstance) {
         throw error
       }
 
-      // Explicit per-turn autonomy selection plus a structured trace. Real
-      // ceilings are enforced by channel ACL and tool policy, not by treating
-      // the configured local default as a security boundary.
       const autonomyResolution = resolveRequestedAutonomy(runtime.autonomy, body.autonomy)
       const effectiveAutonomy = autonomyResolution.effective
       const customCommands =
@@ -1227,7 +1346,9 @@ export async function chatRoutes(app: FastifyInstance) {
         (await runtime.customDefs
           ?.agentsForCwd(requestCwd, requestWorkspaceRoot)
           .catch(() => [])) ?? []
-      const persistedPersonas = createPersonaRepo().list()
+      const storedPersonas = createPersonaRepo().list()
+      const userDefinedPersonaIds = new Set([...storedPersonas.map((persona) => persona.id), ...customAgents.map((agent) => agent.id)])
+      const persistedPersonas = withRoleBotPersonas(storedPersonas, runtime.roleBots)
       const personaSelection = resolveChatPersonaSelection(body, existingSession)
       const unknownPersonaIds = findUnknownChatPersonaIds(
         personaSelection,
@@ -1284,11 +1405,6 @@ export async function chatRoutes(app: FastifyInstance) {
       const provider = selection.provider
       const selectedModel = selection.model
 
-      // Pre-flight skillRefs resolution: a typo'd ref must return 404
-      // before we acquire a run lease or persist a session. The inner
-      // run path resolves skillRefs again to build the system prompt;
-      // the duplication is intentional — this validation only runs to
-      // surface 4xx responses up front.
       const declaredSkillToolNames = new Set<string>()
       const autoLoadedSkillToolNames = new Set<string>()
       const loadedExecutionSkillIds = new Set<string>()
@@ -1381,10 +1497,6 @@ export async function chatRoutes(app: FastifyInstance) {
             session = (await runtime.sessions.updateMeta?.(session.id, patch)) ?? session
           }
         }
-        // pre:user:prompt — Claude-Code parity hook. Fires before the user's
-        // prompt is committed to the session journal or fed to the agent so a
-        // handler can (a) abort the run with a 4xx, or (b) rewrite the prompt
-        // via `modifiedPayload.data.prompt`. Default 'continue' is a no-op.
         const userPromptHook = await runtime.hookRegistry.trigger({
           event: 'pre:user:prompt',
           data: {
@@ -1444,7 +1556,7 @@ export async function chatRoutes(app: FastifyInstance) {
         }
 
         const previousContext = reqSessionId
-          ? await loadAutoCompactedSessionContext({
+          ? await loadAutoCompactedSessionContextWithinBudget({
               sessionStore: runtime.sessions,
               sessionId,
               provider,
@@ -1464,11 +1576,6 @@ export async function chatRoutes(app: FastifyInstance) {
           ...(sessionAttachments.length > 0 ? { attachments: sessionAttachments } : {}),
         })
 
-        // ── Intent routing ────────────────────────────────────────────────
-        // Build an IntentRouter when the config enables it and the router
-        // provider/model are resolvable. A misconfigured router must never
-        // block the chat turn — log and proceed with intentRouter=null so the
-        // kill-switch path in applyIntentRouting takes effect.
         const auxiliaryLlmBudget = createAuxiliaryLlmTurnBudget()
         const routerCfg = runtime.config.agent.intentRouter
         let intentRouter: IntentRouter | null = null
@@ -1492,7 +1599,11 @@ export async function chatRoutes(app: FastifyInstance) {
                 model: routerModel,
                 graphRegistry: runtime.graphRegistry,
                 skillRegistry: runtime.skillRegistry,
-                personaList: () => resolvePersonaCatalog(customAgents, persistedPersonas),
+                personaList: () => routerPersonaCandidates(
+                  resolvePersonaCatalog(customAgents, persistedPersonas),
+                  runtime.roleBots,
+                  userDefinedPersonaIds,
+                ),
                 currentAutonomy: effectiveAutonomy,
                 cwd: requestCwd,
                 workspaceRoot: requestWorkspaceRoot,
@@ -1500,8 +1611,6 @@ export async function chatRoutes(app: FastifyInstance) {
                 maxPreviousMessages: routerCfg.maxPreviousMessages,
                 perMessageCharLimit: routerCfg.perMessageCharLimit,
                 reasonMaxChars: routerCfg.reasonMaxChars,
-                // The module-level logger has typed params; cast to the
-                // IntentRouterOptions.logger shape which uses spread unknown.
                 logger: logger as unknown as IntentRouterOptions['logger'],
                 circuitBreaker: INTENT_ROUTER_CIRCUIT_BREAKER,
                 auxiliaryLlmBudget,
@@ -1514,15 +1623,13 @@ export async function chatRoutes(app: FastifyInstance) {
           }
         }
 
-        // A session-bound solo persona and an explicit panel are deliberate
-        // user selections. Do not let intent routing silently replace either.
         const panelLocked =
           body.mode === 'persona-panel' && (personaSelection.personaIds?.length ?? 0) > 0
         const personaLocked = panelLocked || Boolean(personaSelection.persona)
         const effectiveIntentRouting = personaLocked ? { enabled: false } : body.intentRouting
         const routingMode = body.mode
 
-        const routing = await applyIntentRouting({
+        const initialRouting = await applyIntentRouting({
           defaultMode: runtime.config.agent.mode,
           router: intentRouter,
           graphRegistry: runtime.graphRegistry,
@@ -1534,19 +1641,20 @@ export async function chatRoutes(app: FastifyInstance) {
             skillRefs: body.skillRefs,
             intentRouting: effectiveIntentRouting,
           },
-          // Extracted text attachments are graph-safe context. Only provider-
-          // native image/document parts bypass the plain-text intent router.
           isMultimodal: contentParts
             ? requiresNativeMultimodalInput(contentParts)
             : false,
         })
+        const continuingRouting = initialRouting.decision.contractRelation === 'continue'
+          ? keepContinuingRoleBot(
+              initialRouting,
+              await loadLatestRoutedPersona(runtime.sessions, sessionId).catch(() => undefined),
+              runtime.roleBots,
+            )
+          : initialRouting
+        const { routing, bot: routedRoleBot } = applyRoutedRoleBot(continuingRouting, runtime.roleBots)
+        const turnRoleBot = explicitRoleBot ?? routedRoleBot
 
-        // ── Structured log: per-decision telemetry ───────────────────────
-        // Emitted for every turn so dashboards/log-aggregators can track
-        // routing quality without instrumenting the database.
-        // TODO: wire Prometheus-style counters (intentRouterCalls,
-        // intentRouterLatency, intentRouterTokens) once the daemon exposes
-        // registerCounter/registerHistogram helpers.
         logIntentRouterDecision(
           logger,
           routing,
@@ -1560,13 +1668,13 @@ export async function chatRoutes(app: FastifyInstance) {
           routerCfg?.model,
         )
 
-        // Persist the routing decision immediately after user_message so the
-        // session journal records what drove this turn's configuration.
+        const memoryPolicy = resolveTurnMemoryPolicy(body.memoryPolicy, routing.decision.memoryPolicy, routingLeavesMemoryIntentUnresolved(routing.decision))
         await runtime.sessions.appendEvent(sessionId, {
           type: 'router_decision',
           id: randomUUID(),
           timestamp: new Date().toISOString(),
           decision: {
+            memoryPolicy,
             mode: routing.decision.mode,
             persona: routing.decision.persona,
             skillIds: routing.decision.skillIds,
@@ -1577,12 +1685,13 @@ export async function chatRoutes(app: FastifyInstance) {
           },
         })
 
-        // ── Skill prefix ──────────────────────────────────────────────────
-        // Resolved after routing so that the effective skill refs (which the
-        // router may have augmented) are used. Unknown refs still cause a
-        // 404 here — the run lease is already held so the error terminates
-        // the request cleanly.
+        const botSkillRefs = await filterLoadableSkillRefs(
+          roleBotSkillRefs(turnRoleBot, routing.effectiveSkillRefs),
+          runtime.skillRegistry, requestCwd, effectiveAutonomy, requestWorkspaceRoot,
+          routing.effectiveSkillRefs.length,
+        )
         let skillPrefix = ''
+        let botSkillPrefix = ''
         try {
           skillPrefix = await resolveSkillRefsContent(
             routing.effectiveSkillRefs,
@@ -1594,7 +1703,17 @@ export async function chatRoutes(app: FastifyInstance) {
             requestWorkspaceRoot,
             loadedExecutionSkillIds,
           )
-          skillPrefix += resolveInitialExecutionMode(routing, runtime.config.agent.mode) === 'instant' ? '' : await resolveOfficeAutoSkillContent(
+          botSkillPrefix = await resolveSkillRefsContent(
+            botSkillRefs,
+            runtime.skillRegistry,
+            runtime.toolRegistry,
+            requestCwd,
+            effectiveAutonomy,
+            autoLoadedSkillToolNames,
+            requestWorkspaceRoot,
+            loadedExecutionSkillIds,
+          )
+          skillPrefix += resolveInitialExecutionMode(routing, runtime.config.agent.mode, false, requestSurface ?? undefined) === 'instant' ? '' : await resolveOfficeAutoSkillContent(
             officeAutoIntent,
             routing.effectiveSkillRefs,
             runtime.skillRegistry,
@@ -1606,6 +1725,7 @@ export async function chatRoutes(app: FastifyInstance) {
             previousMessages,
             loadedExecutionSkillIds,
             finalPrompt,
+            turnRoleBot ? turnRoleBot.skills ?? [] : undefined,
           )
           skillPrefix += await resolveImageGeneratorAutoSkillContent(
             message,
@@ -1629,14 +1749,11 @@ export async function chatRoutes(app: FastifyInstance) {
           throw error
         }
 
-        const { buildSystemPrompt } = await import('../../agent/system-prompt.js')
+        const { buildDeferredSystemPrompt } = await import('../../agent/system-prompt.js')
         const { collectAgentsMd, formatAgentsMdSection } = await import('../../memory/agents-md.js')
-        const { withContextualToolExposure, withAuthorizedToolExposure, withDirectApiMemoryToolset, withSwarmToolsForSession, withWritingDocTools } =
+        const { withContextualToolExposure, withTurnToolAuthority, withDirectApiMemoryToolset, withSwarmToolsForSession, withWritingDocTools } =
           await import('../../tools/role-filter.js')
         const { getDocRegistry } = await import('../../agent/doc/session.js')
-        // Direct-API surfaces (CLI/web/desktop) default to a lean memory toolset;
-        // the full ~40-tool set is the channel/auto-memory concept. Channels go
-        // through the pipeline and are unaffected by this.
         const directApiToolRegistry = withWritingDocTools(
           withSwarmToolsForSession(
             withDirectApiMemoryToolset(
@@ -1645,8 +1762,6 @@ export async function chatRoutes(app: FastifyInstance) {
             ),
             sessionId,
           ),
-          // The same expression the doc.* tools resolve with; this route carries
-          // no writingDocId of its own.
           getDocRegistry().getActiveId(),
         )
         const persona = resolvePersona(
@@ -1657,17 +1772,21 @@ export async function chatRoutes(app: FastifyInstance) {
         const activeRemoteBrowser = remoteBrowserBridge(runtime.toolRegistry).list().some(
           (connection) => connection.sessionId === sessionId,
         )
-        const initialMode = resolveInitialExecutionMode(routing, runtime.config.agent.mode, activeRemoteBrowser)
-        const authorizedToolRegistry = withSelectedBrowserTarget(withAuthorizedToolExposure(directApiToolRegistry, {
-          explicitToolNames: body.toolNames, declaredSkillToolNames,
+        const initialMode = resolveInitialExecutionMode(routing, runtime.config.agent.mode, activeRemoteBrowser, requestSurface ?? undefined)
+        const turnToolAuthority = withTurnToolAuthority(directApiToolRegistry, {
+          explicitToolNames: (body.toolNames ?? directApiToolRegistry.list().map(tool => tool.name)).filter(name => memoryToolAllowed(name, memoryPolicy)), declaredSkillToolNames,
           personaAllowedTools: persona?.allowedTools, personaDeniedTools: persona?.deniedTools,
-        }), activeRemoteBrowser)
+        })
+        const delegationToolRegistry = withSelectedBrowserTarget(turnToolAuthority.delegation, activeRemoteBrowser)
+        const authorizedToolRegistry = withSelectedBrowserTarget(turnToolAuthority.own, activeRemoteBrowser)
         const agentToolRegistry = withContextualToolExposure(authorizedToolRegistry, {
           surface: requestSurface,
           semanticRouting: true,
           activeRemoteBrowser,
           selectedGroups: routing.decision.toolGroups,
+          botToolGroups: turnRoleBot?.toolGroups,
           routedMode: initialMode,
+          routingConfidence: routing.decision.confidence,
           routingFallback: routing.decision.fallback,
           activeWritingDocument: Boolean(getDocRegistry().getActiveId()),
           swarmSession: sessionId.startsWith('swarm_'),
@@ -1685,25 +1804,28 @@ export async function chatRoutes(app: FastifyInstance) {
         const closedToolSurface = body.toolNames !== undefined || declaredSkillToolNames.size > 0
         const agentsFiles = await collectAgentsMd({
           cwd: requestCwd,
+          includeUserLevel: !excludesLocalContext(body),
           boundaryRoot: requestWorkspaceRoot,
         })
         const agentsMemory = formatAgentsMdSection(agentsFiles) ?? undefined
-        const relevantKnowledgeContext = await buildChatKnowledgeContext({
+        const relevantKnowledgeContext = memoryPolicy.read && memoryPolicy.automaticRead !== false ? await buildChatKnowledgeContext({
           registry: app.chatKnowledgeProviders,
           message: finalPrompt,
           previousMessages,
-          allowLocalKnowledge: request.authContext?.kind !== 'extension',
-        })
-        const baseSystemPrompt = await buildSystemPrompt({
+          allowLocalKnowledge: request.authContext?.kind !== 'extension' && !excludesLocalContext(body),
+        }) : undefined
+        const { prompt: baseSystemPrompt, systemToolGuidance } = await buildDeferredSystemPrompt({
           config: runtime.config,
           profile: initialMode === 'instant' ? 'instant' : 'agent',
+          longTermInjectKb: roleBotLongTermInjectKb(turnRoleBot),
+          skillInventory: turnRoleBot ? (turnRoleBot.skills ?? []) : undefined,
           tools: agentToolRegistry,
           skills: runtime.skillRegistry,
-          fileMemory: resolveScopedFileMemoryReadView(
+          fileMemory: !excludesLocalContext(body) && memoryPolicy.read && memoryPolicy.automaticRead !== false ? resolveScopedFileMemoryReadView(
             runtime.fileMemory,
             runtime.fileMemoryRegistry,
             scopeTags,
-          ),
+          ) : undefined,
           agentsMemory,
           relevantMemoryContext: relevantKnowledgeContext,
           customInstructions: persona?.systemPromptAddition,
@@ -1712,11 +1834,9 @@ export async function chatRoutes(app: FastifyInstance) {
           workspaceRoot: requestWorkspaceRoot,
           sessionId,
           closedToolSurface,
-          // Session history already supplies same-session context; journals
-          // can aggregate unrelated conversations from the same day.
           includeDailyNotes: false,
         })
-        const systemPrompt = skillPrefix + baseSystemPrompt
+        const systemPrompt = skillPrefix + botSkillPrefix + baseSystemPrompt
         const strictFinalAnswerProtocol =
           process.env.SEPILOTD_STRICT_ANSWER_PROTOCOL === '1' || skillPrefix.trim().length > 0
 
@@ -1733,30 +1853,32 @@ export async function chatRoutes(app: FastifyInstance) {
 
         const createModeRouter = (nextSelection: typeof selection) =>
           new AgentModeRouter({
+            systemToolGuidance,
             provider: nextSelection.provider,
             tools: agentToolRegistry,
             authorizedTools: authorizedToolRegistry,
+            delegationTools: delegationToolRegistry,
             activeRemoteBrowser,
             policy: runtime.policyEngine,
             autonomy: effectiveAutonomy,
             auxiliaryLlmBudget,
-            semanticIndex: runtime.semanticIndex,
+            semanticIndex: excludesLocalContext(body) ? undefined : runtime.semanticIndex,
             systemPrompt,
             previousMessages,
-            maxIterations: resolveChatMaxIterations(body),
+            maxIterations: resolveChatMaxIterations({ ...body, maxIterations: body.maxIterations ?? turnRoleBot?.maxIterations }),
+            ...roleBotModeRouterOptions(turnRoleBot),
             hardMaxIterations: resolveChatHardMaxIterations(body),
             auditLogger: runtime.auditLogger,
             usageTracker: runtime.usageTracker,
             spendBudget: runtime.config.limits,
             hookRegistry: runtime.hookRegistry,
             deviceName: runtime.config.device.name,
-            thinkingLevel: body.thinkingLevel,
+            thinkingLevel: body.thinkingLevel ?? runtime.config.agent.thinkingLevel,
+            thinkingLevelSource: body.thinkingLevel === undefined ? 'default' : 'request',
             maxTokens: body.maxTokens,
             temperature: body.temperature,
             textDeltaMode: body.textDeltaMode,
-            ragEnabled: body.ragEnabled,
-            // 비-streaming /chat 경로에서도 persona-panel을 정상 동작시키려면
-            // 검증된 세션/요청 로스터를 graph context에 넘겨야 한다.
+            ragEnabled: body.ragEnabled ?? turnRoleBot?.documents,
             panelPersonas: resolvedPanelPersonas,
             panelStrategy: body.panelStrategy,
             llmCache: runtime.llmCache,
@@ -1775,8 +1897,6 @@ export async function chatRoutes(app: FastifyInstance) {
               runtime.approvalRegistry.tryAutoApproval({ sessionId, toolCall, runId: messageId }),
             requestQuestion,
             ...createRuntimeBackedModeRouterOptions(runtime),
-            // recovery branch adds the strict-final-answer toggle; everything
-            // else matches the shared helper above.
             strictFinalAnswerProtocol,
             reviewToollessFinals: true,
           })
@@ -1795,6 +1915,7 @@ export async function chatRoutes(app: FastifyInstance) {
         const consumeEvent = async (event: AgentEvent): Promise<void> => {
           await persistAgentSessionEvent(runtime.sessions, sessionId, event)
           if (backgroundChatRequest) {
+            if (backgroundChatJobId) getBackgroundChatEventHub(app).push(backgroundChatJobId, event)
             backgroundProgressEventCount += 1
             let forcePartialWrite = false
             if (event.type === 'text_delta' && typeof event.text === 'string') {
@@ -1831,11 +1952,6 @@ export async function chatRoutes(app: FastifyInstance) {
           }
         }
 
-        // Non-streaming /chat had no cancellation path: if the client
-        // disconnected mid-run, the agent kept running to completion and held
-        // its run lease. Abort the active run on disconnect. Background chat is
-        // exempt — it is designed to survive the client going away and be polled
-        // later — so only wire this for a foreground request.
         let clientDisconnected = false
         let activeRunRouter: AgentModeRouter | null = null
         const releaseDisconnect = backgroundChatRequest
@@ -1845,6 +1961,7 @@ export async function chatRoutes(app: FastifyInstance) {
               void activeRunRouter?.stop().catch(() => {})
             })
 
+        let liveViewTap: LiveViewTap | undefined
         try {
           for (let attemptIndex = 0; attemptIndex < selections.length; attemptIndex += 1) {
             const attemptSelection = selections[attemptIndex]!
@@ -1869,8 +1986,14 @@ export async function chatRoutes(app: FastifyInstance) {
               'started',
             )
 
+            const attemptViewTap = createLiveViewTap({
+              views: liveViewRegistry(runtime.toolRegistry),
+              sessionId,
+              stills: runtime.config.views?.stills ?? DEFAULT_LIVE_VIEW_STILLS,
+            })
+            liveViewTap = attemptViewTap
             try {
-              for await (const event of modeRouter.run(
+              for await (const event of attemptViewTap.wrap(modeRouter.run(
                 agentInput,
                 {
                   sessionId,
@@ -1892,15 +2015,23 @@ export async function chatRoutes(app: FastifyInstance) {
                   },
                   ...(backgroundChatJobId ? { backgroundJobId: backgroundChatJobId } : {}),
                   ...(requestSurface ? { surface: requestSurface } : {}),
+                  providerAttempt: { attempt, isFallbackPending: () => retrying },
+                  ...(turnRoleBot?.id ? { roleBotId: turnRoleBot.id } : {}),
+                  ...(body.toolNames !== undefined ? { requestedToolNames: body.toolNames } : {}),
+                  requestAuthorityComplete: true,
                   systemPrompt,
                   previousMessages,
                   toolAllowlist: authorizedToolRegistry.list().map((tool) => tool.name),
+                  delegationToolAllowlist: delegationToolRegistry.list().map((tool) => tool.name),
                   ...resolveSkillExecutionContext(
                     loadedExecutionSkillIds,
                     new Set([...declaredSkillToolNames, ...autoLoadedSkillToolNames]),
                   ),
                   runContract: previousRunContract,
                   runContractScope: 'previous-turn',
+                  deadlineAt: body.deadlineAt,
+                  completionRequest: body.completionRequest,
+                  memoryPolicy,
                   memoryQuery: finalPrompt,
                   scopeTags,
                   primaryAgentId: runtime.primaryAgents?.get(sessionId),
@@ -1908,7 +2039,7 @@ export async function chatRoutes(app: FastifyInstance) {
                   requireToolApproval: body.requireToolApproval,
                 },
                 requestMode,
-              )) {
+              ))) {
                 if (
                   event.type === 'error' &&
                   nextSelection &&
@@ -1955,8 +2086,6 @@ export async function chatRoutes(app: FastifyInstance) {
             }
 
             if (clientDisconnected) {
-              // The socket is gone; the run was already stopped. Stop iterating —
-              // the response below will simply no-op on the closed connection.
               break
             }
 
@@ -1985,6 +2114,7 @@ export async function chatRoutes(app: FastifyInstance) {
           releaseDisconnect()
         }
 
+        const liveViewRecords = liveViewTap?.records() ?? []
         const finalTerminalError = terminalError as ApiError | null
         if (finalTerminalError) {
           recordChatProviderFailure(runtime, activeSelection, finalTerminalError)
@@ -2007,7 +2137,6 @@ export async function chatRoutes(app: FastifyInstance) {
                 errorMessage: finalTerminalError.message ?? finalTerminalError.code,
               })
             } catch {
-              // best-effort notification only
             }
           }
 
@@ -2015,6 +2144,10 @@ export async function chatRoutes(app: FastifyInstance) {
             ? null
             : outputTracker.providerFailureContent(finalTerminalError)
           if (retainedEvidenceIncomplete) {
+            const failureStopReason = stopReasonProviderError({
+              layer: finalTerminalError.code,
+              summary: finalTerminalError.message,
+            })
             await persistAgentSessionEvent(runtime.sessions, sessionId, {
               type: 'recovery',
               scope: 'output_synthesis',
@@ -2033,18 +2166,12 @@ export async function chatRoutes(app: FastifyInstance) {
               id: randomUUID(),
               timestamp: new Date().toISOString(),
               content: retainedEvidenceIncomplete,
+              ...(liveViewRecords.length > 0 ? { views: liveViewRecords } : {}),
             })
             await persistAgentSessionEvent(runtime.sessions, sessionId, {
               type: 'done',
               usage: totalUsage,
-            })
-            await updateSessionTitleFromFirstTurn({
-              sessions: runtime.sessions,
-              session,
-              provider: activeSelection.provider,
-              model: activeSelection.model,
-              firstMessage: finalPrompt,
-              assistantReply: retainedEvidenceIncomplete,
+              stopReason: failureStopReason,
             })
             return {
               data: {
@@ -2053,7 +2180,7 @@ export async function chatRoutes(app: FastifyInstance) {
                 content: retainedEvidenceIncomplete,
                 toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
                 usage: totalUsage,
-                ...(stopReason ? { stopReason } : {}),
+                stopReason: failureStopReason,
                 routerDecision:
                   routing.decision.fallback && routing.decision.reason === 'router disabled'
                     ? undefined
@@ -2099,16 +2226,19 @@ export async function chatRoutes(app: FastifyInstance) {
           id: randomUUID(),
           timestamp: new Date().toISOString(),
           content,
+          ...(liveViewRecords.length > 0 ? { views: liveViewRecords } : {}),
         })
-        await updateSessionTitleFromFirstTurn({
-          sessions: runtime.sessions,
-          session,
-          provider: activeSelection.provider,
-          model: activeSelection.model,
-          firstMessage: finalPrompt,
-          assistantReply: content,
-        })
-        triggerDreamingTurn(runtime.dreaming, sessionId, 'chat', scopeTags)
+        if (!stopReason || stopReason.kind === 'completed') {
+          app.sessionTitleUpdates?.schedule({
+            sessions: runtime.sessions,
+            session,
+            provider: activeSelection.provider,
+            model: activeSelection.model,
+            firstMessage: finalPrompt,
+            assistantReply: content,
+          })
+          if (!excludesLocalContext(body)) triggerDreamingTurn(runtime.dreaming, sessionId, 'chat', scopeTags)
+        }
         if (!backgroundChatRequest) {
           try {
             publishChatCompletionNotification(runtime.config, {
@@ -2119,7 +2249,6 @@ export async function chatRoutes(app: FastifyInstance) {
               surface: requestSurface,
             })
           } catch {
-            // best-effort notification only
           }
         }
 
@@ -2131,10 +2260,6 @@ export async function chatRoutes(app: FastifyInstance) {
             toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
             usage: totalUsage,
             ...(stopReason ? { stopReason } : {}),
-            // SSE callers see this via the `router_decision` event; surface
-            // the same payload to JSON callers so automation / tests can
-            // observe when the router overrode the caller's `mode` / `persona`
-            // / `skillRefs` hint. Omitted when routing was skipped entirely.
             routerDecision:
               routing.decision.fallback && routing.decision.reason === 'router disabled'
                 ? undefined

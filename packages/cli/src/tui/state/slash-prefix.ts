@@ -1,25 +1,6 @@
-// startStream's first 50 lines were dedicated to handling the
-// "command starts with /" prefix: the reserved /undo and /redo
-// shortcuts that hit the daemon directly, plus the generic
-// resolveUserCommand() round-trip that turns a custom slash command
-// into a real prompt + agent override. Pull that out so startStream
-// itself is just "send the prompt and stream the response."
-//
-// Returns either:
-//   { applied: false } — the input wasn't a slash command, use it as-is
-//   { applied: true; outcome: 'short-circuit' } — a reserved command
-//       was handled (or attempted) and the caller should not start a
-//       chat run for this input
-//   { applied: true; outcome: 'rewritten'; workingContent; resolvedAgent }
-//       — the slash was resolved into a fresh prompt that startStream
-//         should send instead
-
 import type { Dispatch } from 'react'
 import type { ChatAction } from './chat-reducer.js'
 
-// The httpClient surface this helper depends on. Mirrors the subset
-// useChat actually uses for its prefix handling so the helper isn't
-// pulled into the full DaemonClient type.
 export interface SlashPrefixHttpClient {
   undoSession(sessionId: string): Promise<unknown>
   redoSession(sessionId: string): Promise<unknown>

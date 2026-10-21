@@ -89,11 +89,6 @@ export class ArtifactStore {
     return null
   }
 
-  /**
-   * List recent artifacts across sessions, newest first by file mtime.
-   * Artifact payloads do not currently carry createdAt, so filesystem
-   * modification time is the only honest global recency signal.
-   */
   async listRecent(limit: number): Promise<RecentArtifactEntry[]> {
     const safeLimit = Math.max(1, Math.min(50, Math.floor(limit) || 20))
     const root = resolve(this.baseDir)
@@ -120,7 +115,6 @@ export class ArtifactStore {
           candidates.push({ sessionId, path, modifiedAt: info.mtimeMs })
         }
       } catch {
-        // Ignore malformed or concurrently removed session directories.
       }
     }
 
@@ -136,7 +130,6 @@ export class ArtifactStore {
           modifiedAt: candidate.modifiedAt,
         })
       } catch {
-        // Skip corrupt artifact JSON without failing the whole gallery.
       }
     }
     return entries

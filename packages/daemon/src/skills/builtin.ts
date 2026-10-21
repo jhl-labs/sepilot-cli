@@ -587,8 +587,6 @@ export async function seedBuiltinSkills(
     if (existing && !shouldUpdateManagedBuiltin(existing, builtin)) {
       continue
     }
-    // Preserve a user-toggled enabled flag across re-seeds; fall back to the
-    // built-in's declared default only on first install.
     const enabled = existing?.metadata.enabled ?? builtin.metadata.enabled
     await registry.register({ ...builtin.metadata, enabled }, builtin.content, { force: true })
   }
@@ -606,11 +604,6 @@ function shouldUpdateManagedBuiltin(
   if (versionComparison < 0) return true
   if (versionComparison > 0) return false
 
-  // Runtime policy trusts a managed built-in only when its shipped metadata
-  // and prompt body match the canonical bundle. Keeping same-version drift on
-  // disk would make seeding call it current while policy silently rejects it.
-  // Reconcile that split-brain state, but preserve the user's enabled toggle
-  // when register() writes the canonical definition below.
   const { enabled: _existingEnabled, ...existingIdentity } = existing.metadata
   const { enabled: _builtinEnabled, ...builtinIdentity } = builtin.metadata
   return (

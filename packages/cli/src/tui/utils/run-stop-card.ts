@@ -1,5 +1,6 @@
 import {
   describeStopReason,
+  escalationTarget,
   type RunStopLocale,
   type RunStopNextAction,
   type RunStopReason,
@@ -7,11 +8,6 @@ import {
 
 export type RunStopHintMode = 'shell' | 'cli'
 
-/**
- * Command hint for a next action. `shell` spells chat-shell slash commands;
- * `cli` spells top-level `sepilot` verbs for piped/one-shot runs where no
- * slash prompt exists.
- */
 export function runStopActionHint(
   kind: RunStopNextAction,
   reason: RunStopReason,
@@ -32,16 +28,21 @@ export function runStopActionHint(
         : 're-run with a larger maxIterations'
     case 'retry':
       return mode === 'shell' ? '/edit-last' : 'run the same prompt again'
+    case 'escalate': {
+      const target = escalationTarget(reason) ?? 'deep-coder'
+      const bot = reason.detail?.escalateBot
+      if (mode === 'shell') {
+        return bot ? `/bot ${bot} then /edit-last` : `/mode ${target} then /edit-last`
+      }
+      return bot
+        ? `sepilot ask --bot ${bot} "<same prompt>"`
+        : `sepilot ask --mode ${target} "<same prompt>"`
+    }
     default:
       return kind
   }
 }
 
-/**
- * Compact stop card for terminal surfaces: title, one-line body, and the
- * next actions as command hints. Plain text (no ANSI) so it can be stored
- * as a system message and printed by any renderer.
- */
 export function formatRunStopCard(
   reason: RunStopReason,
   options: { locale?: RunStopLocale; hintMode?: RunStopHintMode } = {},

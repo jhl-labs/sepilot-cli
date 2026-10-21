@@ -49,12 +49,6 @@ export function throwIfAborted(
   }
 }
 
-/**
- * Settle with the caller's AbortSignal even when the wrapped operation ignores
- * that signal. Passing the signal down is still required for resource cleanup;
- * this helper independently guarantees that the awaiting control flow is not
- * held open by an uncooperative transport or runtime adapter.
- */
 export function raceWithAbort<T>(
   promise: PromiseLike<T>,
   signal?: AbortSignal | null,

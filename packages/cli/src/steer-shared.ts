@@ -1,20 +1,10 @@
 import { ApiHttpError } from '@sepilotd/api-client'
 import { friendlyErrorMessage } from './utils/error-message.js'
 
-/**
- * Shared guidance shown whenever a steering note is rejected because the
- * daemon reports no active run for the session (`409 NO_ACTIVE_RUN`). Used
- * by all three `/steer` entrypoints (TUI Ctrl+S, TUI/REPL slash command,
- * and the top-level `sepilot steer` command) so the message stays
- * consistent no matter which surface the user hit.
- */
 export const STEER_NO_ACTIVE_RUN_GUIDANCE = '실행 중인 턴이 없습니다 — 그냥 메시지로 보내세요'
 
 export type SteerOutcome =
   | { ok: true; noteId: string; pendingSteeringNoteCount?: number }
-  // Failure outcomes carry `originalMessage` so callers with an ephemeral
-  // input surface (the TUI composer) can restore the user's typed text
-  // instead of losing it. This is a tested contract — keep it populated.
   | { ok: false; noActiveRun: true; guidance: string; originalMessage: string }
   | { ok: false; noActiveRun: false; message: string; originalMessage: string }
 
@@ -40,7 +30,6 @@ export type SteerCancellationOutcome =
       message: string
     }
 
-/** Minimal shape of the api-client method this helper depends on. */
 export interface SteerCapableClient {
   steerSession(
     sessionId: string,
@@ -73,11 +62,6 @@ function isNoActiveRunError(err: unknown): boolean {
   )
 }
 
-/**
- * Submit a mid-run steering note and normalize the result/error into a
- * discriminated union the caller can render without re-deriving the
- * 409/`NO_ACTIVE_RUN` guidance text itself. Never throws.
- */
 export async function submitSteer(
   client: SteerCapableClient,
   sessionId: string,
@@ -130,7 +114,6 @@ const STEER_CANCEL_ERROR = {
   },
 } as const
 
-/** Cancel queued steering by explicit note id or daemon-authoritative selector. */
 export async function cancelSteer(
   client: SteerCancellationCapableClient,
   sessionId: string,

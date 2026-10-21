@@ -16,31 +16,15 @@ type TeamsJsonWebKey = {
 }
 
 export interface TeamsChannelConfig {
-  /** Microsoft App ID */
   appId: string
-  /** Microsoft App Password */
   appPassword: string
-  /** Allowed tenant IDs (empty = allow all) */
   allowedTenants?: string[]
   rateLimitPerMinute?: number
-  /**
-   * Outbound service host allowlist for the Bot Framework connector. Suffix
-   * entries (`.botframework.com`) match any subdomain; bare entries match the
-   * exact host. Defaults to the Bot Framework connector + regional traffic
-   * manager host. Used to stop bot bearer tokens being relayed to an
-   * attacker-chosen serviceUrl (SSRF).
-   */
   allowedServiceHosts?: string[]
 }
 
-/** Default Bot Framework connector hosts the bot token may be sent to. */
 const DEFAULT_TEAMS_SERVICE_HOSTS = ['.botframework.com', 'smba.trafficmanager.net']
 
-/**
- * Whether a Bot Framework serviceUrl points at an allowed connector host.
- * Suffix entries starting with '.' match any subdomain; other entries match
- * the exact hostname. Anything unparseable is rejected (fail-closed).
- */
 export function isAllowedTeamsServiceHost(
   serviceUrl: string,
   allowed: string[] = DEFAULT_TEAMS_SERVICE_HOSTS,
@@ -61,18 +45,10 @@ export function isAllowedTeamsServiceHost(
   })
 }
 
-/** Normalize a serviceUrl for equality comparison (lowercase, no trailing slash). */
 function normalizeServiceUrl(value: string): string {
   return value.trim().toLowerCase().replace(/\/+$/, '')
 }
 
-/**
- * Microsoft Teams channel via Bot Framework REST API.
- *
- * Uses the Bot Framework v4 REST API directly (no SDK dependency).
- * Receives messages via webhook (POST /webhooks/teams).
- * Sends responses via Bot Framework connector service.
- */
 export class TeamsChannel implements IChannel {
   readonly id = 'teams'
   readonly type: ChannelType = 'teams'
@@ -122,7 +98,6 @@ export class TeamsChannel implements IChannel {
   async sendMessage(target: ChannelTarget, msg: ChannelMessage): Promise<void> {
     const [serviceUrl, conversationId] = target.id.split('|')
 
-    // Never relay the bot bearer token to an unvetted host (SSRF / token relay).
     if (!serviceUrl || !isAllowedTeamsServiceHost(serviceUrl, this.allowedServiceHosts)) {
       log.error('Teams send blocked: serviceUrl host not in allowlist', { serviceUrl })
       throw new Error('Teams serviceUrl host not allowed')
@@ -157,20 +132,11 @@ export class TeamsChannel implements IChannel {
       && this.config.appPassword.trim().length > 0
   }
 
-  /**
-   * Whether a JWT `serviceurl` claim matches the inbound activity's serviceUrl.
-   * When the token carries a serviceurl claim it MUST match the activity
-   * (fail-closed) so a caller cannot bind a valid token to an attacker URL.
-   * When no expected serviceUrl is supplied, we cannot bind and fall through
-   * to the outbound host allowlist enforced in sendMessage.
-   */
   private serviceUrlClaimMatches(claim: unknown, expected: string | undefined): boolean {
     if (typeof claim !== 'string' || claim.length === 0) {
-      // No claim to bind against — nothing to reject here.
       return true
     }
     if (typeof expected !== 'string' || expected.length === 0) {
-      // Token asserts a serviceUrl but we have nothing to compare it to.
       return false
     }
     return normalizeServiceUrl(claim) === normalizeServiceUrl(expected)
@@ -196,7 +162,6 @@ export class TeamsChannel implements IChannel {
         return false
       }
 
-      // Bind the token's serviceurl claim to the inbound activity's serviceUrl.
       if (!this.serviceUrlClaimMatches(parsed.payload.serviceurl, expectedServiceUrl)) {
         log.warn('Teams serviceUrl claim mismatch', { expectedServiceUrl })
         return false
@@ -243,11 +208,9 @@ export class TeamsChannel implements IChannel {
     }
   }
 
-  /** Handle incoming Bot Framework activity */
   async handleActivity(activity: TeamsActivity): Promise<void> {
     if (activity.type !== 'message' || !activity.text) return
 
-    // Tenant check
     if (this.allowedTenants.size > 0) {
       const tenantId = activity.channelData?.tenant?.id
       if (tenantId && !this.allowedTenants.has(tenantId)) {
@@ -258,7 +221,6 @@ export class TeamsChannel implements IChannel {
 
     const userId = activity.from?.id ?? 'unknown'
 
-    // Rate limit
     if (!this.checkRateLimit(userId)) return
 
     const incoming: IncomingMessage = {
@@ -289,7 +251,6 @@ export class TeamsChannel implements IChannel {
     }
   }
 
-  /** Get Bot Framework access token (cached) */
   private async getToken(): Promise<string> {
     if (this.accessToken && Date.now() < this.tokenExpiry) {
       return this.accessToken

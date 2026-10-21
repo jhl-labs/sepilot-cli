@@ -59,6 +59,7 @@ import {
   skillEnableCommand,
   skillDisableCommand,
 } from './commands/skills.js'
+import { botsCommand } from './commands/bots.js'
 import { pagesInitCommand, pagesScanCommand, pagesStatusCommand } from './commands/pages.js'
 import {
   containersLsCommand,
@@ -248,6 +249,23 @@ import {
   webhooksListCommand,
   webhooksRemoveCommand,
 } from './commands/webhooks.js'
+import {
+  eventsDefaultCommand,
+  eventsDeliveriesAckCommand,
+  eventsDeliveriesCommand,
+  eventsDeliveriesReplayCommand,
+  eventsDestinationsAddCommand,
+  eventsDestinationsListCommand,
+  eventsDestinationsRemoveCommand,
+  eventsDestinationsTestCommand,
+  eventsLogCommand,
+  eventsRulesAddCommand,
+  eventsRulesDryRunCommand,
+  eventsRulesListCommand,
+  eventsRulesRemoveCommand,
+  eventsRulesUpdateCommand,
+  eventsShowCommand,
+} from './commands/events.js'
 import { secretsSetCommand, secretsListCommand, secretsRemoveCommand } from './commands/secrets.js'
 import { authLoginCommand, authListCommand, authLogoutCommand } from './commands/auth.js'
 import { subagentCategoriesCommand, subagentDispatchCommand } from './commands/subagent.js'
@@ -270,10 +288,6 @@ import {
   type TuiInputSource,
 } from './tui/utils/mouse-input.js'
 
-// No commander default here: when --url is absent, leave options.url
-// undefined so resolveDaemonBaseUrl can fall through to SEPILOTD_URL
-// env or the library default. A baked-in default would always mask
-// the env.
 const urlOption = [
   '--url <url>',
   'Daemon URL (defaults to SEPILOTD_URL env or http://127.0.0.1:17600)',
@@ -381,6 +395,7 @@ assistant
   .option('--provider <provider>', 'Provider')
   .option('--max-tokens <n>', 'Output token cap for this answer')
   .option('--persona <persona>', 'Persona')
+  .option('--bot <id>', 'Role bot for this turn (see `sepilot bots`); sets persona, mode, skills and control stages')
   .option(
     '--mode <mode>',
     'Agent mode or registered graph id (defaults to react)',
@@ -406,6 +421,7 @@ assistant
       provider: options.provider,
       maxTokens: options.maxTokens,
       persona: options.persona,
+      bot: options.bot,
       mode: options.mode,
       autonomy: options.autonomy,
       thinkingLevel: options.thinkingLevel,
@@ -727,6 +743,12 @@ commands
   .action(commandsDeleteCommand)
 commands.action(commandsListCommand)
 
+program
+  .command('bots')
+  .description('List role bots: specialists a turn can be handed to with --bot')
+  .option(...urlOption)
+  .action(botsCommand)
+
 const skills = program.command('skills').description('Manage skills')
 skills
   .command('list')
@@ -992,8 +1014,6 @@ program
   .option(...urlOption)
   .action(extensionInstallCommand)
 
-// `migrate` is a thin facade over /api/v1/migration/* — POSTs the
-// run, polls until terminal, then prints the daemon-side report.
 program
   .command('migrate')
   .description('Import sepilot_desktop user assets via the daemon migration runner')
@@ -1023,6 +1043,7 @@ program
   .option('--input <text>', 'Input for the skill')
   .option('--model <model>', 'Model to use')
   .option('--max-tokens <n>', 'Output token cap for each model response in this skill run')
+  .option('--timeout-ms <n>', 'Total time limit for this run in milliseconds; checkpoint resume keeps the same deadline')
   .option('--background', 'Start the skill run as a detached daemon background chat job')
   .option('--wait', 'With --background, poll until the background skill run completes')
   .option('--poll-ms <n>', 'Polling interval for --wait background skill runs', '1500')
@@ -1560,6 +1581,7 @@ program
   .option('--provider <provider>', 'Provider')
   .option('--max-tokens <n>', 'Output token cap for this answer')
   .option('--persona <persona>', 'Persona')
+  .option('--bot <id>', 'Role bot for this turn (see `sepilot bots`); sets persona, mode, skills and control stages')
   .option(
     '--mode <mode>',
     'Agent mode or registered graph id (defaults to react). react = general-purpose tool execution; instant = chat and read-only knowledge',
@@ -1583,6 +1605,10 @@ program
   .option(
     '--background-status <jobId>',
     'Show a detached background chat job status',
+  )
+  .option(
+    '--background-attach <jobId>',
+    'Attach to a detached background chat job and stream its output live until it ends',
   )
   .option(
     '--background-cancel <jobId>',
@@ -1921,12 +1947,19 @@ webhooks
   .action(webhooksListCommand)
 webhooks
   .command('add <path>')
-  .description('Add or replace a generic inbound webhook endpoint')
-  .requiredOption('--header <header>', 'HTTP header used for the HMAC signature')
-  .requiredOption('--secret <value>', 'Shared secret used to verify the webhook payload')
+  .description('Add or update a generic inbound webhook endpoint (merges with any existing endpoint at the same path; re-adding keeps the endpoint\'s current enabled/disabled state — use `webhooks enable` to re-enable a disabled one)')
+  .option('--header <header>', 'HTTP header used for the HMAC signature or token (required when creating)')
+  .option('--secret <value>', 'Shared secret used to verify the webhook payload (required when creating)')
   .option('--event <event>', 'Allowed event name', collectRepeatedOption, [])
   .option('--ip <cidr>', 'Allowed IP address or CIDR entry', collectRepeatedOption, [])
-  .option('--disabled', 'Create the webhook endpoint in disabled state')
+  .option('--disabled', 'Disable the webhook endpoint')
+  .option('--mode <mode>', 'chat (run an agent turn) or route (record an event-routing event)')
+  .option('--auth <auth>', 'hmac (default) or token')
+  .option('--event-type-header <header>', 'Header carrying the event type for event-routing mode')
+  .option('--delivery-id-header <header>', 'Header carrying an upstream delivery id for dedupe')
+  .option('--require-timestamp', 'Require a freshness timestamp header (replay protection)')
+  .option('--timestamp-header <header>', 'Header carrying the freshness timestamp')
+  .option('--timestamp-max-skew <seconds>', 'Maximum age in seconds before a delivery is treated as replayed', (v) => Number(v))
   .option(...urlOption)
   .action(webhooksAddCommand)
 webhooks
@@ -1945,6 +1978,96 @@ webhooks
   .option(...urlOption)
   .action(webhooksDisableCommand)
 webhooks.action(webhooksListCommand)
+
+const events = program.command('events').description('Manage event routing destinations, rules, events and deliveries')
+const eventsDestinations = events.command('destinations').description('Manage event routing destinations')
+eventsDestinations
+  .command('add <id>')
+  .description('Add or update an event routing destination')
+  .requiredOption('--kind <kind>', 'messenger-webhook|http|channel|notification')
+  .option('--preset <preset>', 'mattermost|slack|discord (for --kind messenger-webhook)')
+  .option('--target <url>', 'Destination URL (for --kind messenger-webhook|http)')
+  .option('--secret <value>', 'Shared secret (for --kind http)')
+  .option('--header <pair>', 'HTTP header as key=value (for --kind http)', collectRepeatedOption, [])
+  .option('--channel-type <type>', 'Channel type (for --kind channel)')
+  .option('--channel-target <target>', 'Channel target (for --kind channel)')
+  .option('--topic <topic>', 'Notification topic (for --kind notification)')
+  .option('--disabled', 'Create the destination in disabled state')
+  .option(...urlOption)
+  .action(eventsDestinationsAddCommand)
+eventsDestinations
+  .command('remove <id>')
+  .description('Remove an event routing destination')
+  .option(...urlOption)
+  .action(eventsDestinationsRemoveCommand)
+eventsDestinations
+  .command('test <id>')
+  .description('Send a test delivery to an event routing destination')
+  .option(...urlOption)
+  .action(eventsDestinationsTestCommand)
+eventsDestinations.action(eventsDestinationsListCommand)
+
+const eventsRules = events.command('rules').description('Manage event routing rules')
+eventsRules
+  .command('add')
+  .description('Add an event routing rule from a JSON/YAML file or inline JSON')
+  .option('--file <path>', 'Path to a .json or .yaml/.yml rule definition')
+  .option('--json <rule>', 'Inline JSON rule definition')
+  .option(...urlOption)
+  .action(eventsRulesAddCommand)
+eventsRules
+  .command('update <id>')
+  .description('Update an event routing rule from a JSON/YAML file or inline JSON')
+  .option('--file <path>', 'Path to a .json or .yaml/.yml rule definition')
+  .option('--json <rule>', 'Inline JSON rule definition')
+  .option(...urlOption)
+  .action(eventsRulesUpdateCommand)
+eventsRules
+  .command('remove <id>')
+  .description('Remove an event routing rule')
+  .option(...urlOption)
+  .action(eventsRulesRemoveCommand)
+eventsRules
+  .command('dry-run <id>')
+  .description('Dry-run an event routing rule against a sample event')
+  .requiredOption('--source <source>', 'Sample event source')
+  .requiredOption('--type <type>', 'Sample event type')
+  .option('--payload <json>', 'Inline JSON payload')
+  .option('--payload-file <path>', 'Path to a JSON payload file')
+  .option(...urlOption)
+  .action(eventsRulesDryRunCommand)
+eventsRules.action(eventsRulesListCommand)
+
+events
+  .command('log')
+  .description('List routed events')
+  .option('--source <source>', 'Filter by event source')
+  .option('--status <status>', 'Filter by event status')
+  .option('--limit <n>', 'Maximum number of events to list')
+  .option(...urlOption)
+  .action(eventsLogCommand)
+events
+  .command('show <eventId>')
+  .description('Show a routed event with its rule runs and deliveries')
+  .option(...urlOption)
+  .action(eventsShowCommand)
+const eventsDeliveries = events.command('deliveries').description('List event routing deliveries')
+eventsDeliveries
+  .command('replay <id>')
+  .description('Replay an event routing delivery')
+  .option(...urlOption)
+  .action(eventsDeliveriesReplayCommand)
+eventsDeliveries
+  .command('ack <id>')
+  .description('Acknowledge an event routing delivery')
+  .option(...urlOption)
+  .action(eventsDeliveriesAckCommand)
+eventsDeliveries
+  .option('--status <status>', 'Filter by delivery status')
+  .option('--limit <n>', 'Maximum number of deliveries to list')
+  .option(...urlOption)
+  .action(eventsDeliveriesCommand)
+events.action(eventsDefaultCommand)
 
 const secrets = program.command('secrets').description('Manage encrypted secrets')
 secrets
@@ -2069,7 +2192,8 @@ subagent
   .option('--model <id>', 'Provider model override')
   .option('--parent-session <id>', 'Tag the subagent session with this parent id')
   .option('--background', 'Queue the subagent as a daemon background job')
-  .addOption(new Option('--isolation <kind>', 'Use a clean HEAD checkout; retain changes for explicit merge').choices(['worktree']))
+  .addOption(new Option('--isolation <kind>', 'Run in an owned git worktree; retain changes for explicit merge').choices(['worktree']))
+  .addOption(new Option('--worktree-base <base>', 'Worktree start: committed HEAD (default) or the current working tree incl. uncommitted edits').choices(['head', 'working-tree']))
   .option(...urlOption)
   .action(subagentDispatchCommand)
 
@@ -2273,8 +2397,6 @@ swarm
   })
 
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<void> {
-  // Hidden subcommand: in a single-file bundle this re-enters the same
-  // executable as the foreground daemon. Resolved before commander sees argv.
   if (argv[0] === '__daemon') {
     const standalone = getStandaloneDaemon()
     if (!standalone) {
@@ -2284,16 +2406,12 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     return
   }
 
-  // Set JSON output format early before any command runs
   if (argv.includes('--json')) setOutputFormat('json')
   const outputFormatFlag = readOptionValue(argv, '--output-format')
   if (outputFormatFlag === 'json' || outputFormatFlag === 'stream-json') {
     setOutputFormat(outputFormatFlag)
   }
 
-  // resolveDaemonBaseUrl falls through: explicit --url → SEPILOTD_URL
-  // env → library default. We coalesce undefined back to the loopback
-  // string so downstream options objects stay string-typed.
   const rootUrl = resolveDaemonBaseUrl(readOptionValue(argv, '--url')) ?? 'http://127.0.0.1:17600'
 
   if (shouldRunRootPrompt(argv)) {
@@ -2312,9 +2430,6 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     const sessionId = readOptionValue(argv, '--session')
     const resume = argv.includes('--resume')
 
-    // Ink crashes with 'Raw mode is not supported on the current
-    // process.stdin' when stdin isn't a TTY (piped/redirected). Refuse
-    // up front with a hint to the non-TUI surface (`ask --session`).
     if (!process.stdin.isTTY) {
       console.error(chalk.red('The TUI requires an interactive terminal (TTY).'))
       console.error(
@@ -2378,8 +2493,6 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       : null
     const tuiStdout = imeCursorOutput?.stdout ?? process.stdout
 
-    // Both shells enable bracketed paste. Only legacy's sequence also enters
-    // alt-screen and mouse reporting; inline mode preserves host scrollback.
     const useTerminalModes = Boolean(process.stdout.isTTY)
     let terminalModesRestored = false
     const restoreTerminalModes = (): void => {
@@ -2388,7 +2501,6 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       try {
         process.stdout.write(terminalSequences.exit)
       } catch {
-        // Best-effort cleanup; the terminal may already be torn down.
       }
     }
     if (useTerminalModes) {
@@ -2396,10 +2508,6 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       process.once('exit', restoreTerminalModes)
     }
 
-    // Legacy's enter sequence enables mouse reporting, so it needs the full
-    // mouse-aware proxy. Inline mode still uses the lighter function-key proxy
-    // to coalesce fragmented F11/F12 escape sequences before Ink sees them;
-    // mouse reporting remains disabled so normal terminal selection is intact.
     const useMouseProxy = terminalPolicy.useMouseProxy
     const stdinWasRaw = Boolean((process.stdin as { isRaw?: boolean }).isRaw)
     let preInkRawModeApplied = false
@@ -2409,21 +2517,14 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       try {
         process.stdin.setRawMode(stdinWasRaw)
       } catch {
-        // Best-effort cleanup; Ink may have already restored or released stdin.
       }
     }
 
-    // Ink enables raw mode from its first input-hook layout effect. Keeping it
-    // enabled through the render handoff prevents terminals from echoing an
-    // IME preedit at the physical cursor below the inline composer before Ink
-    // has mounted its input handler. This matters for the default inline
-    // shell too; the legacy-only mouse proxy is unrelated to terminal echo.
     if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
       try {
         process.stdin.setRawMode(true)
         preInkRawModeApplied = true
       } catch {
-        // Ink will still report a clear raw-mode error if the terminal cannot support it.
       }
     }
 
@@ -2465,14 +2566,9 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     }
 
     const swallowSigint = (): void => {
-      // Raw-mode terminals normally deliver Ctrl+C through Ink's useInput,
-      // where the TUI can apply its staged interrupt rules. Some terminals
-      // still emit SIGINT during the render/raw-mode handoff; treat that as an
-      // explicit exit instead of swallowing it and leaving the app alive.
       try {
         instance.unmount()
       } catch {
-        // Best-effort fallback; the normal teardown path still runs below.
       }
     }
     process.on('SIGINT', swallowSigint)
@@ -2492,7 +2588,6 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       try {
         instance.cleanup()
       } catch {
-        // Best-effort cleanup; Ink may already have disposed the instance.
       }
       restorePreInkRawMode()
 
@@ -2503,7 +2598,6 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       try {
         process.stdin.pause()
       } catch {
-        // Some stdin implementations cannot be paused after teardown.
       }
 
       try {
@@ -2511,7 +2605,6 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         process.stdin.removeAllListeners('readable')
         process.stdin.unref()
       } catch {
-        // Best-effort stdin cleanup so no lingering TTY handle keeps Node alive.
       }
 
       await stopOwnedDaemon(tuiDaemon, daemonClient)
@@ -2559,9 +2652,6 @@ function reportCliError(err: unknown): void {
   if (jsonMode) {
     console.log(JSON.stringify({ ok: false, error: friendly }, null, 2))
   } else if (!printApiError(err)) {
-    // Status-aware copy already emitted by printApiError when it matched
-    // an http error. Otherwise fall through to the friendlyErrorMessage
-    // single-line render — covers connection drops, parse errors, etc.
     console.error(chalk.red(friendly))
   }
   if (process.env.SEPILOTD_DEBUG === '1' && err instanceof Error && err.stack) {

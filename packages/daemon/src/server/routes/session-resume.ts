@@ -117,8 +117,6 @@ export function registerSessionResumeRoute(app: FastifyInstance): void {
       })
     }
 
-    // Resume can recover/replay tools, so it must own the same session lease
-    // before reading the bound workspace or inspecting the checkpoint.
     const sessionLease = runtime.sessionBusy
       ? await runtime.sessionBusy.acquireLeaseWithGrace(params.id)
       : undefined
@@ -282,15 +280,8 @@ export function registerSessionResumeRoute(app: FastifyInstance): void {
       if (checkpoint.graphState) {
         const events = steeringEvents
 
-        // Steering acknowledgements and terminal states are independently
-        // journaled, so always reconcile them with the checkpoint. This
-        // prevents a cancelled follow-up from reappearing after restart and
-        // restores a pending note acknowledged after the last checkpoint.
         reconcileRecoveredSteeringNotes(checkpoint.graphState, events)
 
-        // Restore board-derived state journaled after the last checkpoint
-        // write. Board and checkpoint are normally written together (same
-        // cadence), so this only fills gaps left by a crash between the two.
         if (isStateBoardEnabled()) {
           const boardAt = latestStateBoardAt(events)
           const checkpointAt = Date.parse(checkpoint.checkpointedAt)
@@ -316,6 +307,7 @@ export function registerSessionResumeRoute(app: FastifyInstance): void {
         hookRegistry: runtime.hookRegistry,
         deviceName: runtime.config.device.name,
         thinkingLevel: checkpoint.thinkingLevel,
+        thinkingLevelSource: checkpoint.thinkingLevelSource,
         textDeltaMode: checkpoint.textDeltaMode,
         llmCache: runtime.llmCache,
         providerCircuitBreaker: runtime.providerCircuitBreaker,
@@ -381,8 +373,6 @@ export function registerSessionResumeRoute(app: FastifyInstance): void {
       lifecycle = createSseLifecycle({
         reply,
         inactivityMs: AGENT_INACTIVITY_MS,
-        // A run blocked on a pending approval/question is not stalled: the
-        // stall watchdog is suppressed and the separate decision bound applies.
         pendingDecision: () => inactivityProbe.pendingDecision(),
         decisionTimeoutMs: resolvePendingDecisionTimeoutMs(),
         onInactivity: () => {
@@ -492,7 +482,7 @@ export function registerSessionResumeRoute(app: FastifyInstance): void {
               )
               reply.raw.end()
             }
-          } catch { /* best-effort */ }
+          } catch {}
           return
         }
         throw err
@@ -510,13 +500,13 @@ export function registerSessionResumeRoute(app: FastifyInstance): void {
             })}\n\n`,
           )
         }
-      } catch { /* best-effort */ }
+      } catch {}
       throw err
     } finally {
       lifecycle?.dispose()
       try {
         if (!reply.raw.writableEnded) reply.raw.end()
-      } catch { /* noop */ }
+      } catch {}
       runLease?.release()
     }
     } finally {

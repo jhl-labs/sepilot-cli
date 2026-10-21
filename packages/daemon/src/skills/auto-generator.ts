@@ -10,9 +10,8 @@ export async function generateSkillFromSession(
   events: SessionEvent[],
   model: string,
 ): Promise<GeneratedSkill | null> {
-  // Extract tool calls and results
   const toolEvents = events.filter(e => e.type === 'tool_call' || e.type === 'tool_result')
-  if (toolEvents.length < 2) return null // Not enough tool usage to make a skill
+  if (toolEvents.length < 2) return null
 
   const messages = events
     .filter(e => e.type === 'user_message' || e.type === 'assistant_message')
@@ -47,7 +46,6 @@ Return ONLY the SKILL.md content, starting with +++.`
     const content = typeof response.message.content === 'string' ? response.message.content : ''
     if (!content.includes('+++')) return null
 
-    // Extract metadata from generated content
     const match = content.match(/\+\+\+\n([\s\S]*?)\n\+\+\+/)
     if (!match) return null
 

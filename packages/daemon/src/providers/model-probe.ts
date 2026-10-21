@@ -29,10 +29,6 @@ function extractProbeContent(message: Message): string {
   const normalized = extractContent(message)
   if (normalized.trim() || !Array.isArray(message.content)) return normalized
 
-  // Keep the readiness probe tolerant of provider adapters that return a
-  // text-bearing block before normalizing it to the core `{ type: 'text' }`
-  // shape. It is still visible text, while thinking/reasoning fields remain
-  // intentionally excluded.
   return message.content
     .map((part) => {
       const text = (part as { text?: unknown }).text
@@ -46,13 +42,6 @@ function emptyResponseReason(finishReason: ChatResponse['finishReason'] | undefi
   return finishReason ? `${reason} (finishReason: ${finishReason})` : reason
 }
 
-/**
- * Exercise one concrete provider/model pair and require user-visible text.
- *
- * Reasoning models can spend a very small output allowance entirely on hidden
- * thinking. Give every probe a practical initial budget, then retry one time
- * with a larger allowance before declaring the model unusable.
- */
 export async function probeProviderModel(
   provider: ILLMProvider,
   target: ModelProbeTarget,
@@ -65,9 +54,6 @@ export async function probeProviderModel(
   const deadline = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       const error = new Error(`model probe timed out after ${timeoutMs}ms`)
-      // Reject independently of provider AbortSignal support. Some provider
-      // SDKs do not cancel an in-flight non-streaming request when the signal
-      // changes.
       reject(error)
       controller.abort(error)
     }, timeoutMs)

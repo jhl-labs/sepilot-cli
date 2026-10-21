@@ -1,10 +1,21 @@
 import { randomUUID } from 'node:crypto'
-import { createSubagentWorktree, type SubagentWorktreeReceipt } from './subagent-worktree.js'
+import type { ExternalCliBackend } from '../external-cli/executor.js'
+import type { ExternalCliDispatcher } from '../external-cli/dispatcher.js'
+import {
+  createSubagentWorktree,
+  reopenSubagentWorktree,
+  type SubagentWorktreeBase,
+  type SubagentWorktreeHandle,
+  type SubagentWorktreeReceipt,
+} from './subagent-worktree.js'
+import { loadSessionContext } from './context-loader.js'
+import { boundConversationForChild, resolveChildHistoryBudgetTokens } from './subagent-context.js'
 import type {
   AgentContext,
   AgentEvent,
   AgentRunContract,
   ISessionStore,
+  Message,
   TokenUsage,
   ToolCall,
 } from '@sepilotd/core'
@@ -26,6 +37,7 @@ import {
   resolveSubagentCategoryToolNames,
   resolveSubagentDelegationCategory,
   unknownSubagentCategoryError,
+  type SubagentDelegationCategory,
 } from './subagent-categories.js'
 
 const HARD_CAP_ENV = 'SEPILOTD_SUBAGENT_MAX_ITERATIONS_HARD_CAP'
@@ -74,38 +86,25 @@ export interface SubagentDispatchInput {
   category?: string
   agentId?: string
   maxIterations?: number
-  /**
-   * Parent run budget. When no explicit budget is requested the child claims
-   * `max(24, ceil(parent * 0.35))`, and never more than the parent itself.
-   */
   parentMaxIterations?: number
   tools?: string[]
+  parentProvider?: string
+  parentModel?: string
+  reviewOutcomes?: boolean
   model?: string
   contextPacket?: string
   parentSessionId?: string
-  /** Parent working directory to preserve path-relative tool behavior. */
   cwd?: string
-  /** Immutable strict workspace capability inherited from the parent turn. */
   workspaceRoot?: string
-  /** Effective parent-turn authority; never replace this with daemon defaults. */
   parentExecutionPolicy?: DelegatedAgentExecutionPolicy
-  /** Set only by the owned background service: approvals are inspectable in jobs. Not an authority grant. */
   detached?: boolean
-  /** Explicit clean-HEAD checkout; never copies uncommitted parent changes. */
   isolation?: 'worktree'
-  /** Parent run contract to preserve hard boundaries in the child agent. */
+  worktreeBase?: SubagentWorktreeBase
+  contextMode?: 'packet' | 'fork'
   runContract?: AgentRunContract
-  /** Authoritative parent memory scope, copied into the isolated child context. */
   scopeTags?: string[]
   signal?: AbortSignal
   onSession?: (sessionId: string) => void
-  /**
-   * Optional sink for the subagent's intermediate progress events
-   * (llm_request/tool_call/tool_result/reasoning_step/thinking/message), wrapped as
-   * `subagent_progress`. The parent agent loop wires this to its own
-   * event stream so surfaces can show nested activity. Terminal
-   * done/error are not forwarded — the dispatch result reports those.
-   */
   onEvent?: (event: AgentEvent) => void
 }
 
@@ -123,6 +122,7 @@ const FORWARDED_SUBAGENT_EVENT_TYPES = new Set<AgentEvent['type']>([
 ])
 
 export interface SubagentDispatchResult {
+  budget?: { requestedIterations: number; appliedIterations: number; hardCap: number }
   worktree?: SubagentWorktreeReceipt
   output: string
   sessionId: string
@@ -133,25 +133,17 @@ export interface SubagentDispatchResult {
   status: 'completed' | 'failed' | 'truncated'
   error?: string
   stopReason?: RunStopReason
-  /**
-   * Structured board findings reconstructed from the subagent's tool activity
-   * (evidence ledger, failed-attempts, open-questions) so the parent can roll
-   * them up instead of collapsing the whole run to text. PLAN_065 T1.
-   */
   findings?: SubagentFindings
 }
 
 export interface SubagentEngineFactoryOptions {
   sessionId: string
-  /** Already-journaled runtime events (such as a resolved approval). */
   onEvent?: (event: AgentEvent) => void
-  /** Filtered ToolRegistry — already stripped of `subagent.dispatch` and limited to the requested subset. */
   tools: ToolRegistry
-  /** Hard-clamped maxIterations for this dispatch. */
   maxIterations: number
-  /** Optional model override forwarded by the caller. */
   model?: string
-  /** Effective parent-turn authority inherited by this isolated engine. */
+  providerId?: string
+  reviewOutcomes?: boolean
   executionPolicy?: DelegatedAgentExecutionPolicy
 }
 
@@ -164,6 +156,7 @@ export interface SubagentUserAgentProfile {
   allowedTools?: string[]
   deniedTools?: string[]
   isolation?: 'worktree'
+  external?: { cli: ExternalCliBackend; model?: string }
 }
 
 export interface SubagentDispatcherDeps {
@@ -173,20 +166,11 @@ export interface SubagentDispatcherDeps {
   ) => Promise<void>
   onRunFinished?: (sessionId: string, options: { preserveParked?: boolean }) => void
   sessions: ISessionStore
-  /** Construct a fresh AgentEngine for each dispatch. The factory is responsible for
-   * wiring provider/policy/etc; the dispatcher only supplies the per-run overrides
-   * (tools subset and clamped maxIterations). */
   engineFactory: (options: SubagentEngineFactoryOptions) => AgentEngine
-  /** Parent ToolRegistry — used to resolve concrete ToolDefinitionRuntime entries
-   * for the subagent's allowed-tool subset. */
+  externalCli?: () => ExternalCliDispatcher | null | undefined
   toolRegistry: ToolRegistry
-  /** Returns the parent session's currently allowed tool names (closure for runtime
-   * filtering — must reflect current state at dispatch time). */
   parentAllowedTools: () => string[]
-  /** Returns the daemon's default provider id and model. Used to populate the new
-   * session's metadata when the caller does not pin a provider. */
   defaultProvider: () => { id: string; defaultModel: string } | null
-  /** Resolves user-defined agent prompts for explicit `agentId` dispatches. */
   resolveUserAgent?: (
     id: string,
     cwd?: string,
@@ -196,8 +180,92 @@ export interface SubagentDispatcherDeps {
     | null
     | undefined
     | Promise<SubagentUserAgentProfile | null | undefined>
-  /** Optional hard-cap override (env or test). Defaults to env / DEFAULT_HARD_CAP. */
   hardCap?: number
+  modelContextWindow?: (model: string) => number | undefined
+}
+
+export interface SubagentContinueInput {
+  childSessionId: string
+  prompt: string
+  parentSessionId: string
+  parentExecutionPolicy?: DelegatedAgentExecutionPolicy
+  detached?: boolean
+  signal?: AbortSignal
+  onSession?: (sessionId: string) => void
+  onEvent?: (event: AgentEvent) => void
+}
+
+export interface SubagentChildSummary {
+  sessionId: string
+  title: string
+  category?: string
+  agentId?: string
+  status: 'running' | 'completed' | 'failed' | 'truncated' | 'active' | 'abandoned'
+  summary?: string
+  updatedAt: string
+  worktree?: SubagentWorktreeReceipt
+}
+
+interface SubagentChildSpec {
+  sessionId: string
+  parentSessionId?: string
+  category?: SubagentDelegationCategory
+  agentId?: string
+  toolNames: string[]
+  parentExecutionPolicy?: DelegatedAgentExecutionPolicy
+  providerId: string
+  model: string
+  maxIterations: number
+  budget?: { requestedIterations: number; appliedIterations: number; hardCap: number }
+  systemPrompt: string
+  cwd?: string
+  workspaceRoot?: string
+  isolation?: 'worktree'
+  worktreeBase?: SubagentWorktreeBase
+  worktree?: { receipt: SubagentWorktreeReceipt; cwd: string }
+  runContract?: AgentRunContract
+  scopeTags?: string[]
+  title: string
+  updatedAt: string
+  external?: { cli: ExternalCliBackend; model?: string }
+  externalThreadId?: string
+  reviewOutcomes?: boolean
+  lastStatus?: SubagentDispatchResult['status']
+  lastOutput?: string
+}
+
+interface SubagentRunInput {
+  prompt: string
+  previousMessages: Message[]
+  forked: boolean
+  isNew: boolean
+  detached?: boolean
+  signal?: AbortSignal
+  onSession?: (sessionId: string) => void
+  onEvent?: (event: AgentEvent) => void
+}
+
+const MAX_RETAINED_CHILD_SPECS = 512
+const SUMMARY_CHARS = 240
+const TOOLS_TAG_PREFIX = 'subagent-tools:'
+
+function subagentError(code: string, message: string): Error & { code: string } {
+  const err = new Error(`${code}: ${message}`) as Error & { code: string }
+  err.code = code
+  return err
+}
+
+function narrowExecutionPolicy(
+  original: DelegatedAgentExecutionPolicy | undefined,
+  current: DelegatedAgentExecutionPolicy | undefined,
+): DelegatedAgentExecutionPolicy | undefined {
+  if (!original || !current) return original ?? current
+  const allowed = new Set(current.allowedToolNames)
+  return {
+    autonomy: original.autonomy,
+    requireToolApproval: original.requireToolApproval || current.requireToolApproval,
+    allowedToolNames: original.allowedToolNames.filter((name) => allowed.has(name)),
+  }
 }
 
 function unknownSubagentAgentError(agentId: string): Error & { code: string } {
@@ -206,19 +274,258 @@ function unknownSubagentAgentError(agentId: string): Error & { code: string } {
   return err
 }
 
-/**
- * Dispatches an isolated subagent run.
- *
- * Each dispatch creates its own session and a fresh AgentEngine via the factory,
- * so internal turns never leak into the parent session's event log. Tool access
- * is restricted to a subset of the parent's allowed tools, and `subagent.dispatch`
- * itself is always stripped from the subagent's whitelist (depth 1 enforcement).
- */
 export class SubagentDispatcher {
+  private readonly children = new Map<string, SubagentChildSpec>()
+  private readonly running = new Set<string>()
+
   constructor(private readonly deps: SubagentDispatcherDeps) {}
 
   async dispatch(input: SubagentDispatchInput): Promise<SubagentDispatchResult> {
     input.signal?.throwIfAborted()
+    const contextMode = input.contextMode ?? 'packet'
+    if (contextMode !== 'packet' && contextMode !== 'fork') {
+      throw subagentError('SUBAGENT_CONTEXT_MODE_INVALID', String(contextMode))
+    }
+    if (contextMode === 'fork' && !input.parentSessionId) {
+      throw subagentError('SUBAGENT_FORK_UNAVAILABLE', 'fork context requires a parent session')
+    }
+    const sessionId = randomUUID()
+    const spec = await this.resolveSpec(input, sessionId)
+    const createdAt = spec.updatedAt
+    input.signal?.throwIfAborted()
+    const previousMessages = contextMode === 'fork'
+      ? await this.boundedHistory(input.parentSessionId!, spec.model)
+      : []
+    const tags = [
+      'subagent',
+      ...(input.parentSessionId ? [`parent:${input.parentSessionId}`] : []),
+      ...(spec.category ? [`category:${spec.category.id}`] : []),
+      ...(input.agentId ? [`agent:${input.agentId}`] : []),
+      ...(input.tools ? [`${TOOLS_TAG_PREFIX}${spec.toolNames.join(',')}`] : []),
+      ...(spec.isolation === 'worktree' ? ['isolation:worktree'] : []),
+    ]
+    input.signal?.throwIfAborted()
+    await this.deps.sessions.create({
+      id: sessionId,
+      title: spec.title,
+      createdAt,
+      updatedAt: createdAt,
+      provider: spec.providerId,
+      model: spec.model,
+      device: 'subagent',
+      status: 'active',
+      tags,
+      ...(spec.cwd ? { cwd: spec.cwd } : {}),
+    })
+    this.remember(spec)
+    return this.run(spec, {
+      prompt: input.prompt,
+      previousMessages,
+      forked: contextMode === 'fork',
+      isNew: true,
+      detached: input.detached,
+      signal: input.signal,
+      onSession: input.onSession,
+      onEvent: input.onEvent,
+    })
+  }
+
+  async continue(input: SubagentContinueInput): Promise<SubagentDispatchResult> {
+    input.signal?.throwIfAborted()
+    if (!input.prompt.trim()) throw subagentError('SUBAGENT_PROMPT_REQUIRED', 'prompt required')
+    const spec = this.children.get(input.childSessionId)
+      ?? await this.restoreSpec(input.childSessionId, input.parentExecutionPolicy)
+    if (!spec || !input.parentSessionId || spec.parentSessionId !== input.parentSessionId) {
+      throw subagentError('SUBAGENT_NOT_FOUND', 'subagent not found in this conversation')
+    }
+    if (this.running.has(spec.sessionId)) {
+      throw subagentError('SUBAGENT_BUSY', 'subagent is still running; wait for it before sending a follow-up')
+    }
+    const policy = narrowExecutionPolicy(spec.parentExecutionPolicy, input.parentExecutionPolicy)
+    const allowed = policy ? new Set(policy.allowedToolNames) : undefined
+    const runSpec: SubagentChildSpec = {
+      ...spec,
+      parentExecutionPolicy: policy,
+      toolNames: allowed ? spec.toolNames.filter((name) => allowed.has(name)) : spec.toolNames,
+    }
+    const previousMessages = await this.boundedHistory(spec.sessionId, spec.model)
+    await this.deps.sessions.updateMeta?.(spec.sessionId, { status: 'active' })
+    return this.run(runSpec, {
+      prompt: input.prompt,
+      previousMessages,
+      forked: false,
+      isNew: false,
+      detached: input.detached,
+      signal: input.signal,
+      onSession: input.onSession,
+      onEvent: input.onEvent,
+    })
+  }
+
+  async listChildren(parentSessionId: string, limit = 50): Promise<SubagentChildSummary[]> {
+    if (!parentSessionId) return []
+    const byId = new Map<string, SubagentChildSummary>()
+    for (const spec of this.children.values()) {
+      if (spec.parentSessionId !== parentSessionId) continue
+      byId.set(spec.sessionId, {
+        sessionId: spec.sessionId,
+        title: spec.title,
+        ...(spec.category ? { category: spec.category.id } : {}),
+        ...(spec.agentId ? { agentId: spec.agentId } : {}),
+        status: this.running.has(spec.sessionId) ? 'running' : (spec.lastStatus ?? 'active'),
+        ...(spec.lastOutput ? { summary: spec.lastOutput.slice(0, SUMMARY_CHARS) } : {}),
+        updatedAt: spec.updatedAt,
+        ...(spec.worktree ? { worktree: spec.worktree.receipt } : {}),
+      })
+    }
+    const parentTag = `parent:${parentSessionId}`
+    const page = await this.deps.sessions
+      .list({ query: parentTag, perPage: Math.max(limit, 1) * 2 })
+      .catch(() => ({ items: [] }))
+    for (const meta of page.items) {
+      if (byId.has(meta.id) || !meta.tags.includes('subagent') || !meta.tags.includes(parentTag)) continue
+      const tagValue = (prefix: string) =>
+        meta.tags.find((tag) => tag.startsWith(prefix))?.slice(prefix.length)
+      const category = tagValue('category:')
+      const agentId = tagValue('agent:')
+      byId.set(meta.id, {
+        sessionId: meta.id,
+        title: meta.title,
+        ...(category ? { category } : {}),
+        ...(agentId ? { agentId } : {}),
+        status: this.running.has(meta.id) ? 'running' : meta.status,
+        updatedAt: meta.updatedAt,
+      })
+    }
+    return [...byId.values()]
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, Math.max(1, limit))
+  }
+
+  private async runExternal(spec: SubagentChildSpec, input: SubagentRunInput): Promise<SubagentDispatchResult> {
+    const { sessionId } = spec
+    const external = spec.external!
+    const dispatcher = this.deps.externalCli?.()
+    const startedAt = new Date().toISOString()
+    const usage: TokenUsage = { inputTokens: 0, outputTokens: 0 }
+    let status: SubagentDispatchResult['status'] = 'failed'
+    let output = ''
+    let error: string | undefined
+    this.running.add(sessionId)
+    try {
+      await this.deps.onLifecycle?.('started', { sessionId, parentSessionId: spec.parentSessionId, agentId: spec.agentId })
+      await this.deps.sessions.appendEvent(sessionId, { type: 'user_message', id: randomUUID(), timestamp: startedAt, content: input.prompt })
+      if (!dispatcher) throw new Error('external CLI runtime is not available in this daemon build')
+      input.signal?.throwIfAborted()
+      const result = await dispatcher.dispatch({
+        backend: external.cli,
+        model: external.model,
+        prompt: [spec.systemPrompt, input.prompt].filter((part) => part?.trim()).join('\n\n'),
+        cwd: spec.cwd,
+        threadId: input.isNew ? undefined : spec.externalThreadId,
+        autonomy: spec.parentExecutionPolicy?.autonomy,
+        parentSessionId: spec.parentSessionId,
+        scopeTags: spec.scopeTags,
+        runContract: spec.runContract,
+        signal: input.signal,
+        onEvent: (event) => {
+          if (!input.onEvent) return
+          const inner: AgentEvent | null = event.type === 'text'
+            ? { type: 'message', content: event.text }
+            : event.type === 'progress'
+              ? { type: 'action_progress', summary: event.text, nextStep: '', toolNames: [] }
+              : null
+          if (inner) input.onEvent({ type: 'subagent_progress', subagentId: sessionId, label: spec.agentId ?? external.cli, inner })
+        },
+      })
+      output = result.output
+      usage.inputTokens = result.usage.inputTokens
+      usage.outputTokens = result.usage.outputTokens
+      status = result.status === 'completed' ? 'completed' : 'failed'
+      error = result.error
+      spec.externalThreadId = result.threadId
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err)
+      output = output || `[${external.cli} error] ${error}`
+    } finally {
+      this.running.delete(sessionId)
+    }
+    await this.deps.sessions.appendEvent(sessionId, { type: 'assistant_message', id: randomUUID(), timestamp: new Date().toISOString(), content: output })
+    await this.deps.sessions.updateMeta?.(sessionId, { status: status === 'failed' ? 'abandoned' : 'completed' })
+    const retained = this.children.get(sessionId)
+    if (retained) {
+      retained.lastStatus = status
+      retained.lastOutput = output
+      retained.externalThreadId = spec.externalThreadId
+      retained.updatedAt = new Date().toISOString()
+    }
+    await this.deps.onLifecycle?.('stopped', { sessionId, parentSessionId: spec.parentSessionId, agentId: spec.agentId, status })
+    return {
+      output,
+      sessionId,
+      category: spec.category?.id,
+      iterations: 1,
+      usage,
+      truncated: false,
+      status,
+      ...(error ? { error } : {}),
+      stopReason: status === 'completed'
+        ? { kind: 'completed', code: 'completed', resumable: false, nextActions: [] }
+        : { kind: 'error', code: 'provider_error', summary: error, resumable: false, nextActions: ['retry'] },
+    }
+  }
+
+  private remember(spec: SubagentChildSpec): void {
+    this.children.delete(spec.sessionId)
+    this.children.set(spec.sessionId, spec)
+    while (this.children.size > MAX_RETAINED_CHILD_SPECS) {
+      const oldest = this.children.keys().next().value
+      if (oldest === undefined || this.running.has(oldest)) break
+      this.children.delete(oldest)
+    }
+  }
+
+  private async boundedHistory(sessionId: string, model: string): Promise<Message[]> {
+    const messages = await loadSessionContext(this.deps.sessions, sessionId, Number.MAX_SAFE_INTEGER)
+    return boundConversationForChild(messages, {
+      maxTokens: resolveChildHistoryBudgetTokens(this.deps.modelContextWindow?.(model)),
+    })
+  }
+
+  private async restoreSpec(
+    sessionId: string,
+    parentExecutionPolicy: DelegatedAgentExecutionPolicy | undefined,
+  ): Promise<SubagentChildSpec | null> {
+    const meta = await this.deps.sessions.get(sessionId)
+    if (!meta?.tags.includes('subagent')) return null
+    const tagValue = (prefix: string) =>
+      meta.tags.find((tag) => tag.startsWith(prefix))?.slice(prefix.length)
+    const parentSessionId = tagValue('parent:')
+    if (!parentSessionId) return null
+    if (meta.tags.includes('isolation:worktree')) {
+      throw subagentError(
+        'SUBAGENT_NOT_RESUMABLE',
+        'the worktree of this subagent is not tracked after a daemon restart; dispatch a new subagent',
+      )
+    }
+    const tools = tagValue(TOOLS_TAG_PREFIX)
+    const spec = await this.resolveSpec({
+      prompt: meta.title,
+      category: tagValue('category:'),
+      agentId: tagValue('agent:'),
+      tools: tools === undefined ? undefined : tools.split(',').filter(Boolean),
+      model: meta.model,
+      parentSessionId,
+      cwd: meta.cwd,
+      parentExecutionPolicy,
+    }, sessionId)
+    spec.title = meta.title
+    spec.updatedAt = meta.updatedAt
+    this.remember(spec)
+    return spec
+  }
+
+  private async resolveSpec(input: SubagentDispatchInput, sessionId: string): Promise<SubagentChildSpec> {
     const category = input.category ? resolveSubagentDelegationCategory(input.category) : undefined
     if (input.category && !category) {
       throw unknownSubagentCategoryError(input.category)
@@ -275,28 +582,96 @@ export class SubagentDispatcher {
       }
     }
 
-    // Depth 1 enforcement — strip subagent.dispatch from the subagent's allowed tools
-    // so it cannot recursively spawn further subagents. Also enforce the subset
-    // restriction here even when no explicit `tools` is supplied (default = parent
-    // allowed minus subagent.dispatch).
     const requestedNames =
       input.tools ?? resolveSubagentCategoryToolNames(category, parentAllowedNames)
-    // Live progress transports carry nested approvals while the parent awaits
-    // the tool; detached jobs have their own durable approval surface. Direct
-    // calls without either transport still fail closed to read-only. Merely
-    // having a transport never grants approval: retain the inherited policy.
-    const hasApprovalTransport = input.detached === true || Boolean(input.onEvent)
-    const sanitizedNames = requestedNames.filter(
+    const toolNames = requestedNames.filter(
       (toolName) =>
         toolName !== 'subagent.dispatch' &&
         (userAgent?.allowedTools === undefined || userAgent.allowedTools.includes(toolName)) &&
-        !userAgent?.deniedTools?.includes(toolName) &&
-        (!parentExecutionPolicy?.requireToolApproval ||
-          hasApprovalTransport ||
-          isPolicyReadOnlyTool(toolName)),
+        !userAgent?.deniedTools?.includes(toolName),
     )
+
+    const provider = this.deps.defaultProvider()
+    const providerId = input.parentProvider ?? provider?.id ?? 'unknown'
+    const model = input.model ?? userAgent?.model ?? input.parentModel ?? provider?.defaultModel ?? 'default'
+    const titleSeed = input.prompt.slice(0, 40)
+
+    const contextPacket = input.contextPacket?.trim()
+    const userAgentSystemPrompt = userAgent?.systemPrompt.trim()
+      ? [`[User agent: ${userAgent.name || input.agentId}]`, userAgent.systemPrompt.trim()].join(
+          '\n',
+        )
+      : ''
+    const callerSystemPrompt = input.system?.trim()
+      ? ['Caller system override:', input.system.trim()].join('\n')
+      : ''
+    const systemPrompt = [
+      category?.systemPrompt,
+      userAgentSystemPrompt,
+      callerSystemPrompt,
+      contextPacket
+        ? [
+            '[Parent context]',
+            contextPacket,
+            '(Use this to avoid re-exploring what the parent already knows; verify before relying on specifics.)',
+          ].join('\n')
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n')
+    const isolation = input.isolation ?? userAgent?.isolation
+
+    return {
+      sessionId,
+      ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
+      ...(category ? { category } : {}),
+      ...(input.agentId ? { agentId: input.agentId } : {}),
+      ...(userAgent?.external ? { external: userAgent.external } : {}),
+      ...(input.reviewOutcomes !== undefined ? { reviewOutcomes: input.reviewOutcomes } : {}),
+      toolNames,
+      parentExecutionPolicy,
+      providerId,
+      model,
+      maxIterations,
+      systemPrompt,
+      budget: { requestedIterations: normalizeIterationBudget(requested, subagentDefault), appliedIterations: maxIterations, hardCap },
+      cwd: input.cwd?.trim() || undefined,
+      workspaceRoot: input.workspaceRoot,
+      ...(isolation === 'worktree'
+        ? { isolation, worktreeBase: input.worktreeBase ?? 'head' }
+        : {}),
+      runContract: input.runContract ? structuredClone(input.runContract) : undefined,
+      scopeTags: input.scopeTags ? [...input.scopeTags] : undefined,
+      title: category ? `subagent:${category.id}: ${titleSeed}` : `subagent: ${titleSeed}`,
+      updatedAt: new Date().toISOString(),
+    }
+  }
+
+  private async openWorktree(spec: SubagentChildSpec): Promise<SubagentWorktreeHandle> {
+    if (spec.worktree?.receipt.retained) {
+      return reopenSubagentWorktree({ receipt: spec.worktree.receipt, cwd: spec.worktree.cwd })
+    }
+    if (!spec.cwd) throw new Error('Worktree isolation requires an explicit parent working directory')
+    return createSubagentWorktree({
+      cwd: spec.cwd,
+      workspaceRoot: spec.workspaceRoot,
+      sessionId: spec.sessionId,
+      base: spec.worktreeBase,
+    })
+  }
+
+  private async run(spec: SubagentChildSpec, input: SubagentRunInput): Promise<SubagentDispatchResult> {
+    if (spec.external) return this.runExternal(spec, input)
+    const { sessionId, category, parentExecutionPolicy, model } = spec
+    const startedAt = new Date().toISOString()
+    const hasApprovalTransport = input.detached === true || Boolean(input.onEvent)
     const subagentTools = new ToolRegistry()
-    for (const name of sanitizedNames) {
+    for (const name of spec.toolNames) {
+      if (
+        parentExecutionPolicy?.requireToolApproval &&
+        !hasApprovalTransport &&
+        !isPolicyReadOnlyTool(name)
+      ) continue
       const tool = this.deps.toolRegistry.get(name)
       if (tool) {
         const source = this.deps.toolRegistry.registrationSource(name)
@@ -304,47 +679,23 @@ export class SubagentDispatcher {
       }
     }
 
-    const provider = this.deps.defaultProvider()
-    const model = input.model ?? userAgent?.model ?? provider?.defaultModel ?? 'default'
-    const sessionId = randomUUID()
-    const createdAt = new Date().toISOString()
-    let cwd = input.cwd?.trim() || undefined
-    let workspaceRoot = input.workspaceRoot
-    let worktree: Awaited<ReturnType<typeof createSubagentWorktree>> | undefined
-    const titleSeed = input.prompt.slice(0, 40)
-    const tags = [
-      'subagent',
-      ...(input.parentSessionId ? [`parent:${input.parentSessionId}`] : []),
-      ...(category ? [`category:${category.id}`] : []),
-      ...(input.agentId ? [`agent:${input.agentId}`] : []),
-    ]
-    input.signal?.throwIfAborted()
-    await this.deps.sessions.create({
-      id: sessionId,
-      title: category ? `subagent:${category.id}: ${titleSeed}` : `subagent: ${titleSeed}`,
-      createdAt,
-      updatedAt: createdAt,
-      provider: provider?.id ?? 'unknown',
-      model,
-      device: 'subagent',
-      status: 'active',
-      tags,
-      ...(cwd ? { cwd } : {}),
-    })
+    let cwd = spec.cwd
+    let workspaceRoot = spec.workspaceRoot
+    let worktree: SubagentWorktreeHandle | undefined
     let lifecycleStatus = 'failed'
     let preserveParkedApproval = false
+    this.running.add(sessionId)
     try {
-      if ((input.isolation ?? userAgent?.isolation) === 'worktree') {
-        if (!cwd) throw new Error('Worktree isolation requires an explicit parent working directory')
-        worktree = await createSubagentWorktree({ cwd, workspaceRoot, sessionId })
+      if (spec.isolation === 'worktree') {
+        worktree = await this.openWorktree(spec)
         cwd = worktree.cwd
         workspaceRoot = worktree.receipt.path
         await this.deps.sessions.updateMeta?.(sessionId, { cwd, workspaceIsolation: 'strict' })
       }
       await this.deps.onLifecycle?.('started', {
         sessionId,
-        parentSessionId: input.parentSessionId,
-        agentId: input.agentId,
+        parentSessionId: spec.parentSessionId,
+        agentId: spec.agentId,
       })
       input.signal?.throwIfAborted()
       input.onSession?.(sessionId)
@@ -353,34 +704,23 @@ export class SubagentDispatcher {
         onEvent: (event) =>
           input.onEvent?.({ type: 'subagent_progress', subagentId: sessionId, inner: event }),
         tools: subagentTools,
-        maxIterations,
+        maxIterations: spec.maxIterations,
         model,
+        providerId: spec.providerId,
+        reviewOutcomes: spec.reviewOutcomes ?? false,
         executionPolicy: parentExecutionPolicy,
       })
 
-      const contextPacket = input.contextPacket?.trim()
-      const categorySystemPrompt = category?.systemPrompt
-      const userAgentSystemPrompt = userAgent?.systemPrompt.trim()
-        ? [`[User agent: ${userAgent.name || input.agentId}]`, userAgent.systemPrompt.trim()].join(
-            '\n',
-          )
-        : ''
-      const callerSystemPrompt = input.system?.trim()
-        ? ['Caller system override:', input.system.trim()].join('\n')
-        : ''
       const systemPrompt = [
         parentExecutionPolicy?.requireToolApproval && !hasApprovalTransport
           ? '[Delegated execution policy] This child run is read-only because the parent turn requires fresh human approval for every side effect. Return the requested change as guidance if a mutation is needed; do not claim it was applied.'
           : '',
-        categorySystemPrompt,
-        userAgentSystemPrompt,
-        callerSystemPrompt,
-        contextPacket
-          ? [
-              '[Parent context]',
-              contextPacket,
-              '(Use this to avoid re-exploring what the parent already knows; verify before relying on specifics.)',
-            ].join('\n')
+        spec.systemPrompt,
+        input.forked && input.previousMessages.length > 0
+          ? "[Forked parent context] The conversation before your task is the parent agent's recent history, bounded to a budget (older turns and large tool outputs may be omitted). Use it as background only; your task is the final user message. Do not continue the parent's other work."
+          : '',
+        !input.isNew
+          ? '[Follow-up] The parent agent sent another message to this subagent. Your earlier turns are above; answer the new message.'
           : '',
       ]
         .filter(Boolean)
@@ -388,7 +728,7 @@ export class SubagentDispatcher {
 
       const context: AgentContext = {
         sessionId,
-        provider: provider?.id ?? 'unknown',
+        provider: spec.providerId,
         model,
         cwd,
         workspaceRoot,
@@ -396,26 +736,19 @@ export class SubagentDispatcher {
         toolAllowlist: subagentTools.list().map(tool => tool.name),
         requireToolApproval: parentExecutionPolicy?.requireToolApproval,
         systemPrompt,
-        // Completion belongs to this task, not the parent's delegation receipt
-        // or larger deliverable. Keep every inherited restriction unchanged.
-        runContract: input.runContract ? {
-          ...structuredClone(input.runContract),
+        ...(input.previousMessages.length > 0 ? { previousMessages: input.previousMessages } : {}),
+        runContract: spec.runContract ? {
+          ...structuredClone(spec.runContract),
           summary: input.prompt,
-          acceptanceCriteria: [{ id: 'delegated-task', text: input.prompt }],
+          acceptanceCriteria: [],
         } : undefined,
-        primaryAgentId: input.agentId,
-        scopeTags: input.scopeTags ? [...input.scopeTags] : undefined,
+        primaryAgentId: spec.agentId,
+        scopeTags: spec.scopeTags ? [...spec.scopeTags] : undefined,
       }
 
       let lastAssistantText = ''
       let messageCount = 0
       let observedIterations = 0
-      // Reconstruct board-relevant findings from the subagent's tool activity.
-      // The isolated subagent runs a plain ReAct engine (no graph AgentState), so
-      // there is no evidence ledger to read at the end — we rebuild it here from
-      // the structured tool_call/tool_result event stream the dispatcher already
-      // observes, using the same structural classifier the graph uses. No engine
-      // accessor is added and depth-1 isolation is untouched.
       const findingsState: Pick<AgentState, 'evidenceLedger'> = {
         evidenceLedger: emptyEvidenceLedger(),
       }
@@ -427,7 +760,6 @@ export class SubagentDispatcher {
       let error: string | undefined
       let sawDone = false
       const stopOnAbort = () => {
-        // stop() may be async; an abort listener must never leak a rejection.
         void Promise.resolve()
           .then(() => engine.stop())
           .catch(() => {})
@@ -439,7 +771,7 @@ export class SubagentDispatcher {
         await this.deps.sessions.appendEvent(sessionId, {
           type: 'user_message',
           id: randomUUID(),
-          timestamp: createdAt,
+          timestamp: startedAt,
           content: input.prompt,
         })
         input.signal?.throwIfAborted()
@@ -517,10 +849,6 @@ export class SubagentDispatcher {
         error = 'subagent stream ended without completion evidence'
       }
 
-      // Surface a resumable budget/loop-control stop as `status: 'truncated'` so
-      // callers can distinguish a clean completion from a resumable stop. The
-      // structured stop reason is authoritative; the message sentinel remains a
-      // fallback for engines that predate `done.stopReason`.
       if (
         stopReason ? isTruncatedStopReason(stopReason) : isBudgetExhaustedMessage(lastAssistantText)
       ) {
@@ -542,8 +870,6 @@ export class SubagentDispatcher {
         category: category?.id ?? 'general',
       })
 
-      // Use the same journal as foreground runs so a detached client's session
-      // link contains real tool evidence, usage and a terminal state.
       if (lastAssistantText) {
         await this.deps.sessions.appendEvent(sessionId, {
           type: 'assistant_message',
@@ -558,7 +884,7 @@ export class SubagentDispatcher {
         timestamp: new Date().toISOString(),
         totalTokens: { input: totalUsage.inputTokens, output: totalUsage.outputTokens },
         totalCost: 0,
-        duration_ms: Date.now() - Date.parse(createdAt),
+        duration_ms: Date.now() - Date.parse(startedAt),
         stopReason:
           status === 'failed'
             ? {
@@ -583,11 +909,18 @@ export class SubagentDispatcher {
         await this.deps.sessions.updateMeta?.(sessionId, { status: 'abandoned' })
 
       lifecycleStatus = status
+      const retained = this.children.get(sessionId)
+      if (retained) {
+        retained.lastStatus = status
+        retained.lastOutput = lastAssistantText
+        retained.updatedAt = new Date().toISOString()
+      }
       return {
         ...(worktree ? { worktree: worktree.receipt } : {}),
         output: lastAssistantText,
         sessionId,
         category: category?.id,
+        ...(spec.budget ? { budget: spec.budget } : {}),
         iterations: observedIterations || messageCount,
         usage: totalUsage,
         truncated,
@@ -597,7 +930,15 @@ export class SubagentDispatcher {
         findings,
       }
     } finally {
-      await worktree?.finish(lifecycleStatus !== 'completed')
+      try {
+        await worktree?.finish(lifecycleStatus !== 'completed')
+        if (worktree) {
+          const retained = this.children.get(sessionId)
+          if (retained) retained.worktree = { receipt: worktree.receipt, cwd: worktree.cwd }
+        }
+      } finally {
+        this.running.delete(sessionId)
+      }
       this.deps.onRunFinished?.(sessionId, {
         preserveParked: preserveParkedApproval && !input.signal?.aborted,
       })
@@ -606,8 +947,8 @@ export class SubagentDispatcher {
       }
       await this.deps.onLifecycle?.('stopped', {
         sessionId,
-        parentSessionId: input.parentSessionId,
-        agentId: input.agentId,
+        parentSessionId: spec.parentSessionId,
+        agentId: spec.agentId,
         status: lifecycleStatus,
       })
     }

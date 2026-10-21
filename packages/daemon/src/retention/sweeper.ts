@@ -1,17 +1,3 @@
-/**
- * Retention sweeper.
- *
- * Long-lived installs previously grew every store without bound — sessions,
- * derived memory, and usage rows only ever accumulated (only resume artifacts
- * aged out). This sweeper deletes items older than the configured window. It is
- * intentionally store-agnostic: callers inject small delete functions so the
- * unit is testable with fakes and does not import the route/runtime layer.
- *
- * Session deletion MUST route through the complete-deletion path (see
- * `cleanupSessionRuntimeState`) so aged-out sessions leave no orphaned
- * usage/memory/embeddings/uploads.
- */
-
 export interface RetentionSweepConfig {
   enabled?: boolean
   sessionDays?: number
@@ -21,13 +7,9 @@ export interface RetentionSweepConfig {
 
 export interface RetentionSweepDeps {
   now?: () => Date
-  /** All known sessions with their last-activity timestamp (ISO). */
   listSessions?: () => Promise<Array<{ id: string; updatedAt: string }>>
-  /** Complete deletion for one session (cleanup + store delete). */
   deleteSession?: (id: string) => Promise<void>
-  /** Delete usage rows older than an ISO cutoff; returns rows removed. */
   deleteUsageOlderThan?: (cutoffIso: string) => number | Promise<number>
-  /** Delete memory rows older than an ISO cutoff; returns rows removed. */
   deleteMemoriesOlderThan?: (cutoffIso: string) => number | Promise<number>
   logger?: {
     warn: (message: string, data?: Record<string, unknown>) => void
@@ -46,7 +28,6 @@ function cutoffIso(now: Date, days: number): string {
   return new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString()
 }
 
-/** Whether retention sweeping is turned off (config flag or env kill-switch). */
 export function isRetentionSweepDisabled(config: RetentionSweepConfig): boolean {
   if (process.env.SEPILOTD_RETENTION_SWEEP === '0') return true
   return config.enabled === false
@@ -63,7 +44,6 @@ export async function runRetentionSweep(
   }
   const now = deps.now?.() ?? new Date()
 
-  // Sessions — complete deletion for anything past the window.
   if (config.sessionDays && deps.listSessions && deps.deleteSession) {
     const cutoff = cutoffIso(now, config.sessionDays)
     let sessions: Array<{ id: string; updatedAt: string }> = []
@@ -83,7 +63,6 @@ export async function runRetentionSweep(
     }
   }
 
-  // Memory — age out rows past the window.
   if (config.memoryDays && deps.deleteMemoriesOlderThan) {
     try {
       result.memories = await deps.deleteMemoriesOlderThan(cutoffIso(now, config.memoryDays))
@@ -92,7 +71,6 @@ export async function runRetentionSweep(
     }
   }
 
-  // Usage — age out rows past the window.
   if (config.usageDays && deps.deleteUsageOlderThan) {
     try {
       result.usage = await deps.deleteUsageOlderThan(cutoffIso(now, config.usageDays))
@@ -111,11 +89,6 @@ export async function runRetentionSweep(
   return result
 }
 
-/**
- * Start a periodic retention sweep. Returns a stop function. The timer is
- * unref'd so it never keeps the process alive on its own. A sweep already in
- * flight is not overlapped.
- */
 export function startRetentionSweeper(
   deps: RetentionSweepDeps,
   config: RetentionSweepConfig,

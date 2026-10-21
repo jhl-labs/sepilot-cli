@@ -1,6 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import type { JobsRepo } from './repo.js'
-import type { JobItem } from './types.js'
+import type { Job, JobItem } from './types.js'
 
 interface RunInput {
   jobId: string
@@ -8,7 +8,6 @@ interface RunInput {
   execute: (item: JobItem, signal: AbortSignal) => Promise<unknown>
 }
 
-/** A failed execution may still have useful, inspectable partial evidence. */
 export class JobExecutionError extends Error {
   constructor(message: string, readonly result: unknown) { super(message) }
 }
@@ -18,8 +17,8 @@ export interface JobRunner {
   runPartitioned(input: RunInput): Promise<void>
   cancel(jobId: string): void
   shutdown(): void
-  /** Includes FIFO waiters so callers cannot accidentally submit duplicates. */
   isRunning(jobId: string): boolean
+  onJobFinished(listener: (job: Job) => void): { dispose(): void }
 }
 
 interface JobControl {
@@ -147,5 +146,6 @@ export function createJobRunner(input: { repo: JobsRepo; globalMax: number }): J
     },
     run: (args) => run(args, args.failureMode, false),
     runPartitioned: (args) => run(args, 'continue', true),
+    onJobFinished: (listener) => repo.onJobFinished(listener),
   }
 }

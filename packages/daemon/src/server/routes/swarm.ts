@@ -8,22 +8,12 @@ import { resolveApiActor } from '../request-actor.js'
 import '../fastify-types.js'
 
 export interface SwarmRoutesDeps {
-  /**
-   * Resolver for the registry instance — function (not direct ref) so the
-   * route stays valid across runtime swaps and so tests can inject stubs.
-   */
   registry: () => SwarmRunRegistry | null
-  /** Resolver for the run-jsonl store; required for backfill on GET /events. */
   store: () => SwarmRunStore | null
-  /**
-   * Hook to actually start the run — at minimum calls run.start(); the real
-   * implementation (Task 20) launches the warm pool + the agent engine.
-   */
   startRun: (
     run: SwarmRun,
     opts: { warmPool: readonly string[]; autoApproveAgents: boolean; noSupervisor?: boolean },
   ) => Promise<void>
-  /** Forward keystrokes / resize to the tmux session backing one agent handle. */
   keysHandler: (
     runId: string,
     handle: string,
@@ -35,24 +25,16 @@ export interface SwarmRoutesDeps {
       principal?: string
     },
   ) => Promise<void>
-  /** Capture the current cleaned tmux pane contents for one agent handle. */
   captureHandler: (
     runId: string,
     handle: string,
     options?: { lines?: number; raw?: boolean },
   ) => Promise<string>
-  /** Drive one agent through send/wait/observe turns. */
   driveHandler: (
     runId: string,
     handle: string,
     input: Omit<SwarmDriveInput, 'agent_handle'>,
   ) => Promise<SwarmDriveResult>
-  /**
-   * Stop all warm-pool tmux sessions for the named run, immediately.
-   * Called by DELETE so cancel doesn't leave agents running for minutes
-   * after the user asked to stop. The startSwarmRun's finally block will
-   * still run (no-op for already-stopped agents).
-   */
   killRunAgents: (runId: string) => Promise<void>
 }
 
@@ -99,17 +81,6 @@ function leaseConflictReply(reply: FastifyReply, owner: string) {
   })
 }
 
-/**
- * HTTP surface for the swarm CLI orchestrator.
- *
- * - `POST /api/v1/swarm/runs`            — create + start a run
- * - `GET  /api/v1/swarm/runs`            — list (optional ?status=)
- * - `GET  /api/v1/swarm/runs/:id`        — snapshot for one run
- * - `DELETE /api/v1/swarm/runs/:id`      — cancel + deregister
- * - `GET  /api/v1/swarm/runs/:id/events` — JSONL backfill or SSE stream
- * - `POST /api/v1/swarm/runs/:id/agents/:handle/keys` — send keys / resize
- * - `GET /api/v1/swarm/runs/:id/agents/:handle/capture` — current pane text
- */
 export function registerSwarmRoutes(
   app: FastifyInstance,
   deps: SwarmRoutesDeps,
@@ -167,7 +138,6 @@ export function registerSwarmRoutes(
       const { limit: rawLimit } = request.query
       const limit = Math.max(1, Math.min(200, Number(rawLimit ?? 50) || 50))
       const runs = await store.listHistory(limit)
-      // Newest first.
       runs.sort((a, b) => (b.endedAt ?? b.createdAt) - (a.endedAt ?? a.createdAt))
       return reply.send(runs)
     },
@@ -179,7 +149,6 @@ export function registerSwarmRoutes(
       const params = request.params
       const run = deps.registry()?.get(params.id)
       if (run) return reply.send(run.snapshot())
-      // Fallback: reconstruct from jsonl for completed runs.
       const store = deps.store()
       if (store) {
         const reconstructed = await store.reconstruct(params.id)
@@ -198,9 +167,7 @@ export function registerSwarmRoutes(
       if (!run || !registry) {
         return reply.status(404).send({ error: { code: 'NOT_FOUND' } })
       }
-      // Tear down tmux sessions FIRST so the engine's next swarm.* tool call
-      // fails fast (instead of letting it loop for minutes after cancel).
-      try { await deps.killRunAgents(params.id) } catch { /* best-effort */ }
+      try { await deps.killRunAgents(params.id) } catch {}
       run.finish('cancelled')
       registry.deregister(params.id)
       return reply.send({ status: 'cancelled' })
@@ -258,7 +225,6 @@ export function registerSwarmRoutes(
         try {
           reply.raw.end()
         } catch {
-          /* ignore */
         }
       })
       return reply

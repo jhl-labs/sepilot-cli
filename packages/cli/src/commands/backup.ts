@@ -89,7 +89,6 @@ export async function backupCommand(options: { output?: string }) {
   const outputPath = options.output ?? join(homedir(), `sepilotd-backup-${timestamp}.tar.gz`)
 
   try {
-    // Check the filesystem directly; BSD tar omits errno details for bad outputs.
     const parent = await stat(dirname(outputPath))
     if (!parent.isDirectory()) throw Object.assign(new Error('Output parent is not a directory'), { code: 'ENOTDIR' })
     const target = await stat(outputPath).catch((error: NodeJS.ErrnoException) => {
@@ -117,20 +116,11 @@ export async function backupCommand(options: { output?: string }) {
   }
 }
 
-/**
- * Translate the multi-line tar error spew into a single user-facing
- * sentence. The raw stderr from `tar` is locale-dependent (Korean
- * '허가 거부' on this host) and dumps four lines per failure, which
- * looked like a stack trace to operators.
- */
 function friendlyTarError(
   err: unknown,
   outputPath: string,
   copy: BackupCopy = BACKUP_COPY.en,
 ): string {
-  // execFile failures stash the actual diagnostic in `stderr`; the
-  // top-level message is just `Command failed: tar ...`. Combine
-  // both so we can match locale-specific tar output.
   const code = (err as NodeJS.ErrnoException).code
   if (code === 'ENOENT' || code === 'ENOTDIR') return copy.parentMissing(outputPath)
   const raw = errorMessage(err)
@@ -155,8 +145,6 @@ function friendlyTarError(
   if (/invalid compressed data|gzip|not in gzip format/i.test(combined)) {
     return copy.notGzipArchive(outputPath)
   }
-  // Last-resort: keep just the first stderr line (or message line)
-  // so we don't bury the user under five lines of tar diagnostics.
   const firstStderrLine = stderrText.split('\n').find((line) => line.trim().length > 0)
   return firstStderrLine ?? raw.split('\n')[0] ?? raw
 }
@@ -181,9 +169,6 @@ export async function restoreCommand(
   }
 
   if (!options.yes && getOutputFormat() !== 'json') {
-    // Refuse to proceed without an explicit confirmation. The legacy
-    // 3-2-1 countdown could overwrite ~/.sepilotd if a user couldn't
-    // hit Ctrl+C in time. A real y/n prompt requires intent.
     if (!process.stdin.isTTY) {
       console.error(chalk.red(copy.refusingOverwrite(tildify(dataDir))))
       console.error(chalk.gray(copy.passYesHint))

@@ -5,18 +5,6 @@ import { buildFileToolPosture, type FileToolPostureOptions } from './file-tool-p
 import { resolveToolPath } from './path-utils.js'
 import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
 
-/**
- * Moving a file had no direct expression: the fs kit could read, write, append
- * and edit, so "organise these files into folders" became write-the-content-
- * again plus an apply_patch delete for every file — 29 tool calls for seven
- * files in a captured run, and a rewrite loop when the model lost track of what
- * it had already copied.
- *
- * This adds no authority. apply_patch and terminal.run can already move and
- * delete; this states the intent directly so the policy layer sees one
- * operation with both of its paths, and the model does not have to reconstruct
- * file contents to relocate them.
- */
 export function createFsMoveTool(postureOptions?: FileToolPostureOptions): ToolDefinitionRuntime {
   return {
     name: 'fs.move',
@@ -40,7 +28,6 @@ export function createFsMoveTool(postureOptions?: FileToolPostureOptions): ToolD
       const to = typeof input.to === 'string' ? resolveToolPath(input.to, context.cwd) : ''
       if (!from || !to) return null
 
-      // A completed move leaves the destination present and the source gone.
       try {
         await stat(to)
       } catch {
@@ -106,7 +93,6 @@ export function createFsMoveTool(postureOptions?: FileToolPostureOptions): ToolD
             code: 'EEXIST_PERMANENT',
           }
         } catch {
-          // Destination is free — proceed.
         }
       }
 

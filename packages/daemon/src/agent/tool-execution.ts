@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { hasWorkspaceExecutionTool } from './workspace-execution.js'
 import { realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, relative, resolve } from 'node:path'
 import { AutonomyLevel } from '@sepilotd/core'
@@ -62,10 +63,6 @@ import {
   TOOL_RESULT_SECURITY_EFFECT_METADATA_KEY,
 } from './policy-failure.js'
 
-// cloneToolCall and cloneMessage are part of this module's public API
-// (engine.ts and mode-router.ts both import them from './tool-execution.js').
-// Keep that import path stable while their definitions live with the other
-// pure helpers.
 export { cloneMessage, cloneToolCall }
 import { summarizeToolOutputForAgentContext } from './tool-output.js'
 import { partitionToolCallsBySequence } from './tool-call-budget.js'
@@ -85,6 +82,7 @@ const MAX_CLIENT_IMAGE_PARTS = 1
 const MAX_CLIENT_IMAGE_BASE64_CHARS = 8 * 1024 * 1024
 
 const DEFAULT_TOOL_TIMEOUT_MS = 120_000
+const CHILD_LIVENESS_EVENT_TYPES = new Set(['llm_request', 'tool_call', 'tool_result', 'message', 'action_progress', 'reasoning_step', 'thinking'])
 
 function contentPartsFromToolResult(result: Pick<ToolResult, 'contentParts' | 'images'>): ContentPart[] | undefined {
   const imageParts = (result.images ?? []).map((image): ContentPart => ({
@@ -102,11 +100,6 @@ function contentPartsFromToolResult(result: Pick<ToolResult, 'contentParts' | 'i
   return contentParts.length > 0 ? contentParts : undefined
 }
 
-/**
- * Keep client-visible images opt-in and bounded. Tool images normally exist
- * only for the next model turn; broadcasting every computer screenshot would
- * unnecessarily widen their audience and inflate renderer memory.
- */
 function clientContentPartsFromToolResult(
   result: Pick<ToolResult, 'images'>,
 ): ContentPart[] | undefined {
@@ -129,13 +122,6 @@ function clientContentPartsFromToolResult(
   return parts.length > 0 ? parts : undefined
 }
 
-/**
- * Per-tool wall-clock timeout (ms). A tool that ignores its abort signal and
- * hangs would otherwise suspend the agent generator forever and leak a pending
- * promise for the daemon's lifetime. `0`/negative disables the backstop. Tools
- * with their own (usually shorter) timeout still win because they resolve
- * first. Configurable via SEPILOTD_TOOL_TIMEOUT_MS.
- */
 function resolveToolTimeoutMs(): number {
   const raw = Number(process.env.SEPILOTD_TOOL_TIMEOUT_MS)
   if (Number.isFinite(raw)) {
@@ -144,8 +130,6 @@ function resolveToolTimeoutMs(): number {
   return DEFAULT_TOOL_TIMEOUT_MS
 }
 
-// Chat-role labels that show up as a bogus tool-call `name` when a model's
-// turn/channel format leaks into its tool-calling output.
 const CHAT_ROLE_TOOL_NAMES = new Set([
   'assistant',
   'user',
@@ -233,13 +217,6 @@ function messageText(message: Message): string {
 
 const APPROVAL_CONTEXT_MAX_CHARS = 240
 
-/**
- * Tail of the current assistant turn's text, attached to
- * `approval_request` events so approval surfaces can show *why* the agent
- * wants to run the tool. Pure display-side truncation of text the model
- * already produced (no extra LLM call, no parsing); returns undefined when
- * the tool-call turn carried no prose.
- */
 export function buildApprovalContext(messages: Message[]): string | undefined {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]!
@@ -329,7 +306,6 @@ async function misplacedRequestedArtifactWrite(
       ])
       if (actual === expected && (requestedIsAbsolute || isWithinDirectory(actual, root))) continue
     } catch {
-      // An inaccessible or cyclic path cannot establish target identity.
     }
     return { requestedPath, expectedPath, actualPath }
   }
@@ -614,13 +590,6 @@ function canonicalProcessLifetime(
   }
 }
 
-/**
- * Compare the effective process.start contract rather than raw JSON shape.
- * Optional schema defaults (active cwd, bounded lifetime/default TTL, and
- * network=none) are semantically identical whether a provider emits them or
- * omits them. Command argv and every user-specified option remain exact, and
- * undeclared environment/PTY authority stays forbidden.
- */
 function processStartMatchesConstraint(
   expected: AgentRequestedProcessStart,
   actual: Record<string, unknown>,
@@ -751,9 +720,6 @@ function executionIntentMutationViolation(
   })
   if (requestIsReadOnly) return null
 
-  // A workspace boundary is not a ban on explicitly requested application
-  // state changes. Use the registry's effect contract, never prompt wording or
-  // tool-name families. Normal security policy and approval still run below.
   if (
     intent.kind !== 'inspection'
     && intent.kind !== 'conversation'
@@ -779,6 +745,24 @@ function executionIntentMutationViolation(
     return `side-effecting capability ${toolCall.name} is outside the read-only execution intent: durable application-state changes require an appropriate operational capability; workspace file permission is a separate boundary`
   }
   return `side-effecting capability ${toolCall.name} is outside the read-only execution intent`
+}
+
+export function toolRejectedByExecutionIntentForEveryInput(
+  runContract: AgentRunContract | undefined,
+  toolName: string,
+  tools: ToolRegistry,
+): boolean {
+  const intent = runContract?.executionIntent
+  if (!intent || intent.workspaceMutation !== 'forbidden') return false
+  if (intent.toolSequence?.length || intent.requestedTerminalCommand
+    || intent.requestedProcessStart || intent.constrainedProcessStart) return false
+  if (tools.securityDescriptor(toolName).effect === 'dynamic') return false
+  return executionIntentMutationViolation(
+    runContract,
+    { id: 'intent-probe', name: toolName, arguments: {} },
+    tools,
+    [],
+  ) !== null
 }
 
 function noTouchPagesScaffoldMutationViolation(
@@ -1098,10 +1082,6 @@ function sanitizeArtifactContentForUnsupportedPathClaims(
     return null
   }
 
-  // Return the cleaned artifact body only. The removal bookkeeping ("Coverage
-  // Gaps / Removed Unsupported Path Claims ...") must not be injected into the
-  // user-facing deliverable — it polluted produced docs (CLI_BACKLOG.md C4).
-  // removedLineCount is still returned for the caller's telemetry/logging.
   void unsupported
   return {
     content: sanitized,
@@ -1115,10 +1095,6 @@ const OBSERVED_REPOSITORY_PATH_LINE_PATTERN =
   /\b(?:as[- ]is|existing|observed|verified|actual|implemented|present|today|already)\b|\bcurrently\b[^.;:\n]{0,80}\b(?:exists?|is|contains?|uses?|located|implemented)\b|(?:기존|현행|관찰(?:된|한)|확인(?:된|한)|검증(?:된|한)|실제|구현(?:된|되어)|이미\s*(?:존재|있는)|현재[^.;:\n]{0,60}(?:존재|있는|사용|위치|구현(?:된|되어)))/iu
 
 function lineClaimsObservedRepositoryState(line: string): boolean {
-  // Explicit target-state language wins over incidental temporal words such
-  // as "currently planned" or "현재 단계에서 계획한". A path in such a line
-  // specifies work that does not exist yet; it is not an as-is repository
-  // claim. Explicit observed/existing language remains evidence-gated.
   if (PROSPECTIVE_REPOSITORY_PATH_LINE_PATTERN.test(line)) {
     return false
   }
@@ -1291,13 +1267,6 @@ function messagesInCurrentAgentTurn(messages: Message[]): Message[] {
   return currentTurnStart >= 0 ? messages.slice(currentTurnStart) : []
 }
 
-/**
- * Reuse only the immediately preceding successful, byte-for-byte equivalent
- * workspace observation. Any intervening tool result is an invalidation
- * boundary, so edits, commands, and even a different read force a fresh
- * observation. This bounds repeated-read loops without turning the agent
- * context into a stale filesystem cache.
- */
 function reusableAdjacentObservation(
   messages: Message[],
   toolCall: ToolCall,
@@ -1316,25 +1285,13 @@ function reusableAdjacentObservation(
     ) {
       return messageText(message)
     }
-    return null
+    if (!message.name || !CACHEABLE_ADJACENT_OBSERVATION_TOOLS.has(message.name)) return null
   }
   return null
 }
 
 export interface ApprovalCallbackOptions {
-  /** Bypass remembered/automatic decisions and open a fresh human prompt. */
   forcePrompt?: boolean
-  /**
-   * Abort signal for the run that is waiting.
-   *
-   * Only the client that opened the prompt can answer it, so when that client
-   * goes away the wait can never finish on its own — it parks until the
-   * approval times out, holding the session lease the whole time. Nobody can
-   * re-approve (`/approvals/resume` answers BUSY) and no new turn can start.
-   * Aborting the wait unwinds the run and frees the session; the pending
-   * request and its checkpoint stay behind so the approval can still be
-   * answered afterwards.
-   */
   signal?: AbortSignal
 }
 
@@ -1369,7 +1326,6 @@ interface ToolExecutionCallbacks {
 }
 
 export interface ToolExecutionOptions extends ToolExecutionCallbacks {
-  /** Trusted mode-controller ceiling, never model arguments. Absent means visible registry only. */
   delegationToolNames?: readonly string[]
   messages: Message[]
   toolCalls: ToolCall[]
@@ -1396,20 +1352,11 @@ export interface ToolExecutionOptions extends ToolExecutionCallbacks {
   pluginEvents?: import('../plugins/event-bus.js').PluginEventBus
   cwd?: string
   workspaceRoot?: string
-  /** Desktop writing-canvas doc id forwarded into doc.* tools for this turn. */
   writingDocId?: string
-  /** Caller scope tags forwarded into ToolExecutionContext for scope-aware tools. */
   scopeTags?: string[]
-  /** Originating channel context forwarded into ToolExecutionContext for channel-aware tools. */
   channelContext?: import('../tools/registry.js').ToolExecutionContext['channelContext']
-  /** Durable run contract for this turn; used for invariant checks shared across graphs. */
   runContract?: AgentRunContract
-  /** Whether tool-produced visual content can be attached to the next model turn. */
   canAttachVisualContent?: boolean
-  /**
-   * Appends directory-scoped AGENTS.md/CLAUDE.md below cwd to the first tool
-   * result touching that directory. `null` disables the injection.
-   */
   nestedInstructions?: NestedInstructionInjector | null
 }
 
@@ -1494,7 +1441,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     }
     messages.push({
       role: 'tool',
-      content: summarizeToolOutputForAgentContext(toolCall.name, output),
+      content: summarizeToolOutputForAgentContext(toolCall.name, output, toolCall.id),
       toolCallId: toolCall.id,
       name: toolCall.name,
       metadata: trustedMetadata,
@@ -1588,7 +1535,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       saveRecoveryResult?: boolean
       recoverySource?: 'journal' | 'probe'
       startedAt?: string
-      /** Sink for nested events (e.g. subagent_progress) the tool emits. */
       onProgress?: (event: AgentEvent) => void
     },
   ): Promise<ToolResult> => {
@@ -1612,12 +1558,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       }
     }
     if (preHook.modifiedArguments) {
-      // TOCTOU guard: policy.check and the approval prompt above ran against the
-      // *pre-rewrite* arguments. A `pre:tool:execute` hook that rewrites the
-      // arguments (e.g. path `/tmp/x` -> `/etc/passwd`) must not slip past that
-      // gate. Re-validate the rewritten arguments and fail closed when they land
-      // on a policy-denied or approval-required form — the granted consent was
-      // for the original arguments, not these.
       const rewritten = preHook.modifiedArguments
       const changed = JSON.stringify(rewritten) !== JSON.stringify(toolCall.arguments)
       if (changed) {
@@ -1695,8 +1635,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     })
 
     let result: ToolResult
-    // Link a per-tool AbortController to the run signal so the timeout can
-    // cancel just this tool (best effort) without aborting the whole turn.
     const toolController = new AbortController()
     const onRunAbort = () => toolController.abort()
     if (signal) {
@@ -1711,8 +1649,10 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     let armedAt = 0
     let executionFinished = false
     const pendingChildApprovals = new Map<string, string>()
+    const pendingChildCalls = new Set<string>()
+    const isPaused = () => pendingChildApprovals.size > 0 || pendingChildCalls.size > 0
     const armTimeout = () => {
-      if (executionFinished || timeoutMs <= 0 || pendingChildApprovals.size || !rejectTimeout || timedOut) return
+      if (executionFinished || timeoutMs <= 0 || isPaused() || !rejectTimeout || timedOut) return
       armedAt = Date.now()
       timeoutHandle = setTimeout(() => {
         timedOut = true
@@ -1720,21 +1660,33 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
         rejectTimeout?.(new Error(`Tool ${toolCall.name} timed out after ${timeoutMs}ms`))
       }, Math.max(0, remainingMs))
     }
+    const inactivityBudget = tool.timeoutPolicy === 'inactivity'
     const onProgress = (event: AgentEvent) => {
       if (executionFinished) return
-      // Human consent is not tool execution time. Pause the remaining budget,
-      // not reset it; sibling activity and replay cannot buy more execution.
       if (event.type === 'subagent_progress') {
-        const wasPaused = pendingChildApprovals.size > 0
+        const wasPaused = isPaused()
         const inner = event.inner
         if (inner.type === 'approval_request') pendingChildApprovals.set(event.subagentId, inner.requestId)
         else if ((inner.type === 'approval_response' && pendingChildApprovals.get(event.subagentId) === inner.requestId)
           || inner.type === 'tool_call' || inner.type === 'tool_result') pendingChildApprovals.delete(event.subagentId)
-        if (!wasPaused && pendingChildApprovals.size && timeoutHandle) {
+        if (inactivityBudget) {
+          if (inner.type === 'llm_request') pendingChildCalls.add(event.subagentId)
+          else if (CHILD_LIVENESS_EVENT_TYPES.has(inner.type) || inner.type === 'error') pendingChildCalls.delete(event.subagentId)
+        }
+        const nowPaused = isPaused()
+        if (!wasPaused && nowPaused && timeoutHandle) {
           remainingMs -= Date.now() - armedAt
           clearTimeout(timeoutHandle)
           timeoutHandle = undefined
-        } else if (wasPaused && !pendingChildApprovals.size) armTimeout()
+        } else if (wasPaused && !nowPaused) {
+          if (inactivityBudget) remainingMs = timeoutMs
+          armTimeout()
+        } else if (inactivityBudget && !nowPaused && timeoutHandle && CHILD_LIVENESS_EVENT_TYPES.has(inner.type)) {
+          remainingMs = timeoutMs
+          clearTimeout(timeoutHandle)
+          timeoutHandle = undefined
+          armTimeout()
+        }
       }
       options?.onProgress?.(event)
     }
@@ -1744,6 +1696,9 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
         executionId,
         sessionId,
         startedAt,
+        autonomy,
+        provider,
+        model,
         cwd,
         workspaceRoot,
         writingDocId,
@@ -1761,8 +1716,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
         ...(options?.onProgress ? { emitEvent: onProgress } : {}),
       })
       if (timeoutMs > 0) {
-        // If the tool hangs, a late rejection would surface as an unhandled
-        // rejection once the race has already moved on — swallow it here.
         const guarded = executePromise.catch(() => undefined)
         result = await Promise.race([
           executePromise,
@@ -1776,14 +1729,9 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
         result = await executePromise
       }
     } catch (error) {
-      // Only a genuine run-level abort should propagate and end the turn.
       if (!timedOut && signal?.aborted) {
         throw getAbortError(signal, `Tool ${toolCall.name} aborted`)
       }
-      // Any other throw (including a per-tool timeout) is isolated into an
-      // error result so sibling tool calls keep their results and the
-      // assistant tool_call is not orphaned into a hard provider error next
-      // turn.
       const message = error instanceof Error ? error.message : String(error)
       result = timedOut
         ? {
@@ -1804,9 +1752,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       signal?.removeEventListener('abort', onRunAbort)
     }
 
-    // Capture the registry-owned effect after the executor boundary. Tool
-    // metadata is untrusted input, so overwrite this daemon-owned field rather
-    // than allowing a plugin result to self-classify as observational.
     result = {
       ...result,
       metadata: {
@@ -1897,10 +1842,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
 
     if (result.status === 'error' && typeof result.metadata?.userActionRequired === 'string' && result.metadata.userActionRequired.trim()) userActionRequired = true
 
-    // Surface subdirectory instruction files with the first result that
-    // touches their directory, so the model never has to probe for them.
-    // Appended after persistence/stats so the stored execution keeps the raw
-    // tool output.
     const instructionTarget = nestedInstructions && cwd
       ? nestedInstructionTargetPath(
           toolCall.name,
@@ -1980,17 +1921,8 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     })
   }
 
-  // A completed result and the advanced startIndex are checkpointed together.
-  // Rebuild failure coupling from those trusted, execution-observed messages
-  // so a daemon restart between siblings does not replay a deterministic
-  // template failure that the interrupted run had already observed.
   for (let priorIndex = 0; priorIndex < Math.min(startIndex, toolCalls.length); priorIndex += 1) {
     const priorCall = toolCalls[priorIndex]!
-    // The executed call's stored signature was computed after normalizeInput
-    // canonicalized its arguments (e.g. terminal.run injects the resolved cwd
-    // when the directory exists). A resumed batch receives the pristine prior
-    // call, so it must be canonicalized the same way before comparing — a raw
-    // signature silently fails to match and drops the failure coupling.
     const priorTool = tools.get(priorCall.name)
     const normalizedPriorArguments = priorTool?.normalizeInput
       ? await priorTool.normalizeInput(priorCall.arguments, { cwd, workspaceRoot })
@@ -2026,8 +1958,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     output: string,
     extras: Record<string, unknown>,
   ): AsyncGenerator<AgentEvent> {
-    // A denied attempt is still part of the audit trail, even when an early
-    // semantic/path guard runs before normal policy/execution instrumentation.
     if (emitToolCallOnStart) yield* emitToolCall(toolCall)
     toolStats?.record(sessionId, toolCall.name, {
       status: 'error',
@@ -2143,9 +2073,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
         await advanceRunCheckpoint(index + 1)
         continue
       }
-      // Hook reports recovery:'journal' (we read this off disk),
-      // event surfaces the journaled record's own recovery tag so
-      // consumers see when the original run was probe-recovered.
       yield* yieldToolSuccessOrRecovery(
         toolCall,
         {
@@ -2274,10 +2201,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
           toolCallEventEmitted = true
         }
       }
-      // Some models (notably gpt-oss harmony output via Ollama) occasionally
-      // emit a tool call whose `name` is a chat-role label ("assistant",
-      // "user", ...) while the arguments are perfectly valid for a real tool.
-      // Give the model an actionable hint instead of a bare "Unknown tool".
       const looksLikeChatRoleName = CHAT_ROLE_TOOL_NAMES.has(toolCall.name.trim().toLowerCase())
       const output = looksLikeChatRoleName
         ? `Tool name "${toolCall.name}" is not valid — it looks like a chat-role label, not a registered tool. Re-emit the tool call with the actual tool name (e.g. fs.glob, terminal.run, fs.read), keeping the same arguments.`
@@ -2521,7 +2444,14 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     }
     if (!policyResult.allowed) {
       const output = `Tool ${toolCall.name} blocked: ${policyResult.reason}`
-      yield* yieldToolError(toolCall, output, { source: 'policy', reason: policyResult.reason })
+      const executionUnavailable = policyResult.code === 'workspace_confinement_required'
+        && Boolean(workspaceRoot)
+        && !hasWorkspaceExecutionTool(tools, { cwd, workspaceRoot })
+      if (executionUnavailable) userActionRequired = true
+      yield* yieldToolError(toolCall, output, {
+        source: 'policy', reason: policyResult.reason,
+        ...(executionUnavailable ? { userActionRequiredCode: 'workspace_execution_unavailable' } : {}),
+      })
       await advanceRunCheckpoint(index + 1)
       continue
     }
@@ -2609,9 +2539,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
             }),
           )
         }
-        // `supervised` rules already run directly under Autonomous. Explicit
-        // `ask` rules and raw shell wrappers can pause only when an interactive
-        // approval callback exists; unattended runs fail closed here.
         const reason = [
           `Tool ${toolCall.name} requires human approval (policy rule 'ask' or shell wrapper)`,
           'and this run is autonomous, so it was not executed.',
@@ -2632,11 +2559,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       (autonomy !== AutonomyLevel.Autonomous || freshApprovalRequired || Boolean(approvalCallback))
     ) {
       const strictPoisoning = process.env.SEPILOTD_STRICT_DENIAL_POISONING === '1'
-      // Exact semantic replays are blocked above. A denial of one fs.write or
-      // terminal.run invocation must not poison every materially different
-      // call that happens to share the same tool name; that made user feedback
-      // unrecoverable and caused repeated "already denied" loops. Operators
-      // that need turn-wide fail-stop semantics can opt into strict poisoning.
       if (strictPoisoning && hasDeniedApprovalInHistory(messages)) {
         const output = [
           `[approval:denied] Tool ${toolCall.name} blocked: an approval for ${toolCall.name} was already denied in the current turn.`,
@@ -2664,21 +2586,11 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
           forcePrompt: freshApprovalRequired,
           signal,
         })
-        // ApprovalCallback returns ApprovalDecision synchronously when a
-        // remembered session/always rule short-circuits the prompt, and
-        // a Promise otherwise. Discriminating up front lets us emit
-        // `auto_approval` instead of `approval_request` for the
-        // short-circuit path — operators see a positive signal that the
-        // tool ran because of a prior decision, not because the daemon
-        // silently skipped consent.
         if (approvalDecisionResult instanceof Promise) {
           const { describeRuleFor } = await import('../server/runtime/approval-rules.js')
           const suggestedRule = describeRuleFor(toolCall.name, toolCall.arguments)
           const { buildApprovalPreviewDiff } = await import('../tools/edit-diff.js')
           const previewDiff = await buildApprovalPreviewDiff(toolCall, cwd, {
-            // The preview reads the target file before consent; honor the
-            // operator's fs.read deny rules so a write-approval prompt
-            // cannot leak content that direct reads are denied.
             canReadPath: (path) =>
               policy.check(
                 {
@@ -2752,9 +2664,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       }
     }
 
-    // Approval may remain open for minutes. Re-resolve the canonical root and
-    // target after the user responds so a symlink/junction swap cannot turn a
-    // previously reviewed in-workspace action into an outside access.
     const executionPolicy = checkToolPolicyNow(toolCall)
     if (!executionPolicy.allowed) {
       const reason = executionPolicy.reason ?? 'current workspace policy denied execution'
@@ -2792,10 +2701,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       }
       toolCallEventEmitted = true
 
-      // allSettled (not all): one tool that still throws — e.g. a run-abort
-      // propagating from executeTool, or a logging/hook failure — must not
-      // discard the successful siblings' results, which would orphan their
-      // matching assistant tool_calls and hard-error the next turn.
       const parallelExecutionStarted = new Set<string>()
       const settled = yield* streamToolProgress(emit => Promise.allSettled(
         parallelBatch.map(async ({ toolCall: currentToolCall, tool: currentTool }) => {

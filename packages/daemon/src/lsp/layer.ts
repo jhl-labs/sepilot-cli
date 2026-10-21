@@ -7,16 +7,7 @@ export interface LspLayerOptions {
   servers?: readonly LspServerSpec[]
   which?: (bin: string) => Promise<string | null>
   enabled?: boolean
-  /**
-   * Maximum number of crash-and-respawn cycles before the layer marks
-   * a language permanently disabled for the rest of the session.
-   * Default 3.
-   */
   maxRestartsPerLanguage?: number
-  /**
-   * Minimum gap (ms) between consecutive starts for the same language.
-   * Prevents tight crash-loops from burning CPU. Default 5000.
-   */
   minRestartIntervalMs?: number
 }
 
@@ -61,8 +52,6 @@ class LazyLspLayer implements LspLayer {
 
     const cached = this.clients.get(language)
     if (cached?.isRunning()) return cached
-    // Stale handle (server died) — drop it; we'll respawn below if
-    // policy allows.
     if (cached && !cached.isRunning()) {
       this.clients.delete(language)
     }
@@ -70,9 +59,6 @@ class LazyLspLayer implements LspLayer {
     const spec = this.specs.find((s) => s.language === language)
     if (!spec) return null
 
-    // Crash-loop guard: refuse to start if the previous start was very
-    // recent. Returning null lets the caller fall back gracefully (e.g.
-    // postEditAnalysis falls through to the ripgrep heuristic).
     const now = Date.now()
     if (state && now - state.lastStartAt < this.minRestartIntervalMs) {
       return null
@@ -111,13 +97,9 @@ class LazyLspLayer implements LspLayer {
       try {
         client.stop()
       } catch {
-        // Ignore shutdown errors — best-effort cleanup.
       }
     }
     this.clients.clear()
-    // Operator-driven shutdown — clear restart bookkeeping so a
-    // subsequent get() can respawn freely without tripping the
-    // crash-loop guard.
     this.languageState.clear()
   }
 

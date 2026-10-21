@@ -68,7 +68,6 @@ interface InlineStatusPanelsProps {
   plannerWorkingMemory?: PlannerWorkingMemory | null
   showPlannerPanel?: boolean
   plannerPanelHeight?: number
-  /** Live todo items from the `state_board` stream frame (shown while a run is active). */
   stateBoardTodos?: TodoProgressItem[] | null
   editRollbacks?: EditCheckpointSummary[]
   showEditRollbackPanel?: boolean

@@ -9,6 +9,7 @@ import {
   type OpenApiOverrideMap,
 } from '../openapi.js'
 import { fastifySchemaFromZod } from './utils.js'
+import { resolveRequestedAutonomy } from '../../security/autonomy.js'
 
 const agentBodySchema = z.object({
   agentId: z.string().min(1),
@@ -66,11 +67,6 @@ export async function sessionAgentRoutes(app: FastifyInstance) {
     }
     const { id } = request.params
     const { agentId } = request.body
-    // Reject case/whitespace variants of reserved agent ids: the policy
-    // engine plan-mode block matches the normalized id, so storing 'Plan'
-    // or 'plan ' would leave a session looking like plan mode while a
-    // surface that does an exact compare disagrees. Exact reserved ids and
-    // arbitrary custom-agent ids pass through unchanged.
     const normalizedAgentId = agentId.trim().toLowerCase()
     if (RESERVED_AGENT_IDS.has(normalizedAgentId) && !RESERVED_AGENT_IDS.has(agentId)) {
       return reply.status(400).send({
@@ -92,5 +88,26 @@ export async function sessionAgentRoutes(app: FastifyInstance) {
         primaryAgentId: agentId,
       },
     })
+  })
+}
+
+const privilegeBodySchema = z.object({
+  level: z.enum(['readonly', 'accept-edits', 'workspace-write', 'supervised', 'autonomous']),
+})
+type PrivilegeBody = z.input<typeof privilegeBodySchema>
+
+export async function sessionPrivilegeRoutes(app: FastifyInstance) {
+  app.post<{ Params: SessionParams; Body: PrivilegeBody }>('/sessions/:id/privilege', {
+    schema: fastifySchemaFromZod({ params: sessionParamsSchema, body: privilegeBodySchema }),
+  }, async (request, reply) => {
+    const runtime = app.runtime
+    if (!runtime) {
+      return reply.status(503).send({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Runtime not initialized' } })
+    }
+    const params = request.params
+    const body = request.body
+    const resolution = resolveRequestedAutonomy(runtime.autonomy, body.level)
+    const applied = runtime.activeRuns?.setPrivilege(params.id, resolution.effective) ?? false
+    return reply.send({ data: { sessionId: params.id, level: resolution.effective, applied } })
   })
 }

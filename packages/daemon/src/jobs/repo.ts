@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { SqliteDatabase } from '../db/sqlite.js'
 import { openDomainDb } from '../storage/domain-db.js'
+import { createLogger } from '../logger.js'
 import type {
   ItemStatus,
   Job,
@@ -177,11 +178,42 @@ export interface JobsRepo {
   updateStatus(id: string, status: JobStatus, error?: string | null): void
   markInProgressFailed(): number
   listInProgress(): Job[]
+  onJobFinished(listener: (job: Job) => void): { dispose(): void }
+}
+
+const jobsRepoLog = createLogger('jobs.repo')
+
+const TERMINAL_JOB_STATUSES: ReadonlySet<JobStatus> = new Set(['completed', 'failed', 'canceled'])
+
+const finishedListeners = new Set<(job: Job) => void>()
+
+function notifyFinished(job: Job): void {
+  if (finishedListeners.size === 0) return
+  for (const listener of finishedListeners) {
+    try {
+      listener(job)
+    } catch (error) {
+      jobsRepoLog.error('onJobFinished listener threw', {
+        jobId: job.id,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+}
+
+export function onJobFinished(listener: (job: Job) => void): { dispose(): void } {
+  finishedListeners.add(listener)
+  return { dispose: () => { finishedListeners.delete(listener) } }
+}
+
+export function clearJobFinishedListenersForTests(): void {
+  finishedListeners.clear()
 }
 
 export function createJobsRepo(): JobsRepo {
   const db = openDomainDb({ name: 'jobs' })
   ensureSchema(db)
+
   const createJob = ({
     kind,
     total,
@@ -360,7 +392,6 @@ export function createJobsRepo(): JobsRepo {
       return row ? toItem(row) : null
     },
     completeItem(jobId, idx, payload) {
-      // Terminal item states are immutable, including late results after cancel.
       const current = db.prepare('SELECT status FROM job_items WHERE job_id=? AND idx=?').get(jobId, idx) as { status: ItemStatus } | undefined
       if (!current || !['queued', 'running'].includes(current.status)) return
       const now = Date.now()
@@ -407,6 +438,7 @@ export function createJobsRepo(): JobsRepo {
         jobId,
       )
       const row = db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId) as JobRow | undefined
+      if (row && TERMINAL_JOB_STATUSES.has(row.status)) notifyFinished(toJob(row))
       return row ? toJob(row) : null
     },
     requeueInterruptedPartitioned(kind) {
@@ -489,36 +521,58 @@ export function createJobsRepo(): JobsRepo {
       }
     },
     updateStatus(id, status, error = null) {
+      const isEnd = TERMINAL_JOB_STATUSES.has(status)
+      const wasTerminal = isEnd && finishedListeners.size > 0
+        ? TERMINAL_JOB_STATUSES.has(
+            (db.prepare('SELECT status FROM jobs WHERE id=?').get(id) as { status: JobStatus } | undefined)?.status as JobStatus,
+          )
+        : true
       const now = Date.now()
       const isStart = status === 'running'
-      const isEnd = status === 'completed' || status === 'failed' || status === 'canceled'
       db.prepare(
         `UPDATE jobs SET status=?,
           started_at=COALESCE(started_at, CASE WHEN ? THEN ? END),
           finished_at=CASE WHEN ? THEN ? ELSE finished_at END,
           error=? WHERE id=?`,
       ).run(status, isStart ? 1 : 0, now, isEnd ? 1 : 0, now, error, id)
+      if (isEnd && !wasTerminal) {
+        const row = db.prepare('SELECT * FROM jobs WHERE id=?').get(id) as JobRow | undefined
+        if (row) notifyFinished(toJob(row))
+      }
     },
     markInProgressFailed() {
-      return db.transaction(() => {
+      const affectedIds = db.transaction(() => {
         const now = Date.now()
+        const ids = (
+          db.prepare(
+            `SELECT id FROM jobs WHERE status IN ('pending','running') AND kind <> 'meeting_voice'`,
+          ).all() as Array<{ id: string }>
+        ).map((row) => row.id)
         db.prepare(`UPDATE job_items SET status='failed', error='daemon restart', finished_at=?
           WHERE status IN ('queued','running') AND job_id IN
           (SELECT id FROM jobs WHERE status IN ('pending','running') AND kind <> 'meeting_voice')`).run(now)
-        const r = db
+        db
         .prepare(
           `UPDATE jobs SET status='failed', error='daemon restart', finished_at=?,
             failed=(SELECT COUNT(*) FROM job_items WHERE job_id=jobs.id AND status='failed')
          WHERE status IN ('pending','running') AND kind <> 'meeting_voice'`,
         )
         .run(now)
-        return r.changes
+        return ids
       })()
+      if (finishedListeners.size > 0) {
+        for (const id of affectedIds) {
+          const row = db.prepare('SELECT * FROM jobs WHERE id=?').get(id) as JobRow | undefined
+          if (row) notifyFinished(toJob(row))
+        }
+      }
+      return affectedIds.length
     },
     listInProgress() {
       return (
         db.prepare(`SELECT * FROM jobs WHERE status IN ('pending','running')`).all() as JobRow[]
       ).map(toJob)
     },
+    onJobFinished,
   }
 }

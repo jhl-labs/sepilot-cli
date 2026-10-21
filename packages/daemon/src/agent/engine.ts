@@ -1,8 +1,11 @@
 import { repeatedBrowserClickWithoutProgress } from './browser-progress.js'
-import { resolveThinkingLevel } from '../providers/thinking-policy.js'
+import { terminalRunHasReliableSuccessStatus } from './graph/evidence-ledger.js'
+import { RUN_STABLE_SYSTEM_METADATA_KEY } from './prompt-sections.js'
+import { advanceAutomaticObservationBudget, canAutomaticallyDisableThinking, consecutiveExecutionFailures, resolveThinkingLevel, shouldReduceAutomaticThinking, structuredToolFailureCode as structuredToolFailureCodeFromOutput, type ThinkingLevelSource } from '../providers/thinking-policy.js'
 import { userActionRequiredOutput } from './user-action-required-output.js'
+import { workspaceExecutionBlocker } from './workspace-execution.js'
 import { MODE_TRANSFER_TOOL, type ModeControl } from './mode-control.js'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { ActiveRunRegistry, LiveRunState } from '../server/runtime/active-runs.js'
 import { activeUserInstructions, formatActiveUserInstructions } from './user-steering.js'
 import { recoveredReactSteering, withoutSteeringCheckpoint, withSteeringCheckpoint } from './react-steering.js'
@@ -21,7 +24,7 @@ import type {
   IAuditLogger,
   ToolCall,
 } from '@sepilotd/core'
-import { AutonomyLevel, ThinkingLevel } from '@sepilotd/core'
+import { AutonomyLevel } from '@sepilotd/core'
 import type { ToolRegistry } from '../tools/registry.js'
 import {
   isPolicyReadOnlyRequest,
@@ -49,12 +52,18 @@ import {
 import { tokenCalibration } from '../providers/token-calibration.js'
 import { decodeMultimodalInput } from './multimodal-input.js'
 import { parseToolCallArguments, readLengthContinuationMax } from './tool-call-args.js'
-import { lengthRecoveryInstruction } from './length-recovery.js'
+import {
+  buildTruncatedToolCallRecoveryEvent,
+  lengthRecoveryInstruction,
+  recordTruncatedToolCallAttempt,
+} from './length-recovery.js'
+import type { AgentFailedAttempt } from './graph/types.js'
 import {
   cloneCheckpointExecutionSkillIds,
   cloneCheckpointScopeTags,
   cloneCheckpointSkillExecutionPolicies,
   cloneCheckpointSkillToolNames,
+  cloneCheckpointMemoryPolicy,
   cloneCheckpointToolAllowlist,
   type ApprovalRunCheckpoint,
 } from '../server/runtime/checkpoints.js'
@@ -75,6 +84,7 @@ import {
   emergencyContextRecovery,
   evaluateCurrentTurnToolObservationBudget,
   fitProviderContext,
+  fitControlRequest,
   IrreducibleContextOverflowError,
   semanticCompress,
   supersedeStaleReadResults,
@@ -84,8 +94,13 @@ import {
 import { summarizeProblemTools, type ToolStatsRecord } from './tool-learning/store.js'
 import {
   buildStuckToolRepeatMessage,
+  DEFAULT_EXECUTION_FAILURE_CHURN_THRESHOLD,
+  DEFAULT_PERMANENT_FAILURE_CHURN_THRESHOLD,
+  DEFAULT_STUCK_REPEAT_THRESHOLD,
+  DEFAULT_STUCK_REPEAT_WINDOW,
   DEFAULT_TARGET_REPEAT_THRESHOLD,
   detectStuckToolRepeat,
+  findRepeatedInvalidToolCall,
   signatureOf,
   type StuckToolRepeatEntry,
 } from './stuck-tool-repeat.js'
@@ -113,6 +128,11 @@ import {
   toolCallBudgetHistoryFromCurrentTurnMessages,
 } from './tool-call-budget.js'
 import {
+  advanceValidationConvergence,
+  initialValidationConvergenceState,
+  type ValidationConvergenceEntry,
+} from './validation-convergence.js'
+import {
   explicitlyForbidsToolUse,
   focusedRepositoryLookupNeedsDiff,
   isFocusedBoundedCodingTask,
@@ -138,6 +158,7 @@ import {
   extractTaggedPayload,
   hasPromptFinalEnvelopeIntent,
   parsePromptToolCalls,
+  parseTruncatedPromptToolCallNames,
   repairNativeToolCalls,
   repairPromptToolCalls,
   resolveExplicitFinalTransportText,
@@ -153,10 +174,14 @@ import {
 import {
   normalizeModelAnswerProtocol,
   resolveModelToolTransport,
+  resolveRepairThinkingLevel,
 } from './model-compatibility.js'
 import {
   buildMaxOutputTokenRecoveryEvent,
   detectProviderMaxOutputTokenLimit,
+  recallObservedMaxOutputTokens,
+  rememberObservedMaxOutputTokens,
+  resolveModelOutputAllowance,
 } from './max-output-token-recovery.js'
 import {
   appendAnswerProtocolSystemPrompt,
@@ -253,7 +278,7 @@ import {
   shouldRepairRunOutcomeReview,
   shouldReviewOutcomeWithLLM,
 } from './outcome-review.js'
-import { cloneMessage, cloneToolCall, runToolExecution } from './tool-execution.js'
+import { cloneMessage, cloneToolCall, runToolExecution, toolRejectedByExecutionIntentForEveryInput } from './tool-execution.js'
 import { createToolCallProgressTracker } from './tool-call-progress.js'
 import {
   canExecuteCompletedToolCalls,
@@ -282,6 +307,7 @@ import {
   isRepairableReadOnlyInvocationFailure,
   latestTrustedPolicyFailure,
   readOnlyInvocationRepairToolCallIds,
+  TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY,
   type TrustedPolicyFailure,
 } from './policy-failure.js'
 import {
@@ -290,6 +316,7 @@ import {
   stopReasonBudget,
   stopReasonCompleted,
   stopReasonCompletionGate,
+  incompleteOutputReason,
   stopReasonNoProgress,
   stopReasonObservationBudget,
   stopReasonPolicyBlocked,
@@ -305,14 +332,18 @@ import {
 } from './tool-approval-catalog.js'
 import {
   buildToolApprovalPostureParagraph,
+  withSystemToolGuidance,
   TOOL_APPROVAL_POSTURE_PROMPT_PREFIX,
 } from './system-prompt.js'
 import {
   CONTINUATION_MARKER_METADATA_KEY,
   evaluateProgressSince,
   findProgressMarkerIndex,
-  parseRunWallClockBudgetMs,
+  resolveRunWallClock,
+  runRequestTimeoutMs,
+  resolveWallClockSynthesisReserveMs,
 } from './progress-signal.js'
+import { observeWorkProgress, type WorkProgress } from './work-progress.js'
 import {
   logAgentDebugTrace,
   logAgentRunTrace,
@@ -327,7 +358,8 @@ import {
   buildProviderContextUsageEvent,
 } from './context-usage.js'
 import { createLiveTextDeltaEmitter } from './live-text-delta.js'
-import { runAuxiliaryLlmChat, AuxiliaryLlmTurnBudget, DEFAULT_AUXILIARY_LLM_TURN_BUDGET_MS } from './auxiliary-llm.js'
+import { runAuxiliaryLlmChat, AuxiliaryLlmTurnBudget } from './auxiliary-llm.js'
+import { resolveControlCallTimeoutMs } from './control-call-policy.js'
 import {
   buildMemoryWriteFailureOutput,
   buildMemoryWriteRecoveryMessage,
@@ -399,10 +431,6 @@ const FOCUSED_PROCESS_OBSERVATION_TOOLS = new Set([
   'process.wait',
 ])
 
-// On the final allowed iteration, append a system message that tells the model
-// to stop chasing tool calls and emit its best answer with the information it
-// already has. This stops slow models like glm-4.7 served via Ollama from
-// looping <tool_call> indefinitely on knowledge questions.
 const PLAN_MODE_HINT = [
   'The user has put this session in PLAN mode.',
   'You can read files, search, and explain — but every write tool',
@@ -430,11 +458,6 @@ export function buildAutonomyHint(
   autonomy: AutonomyLevel,
   primaryAgentId?: string,
 ): string | null {
-  // Plan mode is selected via primaryAgentId ('plan'), independently of the
-  // autonomy level (CLI Shift+Tab flips the agent without touching autonomy).
-  // Policy blocks writes for the plan agent, but the model must also be told
-  // it is planning — otherwise it tries writes that policy then rejects
-  // mid-turn and reacts to the denial instead of producing a plan.
   if (primaryAgentId?.trim().toLowerCase() === 'plan') {
     return PLAN_MODE_HINT
   }
@@ -490,19 +513,11 @@ export function buildAutonomyHint(
   }
 }
 
-/**
- * Append a one-shot system message naming tools that have repeatedly
- * failed in the current session so the model can change tactics instead
- * of retrying the same broken call. The hint is injected per-iteration
- * into the outbound message list — it must not be persisted into
- * `messages`, otherwise old hints accumulate across turns.
- */
 export function withProblemToolFeedback(
   messages: Message[],
   stats: ToolStatsRecord[],
   iteration: number,
 ): Message[] {
-  // No useful signal until at least one tool result has been seen.
   if (iteration < 1 || stats.length === 0) {
     return messages
   }
@@ -550,6 +565,21 @@ function appendForceFinalSystemMessage(messages: Message[]): Message[] {
   ]
 }
 
+function appendWallClockSynthesisMessage(messages: Message[]): Message[] {
+  return [
+    ...messages,
+    {
+      role: 'system',
+      content: [
+        'The run is about to reach its wall-clock limit, so tools are closed for this final turn.',
+        'Write the final answer now from the evidence already gathered: report every finding you observed,',
+        'mark items you could not verify as unverified, and name the concrete checks that remain.',
+        'Do not reply only with a resume notice; the gathered evidence must reach the user.',
+      ].join(' '),
+    },
+  ]
+}
+
 function appendFocusedRepositorySynthesisMessage(messages: Message[]): Message[] {
   return [
     ...messages,
@@ -585,13 +615,6 @@ function appendSubstantiveRepositoryReviewMessage(messages: Message[]): Message[
   ]
 }
 
-/**
- * Warn the model that it has only one more turn after this so it can
- * choose to wrap up rather than starting a fresh investigation. Without
- * this nudge the agent often spends the penultimate turn launching new
- * tool calls and then gets the harder force-final message on the last
- * turn with nothing useful to say.
- */
 function appendBudgetWarningSystemMessage(messages: Message[]): Message[] {
   return [
     ...messages,
@@ -612,17 +635,6 @@ function countOutcomeRecoveryPrompts(messages: Message[]): number {
   ).length
 }
 
-/**
- * How many outcome-supervisor blocks stay in the prompt.
- *
- * A run retries up to MAX_OUTCOME_RECOVERY_REPAIRS times and every attempt left
- * its critique behind: one captured request carried six of them, 8,768
- * characters, re-sent on every model call after that. Unlike the retry guards
- * these are not copies of each other — each names what that attempt got wrong —
- * so dropping all but the newest would erase the "this keeps failing" signal
- * the model needs to change approach. Keep the two most recent: the latest
- * critique to act on, and one predecessor to show the pattern.
- */
 export const MAX_LIVE_OUTCOME_RECOVERY_PROMPTS = 2
 
 export function dropStaleOutcomeRecoveryPrompts(messages: Message[]): void {
@@ -633,7 +645,6 @@ export function dropStaleOutcomeRecoveryPrompts(messages: Message[]): void {
       ? [index]
       : [],
   )
-  // One is about to be appended, so keep room for it.
   const excess = indexes.length - (MAX_LIVE_OUTCOME_RECOVERY_PROMPTS - 1)
   if (excess <= 0) return
   const drop = new Set(indexes.slice(0, excess))
@@ -694,29 +705,13 @@ const SUBSTANTIVE_REPOSITORY_REVIEW_TOOLS = new Set([
 ])
 const SUBSTANTIVE_REPOSITORY_REVIEW_OBSERVATION_TOOLS = new Set([
   ...SUBSTANTIVE_REPOSITORY_REVIEW_TOOLS,
-  // Some providers and tool profiles expose repository inspection only
-  // through the structured terminal adapter. Count those observations too,
-  // otherwise the review budget can never converge in a terminal-only route.
   'terminal.run',
 ])
 const SUBSTANTIVE_REPOSITORY_REVIEW_TOOL_TURN_LIMIT = 3
-// Interactive read-only runs should converge after two distinct evidence
-// batches once they have enough successful observations to answer.  Counting
-// both batches and observations avoids cutting off a pair of narrow lookups,
-// while preventing diagnostic agents from repeatedly widening a completed
-// investigation.  Mutation-capable runs and skill-governed workflows keep
-// their existing, larger budgets.
 const READ_ONLY_EVIDENCE_TURN_LIMIT = 2
 const READ_ONLY_EVIDENCE_MIN_SUCCESSFUL_OBSERVATIONS = 4
-// Iterative tool turns need only enough room to emit a compact structured call.
-// Preserve the default 512-token floor for tool-free/final synthesis, but let
-// active tool schemas take precedence when a small-context model is tight.
 const TOOL_ENABLED_MIN_OUTPUT_TOKENS = 256
 const BOUNDED_FINAL_MAX_OUTPUT_TOKENS = 3_072
-// A model that emits hidden reasoning spends the same output budget on its
-// reasoning and on the answer. A cap sized for the answer alone therefore
-// guarantees a truncated final turn — the one turn that has no tool access
-// left to recover with. Give reasoning models explicit headroom.
 const BOUNDED_FINAL_THINKING_MAX_OUTPUT_TOKENS = 12_288
 const BOUNDED_FINAL_TIMEOUT_MS = 120_000
 
@@ -828,6 +823,7 @@ export function buildAnalysisWriteCadenceMessage(cadence: AnalysisWriteCadence):
 }
 
 export interface AgentEngineOptions {
+  systemToolGuidance?: import('./system-prompt.js').SystemToolGuidanceOptions
   provider: ILLMProvider
   tools: ToolRegistry
   policy: PolicyEngine
@@ -835,15 +831,14 @@ export interface AgentEngineOptions {
   modeControl?: ModeControl
   semanticRouting?: boolean
   maxIterations?: number
-  /** Treat maxIterations as a hard provider-turn cap; disables repair inflation and continuation cycles. */
   hardMaxIterations?: boolean
-  /** Maximum model-generated tool calls executed from one response. */
   maxToolCallsPerTurn?: number
   auditLogger?: IAuditLogger
   usageTracker?: UsageTracker
   hookRegistry?: HookRegistry
   deviceName?: string
   thinkingLevel?: string
+  thinkingLevelSource?: ThinkingLevelSource
   maxTokens?: number
   temperature?: number
   textDeltaMode?: 'buffered' | 'live'
@@ -859,69 +854,26 @@ export interface AgentEngineOptions {
   loadToolExecution?: (sessionId: string) => Promise<ToolExecutionRecord | null>
   saveToolExecution?: (record: ToolExecutionRecord) => Promise<void>
   clearToolExecution?: (sessionId: string) => Promise<void>
-  /** Optional in-session stats store. When provided, the engine surfaces
-   * a "tool feedback" system message on iterations after the first if any
-   * tool has been repeatedly failing — gives the model the context it
-   * needs to switch tactics instead of retrying the same call. */
   toolStats?: import('./tool-learning/store.js').ToolStatsStore
   workspaceMutationTracker?: import('./workspace-mutation/tracker.js').WorkspaceMutationTracker
   editSnapshotStore?: import('./edit-rollback/store.js').EditSnapshotStore
-  /** Persist exact criterion-to-observation links for lean ReAct runs. */
   journalStateBoard?: (sessionId: string, board: AgentStateBoardSnapshot) => Promise<void>
   activeRuns?: ActiveRunRegistry
   journalSteeringConsumed?: (sessionId: string, noteId: string) => Promise<void>
-  /**
-   * When true, assistant text with no tool call must explicitly start with
-   * ANSWER: or INCOMPLETE:. This is a structural completion contract used
-   * by skill/high-stakes runs; it does not infer intent from user keywords.
-   */
   strictFinalAnswerProtocol?: boolean
-  /**
-   * When true, run the LLM outcome judge even if the model tried to finish
-   * without using any tools. User-facing surfaces use this to catch cases
-   * where a file/report/build request is answered as prose instead of action.
-   */
   reviewOutcomes?: boolean
   reviewToollessFinals?: boolean
-  /**
-   * Number of times the runtime may automatically continue the same turn after
-   * the normal iteration budget is exhausted. This is a graph-independent
-   * long-running task guard; set 0 to require manual /resume only.
-   */
   maxContinuationCycles?: number
-  /**
-   * When false, the engine does not fire its own `pre:/post:agent:run` hooks.
-   * The mode-router sets this so it can own a single run-boundary gate that
-   * covers react *and* graph turns uniformly (see turn-hooks.ts); direct
-   * engine.run() callers (subagents, supervisor, coordinator) leave it at the
-   * default `true` so nested runs stay gated. Defaults to true.
-   */
   emitAgentRunHooks?: boolean
-  /**
-   * Daily/session USD spend caps checked before every LLM dispatch. undefined
-   * (default) means unlimited. Only priced (costKnown) spend counts.
-   */
   spendBudget?: SpendBudgetConfig
 }
 
-/**
- * Max writes to a single target before the write-loop guard trips
- * (CLI_BACKLOG.md B6). Operator-tunable via SEPILOTD_WRITE_LOOP_LIMIT; floored
- * at 2 so a normal write-then-fix never trips, and defaulted generously.
- */
 function resolveWriteLoopLimit(): number {
   const raw = Number(process.env.SEPILOTD_WRITE_LOOP_LIMIT)
   if (Number.isFinite(raw) && raw >= 2) return Math.floor(raw)
   return DEFAULT_WRITE_LOOP_LIMIT
 }
 
-/**
- * Operator override for how many distinct tool observations one turn may hold
- * in working memory before the request is served from a compacted projection.
- * The observation-budget stop reason advertises `raise_budget` as a next
- * action, so that action needs a real knob. Unset means "scale with the model
- * context window".
- */
 function resolveMaxTurnToolObservations(): number | undefined {
   const raw = Number(process.env.SEPILOTD_MAX_TURN_TOOL_OBSERVATIONS)
   return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : undefined
@@ -1015,7 +967,6 @@ export class AgentEngine implements IAgentEngine {
   private tools: ToolRegistry
   private policy: PolicyEngine
   private autonomy: AutonomyLevel
-  /** Absolute wall-clock ceiling for the active run; read once per run entry. */
   private runWallClock: { startedAt: number; budgetMs?: number } | null = null
   private modeControl?: ModeControl
   private semanticRouting: boolean
@@ -1029,6 +980,7 @@ export class AgentEngine implements IAgentEngine {
   private hookRegistry?: HookRegistry
   private deviceName?: string
   private thinkingLevel?: string
+  private thinkingLevelSource?: ThinkingLevelSource
   private maxTokens?: number
   private temperature?: number
   private textDeltaMode: 'buffered' | 'live'
@@ -1049,6 +1001,7 @@ export class AgentEngine implements IAgentEngine {
   private editSnapshotStore?: import('./edit-rollback/store.js').EditSnapshotStore
   private journalStateBoard?: (sessionId: string, board: AgentStateBoardSnapshot) => Promise<void>
   private strictFinalAnswerProtocol: boolean
+  private readonly systemToolGuidance: AgentEngineOptions['systemToolGuidance']
   private reviewOutcomes: boolean
   private reviewToollessFinals: boolean
   private maxContinuationCycles: number
@@ -1060,6 +1013,7 @@ export class AgentEngine implements IAgentEngine {
   private liveRunState?: LiveRunState
 
   constructor(options: AgentEngineOptions) {
+    this.systemToolGuidance = options.systemToolGuidance
     this.modeControl = options.modeControl
     this.semanticRouting = options.semanticRouting ?? false
     this.provider = options.provider
@@ -1074,6 +1028,7 @@ export class AgentEngine implements IAgentEngine {
     this.hookRegistry = options.hookRegistry
     this.deviceName = options.deviceName
     this.thinkingLevel = options.thinkingLevel
+    this.thinkingLevelSource = options.thinkingLevelSource
     this.maxTokens = options.maxTokens
     this.temperature = options.temperature
     this.textDeltaMode = options.textDeltaMode ?? 'buffered'
@@ -1111,22 +1066,19 @@ export class AgentEngine implements IAgentEngine {
     event: 'post:agent:run' | 'post:llm:call',
     data: Record<string, unknown>,
   ): Promise<void> {
-    // When the run boundary is owned by the mode-router, suppress the engine's
-    // own post:agent:run so a single mode-router turn does not double-fire it.
     if (event === 'post:agent:run' && !this.emitAgentRunHooks) return
     try {
       await this.hookRegistry?.trigger({ event, data })
     } catch {
-      // Observation hooks must not fail the main agent flow.
+    }
+    if (event === 'post:agent:run' && data.status !== 'incomplete') {
+      const sessionId = typeof data.sessionId === 'string' ? data.sessionId : undefined
+      if (sessionId) {
+        await this.workspaceMutationTracker?.cleanupScratch(sessionId).catch(() => {})
+      }
     }
   }
 
-  /**
-   * ReAct has no graph state object to carry criterion snapshots. At the same
-   * terminal boundary, reconstruct only trusted current-turn observations,
-   * ask the shared semantic judge for exact criterion links, and journal the
-   * same mode-neutral board shape consumed by session evaluation.
-   */
   private async *journalReactCriterionEvidence(
     messages: readonly Message[],
     finalContent: string,
@@ -1164,11 +1116,6 @@ export class AgentEngine implements IAgentEngine {
         providerId: this.provider.id,
         auxiliary: true,
       })
-      // Criterion adjudication is a required completion-evidence boundary,
-      // not an optional planner/reviewer. Match Graph's guarded call instead
-      // of sharing the auxiliary wall-clock budget: a preceding outcome review
-      // may legitimately consume that budget, but must not erase exact
-      // criterion evidence from an otherwise completed read-only run.
       let response = await guardedProviderChat({
         provider: this.provider,
         request,
@@ -1295,8 +1242,6 @@ export class AgentEngine implements IAgentEngine {
         meta: { node: activeNode, turnId: activeTurnId, failed: true },
       })
       if (isAbortError(error) || (signal?.aborted ?? false)) throw error
-      // Session evidence remains honestly unverified when the criterion judge
-      // is unavailable; never fail or rewrite an otherwise valid user answer.
     }
   }
 
@@ -1396,16 +1341,16 @@ export class AgentEngine implements IAgentEngine {
         },
       }
     }
-    const isExplicitFinal = hasPromptFinalEnvelopeIntent(content)
+    const hasNativeToolCalls = (normalizedResponse.message.toolCalls?.length ?? 0) > 0
+    const isExplicitFinal = !hasNativeToolCalls && hasPromptFinalEnvelopeIntent(content)
     if (isExplicitFinal) {
-      const hasConflictingNativeToolCall = (normalizedResponse.message.toolCalls?.length ?? 0) > 0
       const finalCandidate = extractPromptFinalCandidate(content)
       return {
         ...normalizedResponse,
         message: {
           ...normalizedResponse.message,
           content:
-            hasConflictingNativeToolCall || containsPromptToolCallEnvelope(content)
+            containsPromptToolCallEnvelope(content)
               ? UNUSABLE_PROMPT_TOOL_CALL_OUTPUT
               : finalCandidate,
           toolCalls: undefined,
@@ -1524,10 +1469,6 @@ export class AgentEngine implements IAgentEngine {
     }
   }
 
-  /**
-   * Stream LLM response, yielding text_delta events for each text chunk.
-   * Returns the assembled ChatResponse for tool processing.
-   */
   private async *streamWithDeltas(
     request: ChatRequest,
     signal?: AbortSignal,
@@ -1549,10 +1490,6 @@ export class AgentEngine implements IAgentEngine {
     const liveTextDeltaEmitter =
       liveTextDeltas
         ? createLiveTextDeltaEmitter({
-            // Plain text is only known to be a final answer once the provider
-            // turn ends with no tool calls. ANSWER: chunks can preserve their
-            // boundaries, while unmarked text falls back to one safe buffered
-            // delta after the response is assembled.
             allowUnmarkedFinal: false,
             isAllowedUnmarkedFinalStart: (candidate) =>
               !containsPromptToolCallMarkup(candidate),
@@ -1577,9 +1514,6 @@ export class AgentEngine implements IAgentEngine {
               if (suppressTextDeltas) {
                 bufferedLiveTextDeltas.push(textDelta)
               } else {
-                // `live` only enters this path after an explicit ANSWER:
-                // stem. Forward safe answer chunks as the provider produces
-                // them; strict/reviewed turns keep using the deferred buffer.
                 yield { type: 'text_delta', text: textDelta }
               }
             }
@@ -1613,6 +1547,9 @@ export class AgentEngine implements IAgentEngine {
         case 'usage':
           totalUsage.inputTokens += chunk.usage.inputTokens
           totalUsage.outputTokens += chunk.usage.outputTokens
+          if (chunk.usage.generationMs) {
+            totalUsage.generationMs = (totalUsage.generationMs ?? 0) + chunk.usage.generationMs
+          }
           if (chunk.usage.thinkingTokens) {
             totalUsage.thinkingTokens = (totalUsage.thinkingTokens ?? 0) + chunk.usage.thinkingTokens
           }
@@ -1632,11 +1569,6 @@ export class AgentEngine implements IAgentEngine {
           throw new Error(chunk.error.message)
       }
     }
-    // The adapter only emits `done` when the provider reported a finish
-    // reason. Reaching EOF without one is a transport failure, not a known
-    // output-cap hit; keep the conservative `length` classification but record
-    // the distinction so recovery can retry instead of inventing a
-    // continuation point.
     let finishDetail: ChatResponse['finishDetail']
     if (!sawDone && sawNonTerminalChunk) {
       finishReason = 'length'
@@ -1652,15 +1584,16 @@ export class AgentEngine implements IAgentEngine {
       }
     }
 
-    // Never execute a tool whose non-empty args failed to parse: that is a
-    // truncated tool call (typically finishReason==='length'). Drop it and
-    // surface the truncation so the run can retry with more budget instead of
-    // silently running the tool with `{}` and losing the intended arguments.
     const truncatedToolCallIds = new Set<string>()
+    const truncatedToolCalls: NonNullable<ChatResponse['truncatedToolCalls']> = []
     for (const tc of toolCalls) {
       const parsed = parseToolCallArguments(toolCallArgs.get(tc.id))
       if (parsed.truncated) {
         truncatedToolCallIds.add(tc.id)
+        truncatedToolCalls.push({
+          name: tc.name,
+          streamedChars: toolCallArgs.get(tc.id)?.length ?? 0,
+        })
       } else {
         tc.arguments = parsed.arguments
       }
@@ -1671,8 +1604,6 @@ export class AgentEngine implements IAgentEngine {
         : toolCalls
     if (truncatedToolCallIds.size > 0 && finishReason !== 'content_filter') {
       finishReason = 'length'
-      // A cut-off tool-call argument body is positive evidence that generation
-      // stopped mid-token, whatever the stream did afterwards.
       finishDetail = 'truncated_output'
     }
 
@@ -1695,6 +1626,9 @@ export class AgentEngine implements IAgentEngine {
         usage: totalUsage,
         finishReason,
         ...(finishDetail ? { finishDetail } : {}),
+        ...(truncatedToolCalls.length > 0 && finishReason === 'length'
+          ? { truncatedToolCalls }
+          : {}),
       },
       allowedToolNames,
     )
@@ -1815,6 +1749,7 @@ export class AgentEngine implements IAgentEngine {
         usage: TokenUsage
         finishReason: ChatResponse['finishReason']
         finishDetail?: ChatResponse['finishDetail']
+        truncatedToolCalls?: ChatResponse['truncatedToolCalls']
         thinking?: string
       },
       void
@@ -1870,6 +1805,9 @@ export class AgentEngine implements IAgentEngine {
           case 'usage':
             usage.inputTokens += chunk.usage.inputTokens
             usage.outputTokens += chunk.usage.outputTokens
+            if (chunk.usage.generationMs) {
+              usage.generationMs = (usage.generationMs ?? 0) + chunk.usage.generationMs
+            }
             if (chunk.usage.thinkingTokens) {
               usage.thinkingTokens = (usage.thinkingTokens ?? 0) + chunk.usage.thinkingTokens
             }
@@ -1888,21 +1826,22 @@ export class AgentEngine implements IAgentEngine {
             throw new Error(chunk.error.message)
         }
       }
-      // See `streamWithDeltas`: EOF without a provider finish reason is a
-      // transport failure, not a known output-cap hit.
       let finishDetail: ChatResponse['finishDetail']
       if (!sawDone && sawNonTerminalChunk) {
         finishReason = 'length'
         finishDetail = 'incomplete_stream'
       }
 
-      // Drop truncated tool calls (non-empty unparseable args) rather than
-      // executing them with `{}`; flag the turn as length-truncated.
       const truncatedToolCallIds = new Set<string>()
+      const truncatedToolCalls: NonNullable<ChatResponse['truncatedToolCalls']> = []
       for (const toolCall of toolCalls) {
         const parsed = parseToolCallArguments(toolCallArgs.get(toolCall.id))
         if (parsed.truncated) {
           truncatedToolCallIds.add(toolCall.id)
+          truncatedToolCalls.push({
+            name: toolCall.name,
+            streamedChars: toolCallArgs.get(toolCall.id)?.length ?? 0,
+          })
         } else {
           toolCall.arguments = parsed.arguments
         }
@@ -1921,7 +1860,8 @@ export class AgentEngine implements IAgentEngine {
       const rawText = strippedText.text
       thinking = [thinking, strippedText.thinking].filter(Boolean).join('\n')
       const promptToolParseText = rawText.trim() ? rawText : thinking ?? ''
-      const promptTextIsExplicitFinal = hasPromptFinalEnvelopeIntent(promptToolParseText)
+      const promptTextIsExplicitFinal = toolCalls.length === 0
+        && hasPromptFinalEnvelopeIntent(promptToolParseText)
       const normalizedResponseText = normalizeModelAnswerProtocol(
         resolveExplicitFinalTransportText(rawText, thinking),
         responseModelInfo,
@@ -1955,6 +1895,9 @@ export class AgentEngine implements IAgentEngine {
         usage,
         finishReason,
         finishDetail,
+        ...(truncatedToolCalls.length > 0 && finishReason === 'length'
+          ? { truncatedToolCalls }
+          : {}),
         thinking: thinking || undefined,
       }
     }
@@ -1972,6 +1915,7 @@ export class AgentEngine implements IAgentEngine {
       usage,
       finishReason,
       finishDetail,
+      truncatedToolCalls,
       thinking,
     } = firstTurnResult.value
 
@@ -1979,12 +1923,6 @@ export class AgentEngine implements IAgentEngine {
       canPublishUserFacingText(finishReason)
       && resolvedToolCalls.length === 0 &&
       shouldAttemptPromptReActRepair(rawText)
-      // A native -> prompt transport recovery already injected an exact,
-      // provider-neutral response contract. Retrying a fully empty prompt
-      // reply with a second format-only prompt cannot recover any malformed
-      // content because there is no content to repair. Let the graph's shared
-      // no-progress guard terminate this model cleanly instead of paying for
-      // another identical provider turn.
       && !(
         rawText.trim().length === 0
         && hasToolTransportRecoveryMessage(request.messages)
@@ -2008,6 +1946,7 @@ export class AgentEngine implements IAgentEngine {
       }
       finishReason = repairTurnResult.value.finishReason
       finishDetail = repairTurnResult.value.finishDetail
+      truncatedToolCalls = repairTurnResult.value.truncatedToolCalls
       thinking = [thinking, repairTurnResult.value.thinking].filter(Boolean).join('\n') || undefined
     }
 
@@ -2026,6 +1965,9 @@ export class AgentEngine implements IAgentEngine {
       usage,
       finishReason: resolvedToolCalls.length > 0 ? 'tool_use' : finishReason,
       ...(finishDetail ? { finishDetail } : {}),
+      ...(truncatedToolCalls?.length && resolvedToolCalls.length === 0
+        ? { truncatedToolCalls }
+        : {}),
     }
 
     if (this.shouldFallbackFromEmptyStream(streamedResponse)) {
@@ -2097,20 +2039,12 @@ export class AgentEngine implements IAgentEngine {
       usage,
       finishReason: resolvedToolCalls.length > 0 ? 'tool_use' : finishReason,
       ...(finishDetail ? { finishDetail } : {}),
+      ...(truncatedToolCalls?.length && resolvedToolCalls.length === 0
+        ? { truncatedToolCalls }
+        : {}),
     }
   }
 
-  /**
-   * Exact match only. The previous `?? models[0]` fallback silently dressed an
-   * unknown model in another model's specs, and `models[0]` is whatever order
-   * the provider returned — alphabetical for Ollama, so an embedding model can
-   * sort first. A model the operator pulled but never added to config then ran
-   * with `toolUse: false` and `maxOutputTokens: 0`, which reads downstream as
-   * "no native tool calling, 2 output tokens" rather than as a lookup miss.
-   *
-   * Every caller already uses optional chaining and has its own default, so an
-   * unknown model now falls back per-field instead of wholesale.
-   */
   private resolveModelInfo(modelId: string) {
     return this.provider.models.find((model) => model.id === modelId)
   }
@@ -2127,37 +2061,16 @@ export class AgentEngine implements IAgentEngine {
   }
 
   private supportsNativeToolUse(modelId: string): boolean {
-    // `adaptivePromptReact` enables an observed-failure fallback; it does not
-    // disable a transport that the model explicitly declares it supports.
-    // Starting prompt-react eagerly is especially unsafe for OpenAI-compatible
-    // servers that consume tool-envelope sentinel tokens in their chat
-    // template: the visible response can then be empty even though native
-    // function calling works correctly. Graph runners already use native-first
-    // semantics; continueRun applies the same bounded, evidence-driven fallback
-    // when an adaptive model's native response is structurally unusable.
     const model = this.resolveModelInfo(modelId)
-    // An unknown model means the catalog is stale, not that the model lacks
-    // tool calling — a freshly pulled Ollama model is the common case. Assume
-    // native: guessing wrong surfaces a provider error naming the model, while
-    // guessing `false` silently drops every tool from the request and renders
-    // the whole tool surface into the prompt instead, which looks to the user
-    // like the agent simply refusing to act.
     return resolveModelToolTransport(model, 'react').initial === 'native'
   }
 
-  /**
-   * The system prompt opens with a plain `Available tools: a, b, c…` list —
-   * 2,932 characters on a full 171-tool registry, re-sent on every call. It
-   * carries nothing the request does not already say: native runs get the same
-   * names in the tool schemas, and prompt-react runs get them in the rendered
-   * catalog (`- name: description / schema=…`), which is appended to the same
-   * request. The graph path already drops it for native runs; runs that
-   * execute without a graph are where the whole registry is sent.
-   */
   private stripDuplicateToolNameList(systemPrompt: string | undefined): string | undefined {
     if (!systemPrompt) return systemPrompt
-    return systemPrompt
-      .replace(/^Available tools:[^\n]*\n?/m, '')
+    const withoutCatalog = this.systemToolGuidance
+      ? systemPrompt
+      : systemPrompt.replace(/^Available tools:[^\n]*\n?/m, '')
+    return withoutCatalog
       .replace(new RegExp(`^${TOOL_APPROVAL_POSTURE_PROMPT_PREFIX}[^\\n]*\\n?`, 'm'), '')
       .replace(
         /^Your autonomy level is: [^.\n]+\.$/m,
@@ -2165,12 +2078,6 @@ export class AgentEngine implements IAgentEngine {
       )
   }
 
-  /**
-   * Static approval posture of every registered tool for this run. Evaluated
-   * from rule modes, autonomy and the primary agent only — no input, no
-   * execution — so the model learns which tools will prompt or are
-   * unavailable before it plans around them.
-   */
   private describeRunToolApprovalPosture(context: AgentContext): ToolApprovalPostureMap {
     return describeToolApprovalPosture(
       this.tools.list(),
@@ -2201,7 +2108,7 @@ export class AgentEngine implements IAgentEngine {
         content: appendAnswerProtocolSystemPrompt(undefined),
       })
     }
-    if (context.relevantMemories?.length) {
+    if (context.memoryPolicy?.read !== false && context.memoryPolicy?.automaticRead !== false && context.relevantMemories?.length) {
       messages.push({
         role: 'system',
         content: [
@@ -2216,20 +2123,12 @@ export class AgentEngine implements IAgentEngine {
     if (runContractMessage) {
       messages.push({ role: 'system', content: runContractMessage })
     }
-    // Generated context is rebuilt on mode transfer. Mark only these messages,
-    // retaining history, compaction summaries and tool receipts verbatim.
     for (const message of messages) {
       message.metadata = { ...message.metadata, runtimeContext: true }
     }
     if (context.previousMessages?.length) {
       messages.push(...context.previousMessages.map(cloneMessage))
     }
-    // chat-stream wraps multimodal turns with a sentinel so we can
-    // restore them as ContentPart[] here. Plain text inputs flow through
-    // unchanged. If the route already persisted this exact input as the last
-    // user message, mark that message as the current turn boundary; otherwise
-    // append a marked user message. The marker survives checkpoints and keeps
-    // synthetic user-role continuation prompts from becoming a false boundary.
     const decodedParts = decodeMultimodalInput(input)
     const userContent: Message['content'] = context.currentUserContent ?? decodedParts ?? input
     return beginCurrentAgentTurnUserMessage(
@@ -2267,7 +2166,10 @@ export class AgentEngine implements IAgentEngine {
       scopeTags: cloneCheckpointScopeTags(context.scopeTags),
       executionSkillIds: cloneCheckpointExecutionSkillIds(context.executionSkillIds),
       skillToolNames: cloneCheckpointSkillToolNames(context.skillToolNames),
+      deadlineAt: this.runWallClock?.budgetMs === undefined ? context.deadlineAt : this.runWallClock.startedAt + this.runWallClock.budgetMs,
+      memoryPolicy: cloneCheckpointMemoryPolicy(context.memoryPolicy),
       toolAllowlist: cloneCheckpointToolAllowlist(context.toolAllowlist),
+      delegationToolAllowlist: cloneCheckpointToolAllowlist(context.delegationToolAllowlist),
       skillExecutionPolicies: cloneCheckpointSkillExecutionPolicies(
         context.skillExecutionPolicies,
       ),
@@ -2279,6 +2181,7 @@ export class AgentEngine implements IAgentEngine {
       iteration,
       maxIterations: this.maxIterations,
       thinkingLevel: this.thinkingLevel,
+      ...(this.thinkingLevelSource ? { thinkingLevelSource: this.thinkingLevelSource } : {}),
       ...(this.textDeltaMode === 'live' ? { textDeltaMode: 'live' as const } : {}),
       createdAt: new Date().toISOString(),
     })
@@ -2314,7 +2217,10 @@ export class AgentEngine implements IAgentEngine {
       scopeTags: cloneCheckpointScopeTags(context.scopeTags),
       executionSkillIds: cloneCheckpointExecutionSkillIds(context.executionSkillIds),
       skillToolNames: cloneCheckpointSkillToolNames(context.skillToolNames),
+      deadlineAt: this.runWallClock?.budgetMs === undefined ? context.deadlineAt : this.runWallClock.startedAt + this.runWallClock.budgetMs,
+      memoryPolicy: cloneCheckpointMemoryPolicy(context.memoryPolicy),
       toolAllowlist: cloneCheckpointToolAllowlist(context.toolAllowlist),
+      delegationToolAllowlist: cloneCheckpointToolAllowlist(context.delegationToolAllowlist),
       skillExecutionPolicies: cloneCheckpointSkillExecutionPolicies(
         context.skillExecutionPolicies,
       ),
@@ -2324,6 +2230,7 @@ export class AgentEngine implements IAgentEngine {
       iteration,
       maxIterations: this.maxIterations,
       thinkingLevel: this.thinkingLevel,
+      ...(this.thinkingLevelSource ? { thinkingLevelSource: this.thinkingLevelSource } : {}),
       ...(this.textDeltaMode === 'live' ? { textDeltaMode: 'live' as const } : {}),
       stage,
       checkpointedAt: new Date().toISOString(),
@@ -2370,8 +2277,6 @@ export class AgentEngine implements IAgentEngine {
       usage: totalUsage,
       stopReason: stopReasonApprovalDenied(denial.toolName ?? 'tool'),
     }
-    // A denied approval ends the turn without completing the user's request;
-    // recording it as 'success' would skew run statistics (plan F6).
     await this.safeTriggerPostHook('post:agent:run', {
       status: 'incomplete',
       sessionId: context.sessionId,
@@ -2501,10 +2406,6 @@ export class AgentEngine implements IAgentEngine {
     onToolResult?: (event: ToolResultEvent) => void,
   ): AsyncGenerator<AgentEvent, string | undefined> {
     let userActionRequired: string | undefined
-    // Map each tool call id to its tool name so the tool_result event (which
-    // only carries the id) can be recorded against the right tool. Without
-    // this the usage tracker never populated tool_name and Agent Stats
-    // "Tool calls" was permanently 0.
     const toolNameByCallId = new Map<string, string>(
       toolCalls.map((toolCall) => [toolCall.id, toolCall.name]),
     )
@@ -2520,6 +2421,8 @@ export class AgentEngine implements IAgentEngine {
             this.workspaceMutationTracker!.recordRead(context.sessionId, path),
           recordWrite: (path: string) =>
             this.workspaceMutationTracker!.recordWrite(context.sessionId, path),
+          recordScratch: (path: string) =>
+            this.workspaceMutationTracker!.recordScratch(context.sessionId, path),
           detectStale: async (path: string) => {
             const stale = await this.workspaceMutationTracker!.detectStale(context.sessionId, path)
             return stale
@@ -2576,10 +2479,6 @@ export class AgentEngine implements IAgentEngine {
       channelContext: context.channelContext,
       canAttachVisualContent,
       persistApprovalCheckpoint: (requestId, nextToolCalls, currentToolIndex) => {
-        // The next tool can pause for approval before this iterator reaches
-        // its final annotation pass. Persist results already observed in this
-        // batch now so a resumed explicit memory request still sees the prior
-        // successful memory.remember result as structured evidence.
         recordObservedToolStatuses()
         return this.persistApprovalCheckpoint(
           requestId,
@@ -2614,10 +2513,6 @@ export class AgentEngine implements IAgentEngine {
         toolNameByCallId.set(event.toolCall.id, event.toolCall.name)
       }
 
-      // One tool_name-tagged record per executed tool so Agent Stats can count
-      // tool calls. Zero token/cost — the LLM-call cost is recorded when received with
-      // a NULL tool_name (the turn), keeping the two accounting streams
-      // separate exactly as getSnapshot() expects.
       if (event.type === 'tool_result' && this.usageTracker) {
         const toolName = toolNameByCallId.get(event.toolCallId)
         if (toolName) {
@@ -2654,8 +2549,6 @@ export class AgentEngine implements IAgentEngine {
       }
     }
     } finally {
-      // Preserve recoverable edits even when cancellation interrupts the tool
-      // iterator. A committed checkpoint records bytes, not task completion.
       if (snapshots && editCheckpointId) {
         editSummary = snapshots.commitCheckpoint(context.sessionId, editCheckpointId)
         await snapshots.flush()
@@ -2663,10 +2556,6 @@ export class AgentEngine implements IAgentEngine {
     }
     if (editSummary) yield { type: 'edit_checkpoint_resolved', checkpoint: editSummary }
 
-    // runToolExecution appends the matching tool message after yielding each
-    // result. Checkpoint callbacks above annotate intermediate results before
-    // cloning; this final pass covers the last result when no later checkpoint
-    // boundary occurs.
     recordObservedToolStatuses()
     return userActionRequired
   }
@@ -2742,7 +2631,22 @@ export class AgentEngine implements IAgentEngine {
     signal?: AbortSignal,
     continuationCycle = 0,
     currentTurnObservationHistory?: ObservationHistoryEntry[],
+    reasoningBudgetExhausted = false,
+    observationBudgetPressure = false,
+    observationBudgetFraction = 0,
+    continuationState?: {
+      validationConvergence: ReturnType<typeof initialValidationConvergenceState>
+      forceFinalAfterValidationConvergence: boolean
+      writeLoopTracker: WriteLoopTracker
+      invocationHistory: StuckToolRepeatEntry[]
+      invalidInvocationRepairUsed: boolean
+      pendingOutcomeReviewReason: string | null
+      repairedOutcomeReviewCount: number
+      mutationReviewBudget?: AuxiliaryLlmTurnBudget
+    },
   ): AsyncIterable<AgentEvent> {
+    const observationScope = () => JSON.stringify([this.provider.id, context.model, context.runContract])
+    let observationBudgetScope = observationScope()
     const activeSkillExecutionPolicies = context.skillExecutionPolicies
       ?? resolveActiveSkillExecutionPolicies(context.executionSkillIds)
     let repairedInterimProgressCount = 0
@@ -2751,6 +2655,7 @@ export class AgentEngine implements IAgentEngine {
     let lengthContinuationPrefix = ''
     let hadLengthContinuation = false
     const lengthContinuationMax = readLengthContinuationMax()
+    const truncatedToolCallAttempts: { failedAttempts?: AgentFailedAttempt[] } = {}
     let repairedDegenerateResponseCount = 0
     let repairedInvalidToolResponseCount = 0
     let forceFinalAfterDegenerateOutput = false
@@ -2765,20 +2670,23 @@ export class AgentEngine implements IAgentEngine {
     let repairedScheduleCompletionCount = countScheduleCompletionRecoveryPrompts(messages)
     let repairedActionCompletionCount = countActionCompletionRecoveryPrompts(messages)
     const writeLoopLimit = resolveWriteLoopLimit()
-    const writeLoopTracker = new WriteLoopTracker(writeLoopLimit)
+    const writeLoopTracker = continuationState?.writeLoopTracker ?? new WriteLoopTracker(writeLoopLimit)
     const readOnlyToolHistory: StuckToolRepeatEntry[] = []
-    // Structured current-run evidence survives message compaction. It is also
-    // mutation-aware, unlike the narrower stuck-read tracker below.
+    const invocationHistory: StuckToolRepeatEntry[] = continuationState?.invocationHistory ?? []
+    let invalidInvocationRepairUsed = continuationState?.invalidInvocationRepairUsed ?? false
+    let pendingOutcomeReviewReason = continuationState?.pendingOutcomeReviewReason ?? null
     const observationHistory = currentTurnObservationHistory
       ?? observationHistoryFromCurrentTurnMessages(messages)
+    let observationReuseOnlyCount = 0
+    let observationProgress: WorkProgress = { revision: 0, seen: [] }
+    let observationProgressCursor = 0
     let readOnlyEvidenceTurns = 0
     let lastReadOnlyToolSignature: string | null = null
     let forceFinalAfterRepeatedRead = false
     let forceFinalAfterObservationBudget = hasToolCallBatchCap(messages)
+    let forceFinalAfterValidationConvergence = continuationState?.forceFinalAfterValidationConvergence ?? false
+    let validationConvergence = continuationState?.validationConvergence ?? initialValidationConvergenceState()
     let announcedObservationCompaction = false
-    // Rolling in-run history summary, carried across iterations so a later
-    // compaction extends the previous summary instead of re-summarizing the
-    // whole run from scratch.
     let compressedHistorySummary: string | undefined
     let compressedHistoryUpToIndex: number | undefined
     let forceFinalAfterNoRetryActionFailure = messages.some((message) => (
@@ -2791,6 +2699,7 @@ export class AgentEngine implements IAgentEngine {
     ))
     let forceFinalAfterReadOnlyPolicyFailure = false
     let forceFinalAfterApprovalGrace = false
+    let forceFinalAfterWallClockReserve = false
     const approvalGraceState = createApprovalGraceState()
     let repairedReadOnlyInvocationCount = countReadOnlyInvocationRepairMessages(messages)
     const ignoredReadOnlyPolicyFailureToolCallIds = new Set(
@@ -2821,16 +2730,16 @@ export class AgentEngine implements IAgentEngine {
     const focusedBoundedCodingTask = !this.semanticRouting && isFocusedBoundedCodingTask(focusedRepositoryRequest)
     const substantiveRepositoryReview =
       !this.semanticRouting && isSubstantiveRepositoryChangeReview(focusedRepositoryRequest)
-    // A repository review needs evidence and a complete answer, but it does
-    // not need a provider-neutral control prefix. Some otherwise capable
-    // models repeatedly omit literal ANSWER:/INCOMPLETE: stems; treating that
-    // cosmetic miss as a failed turn can multiply expensive final-synthesis
-    // calls after all tools have already finished. Explicit strict-protocol
-    // surfaces still retain their existing enforcement.
     const requireFinalAnswerProtocol = this.strictFinalAnswerProtocol
     const rawTerminalOutputRequested = requestsRawTerminalCommandOutput(focusedRepositoryRequest)
     const focusedRepositoryLookup = !this.semanticRouting && isFocusedRepositoryChangeLookup(focusedRepositoryRequest)
     const focusedRepositoryNeedsDiff = focusedRepositoryLookupNeedsDiff(focusedRepositoryRequest)
+    const validationConvergenceEnabled =
+      !substantiveRepositoryReview
+      && !focusedRepositoryLookup
+      && activeSkillExecutionPolicies.length === 0
+      && (context.executionSkillIds?.length ?? 0) === 0
+      && (context.runContract?.requiredArtifacts?.length ?? 0) === 0
     const focusedRepositoryObservedTools = new Set(
       messages
         .filter((message) =>
@@ -2856,12 +2765,13 @@ export class AgentEngine implements IAgentEngine {
         && (!focusedRepositoryNeedsDiff || focusedRepositoryObservedTools.has('git.diff'))
       )
     let repairedRunOutcomeCount = countOutcomeRecoveryPrompts(messages)
-    let repairedOutcomeReviewCount = 0
+    let repairedOutcomeReviewCount = continuationState?.repairedOutcomeReviewCount ?? 0
     let repairedOutcomeReviewSynthesisCount = 0
-    // Mutations require final adjudication. Optional router/planner failure must
-    // not prevent that safety boundary from running. Share one bounded reserve
-    // across all mutation-review repairs, never reset it for every attempt.
-    let mutationReviewBudget: AuxiliaryLlmTurnBudget | undefined
+    let mutationReviewBudget = continuationState?.mutationReviewBudget
+    const retainedContinuationState = () => ({
+      validationConvergence, forceFinalAfterValidationConvergence, writeLoopTracker, invocationHistory, invalidInvocationRepairUsed,
+      pendingOutcomeReviewReason, repairedOutcomeReviewCount, mutationReviewBudget,
+    })
     let outcomeReviewSynthesisEvidenceCount = messages.filter(
       (message) => message.role === 'tool',
     ).length
@@ -2870,7 +2780,7 @@ export class AgentEngine implements IAgentEngine {
     let disableThinkingForProviderRecovery = false
     let contextRecoveries = 0
     let maxOutputTokenRecoveries = 0
-    let effectiveMaxOutputTokens: number | undefined
+    let effectiveMaxOutputTokens: number | undefined = recallObservedMaxOutputTokens(this.provider.id, context.model)
     let effectiveContextWindow: number | null = null
     let imageInputRecoveries = 0
     let disableVisualAttachmentsForProviderRecovery = false
@@ -2907,10 +2817,6 @@ export class AgentEngine implements IAgentEngine {
       failure: TrustedPolicyFailure,
     ): 'repair' | 'synthesize' | 'terminate' => {
       if (hasSuccessfulToolEvidenceInCurrentTurn(messages)) {
-        // A model gets exactly one tool-free chance to synthesize from the
-        // successful evidence. If it ignores that boundary and emits another
-        // blocked tool call, terminate deterministically instead of feeding
-        // the same blocker through an unbounded synthesis loop.
         if (forceFinalAfterReadOnlyPolicyFailure) return 'terminate'
         messages.push(buildReadOnlyPolicyBlockSynthesisMessage(failure))
         forceFinalAfterReadOnlyPolicyFailure = true
@@ -2953,6 +2859,15 @@ export class AgentEngine implements IAgentEngine {
       i++
     ) {
       const wallClock = this.runWallClock
+      const executionBlocker = workspaceExecutionBlocker(this.tools, context, context.runContract)
+      if (executionBlocker) {
+        yield* this.finishAfterUserActionRequired(
+          userActionRequiredOutput('workspace_execution_unavailable', executionBlocker, latestUserText(messages)),
+          context,
+          totalUsage,
+        )
+        return
+      }
       if (
         wallClock?.budgetMs !== undefined
         && Date.now() - wallClock.startedAt >= wallClock.budgetMs
@@ -2994,6 +2909,18 @@ export class AgentEngine implements IAgentEngine {
           usage: { ...totalUsage },
         })
         return
+      }
+      if (
+        wallClock?.budgetMs !== undefined
+        && !forceFinalAfterWallClockReserve
+        && Date.now() - wallClock.startedAt
+          >= wallClock.budgetMs - resolveWallClockSynthesisReserveMs(wallClock.budgetMs)
+      ) {
+        forceFinalAfterWallClockReserve = true
+        yield {
+          type: 'thinking',
+          content: '[supervisor] Wall-clock limit is near; tools are closed and the final answer is written from the evidence gathered so far.',
+        }
       }
       this.activeRuns?.upsert({ sessionId: context.sessionId, graphId: 'react',
         currentNode: pendingToolExecution ? 'tools' : 'agent', iteration: i,
@@ -3098,9 +3025,28 @@ export class AgentEngine implements IAgentEngine {
         continue
       }
 
+      const priorObservationRevision = observationProgress.revision
+      for (; observationProgressCursor < observationHistory.length; observationProgressCursor++) {
+        observationProgress = observeWorkProgress(
+          observationProgress,
+          observationHistory[observationProgressCursor]!,
+        )
+      }
+      if (observationProgress.revision > priorObservationRevision) observationReuseOnlyCount = 0
       const freshSteering = (this.liveRunState?.steeringNotes ?? []).filter(
         (note) => note.consumedAt === undefined && note.cancelledAt === undefined,
       )
+      if (freshSteering.length > 0) {
+        observationReuseOnlyCount = 0
+        reasoningBudgetExhausted = false
+        observationBudgetPressure = false
+        observationBudgetFraction = 0
+      }
+      if (observationBudgetScope !== observationScope()) {
+        observationBudgetScope = observationScope()
+        observationBudgetPressure = false
+        observationBudgetFraction = 0
+      }
       for (const note of freshSteering) {
         note.consumedAt = Date.now()
         await this.journalSteeringConsumed?.(context.sessionId, note.id)
@@ -3148,9 +3094,6 @@ export class AgentEngine implements IAgentEngine {
         charsPerToken,
         maxObservationCount: resolveMaxTurnToolObservations(),
       })
-      // Working-memory pressure is handled by the compacted projection built
-      // below; only a turn that keeps gathering past several full loads has
-      // stopped converging and earns a closed tool surface.
       if (observationBudget.exceeded) forceFinalAfterObservationBudget = true
       if (observationBudget.compactionRequired && !observationBudget.exceeded
         && !announcedObservationCompaction) {
@@ -3161,12 +3104,6 @@ export class AgentEngine implements IAgentEngine {
         }
       }
       if (repeatedBrowserClickWithoutProgress(messages)) forceFinalAfterRepeatedRead = true
-      // Proactive in-run compaction, matching the graph agent node. Without it
-      // a long react run only reacts *after* the provider rejects the prompt,
-      // and until then `fitProviderContext` silently drops the oldest turns —
-      // losing the user's goal and earlier decisions with no summary left
-      // behind. `semanticCompress` self-guards: it returns null while the run
-      // still fits, so turns that are not under pressure cost nothing.
       if (process.env.SEPILOTD_SEMANTIC_COMPRESSION !== '0') {
         try {
           const compressed = await semanticCompress(
@@ -3188,8 +3125,6 @@ export class AgentEngine implements IAgentEngine {
             messages.splice(0, messages.length, ...compressed.messages)
             compressedHistorySummary = compressed.summary
             compressedHistoryUpToIndex = compressed.upToIndex
-            // Fold the compression round-trip into the run total so cost and
-            // spend gates account for it.
             if (compressed.usage) {
               totalUsage.inputTokens += compressed.usage.inputTokens
               totalUsage.outputTokens += compressed.usage.outputTokens
@@ -3200,27 +3135,18 @@ export class AgentEngine implements IAgentEngine {
             }
           }
         } catch {
-          // Compression is an optimization, never a fatal step: the request
-          // fitter still bounds whatever is left.
         }
       }
       const compactedReadMessages = compactOversizedToolProtocolUnits(
         supersedeStaleSystemReminders(supersedeStaleReadResults(messages)),
         { contextWindowTokens: contextWindow, charsPerToken },
       )
-      // Inject a per-iteration system message naming tools that have been
-      // failing in this session, so the model can change tactics instead
-      // of looping on the same broken call. The hint lives only in the
-      // outbound request, not in `messages`, so it doesn't accumulate.
       let messagesForRequest = withProblemToolFeedback(
         compactedReadMessages,
         this.toolStats?.list(context.sessionId) ?? [],
         i,
       )
       const nativeToolUse = this.supportsNativeToolUse(context.model)
-      // An explicit maxTokens option remains preferred over the model default,
-      // but the final request fitter may lower it when the concrete prompt
-      // would otherwise exceed the model's physical context window.
       const resolvedMaxTokens = this.maxTokens ?? modelInfo?.maxOutputTokens
       const iterationBudget = effectiveMaxIterations()
       const isLastIteration = i >= iterationBudget - 1
@@ -3235,18 +3161,17 @@ export class AgentEngine implements IAgentEngine {
         || forceFinalAfterReadOnlyPolicyFailure
         || forceFinalAfterApprovalGrace
         || forceFinalAfterNoRetryActionFailure
+        || forceFinalAfterWallClockReserve
       const allToolsForRequest = this.tools.toToolDefinitions(context).filter((tool) => (
         this.autonomy !== AutonomyLevel.ReadOnly
         || tool.name === 'terminal.run'
         || isPolicyReadOnlyTool(tool.name, this.tools.securityDescriptor(tool.name))
       ) && (
-        // A denial grants one side-effect-free turn: offer only policy
-        // read-only tools so the catalog and the grace message agree.
         !approvalGraceState.denial
         || isPolicyReadOnlyTool(tool.name)
+      ) && (
+        !toolRejectedByExecutionIntentForEveryInput(context.runContract, tool.name, this.tools)
       )).map((tool) => {
-        // Announce the static approval posture in the catalog itself so the
-        // model does not discover prompts and blocks one call at a time.
         const suffix = toolApprovalDescriptionSuffix(toolApprovalPosture.get(tool.name))
         return suffix ? { ...tool, description: `${tool.description}${suffix}` } : tool
       })
@@ -3269,29 +3194,23 @@ export class AgentEngine implements IAgentEngine {
       const missingSkillStageToolsAvailable = skillCompletionBeforeRequest.missing.every(
         (missing) => missing.tools.some((toolName) => allToolNames.has(toolName)),
       )
-      // A generic observation budget closes unrelated discovery, but it must
-      // not make a selected skill's still-missing required stage unreachable.
-      // Re-open only the declared stage tools, under the skill's own bounded
-      // completion retry budget. Strong terminal boundaries remain final.
+      const observationReuseExhausted = observationReuseOnlyCount >= DEFAULT_STUCK_REPEAT_THRESHOLD
       const prioritizeMissingSkillStage =
-        (forceFinalAfterRepeatedRead || forceFinalAfterObservationBudget)
+        (forceFinalAfterRepeatedRead || forceFinalAfterObservationBudget
+          || forceFinalAfterValidationConvergence || observationReuseExhausted)
         && requiresVerifiedSkillExecution
         && missingSkillStageToolsAvailable
         && skillCompletionBeforeRequest.maxRetries > 0
-        // The retry counter is incremented when the recovery prompt is
-        // issued, before the provider gets the tool-enabled turn it grants.
         && repairedSkillExecutionCompletionCount <= skillCompletionBeforeRequest.maxRetries
         && !closedExactToolWorkflowComplete
         && !forceFinalAfterDegenerateOutput
         && !forceFinalAfterReadOnlyPolicyFailure
         && !forceFinalAfterNoRetryActionFailure
+        && !forceFinalAfterWallClockReserve
       const contractCommandToolNames = context.runContract?.executionIntent?.kind === 'operational-action'
         ? (context.runContract.executionIntent.allowedTools ?? [])
             .filter((toolName) => allToolNames.has(toolName))
         : []
-      // A closed capability boundary is not an exact tool-name allowlist.
-      // Only an explicitly present allowedTools list (including []) narrows
-      // this surface; absence must retain the request-scoped registry.
       const closedContractToolNames =
         context.runContract?.executionIntent?.allowedTools !== undefined
           ? context.runContract.executionIntent.allowedTools
@@ -3334,19 +3253,23 @@ export class AgentEngine implements IAgentEngine {
         && hasToolResultForName(messages, 'terminal.run')
       const forceSynthesisFromObservationBudget =
         (
-          (forceFinalAfterRepeatedRead || forceFinalAfterObservationBudget)
+          (forceFinalAfterRepeatedRead || forceFinalAfterObservationBudget
+            || forceFinalAfterValidationConvergence || observationReuseExhausted)
           && !prioritizeMissingSkillStage
         )
         || forceFinalAfterDegenerateOutput
         || forceFinalAfterReadOnlyPolicyFailure
         || forceFinalAfterApprovalGrace
         || forceFinalAfterNoRetryActionFailure
+        || forceFinalAfterWallClockReserve
         || focusedTerminalCommandCompleted
       if (substantiveRepositoryReview) {
         messagesForRequest = appendSubstantiveRepositoryReviewMessage(messagesForRequest)
       }
       if (focusedEvidenceReady) {
         messagesForRequest = appendFocusedRepositorySynthesisMessage(messagesForRequest)
+      } else if (forceFinalAfterWallClockReserve) {
+        messagesForRequest = appendWallClockSynthesisMessage(messagesForRequest)
       } else if (forceSynthesisFromObservationBudget) {
         messagesForRequest = appendForceFinalSystemMessage(messagesForRequest)
       }
@@ -3354,10 +3277,13 @@ export class AgentEngine implements IAgentEngine {
         && (context.executionSkillIds?.length ?? 0) === 0
         && (
           forceFinalAfterRepeatedRead
+          || observationReuseExhausted
           || forceFinalAfterObservationBudget
+          || forceFinalAfterValidationConvergence
           || forceFinalAfterReadOnlyPolicyFailure
           || forceFinalAfterApprovalGrace
           || forceFinalAfterNoRetryActionFailure
+          || forceFinalAfterWallClockReserve
         )
       if (useBoundedFinalContext) {
         messagesForRequest = buildBoundedFinalSynthesisContext(messagesForRequest, {
@@ -3426,8 +3352,6 @@ export class AgentEngine implements IAgentEngine {
       const toolsForRequest = allowedToolNames
         ? allToolsForRequest.filter((tool) => allowedToolNames.has(tool.name))
         : allToolsForRequest
-      // A mode-local final turn may still hand off within the original turn
-      // budget. Do not reopen actions/discovery or evade a terminal boundary.
       const canTransferOnLocalFinal = isLastIteration
         && (this.modeControl?.state.turnMaxIterations ?? 0) > i + 1
         && !forceSynthesisFromObservationBudget
@@ -3439,18 +3363,12 @@ export class AgentEngine implements IAgentEngine {
       const progressAwareToolsForRequest = [
         ...withAgentActionProgressSchemas(toolsForRequest), ...controlToolsForRequest,
       ]
-      if (this.modeControl?.prompt) messagesForRequest = [...messagesForRequest, { role: 'system', content: this.modeControl.prompt }]
+      if (this.modeControl?.prompt) messagesForRequest = [...messagesForRequest, { role: 'system', content: this.modeControl.prompt, metadata: { [RUN_STABLE_SYSTEM_METADATA_KEY]: true } }]
       if (allowedToolNames) for (const tool of controlToolsForRequest) allowedToolNames.add(tool.name)
-      // Adaptive OpenAI-compatible models can emit an empty native completion
-      // after tool history when the final request itself has no tools. A
-      // bounded final has no opportunity for another transport-recovery turn,
-      // so serialize that one request through the provider-safe prompt path
-      // immediately instead of paying for a known empty native attempt first.
       const useNativeToolUse = nativeToolUse
         && !preferPromptReact
         && !(useBoundedFinalContext && modelInfo?.capabilities.adaptivePromptReact === true)
 
-      // Keep amendments outside compactable history and after older contract hints.
       const steeringContent = [
         formatActiveUserInstructions(activeUserInstructions(this.liveRunState?.steeringNotes)),
         ...freshSteering.filter((note) => note.kind === 'question').map((note) =>
@@ -3469,13 +3387,10 @@ export class AgentEngine implements IAgentEngine {
       const providerProtocolRepair = repairProviderMessageProtocol(messagesWithBudgetHint)
       let requestMessages = providerProtocolRepair.messages
 
-      // A satisfied deterministic skill policy is already grounded in exact
-      // successful tool evidence. Running a second LLM reviewer in that state
-      // can only ask for duplicate work, so the shared policy gate is final.
       const willReviewCandidateFinal = !deterministicSkillCompletionSatisfiedBeforeRequest
         && !skipOutcomeReview
         && shouldReviewOutcomeWithLLM(messages, {
-          includeToollessFinal: this.reviewToollessFinals,
+          includeToollessFinal: this.reviewToollessFinals || context.runContract?.executionIntent?.workspaceMutation === 'required',
         })
       const configuredRequestedOutputTokens = resolvedMaxTokens
         ?? Math.min(4096, Math.max(256, Math.floor(contextWindow / 2)))
@@ -3500,6 +3415,7 @@ export class AgentEngine implements IAgentEngine {
         ? requestTools ?? []
         : useBoundedFinalContext ? [] : finalStepTools).map((tool) => tool.name))
       let renderedToolDefinitions = finalStepTools
+      requestMessages = withSystemToolGuidance(requestMessages, [...effectiveAllowedToolNames], this.systemToolGuidance)
       let contextFit: ProviderContextFitResult | undefined
       try {
         const toolDefinitionsActive = useNativeToolUse
@@ -3537,6 +3453,7 @@ export class AgentEngine implements IAgentEngine {
             requestTools = undefined
             effectiveAllowedToolNames = new Set<string>()
             renderedToolDefinitions = []
+            requestMessages = withSystemToolGuidance(requestMessages, [], this.systemToolGuidance)
             contextFit = fitProviderContext(requestMessages, {
               contextWindowTokens: contextWindow,
               requestedOutputTokens,
@@ -3561,10 +3478,6 @@ export class AgentEngine implements IAgentEngine {
         if (!contextFit) {
           if (!(fitError instanceof IrreducibleContextOverflowError)) throw fitError
           this.state = 'error'
-          // A model missing from the catalog has no declared context window, so
-          // the conservative default applies and a normal turn can overflow it.
-          // Say so: the window in the message is a guess, not the model's real
-          // limit, and refreshing the provider's model list is the actual fix.
           const message = modelInfo
             ? fitError.message
             : `${fitError.message} Model '${context.model}' is not in provider `
@@ -3588,11 +3501,23 @@ export class AgentEngine implements IAgentEngine {
         messages: contextFit.requestMessages,
         tools: requestTools,
         thinkingLevel: useBoundedFinalContext
-          ? ThinkingLevel.Off
+          ? resolveRepairThinkingLevel(modelInfo, this.thinkingLevel)
           : disableThinkingForProviderRecovery
           ? undefined
           : resolveThinkingLevel(this.thinkingLevel, {
-              toolNames: requestTools?.map((tool) => tool.name),
+              taskComplexity: context.runContract?.reasoningComplexity,
+              toolNames: [...effectiveAllowedToolNames],
+              reasoningBudgetExhausted,
+              observationBudgetPressure,
+              observationBudgetExhausted: observationBudgetFraction >= 2,
+              canDisableThinking: canAutomaticallyDisableThinking(modelInfo),
+              executionFailure: observationHistory.at(-1)?.executionObserved === true
+                && observationHistory.at(-1)?.status === 'error',
+              executionFailureEffect: observationHistory.at(-1)?.securityEffect,
+              executionFailureCode: observationHistory.at(-1)?.status === 'error'
+                ? structuredToolFailureCodeFromOutput(observationHistory.at(-1)?.output)
+                : undefined,
+              consecutiveExecutionFailures: consecutiveExecutionFailures(observationHistory),
             }),
         maxTokens:
           !useBoundedFinalContext
@@ -3603,7 +3528,9 @@ export class AgentEngine implements IAgentEngine {
           ? undefined
           : contextFit.maxOutputTokens,
         temperature: this.temperature,
-        timeoutMs: useBoundedFinalContext ? BOUNDED_FINAL_TIMEOUT_MS : undefined,
+        timeoutMs: this.runWallClock?.budgetMs !== undefined
+          ? runRequestTimeoutMs(this.runWallClock, useBoundedFinalContext ? BOUNDED_FINAL_TIMEOUT_MS : resolveProviderStreamFirstTokenMs() ?? undefined)
+          : useBoundedFinalContext ? BOUNDED_FINAL_TIMEOUT_MS : undefined,
       }
       const suppressTextDeltas =
         requireFinalAnswerProtocol
@@ -3616,9 +3543,6 @@ export class AgentEngine implements IAgentEngine {
         || lengthContinuationPrefix.length > 0
       const llmTurnId = buildLlmTurnId(context.sessionId, i + 1, 'react')
 
-      // Spend-cap gate — refuse the dispatch BEFORE the provider call so a
-      // runaway loop cannot burn unbounded provider dollars. Only priced spend
-      // counts, so local-model runs are never blocked.
       if (this.usageTracker && this.spendBudget) {
         const spend = checkSpendBudget(this.usageTracker, this.spendBudget, {
           sessionId: context.sessionId,
@@ -3634,10 +3558,6 @@ export class AgentEngine implements IAgentEngine {
         }
       }
 
-      // pre:llm:call gate — fires before every provider call so a policy hook
-      // can block (or inspect) the outbound request. Previously advertised in the
-      // command-hook schema but never emitted, so registering it was a silent
-      // no-op; emit it here at the react LLM-call boundary.
       if (this.hookRegistry) {
         const preLlm = await this.hookRegistry.trigger({
           event: 'pre:llm:call',
@@ -3673,6 +3593,7 @@ export class AgentEngine implements IAgentEngine {
           iteration: i + 1,
           source: 'estimated',
         })
+        if (this.runWallClock?.budgetMs !== undefined) request.timeoutMs = runRequestTimeoutMs(this.runWallClock, request.timeoutMs)
         yield buildLlmRequestEvent({
           sessionId: context.sessionId,
           iteration: i + 1,
@@ -3680,7 +3601,7 @@ export class AgentEngine implements IAgentEngine {
           request,
           turnId: llmTurnId,
           providerId: this.provider.id,
-          timeoutMs: resolveProviderStreamFirstTokenMs(),
+          timeoutMs: request.timeoutMs ?? resolveProviderStreamFirstTokenMs(),
         })
         const streamGen = useNativeToolUse
           ? this.streamWithDeltas(
@@ -3740,10 +3661,19 @@ export class AgentEngine implements IAgentEngine {
         totalUsage.inputTokens += response.usage.inputTokens
         totalUsage.outputTokens += response.usage.outputTokens
 
-        // A response planned before a new instruction must not execute stale
-        // actions or finish the turn. Account for its usage, then re-plan.
         if (this.aborted || signal?.aborted) break
         if (this.hasPendingSteering()) continue
+
+        if (shouldReduceAutomaticThinking(this.thinkingLevel, request.thinkingLevel, {
+          toolEnabled: effectiveAllowedToolNames.size > 0,
+          finishReason: response.finishReason,
+          finishDetail: response.finishDetail,
+          content: this.responseTextContent(response),
+          thinking: response.thinking,
+          hasToolOutput: (response.message.toolCalls?.length ?? 0) > 0,
+          outputTokens: response.usage.outputTokens,
+          maxTokens: request.maxTokens,
+        })) reasoningBudgetExhausted = true
 
         const requestHasNativeTools = (request.tools?.length ?? 0) > 0
         const hasCompletedNativeToolHistory =
@@ -3802,9 +3732,6 @@ export class AgentEngine implements IAgentEngine {
         const actionProgress = argumentActionProgress ?? contentActionProgress
         if (toolCalls && toolCalls.length > 0) {
           if (approvalGraceState.denial) {
-            // The side-effect-free turn after a denial may inspect, never act.
-            // A non-read-only call (including a retry of the denied one) is
-            // not executed; the run ends as approval_denied instead.
             const sideEffectingCall = toolCalls.find((call) => (
               !isPolicyReadOnlyTool(call.name)
             ))
@@ -4064,8 +3991,10 @@ export class AgentEngine implements IAgentEngine {
               sessionId: context.sessionId,
               runId: context.sessionId,
               iteration: i + 1,
-              status: executableToolCalls.length === 0 ? 'force-final' : 'partial-reuse',
+              status: executableToolCalls.length === 0 ? 'force-next-turn' : 'partial-reuse',
               data: {
+                reuseOnlySelections: observationReuseOnlyCount + (executableToolCalls.length === 0 ? 1 : 0),
+                novelEvidenceRevision: observationProgress.revision,
                 skippedCalls: observationReuse.coveredCalls.map(({ requested, observed }) => ({
                   requestedTool: requested.name,
                   requestedCallId: requested.id,
@@ -4084,29 +4013,54 @@ export class AgentEngine implements IAgentEngine {
               content: `[supervisor] Reused ${observationReuse.coveredCalls.length} successful current-turn read observation(s), narrowed ${observationReuse.narrowedCalls.length} overlapping request(s), and retained ${executableToolCalls.length} still-unobserved call(s).`,
             }
             if (executableToolCalls.length === 0) {
-              forceFinalAfterRepeatedRead = true
+              observationReuseOnlyCount += 1
               messages.push(response.message)
               messages.push(...buildObservationReuseToolResultMessages(
                 observationReuse.coveredCalls,
               ))
-              messages.push(observationReuseMessage)
+              messages.push({
+                ...observationReuseMessage,
+                content: `${observationReuseMessage.content}\nReuse-only selections since last new evidence: ${observationReuseOnlyCount}/${DEFAULT_STUCK_REPEAT_THRESHOLD}. Continue the active task with a genuinely new observation, authorized action, verification, or grounded final answer. Reuse is not evidence that the task is finished.`,
+              })
+              if (observationReuseOnlyCount >= DEFAULT_STUCK_REPEAT_THRESHOLD) {
+                yield { type: 'thinking', content: `[supervisor] ${observationReuseOnlyCount} cache-only decisions produced no new executor evidence; switching to bounded synthesis with the completion checks still active.` }
+              }
               this.state = 'observing'
               yield { type: 'state_change', state: 'observing' }
               continue
             }
           }
 
-          // Write-loop guard (CLI_BACKLOG.md B6): if the model keeps rewriting
-          // the same target, skip this write turn and tell it to stop/finalize
-          // instead of letting it burn the iteration budget rewriting one file
-          // dozens of times. Mirrors the duplicate-tool-call repair shape, so no
-          // control-flow change; the limit is deliberately generous.
           const writeLoopTarget = writeLoopTracker.offendingTarget(executableToolCalls)
           if (writeLoopTarget) {
             messages.push(response.message)
             messages.push(buildWriteLoopRepairMessage(writeLoopTarget, writeLoopLimit))
             this.state = 'observing'
             yield { type: 'state_change', state: 'observing' }
+            continue
+          }
+
+          const invalidRepeat = findRepeatedInvalidToolCall(invocationHistory,
+            executableToolCalls.map(call => ({ tool: call.name, input: call.arguments })))
+          if (invalidRepeat) {
+            const exhausted = invalidInvocationRepairUsed
+            invalidInvocationRepairUsed = true
+            if (exhausted) forceFinalAfterNoRetryActionFailure = true
+            messages.push({
+              role: 'system',
+              metadata: { reminderKind: exhausted ? 'no_retry_action_failure' : 'invalid_invocation_repair' },
+              content: exhausted
+                ? `[Invalid invocation boundary] ${invalidRepeat.tool} was proposed again with unchanged rejected input after the input-contract repair turn. This batch was not executed. Tool recovery is exhausted; summarize retained evidence and report the remaining blocker as INCOMPLETE. Do not claim the rejected action succeeded.`
+                : `[Tool input correction] ${invalidRepeat.tool} has twice rejected the same input before execution. This repeated batch was not executed. One input-contract repair turn is available: use the reported validation error and the schema below to supply corrected arguments, or choose an appropriate alternative tool. Do not repeat the unchanged input. If you cannot correct it, report the concrete blocker. This does not authorize any additional action. Input schema: ${JSON.stringify(this.tools.get(invalidRepeat.tool)?.inputSchema ?? {})}`,
+            })
+            this.state = 'observing'
+            yield { type: 'state_change', state: 'observing' }
+            yield {
+              type: 'thinking',
+              content: exhausted
+                ? `[supervisor] Input-contract repair did not resolve repeated invalid ${invalidRepeat.tool} calls; reporting the remaining blocker.`
+                : `[supervisor] Skipped unchanged invalid ${invalidRepeat.tool}; allowing one explicit input-contract repair.`,
+            }
             continue
           }
 
@@ -4126,6 +4080,7 @@ export class AgentEngine implements IAgentEngine {
               tool: call.name,
               input: call.arguments,
               status: 'success',
+              executionObserved: false,
               ts: Date.now(),
             }))
           const readLoop = detectStuckToolRepeat(
@@ -4133,6 +4088,8 @@ export class AgentEngine implements IAgentEngine {
             {
               trackedTools: REACT_CONSECUTIVE_READ_GUARD_TOOLS,
               targetRepeatThreshold: DEFAULT_TARGET_REPEAT_THRESHOLD,
+              permanentFailureChurnThreshold: DEFAULT_PERMANENT_FAILURE_CHURN_THRESHOLD,
+              executionFailureChurnThreshold: DEFAULT_EXECUTION_FAILURE_CHURN_THRESHOLD,
             },
           )
           if (readLoop.stuck && readLoop.tool && readLoop.count) {
@@ -4206,6 +4163,9 @@ export class AgentEngine implements IAgentEngine {
               : { ...response.message, toolCalls: executableToolCalls },
           )
           let focusedActionResult: ToolResultEvent | undefined
+          const readResultFingerprints = new Map<string, string>()
+          const guardedReadIds = new Set(guardedObservationCalls.map(call => call.id))
+          const proposedInputs = new Map(executableToolCalls.map((call) => [call.id, call.arguments]))
           const requiredUserAction = yield* this.runToolCalls(
             messages,
             executableToolCalls,
@@ -4215,18 +4175,80 @@ export class AgentEngine implements IAgentEngine {
             undefined,
             signal,
             canAttachVisualContent,
-            rawTerminalOutputRequested
-              || focusedProcessStart
-              || focusedProcessObservation
-              || focusedBrowserObservation
-              || focusedVisibleUrlOpen
-              ? (event) => { focusedActionResult = event }
-              : undefined,
+            (event) => {
+              if (guardedReadIds.has(event.toolCallId)) {
+                readResultFingerprints.set(event.toolCallId, createHash('sha256').update(event.output).digest('hex'))
+              }
+              if (rawTerminalOutputRequested || focusedProcessStart || focusedProcessObservation
+                || focusedBrowserObservation || focusedVisibleUrlOpen) focusedActionResult = event
+            },
           )
           if (requiredUserAction) {
             yield* this.finishAfterUserActionRequired(requiredUserAction, context, totalUsage)
             return
           }
+          if (validationConvergenceEnabled) {
+            const validationEvidenceEntries: ValidationConvergenceEntry[] = executableToolCalls.map((call) => {
+              const resultMessage = [...messages].reverse().find((message) => (
+                message.role === 'tool' && message.toolCallId === call.id
+              ))
+              return {
+                status: resultMessage?.metadata?.toolResultStatus === 'success'
+                  ? 'success'
+                  : 'error',
+                executionObserved: resultMessage?.metadata?.[TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY] === true,
+                reliableSuccess: call.name !== 'terminal.run'
+                  || terminalRunHasReliableSuccessStatus(call.arguments),
+                securityEffect: this.tools.securityDescriptor(call.name)?.effect ?? 'unknown',
+                ...(Object.hasOwn(call.arguments, 'actionPurpose')
+                  ? { actionPurpose: call.arguments.actionPurpose }
+                  : {}),
+              }
+            })
+            const validationConvergenceTransition = advanceValidationConvergence(
+              validationConvergence,
+              validationEvidenceEntries,
+            )
+            validationConvergence = validationConvergenceTransition.state
+            if (validationConvergenceTransition.forceFinal) {
+              forceFinalAfterValidationConvergence = true
+              messages.push({
+                role: 'system',
+                metadata: { reminderKind: 'post_validation_convergence' },
+                content: [
+                  '[Post-validation convergence boundary]',
+                  'A workspace mutation has already been followed by successful validation evidence.',
+                  'The bounded follow-up observation allowance is exhausted. Do not widen discovery or create a new reproduction; synthesize the current result now.',
+                  'If an acceptance criterion is still genuinely unmet, respond with INCOMPLETE and name that concrete gap instead of calling more read-only tools.',
+                ].join(' '),
+              })
+              yield {
+                type: 'thinking',
+                content: '[supervisor] Successful post-mutation validation reached the bounded convergence boundary; switching to final synthesis.',
+              }
+            }
+          }
+          const successfulNonObservation = executableToolCalls.some((call) => {
+            if (this.tools.securityDescriptor(call.name).effect === 'observe') return false
+            const resultMessage = [...messages].reverse().find((message) => (
+              message.role === 'tool' && message.toolCallId === call.id
+            ))
+            return resultMessage?.metadata?.toolResultStatus === 'success'
+          })
+          const staleObservationScope = observationBudgetScope !== observationScope()
+          if (successfulNonObservation || staleObservationScope) observationBudgetFraction = 0
+          if (!staleObservationScope) observationBudgetFraction = advanceAutomaticObservationBudget(this.thinkingLevel, request.thinkingLevel, observationBudgetFraction, {
+            finishReason: response.finishReason,
+            finishDetail: response.finishDetail,
+            outputTokens: response.usage.outputTokens,
+            maxTokens: request.maxTokens,
+            thinkingChars: response.thinking?.length ?? 0,
+            visibleChars: this.responseTextContent(response).length,
+            observationOnlyTools: executableToolCalls.length > 0
+              && executableToolCalls.every((call) => this.tools.securityDescriptor(call.name).effect === 'observe'),
+            taskComplexity: context.runContract?.reasoningComplexity,
+          })
+          observationBudgetPressure = observationBudgetFraction >= 1
           if (closedExactOnceToolBudgetComplete(
             focusedRepositoryRequest,
             toolCallBudgetHistoryFromCurrentTurnMessages(messages),
@@ -4272,7 +4294,7 @@ export class AgentEngine implements IAgentEngine {
             messages.push(...deferredCanonicalReadTargetRepairs.map((build) => build()))
           }
           if (observationReuseMessage) messages.push(observationReuseMessage)
-          const completedReadEntries = guardedObservationCalls.map((call) => {
+          const completedInvocationEntries = executableToolCalls.map((call) => {
             const resultMessage = [...messages].reverse().find((message) => (
               message.role === 'tool' && message.toolCallId === call.id
             ))
@@ -4282,8 +4304,14 @@ export class AgentEngine implements IAgentEngine {
             const blocked = blockSourceFromMetadata(resultMessage?.metadata) !== null
             return {
               tool: call.name,
-              input: call.arguments,
+              input: proposedInputs.get(call.id) ?? call.arguments,
               status,
+              executionObserved: resultMessage?.metadata?.[TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY] === true,
+              securityEffect: this.tools.securityDescriptor(call.name).effect,
+              outputFingerprint: readResultFingerprints.get(call.id),
+              ...(typeof resultMessage?.content === 'string'
+                ? { output: resultMessage.content.slice(0, 4_000) }
+                : {}),
               ...(status === 'error' && !blocked
                 ? { failureCode: structuredToolFailureCode(resultMessage) }
                 : {}),
@@ -4291,7 +4319,11 @@ export class AgentEngine implements IAgentEngine {
               ts: Date.now(),
             }
           })
-          readOnlyToolHistory.push(...completedReadEntries)
+          readOnlyToolHistory.push(...completedInvocationEntries.filter((_, index) => (
+            guardedReadIds.has(executableToolCalls[index]!.id)
+          )))
+          invocationHistory.push(...completedInvocationEntries)
+          invocationHistory.splice(0, Math.max(0, invocationHistory.length - DEFAULT_STUCK_REPEAT_WINDOW))
           for (const call of executableToolCalls) {
             const resultMessage = [...messages].reverse().find((message) => (
               message.role === 'tool' && message.toolCallId === call.id
@@ -4299,6 +4331,8 @@ export class AgentEngine implements IAgentEngine {
             observationHistory.push({
               tool: call.name,
               input: { ...call.arguments },
+              securityEffect: this.tools.securityDescriptor(call.name)?.effect ?? 'unknown',
+              executionObserved: resultMessage?.metadata?.[TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY] === true,
               status: resultMessage?.metadata?.toolResultStatus === 'success'
                 ? 'success'
                 : 'error',
@@ -4494,9 +4528,13 @@ export class AgentEngine implements IAgentEngine {
               totalUsage,
               0,
               undefined,
-            signal,
-            nextCycle,
-            observationHistory,
+              signal,
+              nextCycle,
+              observationHistory,
+              reasoningBudgetExhausted,
+              observationBudgetPressure,
+              observationBudgetFraction,
+              retainedContinuationState(),
             )
             return
           }
@@ -4548,10 +4586,6 @@ export class AgentEngine implements IAgentEngine {
           && approvalGraceState.denial
           && !suppressToolCallsForFinalIteration
         ) {
-          // During the side-effect-free grace turn the outbound catalog holds
-          // only read-only tools, so a call that was rejected as unavailable is
-          // a retry or rewrite of the declined side effect. Repairing it would
-          // only invite another attempt; end the run as approval_denied.
           yield {
             type: 'thinking',
             content: `[supervisor] The model requested an unavailable tool after the user declined ${approvalGraceState.denial.toolName ?? 'the tool'}; stopping without executing it.`,
@@ -4572,17 +4606,12 @@ export class AgentEngine implements IAgentEngine {
           && !suppressToolCallsForFinalIteration
         ) {
           const evidenceAvailable = hasSuccessfulToolEvidenceInCurrentTurn(messages)
-          // An observation is evidence, not proof that the whole goal is
-          // complete. Preserve the single repair opportunity when a permitted
-          // handoff can activate a missing capability; never expand authority.
           const synthesisOnly = evidenceAvailable
             && !controlToolsForRequest.some(tool => tool.name === MODE_TRANSFER_TOOL)
           repairedInvalidToolResponseCount += 1
           if (synthesisOnly) forceFinalAfterDegenerateOutput = true
           messages.push(buildInvalidToolResponseRepairMessage({
             evidenceAvailable: synthesisOnly,
-            // Repair against the actual outbound surface, including mode
-            // control. A hidden action may require discovery/transfer first.
             availableToolNames: progressAwareToolsForRequest.map((tool) => tool.name),
           }))
           this.state = 'observing'
@@ -4596,14 +4625,17 @@ export class AgentEngine implements IAgentEngine {
           continue
         }
 
+        const truncatedNativeToolCalls = response.finishReason === 'length'
+          ? response.truncatedToolCalls ?? []
+          : []
         const truncatedPromptToolCall =
-          !useNativeToolUse
-          && response.finishReason === 'length'
-          && containsPromptToolCallEnvelope(content)
+          truncatedNativeToolCalls.length > 0
+          || (
+            !useNativeToolUse
+            && response.finishReason === 'length'
+            && containsPromptToolCallEnvelope(content)
+          )
 
-        // A tool call is an atomic protocol message. Never concatenate a
-        // length-truncated JSON/envelope with a later model turn. The fragment
-        // was not executed, so discard it and ask for one fresh bounded call.
         if (
           truncatedPromptToolCall
           && !degenerateResponse
@@ -4615,7 +4647,34 @@ export class AgentEngine implements IAgentEngine {
           repairedLengthContinuationCount += 1
           hadLengthContinuation = true
           lengthContinuationPrefix = ''
-          messages.push(buildTruncatedPromptToolCallRecoveryMessage())
+          const truncatedToolCalls = truncatedNativeToolCalls.length > 0
+            ? truncatedNativeToolCalls
+            : parseTruncatedPromptToolCallNames(content)
+          const attempt = recordTruncatedToolCallAttempt(
+            truncatedToolCallAttempts,
+            truncatedToolCalls,
+            request.maxTokens,
+          )
+          const recovery = buildTruncatedPromptToolCallRecoveryMessage({
+            toolCalls: truncatedToolCalls,
+            maxOutputTokens: request.maxTokens,
+            attempt,
+          })
+          const recoveryPrefix = String(recovery.content).split('\n')[0] ?? ''
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const message = messages[i]!
+            if (message.role === 'system' && typeof message.content === 'string'
+              && recoveryPrefix && message.content.startsWith(recoveryPrefix)) {
+              messages.splice(i, 1)
+            }
+          }
+          messages.push(recovery)
+          yield buildTruncatedToolCallRecoveryEvent(
+            truncatedToolCalls,
+            request.maxTokens,
+            attempt,
+            { budget: lengthContinuationMax, used: repairedLengthContinuationCount },
+          )
           this.state = 'observing'
           yield { type: 'state_change', state: 'observing' }
           yield {
@@ -4625,11 +4684,6 @@ export class AgentEngine implements IAgentEngine {
           continue
         }
 
-        // A provider stream that ended without any terminal event published
-        // nothing and executed no tool. That is a transport failure, not a
-        // truncated answer: asking the model to "continue" from an empty
-        // prefix invents a resumption point that never existed. Re-issue the
-        // identical request instead, under the same bounded budget.
         if (
           !degenerateResponse
           && response.finishReason === 'length'
@@ -4649,18 +4703,6 @@ export class AgentEngine implements IAgentEngine {
           continue
         }
 
-        // Length-truncation continuation: the model stopped because it hit the
-        // output cap (finishReason==='length') with no usable tool call. Do not
-        // finalize this partial turn as a complete answer — keep the partial
-        // assistant text and ask it to continue, bounded by
-        // SEPILOTD_LENGTH_CONTINUE_MAX (default 1).
-        //
-        // This applies to a forced tool-free synthesis turn too. That turn has
-        // no tool access left to recover with, so refusing it the continuation
-        // repair makes the single most important turn of the run the only one
-        // that dies on truncation and reports an internal fallback to the user.
-        // The iteration budget is a different constraint and still applies:
-        // there is no next turn to continue into on the final iteration.
         if (
           !degenerateResponse
           && response.finishReason === 'length'
@@ -4719,15 +4761,13 @@ export class AgentEngine implements IAgentEngine {
         }
 
         const memoryWriteOutcome = memoryWriteOutcomeFromMessages(messages)
-        // An interrupted provider turn is already a terminal safety result.
-        // Do not reinterpret its synthetic INCOMPLETE message as ordinary
-        // progress and spend more iterations retrying an unpublishable turn.
         let terminalResponseFailure =
           interruptedResponse
           || repeatedRecoveryFailed
           || emptyDegenerationRecovery
           || closedExactToolWorkflowComplete
           || forceFinalAfterNoRetryActionFailure
+          || forceFinalAfterWallClockReserve
           || content.trim() === UNUSABLE_PROMPT_TOOL_CALL_OUTPUT
           || (forceFinalAfterDegenerateOutput && hasIncompleteAnswerStem(content))
         const scheduleCompletionOutcome = scheduleCompletionOutcomeFromMessages(messages)
@@ -4813,11 +4853,6 @@ export class AgentEngine implements IAgentEngine {
             missingStageToolsAvailable
             && !forceFinalAfterReadOnlyPolicyFailure
             && repairedSkillExecutionCompletionCount < skillExecutionCompletion.maxRetries
-            // A completion repair contributes its own bounded inflation to
-            // effectiveMaxIterations(). Allow it to start at the ordinary
-            // budget boundary; otherwise the guard prevents the counter from
-            // increasing precisely when that extra budget is needed. An
-            // explicit hard cap must remain absolute.
             && (!isLastIteration || canAutoContinueAfterBudget || !this.hardMaxIterations)
           ) {
             repairedSkillExecutionCompletionCount += 1
@@ -5038,7 +5073,7 @@ export class AgentEngine implements IAgentEngine {
           !deterministicSkillCompletionSatisfied
           && !skipOutcomeReview
           && shouldReviewOutcomeWithLLM(messages, {
-            includeToollessFinal: this.reviewToollessFinals,
+            includeToollessFinal: this.reviewToollessFinals || context.runContract?.executionIntent?.workspaceMutation === 'required',
           })
           && allToolsForRequest.length > 0
           && hasPendingRunOutcomeReviewRecovery(messages)
@@ -5063,7 +5098,7 @@ export class AgentEngine implements IAgentEngine {
           !deterministicSkillCompletionSatisfied
           && !skipOutcomeReview
           && shouldReviewOutcomeWithLLM(messages, {
-            includeToollessFinal: this.reviewToollessFinals,
+            includeToollessFinal: this.reviewToollessFinals || context.runContract?.executionIntent?.workspaceMutation === 'required',
           })
           && hasPendingRunOutcomeReviewRecovery(messages)
           && !hasIncompleteAnswerStem(content)
@@ -5114,7 +5149,7 @@ export class AgentEngine implements IAgentEngine {
           && !deterministicSkillCompletionSatisfied
           && !skipOutcomeReview
           && shouldReviewOutcomeWithLLM(messages, {
-            includeToollessFinal: this.reviewToollessFinals,
+            includeToollessFinal: this.reviewToollessFinals || context.runContract?.executionIntent?.workspaceMutation === 'required',
           })
         ) {
           const reviewRequest = buildRunOutcomeReviewRequest({
@@ -5124,15 +5159,21 @@ export class AgentEngine implements IAgentEngine {
             userInstructions: activeUserInstructions(this.liveRunState?.steeringNotes),
             availableToolNames: allToolsForRequest.map((tool) => tool.name),
             runContract: context.runContract,
-            maxTokens: OUTCOME_REVIEW_MAX_TOKENS,
+            maxTokens: resolveModelOutputAllowance({
+              requested: this.maxTokens,
+              modelMaximum: modelInfo?.maxOutputTokens,
+              observedMaximum: effectiveMaxOutputTokens,
+              fallback: OUTCOME_REVIEW_MAX_TOKENS,
+            }),
           })
           const reviewTurnId = buildLlmTurnId(context.sessionId, i + 1, 'outcome-review')
-          const requiresMutationReview = unavailableOutcomeReviewReason(messages) !== null
+          const requiresMutationReview = unavailableOutcomeReviewReason(messages, context.runContract) !== null
           if (requiresMutationReview && !mutationReviewBudget) {
-            mutationReviewBudget = new AuxiliaryLlmTurnBudget(DEFAULT_AUXILIARY_LLM_TURN_BUDGET_MS)
+            mutationReviewBudget = new AuxiliaryLlmTurnBudget(resolveControlCallTimeoutMs())
           }
           const reviewBudget = requiresMutationReview ? mutationReviewBudget : this.auxiliaryLlmBudget
           try {
+            Object.assign(reviewRequest, fitControlRequest(reviewRequest, modelInfo))
             yield buildLlmRequestEvent({
               sessionId: context.sessionId,
               iteration: i + 1,
@@ -5146,10 +5187,15 @@ export class AgentEngine implements IAgentEngine {
             const reviewResponse = await runAuxiliaryLlmChat({
               provider: this.provider,
               request: reviewRequest,
+              controlResponseAccepted: (response) => parseRunOutcomeReviewTransport(
+                this.responseTextContent(response),
+                response.thinking,
+              ) !== null,
               label: 'outcome review',
               breaker: this.providerCircuitBreaker,
               signal,
               budget: reviewBudget,
+              timeoutMs: requiresMutationReview ? null : undefined,
             })
             this.recordLlmUsage(context, reviewResponse.usage)
             totalUsage.inputTokens += reviewResponse.usage.inputTokens
@@ -5179,7 +5225,11 @@ export class AgentEngine implements IAgentEngine {
               reviewText,
               reviewResponse.thinking,
             )
-              ?? buildEmptyRunOutcomeReviewRecovery(reviewText)
+              ?? (reviewResponse.finishReason === 'length'
+                ? null : buildEmptyRunOutcomeReviewRecovery(reviewText))
+            if (!parsedReview && reviewResponse.finishReason === 'length') {
+              exhaustedOutcomeReviewReason = 'Completion review was unavailable after its bounded output recovery; no complete judgment was returned.'
+            }
             const review = enforceRunOutcomeReviewEvidenceFloor({
               review: parsedReview,
               messages,
@@ -5188,6 +5238,12 @@ export class AgentEngine implements IAgentEngine {
             })
             if (review?.status === 'needs_recovery') {
               outcomeReviewRecoveryReasons.push(review.reason)
+              if (review.recoveryMode !== 'synthesis' && (requiresMutationReview
+                || review.recoveryMode === 'tool' || review.recoveryMode === 'user-input')) {
+                pendingOutcomeReviewReason = review.reason
+              }
+            } else if (review?.status === 'complete') {
+              pendingOutcomeReviewReason = null
             }
             const currentToolResultCount = messages.filter(
               (message) => message.role === 'tool',
@@ -5216,11 +5272,6 @@ export class AgentEngine implements IAgentEngine {
               messages.push(responseMessageForHistory)
               dropStaleRunOutcomeReviewRecovery(messages)
               if (forceSynthesisFromObservationBudget) {
-                // A read/observation guard already decided that more evidence
-                // gathering is counterproductive and removed all tools. Do not
-                // install the normal recovery prompt, which requires new tool
-                // evidence and creates an impossible supervisor loop. Give the
-                // reviewer one bounded, tool-free synthesis retry instead.
                 messages.push({
                   role: 'system',
                   content: [
@@ -5378,13 +5429,10 @@ export class AgentEngine implements IAgentEngine {
               meta: { node: 'outcome-review', turnId: reviewTurnId, failed: true },
             })
             if (isAbortError(error) || signal?.aborted) throw error
-            exhaustedOutcomeReviewReason = unavailableOutcomeReviewReason(messages)
+            exhaustedOutcomeReviewReason = unavailableOutcomeReviewReason(messages, context.runContract)
           }
         }
 
-        // The deterministic evidence floor also applies when the auxiliary
-        // judge is unavailable or its budget expired. Never report a missing
-        // required artifact as completed merely because review could not run.
         const terminalEvidenceFloor = context.runContract?.requiredArtifacts?.length
           ? enforceRunOutcomeReviewEvidenceFloor({
               review: { status: 'complete', reason: 'Candidate reached the terminal acceptance boundary.' },
@@ -5399,6 +5447,9 @@ export class AgentEngine implements IAgentEngine {
         let finalContent = forceFinalAfterNoRetryActionFailure
           ? 'A required action failed under the no-retry contract, so the workflow is incomplete and later required actions were not executed.'
           : stripFinalAnswerStem(content)
+        if (pendingOutcomeReviewReason && !exhaustedOutcomeReviewReason) {
+          exhaustedOutcomeReviewReason = pendingOutcomeReviewReason
+        }
         if (exhaustedOutcomeReviewReason) {
           finalContent = buildOutcomeReviewExhaustedMessage(exhaustedOutcomeReviewReason)
         } else if (!finalContent) {
@@ -5430,7 +5481,6 @@ export class AgentEngine implements IAgentEngine {
           signal,
         )
 
-        // A follow-up can also arrive while the completion reviewer is running.
         if (this.aborted || signal?.aborted) break
         if (this.hasPendingSteering()) continue
 
@@ -5458,14 +5508,21 @@ export class AgentEngine implements IAgentEngine {
         yield { type: 'state_change', state: 'done' }
         const finalStopReason = approvalGraceState.denial && isIncompleteOutput(finalContent)
           ? stopReasonApprovalDenied(approvalGraceState.denial.toolName ?? 'tool')
-          : forceFinalAfterObservationBudget
+          : forceFinalAfterWallClockReserve && isIncompleteOutput(finalContent)
+          ? stopReasonWallClock(this.runWallClock?.budgetMs)
+          : (forceFinalAfterObservationBudget || forceFinalAfterValidationConvergence)
           ? stopReasonObservationBudget({
               incomplete: isIncompleteOutput(finalContent),
               contract: context.runContract,
             })
-          : exhaustedOutcomeReviewReason || isIncompleteOutput(finalContent)
-            || hasIncompleteAnswerStem(content) || forceFinalAfterNoRetryActionFailure
-            ? stopReasonCompletionGate({})
+          : isIncompleteOutput(finalContent)
+          ? stopReasonCompletionGate({
+              source: exhaustedOutcomeReviewReason ? 'gate' : 'self_reported',
+              unmet: [exhaustedOutcomeReviewReason ?? incompleteOutputReason(content) ?? incompleteOutputReason(finalContent)]
+                .filter((x): x is string => Boolean(x)),
+            })
+          : exhaustedOutcomeReviewReason || hasIncompleteAnswerStem(content) || forceFinalAfterNoRetryActionFailure
+            ? stopReasonCompletionGate({ unmet: exhaustedOutcomeReviewReason ? [exhaustedOutcomeReviewReason] : undefined })
             : stopReasonCompleted()
         yield {
           type: 'done',
@@ -5495,9 +5552,6 @@ export class AgentEngine implements IAgentEngine {
         await this.clearRunCheckpoint(context.sessionId)
         return
       } catch (err: unknown) {
-        // A parked approval (timeout without an answer) must unwind to the
-        // caller so the run lease is released and the checkpoint is kept for
-        // /approvals/resume; it is neither a provider failure nor a user abort.
         if (isApprovalParkedSignal(err)) throw err
         if ((signal?.aborted ?? false) || (this.aborted && isAbortError(err))) {
           this.state = 'done'
@@ -5514,12 +5568,14 @@ export class AgentEngine implements IAgentEngine {
           })
           return
         }
+        if (this.runWallClock?.budgetMs !== undefined && Date.now() - this.runWallClock.startedAt >= this.runWallClock.budgetMs) continue
         const observedMaxOutputTokens = maxOutputTokenRecoveries < 1
           ? detectProviderMaxOutputTokenLimit(err, request.maxTokens ?? requestedOutputTokens)
           : null
         if (observedMaxOutputTokens) {
           maxOutputTokenRecoveries += 1
           effectiveMaxOutputTokens = observedMaxOutputTokens
+          rememberObservedMaxOutputTokens(this.provider.id, context.model, observedMaxOutputTokens)
           this.state = 'observing'
           yield { type: 'state_change', state: 'observing' }
           yield buildMaxOutputTokenRecoveryEvent(
@@ -5549,10 +5605,6 @@ export class AgentEngine implements IAgentEngine {
               {
                 model: context.model,
                 signal,
-                // Carry the rolling summary in and back out. Without it a
-                // second recovery re-summarizes the whole run from scratch,
-                // paying for a longer call and losing the first pass's
-                // wording (the graph path already threads it through).
                 previousSummary: compressedHistorySummary,
                 previousUpToIndex: compressedHistoryUpToIndex,
                 charsPerToken: tokenCalibration.charsPerToken(this.provider.id, context.model),
@@ -5769,10 +5821,6 @@ export class AgentEngine implements IAgentEngine {
     }
 
     const finalIterationBudget = effectiveMaxIterations()
-    // Continuation is progress-driven, not count-driven: a cycle that produced
-    // new tool evidence, artifact mutations or a verified partial may continue
-    // while cycles remain; a cycle that produced nothing stops now even if
-    // cycles remain. A zero-iteration budget never ran a cycle to judge.
     const progressSinceCycleStart = finalIterationBudget > 0
       ? evaluateProgressSince(messages, findProgressMarkerIndex(messages))
       : undefined
@@ -5858,6 +5906,10 @@ export class AgentEngine implements IAgentEngine {
         signal,
         nextCycle,
         observationHistory,
+        reasoningBudgetExhausted,
+        observationBudgetPressure,
+        observationBudgetFraction,
+        retainedContinuationState(),
       )
       return
     }
@@ -5912,14 +5964,15 @@ export class AgentEngine implements IAgentEngine {
     })
   }
 
+  setAutonomy(level: AutonomyLevel): void {
+    this.autonomy = level
+  }
+
   async *run(input: string, context: AgentContext): AsyncIterable<AgentEvent> {
     this.aborted = false
     const abortController = new AbortController()
     this.runAbortController = abortController
-    this.runWallClock = {
-      startedAt: Date.now(),
-      budgetMs: parseRunWallClockBudgetMs(process.env.SEPILOTD_RUN_MAX_WALL_MS),
-    }
+    this.runWallClock = resolveRunWallClock(Date.now(), context.deadlineAt)
     try {
       if (this.hookRegistry && this.emitAgentRunHooks) {
         const hookResult = await this.hookRegistry.trigger({
@@ -5994,10 +6047,7 @@ export class AgentEngine implements IAgentEngine {
     this.aborted = false
     const abortController = new AbortController()
     this.runAbortController = abortController
-    this.runWallClock = {
-      startedAt: Date.now(),
-      budgetMs: parseRunWallClockBudgetMs(process.env.SEPILOTD_RUN_MAX_WALL_MS),
-    }
+    this.runWallClock = resolveRunWallClock(Date.now(), checkpoint.deadlineAt)
     try {
       yield* this.runWithLiveState(
         checkpoint.messages.map(cloneMessage),
@@ -6011,7 +6061,10 @@ export class AgentEngine implements IAgentEngine {
           scopeTags: cloneCheckpointScopeTags(checkpoint.scopeTags),
           executionSkillIds: cloneCheckpointExecutionSkillIds(checkpoint.executionSkillIds),
           skillToolNames: cloneCheckpointSkillToolNames(checkpoint.skillToolNames),
+          deadlineAt: checkpoint.deadlineAt,
+          memoryPolicy: cloneCheckpointMemoryPolicy(checkpoint.memoryPolicy),
           toolAllowlist: cloneCheckpointToolAllowlist(checkpoint.toolAllowlist),
+          delegationToolAllowlist: cloneCheckpointToolAllowlist(checkpoint.delegationToolAllowlist),
           skillExecutionPolicies: cloneCheckpointSkillExecutionPolicies(
             checkpoint.skillExecutionPolicies,
           ),
@@ -6041,10 +6094,7 @@ export class AgentEngine implements IAgentEngine {
     this.aborted = false
     const abortController = new AbortController()
     this.runAbortController = abortController
-    this.runWallClock = {
-      startedAt: Date.now(),
-      budgetMs: parseRunWallClockBudgetMs(process.env.SEPILOTD_RUN_MAX_WALL_MS),
-    }
+    this.runWallClock = resolveRunWallClock(Date.now(), checkpoint.deadlineAt)
     const resumedState: AgentState = checkpoint.pendingToolExecution?.toolCalls.length
       ? 'acting'
       : 'thinking'
@@ -6063,7 +6113,10 @@ export class AgentEngine implements IAgentEngine {
           scopeTags: cloneCheckpointScopeTags(checkpoint.scopeTags),
           executionSkillIds: cloneCheckpointExecutionSkillIds(checkpoint.executionSkillIds),
           skillToolNames: cloneCheckpointSkillToolNames(checkpoint.skillToolNames),
+          deadlineAt: checkpoint.deadlineAt,
+          memoryPolicy: cloneCheckpointMemoryPolicy(checkpoint.memoryPolicy),
           toolAllowlist: cloneCheckpointToolAllowlist(checkpoint.toolAllowlist),
+          delegationToolAllowlist: cloneCheckpointToolAllowlist(checkpoint.delegationToolAllowlist),
           skillExecutionPolicies: cloneCheckpointSkillExecutionPolicies(
             checkpoint.skillExecutionPolicies,
           ),

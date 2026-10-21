@@ -32,11 +32,6 @@ export class SwarmRunStore {
     return all.filter((e) => e.ts > sinceMs)
   }
 
-  /**
-   * Reconstruct a SwarmRun snapshot from jsonl events. Used to surface
-   * already-completed runs (which have been deregistered from the active
-   * map) via the same shape the active /runs endpoints return.
-   */
   async reconstruct(runId: string): Promise<SwarmRun | null> {
     const events = await this.readAll(runId)
     if (events.length === 0) return null
@@ -72,7 +67,6 @@ export class SwarmRunStore {
     }
   }
 
-  /** List runs in the sessions dir, newest-first. Does NOT load events. */
   async listIds(): Promise<string[]> {
     if (!existsSync(this.sessionsDir)) return []
     const entries = await readdir(this.sessionsDir, { withFileTypes: true })
@@ -81,10 +75,6 @@ export class SwarmRunStore {
       .map((d) => d.name.slice(0, -'.jsonl'.length))
   }
 
-  /**
-   * Reconstruct snapshots for the most-recently-modified `limit` runs.
-   * Used to power /swarm history without loading the entire on-disk corpus.
-   */
   async listHistory(limit = 50): Promise<SwarmRun[]> {
     const ids = await this.listIds()
     if (ids.length === 0) return []

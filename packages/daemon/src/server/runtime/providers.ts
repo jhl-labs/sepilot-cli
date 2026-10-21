@@ -29,8 +29,6 @@ export class ProviderFactoryRegistry implements IProviderFactoryRegistry {
   register(type: string, factory: ProviderFactory, options?: { source?: ProviderFactorySource }): void {
     const source = options?.source ?? (this.pluginScope ? 'plugin' : 'builtin')
     const existing = this.sources.get(type)
-    // A plugin may never overwrite a built-in provider factory (e.g. 'anthropic')
-    // nor another plugin's factory — that is a silent credential/impl hijack.
     if (source === 'plugin' && existing) {
       throw new Error(
         `plugin cannot register provider factory '${type}': already registered by ${existing}`,
@@ -84,6 +82,7 @@ function registerBuiltinProviderFactories(
   registry.register('opencode', (provider) => ({
     provider: new OpencodeProvider({
       models: provider.models,
+      disableDefaultPlugins: provider.disableDefaultPlugins,
       defaultContextWindow: provider.defaultContextWindow,
       defaultMaxOutputTokens: provider.defaultMaxOutputTokens,
     }),
@@ -92,6 +91,7 @@ function registerBuiltinProviderFactories(
   registry.register('codex', (provider) => ({
     provider: new CodexProvider({
       models: provider.models,
+      structuredToolCalling: provider.structuredToolCalling,
       defaultContextWindow: provider.defaultContextWindow,
       defaultMaxOutputTokens: provider.defaultMaxOutputTokens,
     }),
@@ -221,10 +221,6 @@ export function applyProviderModelOverrides(
     const exact = exactModelOverrides.get(modelId)
     if (exact) return exact
 
-    // Endpoint discovery can replace a configured alias with a separator-only
-    // or family-suffixed exact id. Inherit only the single most-specific
-    // explicit override; equal candidates are ambiguous and intentionally
-    // leave the model at provider defaults.
     const targetParts = modelIdParts(modelId)
     const prefixMatches = configuredOverrides
       .map((override) => ({ override, parts: modelIdParts(override.id) }))
@@ -268,9 +264,15 @@ export function applyProviderModelOverrides(
       }
     }
     if (override.compatibility) {
+      const compatibility = { ...override.compatibility }
+      if (override.id !== model.id) {
+        delete compatibility.reasoningEffortOffValue
+        delete compatibility.auxiliaryThinkingOffFallback
+        delete compatibility.repairThinkingOffFallback
+      }
       model.compatibility = {
         ...model.compatibility,
-        ...override.compatibility,
+        ...compatibility,
         notes: override.compatibility.notes
           ? [...override.compatibility.notes]
           : model.compatibility?.notes,

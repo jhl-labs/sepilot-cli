@@ -1,12 +1,5 @@
 import type { AgentEvidenceRequirement } from '@sepilotd/core'
 
-/**
- * `source` represents an observed external, application, document, or local
- * source. `repository` represents broad source-code coverage. Keeping those
- * meanings separate prevents a successful web/page observation from being
- * rejected merely because it is not one of four filesystem reads, while
- * preserving the stronger default for repository-wide analysis.
- */
 export function evidenceRequirementMinSourceFiles(
   requirement: AgentEvidenceRequirement,
 ): number {

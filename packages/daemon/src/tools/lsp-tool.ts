@@ -20,7 +20,6 @@ function formatLocation(loc: LspLocation): string {
   return `${loc.uri}:${loc.range.start.line + 1}:${loc.range.start.character + 1}`
 }
 
-/** Flatten an LSP Hover `contents` (string | MarkedString | MarkupContent | array). */
 function formatHoverContents(contents: unknown): string {
   if (contents == null) return ''
   if (typeof contents === 'string') return contents
@@ -32,12 +31,6 @@ function formatHoverContents(contents: unknown): string {
   return ''
 }
 
-/**
- * Pick a small set of symbol positions worth running `references` on.
- * Strategy: ask documentSymbol for top-level declarations, prefer
- * exported / file-level kinds (function, class, interface, …), cap at 3
- * to bound the round-trip count.
- */
 async function collectReferencePositions(
   client: LspClient,
   uri: string,
@@ -48,9 +41,6 @@ async function collectReferencePositions(
   } catch {
     return []
   }
-  // Prefer kinds that typically appear in import sites: function (12),
-  // class (5), interface (11), enum (10), variable (13). We stay
-  // shallow — top-level only — and skip property/field/parameter kinds.
   const interestingKinds = new Set([5, 6, 10, 11, 12, 13])
   const picked: Array<{ line: number; character: number }> = []
   for (const sym of symbols) {

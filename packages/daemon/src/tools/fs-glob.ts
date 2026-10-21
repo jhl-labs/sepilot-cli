@@ -101,8 +101,6 @@ function expandGlobPatternAlternatives(pattern: string): string[] {
       changed = true
       const options = alternative[1]!.split(',')
       if (next.length + options.length > MAX_GLOB_PATTERN_EXPANSIONS) {
-        // A partial expansion would create false absence claims for the
-        // discarded alternatives. Keep the original literal and fail closed.
         return [pattern]
       }
       for (const option of options) {
@@ -120,9 +118,6 @@ function expandGlobPatternAlternatives(pattern: string): string[] {
 
 function globPatternToRegExp(pattern: string): RegExp {
   const normalized = pattern.replaceAll('\\', '/')
-  // ripgrep treats a slash-less pattern (e.g. `*.ts`) as a basename match at any
-  // depth; the Node fallback must do the same, otherwise a bare pattern only
-  // matches top-level files and the two backends diverge.
   let source = normalized.includes('/') ? '^' : '^(?:.*/)?'
 
   for (let index = 0; index < normalized.length; index += 1) {
@@ -198,9 +193,6 @@ function gitignorePatternToRule(rawLine: string): GitignoreRule | null {
       source += escapeRegexChar(char)
     }
   }
-  // A slash-less pattern matches at any depth (basename); an anchored one is
-  // rooted at the search dir. Either way a matched directory ignores its whole
-  // subtree, so allow an optional trailing path segment.
   const prefix = anchored ? '^' : '^(?:.*/)?'
   return { negated, dirOnly, regex: new RegExp(`${prefix}${source}(?:/.*)?$`) }
 }
@@ -264,7 +256,6 @@ async function listFilesForGlob(
       if (!hidden && entry.name.startsWith('.')) {
         continue
       }
-      // ripgrep never descends into .git even with --hidden; match that.
       if (entry.isDirectory() && entry.name === '.git') {
         continue
       }
@@ -315,8 +306,6 @@ async function globWithoutRipgrep(
   const regexes = patterns
     .flatMap(expandGlobPatternAlternatives)
     .map(globPatternToRegExp)
-  // ripgrep honors .gitignore by default; mirror that in the fallback so the
-  // two backends return the same set. includeIgnored disables it on both sides.
   const gitignoreRules = includeIgnored ? [] : await loadGitignoreRules(cwd)
   return listFilesForGlob(
     cwd,
@@ -401,9 +390,6 @@ async function runGlobPatternGroups(
     return runGroup(groups[0]!, limit, offset)
   }
 
-  // Apply pagination after merging both path-sorted, disjoint scopes. Paging
-  // each scope first could hide an earlier explicit dot-directory match behind
-  // a later visible match (or vice versa).
   const groupLimit = Math.min(Number.MAX_SAFE_INTEGER, offset + limit)
   const results: GlobMatches[] = []
   for (const group of groups) {
@@ -616,8 +602,6 @@ export function createFsGlobTool(): ToolDefinitionRuntime {
           limit,
           offset,
           async (group, groupLimit, groupOffset) => {
-            // Do not inherit RIPGREP_CONFIG_PATH. A user config can enable
-            // --follow and make a workspace glob traverse an outside symlink.
             const args = ['--no-config', '--files', '--sort', 'path']
             if (group.hidden) {
               args.push('--hidden')

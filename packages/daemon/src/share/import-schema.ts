@@ -26,12 +26,6 @@ export type ImportableSessionEventsParseResult =
   | { success: true; events: SessionEvent[] }
   | { success: false }
 
-/**
- * Import only user/assistant transcript messages from an untrusted share.
- * Planner state, compacted context, tool history, approvals, memory context,
- * and delegation events can be promoted to system/tool authority when a
- * session resumes, so they must never cross this trust boundary.
- */
 export function parseImportableSessionEvents(
   values: readonly unknown[],
 ): ImportableSessionEventsParseResult {

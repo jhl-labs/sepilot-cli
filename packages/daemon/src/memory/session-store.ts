@@ -6,7 +6,10 @@ import type {
   SessionMeta,
   PaginatedResult,
   PaginationParams,
+  ToolCallEvent,
+  ToolResultEvent,
 } from '@sepilotd/core'
+import { throwIfAborted } from '../abort.js'
 import { createLogger } from '../logger.js'
 import { isNodeFsError } from '../utils/fs-error.js'
 import { assertSafeId } from '../utils/safe-id.js'
@@ -41,11 +44,6 @@ interface SessionIndex {
   sessions: IndexedSessionMeta[]
 }
 
-/**
- * Reconstruct an index entry from a session's JSONL journal. Token/cost totals
- * are not recoverable from message events alone and reset to zero; everything
- * else derives from the journal, which is the durable source of truth.
- */
 function buildSessionMetaFromJournalEvents(
   sessionId: string,
   events: SessionEvent[],
@@ -84,7 +82,6 @@ type SessionMetaPatch = {
   provider?: string
   model?: string
   personaIds?: string[]
-  /** Server-bound isolated persona memory identity. */
   memoryNamespace?: string
   preferPromptReact?: boolean
   starred?: boolean
@@ -94,7 +91,6 @@ type SessionMetaPatch = {
 export class JsonlSessionStore implements ISessionStore {
   private sessionsDir: string
   private index: SessionIndex = { version: SESSION_INDEX_VERSION, sessions: [] }
-  // Serialize both index mutation and flush across different sessions.
   private indexWriteQueue: Promise<void> = Promise.resolve()
   private readonly sessionWriteQueues = new Map<string, Promise<void>>()
 
@@ -102,12 +98,6 @@ export class JsonlSessionStore implements ISessionStore {
     this.sessionsDir = sessionsDir
   }
 
-  /**
-   * Keep every mutation of one session in FIFO order. Chat turns are not the
-   * only writers: steering, dreaming, scheduler callbacks, undo, and delete can
-   * overlap. A recovered tail prevents one failed write from poisoning every
-   * later operation for that session.
-   */
   private withSessionWrite<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.sessionWriteQueues.get(sessionId) ?? Promise.resolve()
     const current = previous.catch(() => undefined).then(operation)
@@ -137,10 +127,6 @@ export class JsonlSessionStore implements ISessionStore {
     assertSafeId(sessionId, 'sessionId')
     const root = resolve(this.sessionsDir)
     const file = resolve(join(root, `${sessionId}.jsonl`))
-    // Use the platform path separator instead of a hard-coded `/` —
-    // on Windows `resolve()` returns backslash paths so the previous
-    // `${root}/` prefix never matched and every sessionId tripped the
-    // "invalid sessionId" guard.
     const prefix = root.endsWith(sep) ? root : `${root}${sep}`
     if (!file.startsWith(prefix)) {
       throw new Error('invalid sessionId')
@@ -162,19 +148,10 @@ export class JsonlSessionStore implements ISessionStore {
       data = await retryTransientFsOperation(() => readFile(indexPath, 'utf-8'))
     } catch (err) {
       if (isNodeFsError(err, 'ENOENT')) {
-        // First run — no index yet. Reconstruct from JSONL files
-        // (which may already exist if a previous run crashed before
-        // first index.json write, though usually empty).
         this.index = { version: SESSION_INDEX_VERSION, sessions: [] }
         await this.rebuildIndex()
         return
       }
-      // EACCES / EIO / EBUSY — DON'T silently fall through to
-      // rebuildIndex. The rebuild path resets every session's
-      // tags/totalTokens/totalCost/provider/model/device to
-      // 'unknown' / 0 / [], so a transient permission flap on
-      // index.json would silently destroy weeks of accrued
-      // metadata. Surface the error and refuse to start.
       log.error('failed to read session index — refusing to silently rebuild and lose meta', {
         path: indexPath,
         error: err instanceof Error ? err.message : String(err),
@@ -186,10 +163,6 @@ export class JsonlSessionStore implements ISessionStore {
       this.index = parseSessionIndex(data)
       await this.ensureSearchIndex()
     } catch (err) {
-      // index.json present but malformed JSON. The on-disk JSONL
-      // events are intact, but the meta we'd reconstruct from them
-      // is lossy. Rotate the bad index aside (preserved for
-      // forensics) so a rebuild starting fresh isn't invisible.
       const aside = `${indexPath}.broken-${Date.now()}`
       log.error('session index unparseable; rotating aside before rebuild', {
         path: indexPath,
@@ -214,9 +187,6 @@ export class JsonlSessionStore implements ISessionStore {
     try {
       files = await retryTransientFsOperation(() => readdir(this.sessionsDir))
     } catch (err) {
-      // Surface the error rather than the previous `catch {}` which
-      // silently advertised zero sessions while JSONL files were
-      // intact on disk.
       log.error('failed to list session JSONL files during rebuild', {
         sessionsDir: this.sessionsDir,
         error: err instanceof Error ? err.message : String(err),
@@ -231,9 +201,6 @@ export class JsonlSessionStore implements ISessionStore {
       try {
         events = await this.getEvents(sessionId)
       } catch (err) {
-        // Persisting an incomplete rebuilt index would make a temporarily
-        // locked session disappear permanently. Abort and retry startup later;
-        // the JSONL files and any rotated broken index remain available.
         log.error('failed to read session during index rebuild', {
           sessionId,
           error: err instanceof Error ? err.message : String(err),
@@ -246,15 +213,6 @@ export class JsonlSessionStore implements ISessionStore {
     await this.saveIndex()
   }
 
-  /**
-   * Re-register a session whose JSONL journal exists on disk but whose index
-   * entry is missing. `delete()` unlinks the journal and removes the index
-   * entry under the same per-session write lock, so this state can only mean
-   * the index lost the entry (e.g. a crash or ENOSPC during an index flush) —
-   * the journal is the durable source of truth, so heal the index from it
-   * instead of failing the write. Returns false when the journal itself is
-   * absent or empty (a genuinely unknown or deleted session).
-   */
   private async recoverIndexEntryFromJournal(sessionId: string): Promise<boolean> {
     const events = await this.getEvents(sessionId)
     if (events.length === 0) return false
@@ -271,10 +229,6 @@ export class JsonlSessionStore implements ISessionStore {
     return true
   }
 
-  /**
-   * assertSessionExists for journal writers: unknown sessions still fail, but
-   * an index entry lost while the journal survived is recovered in place.
-   */
   private async ensureSessionIndexed(sessionId: string): Promise<void> {
     if (this.index.sessions.some((session) => session.id === sessionId)) return
     if (await this.recoverIndexEntryFromJournal(sessionId)) return
@@ -348,7 +302,6 @@ export class JsonlSessionStore implements ISessionStore {
         await this.saveIndex()
       }
     }
-    // Sort by updatedAt desc
     filtered.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     const page = params?.page ?? 1
     const perPage = params?.perPage ?? 20
@@ -418,9 +371,18 @@ export class JsonlSessionStore implements ISessionStore {
     return this.withSessionWrite(sessionId, () => this.updateMetaUnlocked(sessionId, patch))
   }
 
+  async updateTitleIfUnchanged(
+    sessionId: string,
+    title: string,
+    expected: Pick<SessionMeta, 'title' | 'createdAt'>,
+  ): Promise<SessionMeta | null> {
+    return this.withSessionWrite(sessionId, () => this.updateMetaUnlocked(sessionId, { title }, expected))
+  }
+
   private async updateMetaUnlocked(
     sessionId: string,
     patch: SessionMetaPatch,
+    expectedTitle?: Pick<SessionMeta, 'title' | 'createdAt'>,
   ): Promise<SessionMeta | null> {
     const events = await this.getEvents(sessionId)
     return this.withIndexWrite(async () => {
@@ -428,6 +390,9 @@ export class JsonlSessionStore implements ISessionStore {
       if (index < 0) return null
 
       const previous = this.index.sessions[index]
+      if (expectedTitle && (previous.title !== expectedTitle.title || previous.createdAt !== expectedTitle.createdAt)) {
+        return null
+      }
       const meta: IndexedSessionMeta = { ...previous }
       if (typeof patch.title === 'string') {
         const trimmed = patch.title.trim()
@@ -498,19 +463,11 @@ export class JsonlSessionStore implements ISessionStore {
   }
 
   private async appendEventUnlocked(sessionId: string, event: SessionEvent): Promise<void> {
-    // This check runs inside the per-session write queue. A delete that won the
-    // queue therefore cannot be followed by a stale turn recreating its JSONL
-    // journal (and making the deleted session reappear on the next rebuild).
-    // An index entry lost while the journal survived is healed instead of
-    // thrown: a mid-run bookkeeping throw here escapes as an unhandled
-    // rejection in fire-and-forget journaling callers and killed the daemon.
     await this.ensureSessionIndexed(sessionId)
 
     const line = JSON.stringify(event) + '\n'
     const path = this.sessionFile(sessionId)
     try {
-      // Retry only opening the append handle. Retrying a write after a possible
-      // partial append could duplicate an event.
       const handle = await retryTransientFsOperation(() => open(path, 'a', 0o600))
       try {
         await handle.writeFile(line, 'utf-8')
@@ -530,9 +487,6 @@ export class JsonlSessionStore implements ISessionStore {
       const index = this.index.sessions.findIndex((session) => session.id === sessionId)
       if (index < 0) return
 
-      // The journal append above is the durable source of truth. Keep this
-      // derived in-memory update if its flush fails so a later index commit can
-      // heal it without losing the already-persisted event.
       const meta: IndexedSessionMeta = { ...this.index.sessions[index] }
       meta.updatedAt = event.timestamp
       if (event.type === 'user_message' || event.type === 'assistant_message') {
@@ -552,6 +506,74 @@ export class JsonlSessionStore implements ISessionStore {
     })
   }
 
+  async getToolResult(
+    sessionId: string,
+    toolCallId: string,
+    options: { signal?: AbortSignal } = {},
+    decode: (event: SessionEvent) => SessionEvent = (event) => event,
+  ): Promise<{ call: ToolCallEvent; result: ToolResultEvent } | null> {
+    throwIfAborted(options.signal)
+    if (!toolCallId || toolCallId.length > 128) return null
+    const handle = await open(this.sessionFile(sessionId), 'r').catch((error: unknown) => {
+      if (isNodeFsError(error, 'ENOENT')) return null
+      throw error
+    })
+    if (!handle) return null
+    try {
+      const { size } = await handle.stat()
+      if (!size || size > 32 * 1024 * 1024) return null
+      let call: ToolCallEvent | undefined
+      let result: ToolResultEvent | undefined
+      let pending = ''
+      const consume = (line: string): boolean => {
+        if (!line.trim()) return true
+        if (line.length > 2 * 1024 * 1024) return false
+        let event: SessionEvent
+        try {
+          const raw = JSON.parse(line) as SessionEvent
+          if (!raw || typeof raw !== 'object') return false
+          if (raw.type !== 'tool_result' && !(raw.type === 'tool_call' && raw.id === toolCallId)) return true
+          event = decode(raw)
+          if ('_encrypted' in event) return false
+        } catch { return false }
+        if (event.type === 'tool_call' && event.id === toolCallId) {
+          if (call || result || typeof event.tool !== 'string' || event.tool.length > 256) return false
+          call = event
+        }
+        if (event.type === 'tool_result' && event.toolCallId === toolCallId) {
+          if (!call || result || typeof event.output !== 'string'
+            || !['success', 'error', 'timeout', 'cancelled'].includes(event.status)
+            || typeof event.timestamp !== 'string' || event.timestamp.length > 64) return false
+          result = event
+        }
+        return true
+      }
+      const stream = handle.createReadStream({
+        start: 0, end: size - 1, encoding: 'utf8', highWaterMark: 64 * 1024,
+        autoClose: false, signal: options.signal,
+      })
+      try {
+        for await (const chunk of stream) {
+          throwIfAborted(options.signal)
+          pending += String(chunk)
+          let newline: number
+          while ((newline = pending.indexOf('\n')) >= 0) {
+            if (!consume(pending.slice(0, newline))) return null
+            pending = pending.slice(newline + 1)
+          }
+          if (pending.length > 2 * 1024 * 1024) return null
+        }
+        if (pending && !consume(pending)) return null
+      } finally {
+        stream.destroy()
+      }
+      throwIfAborted(options.signal)
+      return call && result ? { call, result } : null
+    } finally {
+      await handle.close()
+    }
+  }
+
   async getEvents(sessionId: string): Promise<SessionEvent[]> {
     try {
       const path = this.sessionFile(sessionId)
@@ -563,9 +585,6 @@ export class JsonlSessionStore implements ISessionStore {
         try {
           events.push(JSON.parse(line) as SessionEvent)
         } catch {
-          // A torn/truncated JSONL line (e.g. a crash mid-append) was
-          // previously dropped silently, so a corrupted session lost events
-          // with no operator signal. Count and warn instead.
           tornLines += 1
         }
       }
@@ -595,16 +614,11 @@ export class JsonlSessionStore implements ISessionStore {
   }
 
   private async replaceEventsUnlocked(sessionId: string, events: SessionEvent[]): Promise<void> {
-    // Undo/redo can finish after the UI requested deletion. Refuse that stale
-    // replacement before it can recreate an orphan journal, but heal an index
-    // entry the index lost while the journal survived.
     await this.ensureSessionIndexed(sessionId)
 
     const path = this.sessionFile(sessionId)
     const body = events.map((event) => JSON.stringify(event)).join('\n')
     const trailing = events.length > 0 ? '\n' : ''
-    // Undo/redo replaces the full journal. Use a unique staging file and retry
-    // transient Windows sharing locks without ever deleting the old journal.
     try {
       await writeFileAtomic(path, body + trailing)
     } catch (error) {

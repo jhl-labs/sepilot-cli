@@ -179,8 +179,6 @@ export function createDelegateTool(
           executionId: context?.executionId,
           runContract: context?.runContract,
         })
-        // A failed gateway write must surface as an error, not a success — the
-        // delegation was never persisted for the target to pick up.
         if (result.status === 'failed') {
           return {
             output: `Task delegation failed: ${result.delegationId}${result.result ? ` — ${result.result}` : ''}`,

@@ -87,12 +87,6 @@ function toolHistoryEntryPaths(
   return [...new Set(paths)]
 }
 
-/**
- * Document production can use the semantic criterion judge after the exact
- * requested artifacts were written and then observed again. Mutation results
- * themselves never become criterion evidence: the judge sees only
- * executor-confirmed observe calls, including the post-write read-back.
- */
 export function documentArtifactCriterionReviewEligible(
   state: Pick<AgentState, 'seedContract' | 'toolCallHistory'>,
 ): boolean {
@@ -140,12 +134,6 @@ export function documentArtifactCriterionReviewEligible(
   })
 }
 
-/**
- * Runtime-owned tool-result metadata can carry the same execution posture
- * that Graph journals on its tool-call ledger. Validate the complete shape
- * before using it: arbitrary tool result metadata is never copied into this
- * field by the executor, and malformed persisted messages fail closed.
- */
 function executionPostureFromMessage(message: Message): ToolExecutionPosture | undefined {
   const candidate = record(message.metadata?.executionPosture)
   const sandbox = record(candidate?.sandbox)
@@ -186,14 +174,6 @@ function executionPostureFromMessage(message: Message): ToolExecutionPosture | u
   }
 }
 
-/**
- * Reconstruct the same exact-id observation packet for the lean ReAct loop
- * that Graph keeps in `toolCallHistory`. Only executor-confirmed successful
- * calls whose registry-owned effect is statically `observe` are admitted.
- * Dynamic tools require the daemon-owned posture copied by the executor plus
- * their structured `actionPurpose=observe`; missing or malformed posture fails
- * closed instead of trusting provider text or tool-supplied result metadata.
- */
 export function criterionEvidenceStateFromMessages(options: {
   messages: readonly Message[]
   contract: AgentRunContract
@@ -261,7 +241,6 @@ export function criterionEvidenceStateFromMessages(options: {
   }
 }
 
-/** Build the durable, mode-neutral completion packet consumed by session evaluation. */
 export function buildCriterionEvidenceBoardSnapshot(options: {
   contract: AgentRunContract
   state: Pick<AgentState, 'toolCallHistory'>
@@ -452,12 +431,6 @@ export function buildCriterionEvidenceReviewRequest(options: {
   }
 }
 
-/**
- * Re-ask the same semantic judgment once when the provider returned only a
- * partially valid structured packet. This repairs representation only: the
- * contract, candidate answer, and bounded evidence excerpts are unchanged,
- * no tool is exposed, and missing criteria are named from parser output.
- */
 export function buildCriterionEvidenceReviewRepairRequest(options: {
   model: string
   state: Pick<AgentState, 'seedContract' | 'toolCallHistory' | 'steeringNotes'>
@@ -549,19 +522,10 @@ export function parseCriterionEvidenceReview(
 
   return contractCriteria.flatMap((criterion) => {
     const candidates = candidatesById.get(criterion.id) ?? []
-    // Duplicate output is protocol-ambiguous even when the values happen to
-    // match. Ignore it so a malformed judge response cannot overwrite the
-    // ordinary completion-gate recovery path.
     return candidates.length === 1 ? candidates : []
   })
 }
 
-/**
- * Reasoning-capable transports can place a requested JSON-only control reply
- * in their non-visible thinking field while leaving message content empty.
- * Prefer visible content, then admit thinking only through the same strict
- * criterion/id/evidence validation. The raw thinking text is never surfaced.
- */
 export function parseCriterionEvidenceReviewTransport(
   visibleContent: string,
   thinking: string | undefined,

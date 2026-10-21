@@ -9,18 +9,6 @@ import { isVisibleUrlOpenRequest } from '../agent/desktop-control-intent.js'
 
 type DeviceRole = 'desktop' | 'server' | 'edge'
 
-/**
- * Memory toolset exposed to *direct-API* surfaces (CLI `sepilot ask`/TUI,
- * web, desktop). The full ~40-tool set (pin/diff/audit/documents/reminders/
- * tag-rename/maintenance/...) is the channel / auto-memory ("OpenClaw")
- * concept and only bloats the LLM tool list for one-shot CLI work, so direct
- * API defaults to `lean`. The channel pipeline keeps the full registry — this
- * filter is never applied there.
- *
- * - `lean`: core memory recall/write tools plus read-only memory graph lookup
- * - `full`: every registered `memory.*` tool (same as channels)
- * - `none`: no `memory.*` tools at all
- */
 export type DirectApiMemoryToolset = 'lean' | 'full' | 'none'
 
 export const TOOL_EXPOSURE_GROUPS = [
@@ -90,6 +78,8 @@ export function isLeanMemoryTool(name: string): boolean {
 }
 
 const DEFAULT_PERSONAL_TOOL_NAMES = new Set([
+  'agent.tools',
+  'agent.transfer',
   'question',
   'skill',
   'todowrite',
@@ -108,8 +98,9 @@ const DEFAULT_PERSONAL_TOOL_NAMES = new Set([
   'schedule_run_now',
   'monitor.evaluate',
   'monitor.report',
-  // Personal data is a shared capability, independent of reasoning mode or
-  // intent-router availability. Exact caller/skill/persona ceilings still win.
+  'monitor.watch',
+  'monitor.watches',
+  'session.schedule_wakeup',
   'knowledge.search',
   'knowledge.save',
   'knowledge.read',
@@ -123,21 +114,17 @@ const DEFAULT_PERSONAL_TOOL_NAMES = new Set([
   ...LEAN_MEMORY_TOOLS,
 ])
 
-// The terminal surface starts with its general development/command toolbox.
-// Specialist schemas remain discoverable through agent.tools / agent.transfer;
-// this is a visibility projection, never an authority restriction.
 const CLI_REACT_GROUPS: readonly ToolExposureGroup[] = ['files', 'code', 'process', 'web']
 const CLI_REACT_TOOL_NAMES = new Set([
   'question', 'skill', 'todowrite', 'system.info',
   'memory.search', 'memory.list', 'knowledge.search', 'knowledge.read',
-  // Native delegation is a core CLI capability, not a specialist integration.
-  // Avoid discovery/transfer model turns just to submit or collect a child.
   'subagent.dispatch', 'subagent.job',
 ])
 
 export function toolExposureGroupForTool(name: string): ToolExposureGroup | null {
   if (
     name === 'terminal.run'
+    || name === 'tool.output.read'
     || name === 'apply_patch'
     || name === 'workspace.prepare'
     || name.startsWith('fs.')
@@ -166,6 +153,7 @@ export function toolExposureGroupForTool(name: string): ToolExposureGroup | null
     name.startsWith('subagent.')
     || name === 'device.delegate'
     || name === 'external_acp.run'
+    || name === 'external_cli.run'
     || name.startsWith('a2a.')
   ) return 'delegation'
   if (
@@ -174,24 +162,11 @@ export function toolExposureGroupForTool(name: string): ToolExposureGroup | null
     || name.startsWith('gitea.')
     || name.startsWith('jpad.')
     || name.startsWith('notification.')
+    || name.startsWith('event.')
   ) return 'integrations'
   return null
 }
 
-/**
- * Preserve observe-only integration tools when the user names their canonical
- * namespace in ordinary prose (for example "Gitea Actions" or "JPAD pages").
- * A concrete caller mode controls the execution loop, not which requested
- * read capability exists; without this projection an explicit `react` mode
- * can hide the only canonical reader and push the model toward filesystem or
- * terminal guesses.
- *
- * Keep the fallback deliberately narrow:
- * - match registry-derived namespaces rather than prompt-specific phrases;
- * - inspect only the affirmative request scope, so explicit exclusions win;
- * - expose only daemon-attested `observe` tools. Mutation tools still require
- *   intent routing, a selected skill, or an explicit canonical tool name.
- */
 function explicitlyNamedObserveIntegrationTools(
   source: ToolRegistry,
   requestInput: string,
@@ -214,12 +189,8 @@ function explicitlyNamedObserveIntegrationTools(
 }
 
 const MODE_EXPOSURE_GROUPS: Record<string, readonly ToolExposureGroup[]> = {
-  // This is the capability ceiling passed into the coder graph, not the tool
-  // list shown on every coder-model call. The graph applies its own
-  // node/phase profiles afterwards. Preserve every family that a coder
-  // subgraph may activate; otherwise a later grounded contract cannot restore
-  // a browser or service tool removed by this earlier routing projection.
   coder: ['files', 'code', 'web', 'browser', 'process', 'services'],
+  'deep-coder': ['files', 'code', 'web', 'browser', 'process', 'services'],
   researcher: ['web', 'browser'],
   'deep-web-research': ['web', 'browser'],
   'computer-use': ['computer', 'office', 'media'],
@@ -230,38 +201,23 @@ const VISIBLE_OPEN_URL_TOOL_NAME = 'computer.open_url'
 
 export interface ContextualToolExposureOptions {
   surface?: string | null
-  /** The model owns natural-language selection; projection uses only structured metadata. */
   semanticRouting?: boolean
   selectedGroups?: readonly ToolExposureGroup[]
+  botToolGroups?: readonly ToolExposureGroup[]
   routedMode?: string
+  routingConfidence?: 'high' | 'medium' | 'low'
   routingFallback?: boolean
   activeRemoteBrowser?: boolean
   activeWritingDocument?: boolean
   swarmSession?: boolean
   declaredSkillToolNames?: ReadonlySet<string>
-  /**
-   * Tools needed by an automatically inferred skill. Unlike an explicitly
-   * selected skill allowlist, these tools augment the contextual surface and
-   * must never remove capabilities selected by the intent router.
-   */
   supplementalToolNames?: ReadonlySet<string>
-  /**
-   * Complete current-turn input used to preserve explicitly named registered
-   * tools when contextual routing defers their specialist exposure group.
-   * This affects visibility only; policy, autonomy, approval, persona, and
-   * exact caller/skill allowlists remain the authority boundary.
-   */
   requestInput?: string
   explicitToolNames?: readonly string[]
   personaAllowedTools?: readonly string[]
   personaDeniedTools?: readonly string[]
 }
 
-/**
- * Build the per-turn personal-agent surface. Registration/global enablement is
- * only the capability ceiling; this function decides what the model actually
- * sees for one request.
- */
 export function withContextualToolExposure(
   source: ToolRegistry,
   options: ContextualToolExposureOptions,
@@ -281,49 +237,49 @@ export function withContextualToolExposure(
     : declaredExactAllowlist
 
   if (exactAllowlist !== undefined) {
+    const botSurface = options.botToolGroups === undefined || options.explicitToolNames === undefined
+      ? undefined
+      : contextualToolExposureNames(source, options)
     return withOptionalToolNameAllowlist(
       source,
-      exactAllowlist.filter((name) => !denied.has(name)),
+      exactAllowlist.filter((name) => (!botSurface || botSurface.has(name)) && !denied.has(name)),
     )
   }
 
+  const allowed = contextualToolExposureNames(source, options)
+  for (const name of denied) allowed.delete(name)
+  return withToolNameAllowlist(source, allowed)
+}
+
+function contextualToolExposureNames(
+  source: ToolRegistry,
+  options: ContextualToolExposureOptions,
+): Set<string> {
   const cliReact = options.surface === 'cli' && options.semanticRouting === true && options.routedMode === 'react'
   const workspaceReact = options.semanticRouting === true && options.routedMode === 'react'
     && ['cli', 'desktop', 'web'].includes(options.surface ?? '')
-  const groups = new Set<ToolExposureGroup>(options.selectedGroups ?? [])
-  if (workspaceReact) for (const group of CLI_REACT_GROUPS) groups.add(group)
+  const botScoped = options.botToolGroups !== undefined
+  const groups = new Set<ToolExposureGroup>(botScoped ? options.botToolGroups : (options.selectedGroups ?? []))
+  const trustedSelection = options.routingConfidence === 'high' && !options.routingFallback && options.selectedGroups !== undefined
+  if (workspaceReact && !botScoped && !trustedSelection) for (const group of CLI_REACT_GROUPS) groups.add(group)
   if (options.routedMode) {
     for (const group of MODE_EXPOSURE_GROUPS[options.routedMode] ?? []) groups.add(group)
   }
-  if (options.routingFallback && !workspaceReact) {
-    // The intent router is an advisory first pass, not the final graph/capability
-    // decision.  In particular, a local or otherwise slower provider can time
-    // out here and the graph router can still correctly select coder/cowork
-    // from the structured request.  Do not irreversibly remove capabilities
-    // that those graphs may activate later: graph/node profiles will narrow
-    // this ceiling before each model request.  Keep this to the general coding
-    // families rather than restoring the 100+ tool catalog (Office,
-    // media, integrations, and other specialist surfaces remain deferred).
+  if (options.routingFallback && !workspaceReact && !botScoped) {
     for (const group of MODE_EXPOSURE_GROUPS.coder ?? []) groups.add(group)
   }
   if (options.activeWritingDocument) groups.add('documents')
   if (options.swarmSession) groups.add('swarm')
 
-  const allowed = new Set(cliReact ? CLI_REACT_TOOL_NAMES : DEFAULT_PERSONAL_TOOL_NAMES)
-  if (options.routedMode === 'coder') {
+  const allowed = new Set(botScoped ? BOT_CORE_TOOL_NAMES : cliReact ? CLI_REACT_TOOL_NAMES : DEFAULT_PERSONAL_TOOL_NAMES)
+  if (options.routedMode === 'coder' || options.routedMode === 'deep-coder') {
     allowed.add('subagent.dispatch')
     allowed.add('subagent.job')
   }
   for (const tool of source.list()) {
     const group = toolExposureGroupForTool(tool.name)
-    // Semantic mode control discovers ungrouped integrations through the
-    // authorized catalog and activates exact names on demand. Legacy callers
-    // without that discovery channel still expose ungrouped tools directly.
     if ((!group && !options.semanticRouting) || (group && groups.has(group))) allowed.add(tool.name)
   }
-  // A session-bound tab is an explicit user-selected capability, even when
-  // the advisory intent router omits the browser group. Exact caller/skill
-  // allowlists above and persona denials below remain authoritative.
   if (options.activeRemoteBrowser) {
     allowed.add('browser.remote_snapshot')
     allowed.add('browser.remote_action')
@@ -341,20 +297,12 @@ export function withContextualToolExposure(
   )) {
     allowed.add(name)
   }
-  // "Open/show this page for me" states an outcome outright, so the advisory
-  // intent router must not be able to defer the one tool that satisfies it.
-  // Without this, guessing the `browser` group drops computer.open_url, which
-  // makes the visible-open route unreachable and so confirms the guess —
-  // leaving headless inspection as the only way to answer a request that asked
-  // for a visible browser. Visibility only; the ask policy still gates it.
   if (!options.semanticRouting && options.requestInput && isVisibleUrlOpenRequest(options.requestInput)) {
     if (source.get(VISIBLE_OPEN_URL_TOOL_NAME)) allowed.add(VISIBLE_OPEN_URL_TOOL_NAME)
   }
-  for (const name of denied) allowed.delete(name)
-  return withToolNameAllowlist(source, allowed)
+  return allowed
 }
 
-/** Preserve the authority ceiling independently of temporary mode visibility. */
 export function withAuthorizedToolExposure(
   source: ToolRegistry,
   options: Pick<ContextualToolExposureOptions, 'explicitToolNames' | 'declaredSkillToolNames' | 'personaAllowedTools' | 'personaDeniedTools'>,
@@ -367,6 +315,23 @@ export function withAuthorizedToolExposure(
     .filter((tool) => !denied.has(tool.name) && ceilings.every((names) => names.includes(tool.name)))
     .map((tool) => tool.name)))
 }
+
+export function withTurnToolAuthority(
+  source: ToolRegistry,
+  options: Pick<ContextualToolExposureOptions, 'explicitToolNames' | 'declaredSkillToolNames' | 'personaAllowedTools' | 'personaDeniedTools'>,
+): { delegation: ToolRegistry; own: ToolRegistry } {
+  const { personaDeniedTools, ...authority } = options
+  const delegation = withAuthorizedToolExposure(source, authority)
+  const own = personaDeniedTools?.length
+    ? withAuthorizedToolExposure(delegation, { personaDeniedTools })
+    : delegation
+  return { delegation, own }
+}
+
+const BOT_CORE_TOOL_NAMES = new Set([
+  'question', 'skill', 'todowrite', 'memory.search', 'memory.list', 'knowledge.search', 'knowledge.read',
+  'self.info',
+])
 
 export function isDefaultPersonalTool(name: string): boolean {
   return DEFAULT_PERSONAL_TOOL_NAMES.has(name)
@@ -388,14 +353,6 @@ export function withDirectApiMemoryToolset(
   return filtered
 }
 
-/**
- * Every swarm.* tool starts by resolving the swarm run for its session and
- * fails with "not in a swarm run" when there is none — so outside a swarm
- * session the whole family is uncallable. Their schemas were still sent on
- * every ordinary chat call (11 tools, ~3,500 characters), inviting the model
- * to reach for something that can only fail. The supervisor prompt that
- * explains them is already gated on the same session-id prefix.
- */
 export function withSwarmToolsForSession(
   source: ToolRegistry,
   sessionId: string | undefined,
@@ -409,14 +366,6 @@ export function withSwarmToolsForSession(
   return filtered
 }
 
-/**
- * The doc.* family edits the active writing document and nothing else — none
- * of the eight tools can open or create one, so with no active document every
- * call returns "활성 글쓰기 문서가 없습니다". Their schemas rode on every
- * ordinary chat call anyway (8 tools, ~2,000 characters). Callers pass the
- * same value the tools resolve (`writingDocId ?? registry.getActiveId()`), so
- * the gate cannot disagree with the tools about what is active.
- */
 export function withWritingDocTools(
   source: ToolRegistry,
   activeDocId: string | null | undefined,
@@ -458,14 +407,12 @@ export function withOptionalToolNameAllowlist(
   return filtered
 }
 
-/** Tools available per device role */
 const ROLE_TOOLS: Record<DeviceRole, string[] | '*'> = {
-  desktop: '*',  // All tools
+  desktop: '*',
   server: ['terminal.run', 'fs.read', 'fs.list', 'fs.write', 'fs.append', 'todowrite', 'assistant.status', 'gitea.*', 'web.search', 'webfetch', 'market.quote', 'monitor.*', 'browser.navigate', 'browser.extract', 'browser.screenshot', 'browser.click', 'browser.evaluate', 'device.delegate', 'pages.*', 'mcp.*'],
-  edge: ['terminal.run', 'fs.read', 'fs.list', 'fs.write', 'fs.append', 'todowrite'],  // Minimal set for resource-constrained devices
+  edge: ['terminal.run', 'fs.read', 'fs.list', 'fs.write', 'fs.append', 'todowrite'],
 }
 
-/** Tools explicitly blocked per role */
 const ROLE_BLOCKED: Record<DeviceRole, string[]> = {
   desktop: [],
   server: [],
@@ -489,5 +436,4 @@ export function filterToolsByRole(registry: ToolRegistry, role: DeviceRole): Too
 }
 
 export function applyRoleFilter(_registry: ToolRegistry, _role: DeviceRole): void {
-  // Note: actual filtering happens at engine level, not registry level
 }

@@ -12,33 +12,18 @@ export interface WorkspaceBoundCheckpoint {
   workspaceIsolation?: 'policy' | 'strict'
 }
 
-/**
- * A resumable execution inherits the immutable workspace capability captured
- * when it started. It is invalid as soon as the session binding differs.
- */
 export function checkpointMatchesSessionWorkspace(
   session: WorkspaceBoundSession,
   checkpoint: WorkspaceBoundCheckpoint,
 ): boolean {
   if (session.workspaceIsolation === 'policy' || checkpoint.workspaceIsolation === 'policy') {
     return session.workspaceIsolation === checkpoint.workspaceIsolation
-      // A narrower graph (for example read-only scouting) may impose a root
-      // within a normal CLI session. Resuming retains that stricter root.
       && (!checkpoint.workspaceRoot || checkpoint.workspaceRoot === session.cwd)
       && session.cwd === checkpoint.cwd
   }
-  // A fresh CLI chat sends `cwd` without an explicit workspaceRoot. The
-  // session binds that directory as its workspace, while graph checkpoints
-  // retain it in `cwd`. Treat both checkpoint shapes as the same immutable
-  // capability; otherwise every first approval in a CLI-created session is
-  // rejected as WORKSPACE_BINDING_CHANGED.
   return session.cwd === (checkpoint.workspaceRoot ?? checkpoint.cwd)
 }
 
-/** Separate a CLI launch directory from a requested strict filesystem boundary.
- * Persist this decision: neither a later transport nor an omitted root may
- * downgrade a bound session. Legacy sessions deliberately remain strict.
- */
 export async function resolveChatRequestWorkspace(input: {
   cwd?: unknown
   workspaceRoot?: unknown
@@ -113,11 +98,6 @@ export async function resolveRequestCwd(raw: unknown): Promise<string | undefine
   }
 }
 
-/**
- * Resolve the immutable workspace capability root and ensure the requested
- * working directory cannot escape it. Both values are real paths at this
- * transport boundary, so later tool arguments cannot redefine the root.
- */
 export async function resolveRequestWorkspace(
   rawCwd: unknown,
   rawWorkspaceRoot: unknown,

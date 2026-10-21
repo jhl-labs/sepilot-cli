@@ -198,7 +198,6 @@ export async function statusCommand(options: {
       }
     }
 
-    // Show providers
     try {
       const providers = await client.providers()
       if (providers?.length) {
@@ -206,7 +205,6 @@ export async function statusCommand(options: {
       }
     } catch {}
 
-    // Show usage summary
     try {
       const usage = await client.usage()
       if (usage.requestCount > 0) {
@@ -214,9 +212,6 @@ export async function statusCommand(options: {
       }
     } catch {}
 
-    // Show active detached work so users can discover runs that are waiting
-    // for approval or a question without knowing the separate background-list
-    // command first.
     try {
       const backgroundJobs = await client.backgroundChatJobs()
       const activeJobs = backgroundJobs.jobs.filter((job) => job.status === 'running')

@@ -1,5 +1,4 @@
 import { createHash, randomBytes } from 'node:crypto'
-/** Single-use bootstrap tickets. Never persisted and invalidated by token rotation. */
 export class MobilePairingTickets {
   private tickets = new Map<string, { expiresAt: number; tokenHash: string }>()
   constructor(private readonly now = Date.now) {}

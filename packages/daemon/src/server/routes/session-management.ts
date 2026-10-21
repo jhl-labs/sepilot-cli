@@ -167,8 +167,6 @@ async function findUnreferencedSessionAttachmentIds(
         }),
     )
   } catch {
-    // Fail closed: a history read failure must not delete a file that another
-    // session or branch may still reference.
     return new Set()
   }
 
@@ -264,8 +262,6 @@ export async function cleanupSessionRuntimeState(
   runtime: SessionManagementRuntime,
   sessionId: string,
 ): Promise<SessionRuntimeCleanupResult> {
-  // Session-owned ids join the same cross-session reference scan as journaled
-  // attachments, so deleting the source session cannot break a branch.
   const sessionOwnedUploads = listUploadedFilesBySession(sessionId)
   const unreferencedAttachmentIds = await findUnreferencedSessionAttachmentIds(
     runtime,
@@ -289,13 +285,8 @@ export async function cleanupSessionRuntimeState(
     runtime.toolExecutions?.delete(sessionId) ?? Promise.resolve(),
   ])
   runtime.sessionRuntimeSnapshots?.delete(sessionId)
-  // Per-session tool-stats bucket was never evicted — the Map grew for the
-  // daemon's lifetime. Drop it here alongside the other per-session runtime state.
   runtime.toolStatsStore?.dispose(sessionId)
 
-  // Complete-deletion (GDPR): purge the durable stores the delete path used to
-  // leave orphaned — usage rows, session-derived memory entries + embeddings,
-  // and uploaded files owned by the session.
   const usageRecords = runtime.usageTracker?.deleteBySession(sessionId) ?? 0
   const derivedMemories =
     (await runtime.semanticIndex?.deleteBySession(sessionId)) ?? 0
@@ -430,8 +421,6 @@ async function cleanupOrphanedSessionState(
     unavailableApprovalCheckpoints: 0,
     runCheckpoints: 0,
     toolExecutions: 0,
-    // Orphan cleanup does not touch the durable per-session stores (those are
-    // handled by the complete per-session delete path); report zero here.
     usageRecords: 0,
     derivedMemories: 0,
     uploadedFiles: 0,

@@ -38,21 +38,44 @@ const INLINE_TOOL_NAMESPACES = new Set(['fs', 'git', 'code', 'terminal'])
 export const UNUSABLE_PROMPT_TOOL_CALL_OUTPUT =
   'INCOMPLETE: The model returned an unavailable, disallowed, or malformed tool call instead of a user-facing response. No tool was run; retry or resume the run.'
 
-/**
- * Tool calls are atomic protocol messages. A JSON/envelope fragment that hit
- * the provider output limit cannot safely be concatenated with a later turn:
- * the later turn may restart prose, repeat fields, or close a different
- * structure. Discard the fragment and request one fresh, smaller call.
- */
-export function buildTruncatedPromptToolCallRecoveryMessage(): Message {
+export interface TruncatedToolCallRecoveryDetails {
+  toolCalls?: ReadonlyArray<{ name: string; streamedChars: number }>
+  maxOutputTokens?: number
+  attempt?: number
+}
+
+function formatTruncatedToolCallSummary(
+  toolCalls: ReadonlyArray<{ name: string; streamedChars: number }>,
+): string {
+  return toolCalls
+    .map((call) => {
+      const kib = Math.max(1, Math.round(call.streamedChars / 1024))
+      return `${call.name} (~${kib} KiB of arguments streamed before the cut)`
+    })
+    .join(', ')
+}
+
+export function buildTruncatedPromptToolCallRecoveryMessage(
+  details: TruncatedToolCallRecoveryDetails = {},
+): Message {
+  const truncated = details.toolCalls?.filter((call) => call.name) ?? []
+  const lines = [
+    '[Truncated tool-call recovery]',
+    truncated.length > 0
+      ? `Your previous reply ended while forming a tool call: ${formatTruncatedToolCallSummary(truncated)}. The partial call was discarded and was not executed.`
+      : 'Your previous reply ended while forming a tool call. The partial call was discarded and was not executed.',
+    details.maxOutputTokens
+      ? `One reply may contain at most ${details.maxOutputTokens} output tokens, and a single call's arguments must fit well inside that. The payload you attempted does not.`
+      : 'A single call\'s arguments must fit inside one reply\'s output limit. The payload you attempted does not.',
+    'Start over and emit exactly one fresh, complete tool call. Do not continue or complete the prior fragment, and do not retry the same oversized call.',
+    'Split the artifact: write a small complete skeleton or the first section now, then grow it with further complete calls (for example separate files, or fs.append for later sections).',
+  ]
+  if ((details.attempt ?? 0) > 1) {
+    lines.push(`This is truncation ${details.attempt} in this run; the previous attempts also exceeded the limit, so make this call substantially smaller.`)
+  }
   return {
     role: 'system',
-    content: [
-      '[Truncated tool-call recovery]',
-      'Your previous reply ended while forming a tool call. The partial call was discarded and was not executed.',
-      'Start over and emit exactly one fresh, complete tool-call envelope. Do not continue or complete the prior JSON fragment.',
-      'Keep the arguments bounded. For a large artifact, make a smaller complete write/edit now and use later complete calls for the remainder.',
-    ].join('\n'),
+    content: lines.join('\n'),
   }
 }
 
@@ -210,15 +233,6 @@ export function hasPromptFinalEnvelopeIntent(text: string): boolean {
     || /^\s*<(?:[A-Za-z][\w.-]*:)?(?:final|answer)\b/i.test(visible)
 }
 
-/**
- * Normalize provider transports that put an explicit final-answer protocol
- * envelope in the reasoning channel while leaving visible content empty.
- *
- * Visible content is always authoritative. Hidden reasoning is eligible only
- * when it deliberately uses the same ANSWER/INCOMPLETE or tagged-final
- * protocol accepted on the visible channel. Untagged reasoning therefore
- * remains private and continues through the ordinary bounded recovery path.
- */
 export function resolveExplicitFinalTransportText(
   visibleText: string,
   hiddenThinking?: string,
@@ -242,13 +256,6 @@ function buildPromptToolCatalog(tools: PromptReActToolDefinition[]): string {
     .join('\n')
 }
 
-/**
- * Prompt-ReAct describes the shared progress envelope once in its transport
- * contract. Repeating the same nested metadata schema inside every textual
- * tool definition wastes a material fraction of small context windows. Native
- * function calling still receives the fully decorated schemas; only this
- * prompt-serialized catalog removes the transport-owned field.
- */
 function promptTransportToolSchema(
   schema: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -289,16 +296,6 @@ function insertSystemMessages(
   ]
 }
 
-/**
- * Rewrite native tool-transport history into the text protocol the
- * prompt-react run actually speaks. Without this, `role:'tool'` results and
- * assistant `toolCalls` reach the provider verbatim; chat templates render
- * tool messages only in native tool-calling context, so on a prompt-react run
- * many models (observed: gemma) see *empty* turns where the tool output
- * should be — the model then truthfully reports "the tool returned nothing"
- * despite a successful execution. Protocol handling of our own transport, not
- * a model-specific branch.
- */
 function toPromptReActTransportHistory(messages: Message[]): Message[] {
   const completedToolCallIds = new Set(messages
     .filter((message) => message.role === 'tool' && Boolean(message.toolCallId))
@@ -345,17 +342,8 @@ function toPromptReActTransportHistory(messages: Message[]): Message[] {
           arguments: toolCall.arguments,
         })}</sepilot_tool_call>`)
       const text = typeof message.content === 'string' ? message.content.trim() : ''
-      // Prompt-ReAct turns retain both their raw XML envelope in `content`
-      // and the parsed canonical `toolCalls`. Re-emitting both doubles every
-      // historical call (and can turn a provider duplicate into four calls).
-      // Preserve native-tool narration, but never preserve a raw envelope
-      // when the canonical calls already carry the action.
       const narrative = text && !containsPromptToolCallEnvelope(text) ? text : ''
       const content = [narrative, ...completedCallTags, ...callTags].filter(Boolean).join('\n')
-      // Completed actions stay in the assistant role and are paired with the
-      // following untrusted user-role observation. This preserves who acted
-      // when native tool messages must be rewritten for a text-only chat
-      // template, while the non-executable history tag prevents replay.
       if (!content) return []
       return [{
         role: 'assistant' as const,
@@ -374,12 +362,6 @@ const COMPLETED_MUTATION_PAYLOAD_KEYS = new Set([
 ])
 const MAX_COMPLETED_MUTATION_PAYLOAD_CHARS = 320
 
-/**
- * A completed write/edit payload is evidence that an action happened, not
- * source context that needs to be replayed on every later model call. Keep
- * small payloads verbatim and retain the target/path, but replace large text
- * bodies with a size marker after the matching tool result exists.
- */
 const COMPLETED_PAYLOAD_OMISSION_PATTERN = /^\[completed payload omitted: (\d+) chars\]$/
 
 export function isCompletedPayloadOmissionMarker(value: unknown): value is string {
@@ -426,14 +408,6 @@ function compactCompletedToolCallRecord(toolCall: ToolCall): {
   }
 }
 
-/**
- * The shared system prompt already carries a "Time-sensitive public facts"
- * paragraph saying the same thing in more detail, and both ride in the same
- * prompt-react request — the two overlap 86% by content. Repeat it only when
- * the caller's prompt does not have it (a bench harness or embedder supplying
- * its own minimal system prompt), so the guidance is never lost and never
- * doubled.
- */
 const STALE_FACT_MARKER = 'Time-sensitive public facts'
 const STALE_FACT_LINES = [
   'BUT for time-sensitive or fast-changing facts — recent model releases or',
@@ -500,12 +474,6 @@ export function buildPromptReActMessages(
   )
 }
 
-/**
- * Serialize a tool-free terminal synthesis without carrying the much larger
- * tool-selection protocol. This path is deliberately model-agnostic: once the
- * supervisor has closed tool access, every provider only needs the final
- * envelope contract and a clear convergence bound.
- */
 export function buildPromptFinalMessages(messages: Message[]): Message[] {
   return insertSystemMessages(
     toPromptReActTransportHistory(messages),
@@ -519,12 +487,6 @@ export function buildPromptFinalMessages(messages: Message[]): Message[] {
   )
 }
 
-/**
- * Repair a malformed response after the supervisor has structurally closed
- * tool access. Keep the repair transport tool-free as well: reintroducing the
- * normal tool catalog here would contradict the state transition and prime a
- * weak provider to request another observation.
- */
 export function buildPromptFinalRepairMessages(
   messages: Message[],
   invalidOutput: string,
@@ -685,12 +647,6 @@ function parseToolCallObject(parsed: unknown): ToolCall | null {
   ) {
     name = 'terminal.run'
   }
-  // Some models flatten the tool name into a namespace key with the method
-  // as its string value, e.g. `{"fs": "search", "query": "X", "cwd": "/p"}`
-  // instead of `{"name": "fs.search", "arguments": {...}}`. When the
-  // remaining object has no recognisable name field, look for a single
-  // namespace-key whose value forms a known tool name and treat the rest
-  // of the object as the arguments.
   let inlineNamespaceKey: string | null = null
   if (!name) {
     const fullRecord = parsed as Record<string, unknown>
@@ -725,12 +681,6 @@ function parseToolCallObject(parsed: unknown): ToolCall | null {
       ? { ...(args as Record<string, unknown>) }
       : {}
   if (!hasExplicitArgumentContainer && !inlineNamespaceKey) {
-    // Some OpenAI-compatible endpoints flatten a function call into one JSON
-    // object (`{ "name": "fs.read", "path": "src/app.ts" }`) instead of
-    // nesting the input under `arguments`. This is a provider-neutral shape
-    // repair: preserve every non-envelope field as input only when no explicit
-    // argument container exists. An explicit container always wins, so
-    // response metadata can never overwrite canonical tool arguments.
     const envelopeKeys = new Set([
       'id',
       'name',
@@ -777,9 +727,7 @@ function parseToolCallObject(parsed: unknown): ToolCall | null {
     }
   }
   return {
-    id: typeof record.id === 'string' && record.id.trim().length > 0
-      ? record.id
-      : randomUUID(),
+    id: randomUUID(),
     name,
     arguments: normalizedArgs,
   }
@@ -801,7 +749,6 @@ function parseInlineToolArguments(source: string): Record<string, unknown> {
         args[key] = JSON.parse(trimmed)
         continue
       } catch {
-        // Fall back to the raw string below.
       }
     }
     args[key] = rawValue
@@ -817,10 +764,6 @@ function repairInlineToolNameArguments(
     return toolCall
   }
 
-  // Small/local models frequently copy a snake_case tool from prose as a
-  // dotted namespace (for example schedule.list instead of schedule_list).
-  // Repair only when separator-insensitive matching identifies exactly one
-  // currently available tool, so this cannot widen the active allowlist.
   const separatorInsensitiveName = (name: string) =>
     name.trim().toLowerCase().replace(/[._-]+/g, '')
   const normalizedToolName = separatorInsensitiveName(toolCall.name)
@@ -1081,21 +1024,6 @@ function parseDirectXmlToolCalls(text: string): ToolCall[] {
   return toolCalls
 }
 
-// MiniMax-M2 family models emit tool calls in a custom non-JSON format wrapped
-// in `[TOOL_CALL]...[/TOOL_CALL]` brackets, with a Ruby-ish hash body and CLI
-// flag style arguments:
-//
-//   [TOOL_CALL]
-//   {tool => "terminal.run", args => {
-//     --timeout-ms 60000
-//     --command "cloc /repo --json"
-//   }}
-//   [/TOOL_CALL]
-//
-// They additionally open an unclosed `<minimax:tool_call>` tag which the
-// generic XML extractor cannot match. This parser is narrow on purpose — it
-// only fires when the bracketed payload is present and identifies the tool
-// name from `tool => "..."`, so it is a no-op for every other model family.
 function parseMinimaxBracketToolCalls(text: string): ToolCall[] {
   if (!text.includes('[TOOL_CALL]')) {
     return []
@@ -1121,10 +1049,6 @@ function parseMinimaxBracketToolCalls(text: string): ToolCall[] {
 
 function parseMinimaxFlagArguments(body: string): Record<string, unknown> {
   const args: Record<string, unknown> = {}
-  // Accept `--key "quoted value"`, `--key 'value'`, or `--key bareToken` on
-  // either separate lines or comma-separated. Quoted strings may contain
-  // arbitrary characters including `--`, which is why bare tokens are limited
-  // to non-whitespace runs.
   const flagRegex = /--([A-Za-z][\w-]*)\s+(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(\S+))/g
   for (const match of body.matchAll(flagRegex)) {
     const key = match[1] ?? ''
@@ -1155,19 +1079,11 @@ function unescapeQuoted(value: string): string {
   return value.replace(/\\(["'\\])/g, '$1')
 }
 
-/**
- * Local models occasionally close a complete JSON tool object with one extra
- * `}` before closing the surrounding XML tag. This is unambiguous only when
- * removing a small suffix of closing braces yields valid JSON. Do not attempt
- * quote repair, field completion, truncation stitching, or any other semantic
- * guess: those cases remain non-executable.
- */
 function parseJsonWithSurplusClosingBraces(candidate: string): unknown | undefined {
   const trimmed = candidate.trim()
   try {
     return JSON.parse(trimmed) as unknown
   } catch {
-    // Try only the structurally conservative suffix repair below.
   }
 
   let repaired = trimmed
@@ -1176,16 +1092,12 @@ function parseJsonWithSurplusClosingBraces(candidate: string): unknown | undefin
     try {
       return JSON.parse(repaired) as unknown
     } catch {
-      // A second surplus closer is still bounded and unambiguous.
     }
   }
   return undefined
 }
 
 export function parsePromptToolCalls(text: string): ToolCall[] {
-  // tool_code: emitted by Gemini-style models (qwen3.6 follows this convention).
-  // `sepilot_tool_call` is the canonical provider-neutral envelope. Legacy
-  // model/provider spellings remain accepted as input for compatibility.
   const taggedPayloads = extractTaggedPayloads(text, ['sepilot_tool_call', 'tool_call', 'tool', 'tool_code'])
   const taggedCandidates = taggedPayloads
     .map((payload) => extractJsonCandidate(payload) ?? payload)
@@ -1205,7 +1117,6 @@ export function parsePromptToolCalls(text: string): ToolCall[] {
         }
       }
     } catch {
-      // Fall through to the next parse candidate.
     }
     return []
   }
@@ -1215,32 +1126,14 @@ export function parsePromptToolCalls(text: string): ToolCall[] {
     return taggedCalls
   }
 
-  // A tag-scoped final answer takes priority over whole-text JSON scanning.
-  // A brace-object *inside* <final>/<answer> (e.g. `<final>ANSWER: the config
-  // is {"port":17600}</final>`) is answer content, not a tool call. Without
-  // this short-circuit, extractJsonCandidate(text) below misread that object as
-  // a tool call and suppressed the final answer. An explicit tool envelope still
-  // wins because it is handled above.
   if (extractTaggedPayload(text, ['final', 'answer']) !== null) {
     return []
   }
 
-  // The runtime uses this tag only for already-completed canonical history.
-  // It is deliberately distinct from every executable envelope. Reject the
-  // entire response before generic JSON scanning so a copied history record
-  // can never become a new tool call.
   if (/<completed_action_history\b/iu.test(text)) {
     return []
   }
 
-  // Some models imitate the immutable history envelope when they intend the
-  // next action, even though the protocol prompt explicitly names
-  // <sepilot_tool_call>. Recover only a complete trailing sequence whose
-  // records each occupy their own line and contain full arguments. The entire
-  // batch is atomic: one malformed/compacted record rejects all of it. This
-  // supports providers that place several intended calls in either content or
-  // the reasoning channel while keeping inline prose/examples and historical
-  // compact records non-executable.
   const completedActionTail = text.match(
     /(?:^|\n)((?:[ \t]*<completed_action_record>\{[\s\S]*?\}<\/completed_action_record>[ \t]*(?:\n|$))+)\s*$/u,
   )?.[1]
@@ -1333,11 +1226,21 @@ export function parsePromptToolCalls(text: string): ToolCall[] {
   }
 }
 
-/**
- * Conservative stream gate for text that may encode a tool call. This is
- * shared by React and graph runners so no transport publishes provider text
- * before the same tool-envelope checks have completed.
- */
+export function parseTruncatedPromptToolCallNames(
+  text: string,
+): Array<{ name: string; streamedChars: number }> {
+  const names = new Set<string>()
+  for (const match of text.matchAll(/"(?:name|tool_name|tool)"\s*:\s*"([A-Za-z][\w.-]*)"/g)) {
+    if (match[1] && isRecognizedPromptToolName(match[1])) names.add(match[1])
+  }
+  for (const match of text.matchAll(/<(fs\.(?:read|write|append|edit|search)|terminal\.run|apply_patch)\b/g)) {
+    if (match[1]) names.add(match[1])
+  }
+  if (names.size === 0 && /^\s*\*\*\* Begin Patch\b/m.test(text)) names.add('apply_patch')
+  const streamedChars = text.length
+  return [...names].map((name) => ({ name, streamedChars }))
+}
+
 export function containsPromptToolCallEnvelope(text: string): boolean {
   const taggedFinal = extractTaggedPayload(text, ['final', 'answer'])
   const taggedCandidates = taggedFinal === null
@@ -1379,11 +1282,6 @@ export function parsePromptToolCall(text: string): ToolCall | null {
   return parsePromptToolCalls(text)[0] ?? null
 }
 
-/**
- * Extract the model's final candidate without removing ANSWER:/INCOMPLETE:
- * protocol lines. Completion-gated graph runs need the intact candidate until
- * the gate has parsed the criterion verdicts that precede ANSWER:.
- */
 export function extractPromptFinalCandidate(text: string): string {
   const visible = stripPromptReActThinkingArtifacts(text).text
   const taggedFinal = extractTaggedPayload(visible, ['final', 'answer'])
@@ -1404,10 +1302,6 @@ export function shouldAttemptPromptReActRepair(text: string): boolean {
   if (taggedFinal !== null) {
     return false
   }
-  // An explicit ANSWER:/INCOMPLETE: line is already an unambiguous terminal
-  // envelope even when a provider omits the optional <final> wrapper. Repairing
-  // it can delete completion-gate criterion lines that intentionally precede
-  // ANSWER:, so accept the protocol directly.
   if (hasAnyAnswerProtocolStem(trimmed)) {
     return false
   }
@@ -1421,11 +1315,6 @@ export function buildPromptReActRepairMessages(
   messages: Message[],
   invalidOutput: string,
 ): Message[] {
-  // Older sessions may still contain a legacy completed-action envelope.
-  // Echoing a replayed copy back as the assistant's repair candidate strongly
-  // primes smaller providers to emit the same non-action again. Replace the
-  // whole malformed candidate with a semantic marker; never reinterpret or
-  // execute the history record.
   const repeatedCompletedActionRecord = /<completed_action_(?:record|history)\b/iu.test(invalidOutput)
   const repairCandidate = repeatedCompletedActionRecord
     ? '[previous reply repeated an immutable completed-action history record; it was discarded and no new action was requested]'

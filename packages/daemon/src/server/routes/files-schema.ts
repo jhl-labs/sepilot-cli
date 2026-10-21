@@ -74,9 +74,6 @@ export const uploadedFileIndexRequestSchema = z.object({
   ocrMaxPages: z.number().int().min(1).max(500).optional(),
 })
 
-// /files/search query schema. limit is z.coerce.number to absorb the
-// stringly-typed query value; route still clamps to [1, 32] inline so
-// a regression in zod limits won't widen the cap.
 export const filesSearchQuerySchema = z.object({
   q: z.string().optional(),
   cwd: z.string().min(1),

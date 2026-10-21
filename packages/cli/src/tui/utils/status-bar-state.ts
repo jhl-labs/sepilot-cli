@@ -10,31 +10,16 @@ export interface StatusBarPresentationOptions {
   autonomy: AutonomyLevel
   primaryAgentId?: string | null
   usage: { input: number; output: number; cost: number }
-  /** Provider id of the model currently in effect for this session. */
   provider?: string | null
-  /** Model id currently in effect for this session. */
   model?: string | null
-  /** Input tokens in the latest provider request, or the daemon's preflight estimate. */
   contextInputTokens?: number | null
-  /** Whether `contextInputTokens` is the daemon's preflight estimate. */
   contextEstimated?: boolean
-  /**
-   * Effective context window for the current provider/model pair — the
-   * caller is responsible for resolving per-model `modelOverrides`, then
-   * provider `defaultContextWindow`, then the model's own base value (the
-   * daemon's `/config/providers` response already returns this precedence
-   * pre-resolved per `ModelInfo`). This must never be a single global
-   * default shared across every model.
-   */
   contextWindow?: number | null
-  /** Effective max output tokens for the current provider/model pair — same precedence as `contextWindow`. */
   maxOutputTokens?: number | null
   isStreaming: boolean
   streamLabel?: string | null
   hasPendingApproval: boolean
-  /** Current named run phase (implementation/validation/review/finalize). */
   currentPhase?: string | null
-  /** Structured counts-only snapshot from the `state_board` stream frame. */
   stateBoardCounts?: {
     criteriaTotal: number
     planTotal: number
@@ -61,18 +46,10 @@ export interface StatusBarPresentationState {
   contextColor: string
   costLabel: string
   costColor: string
-  /** `provider/model [ctx·out]` badge reflecting the effective per-model limits, or `null` when no model is selected yet. */
   modelLabel: string | null
   maxOutputLabel: string | null
   rightStatus: StatusBarStateLabel | null
-  /** `phase: <name>` badge, or `null` when no phase has been reported yet. */
   phaseLabel: string | null
-  /**
-   * Bare criteria total (no "met" count — the board has no structured
-   * met/status field for acceptance criteria today) plus todos done/total,
-   * both sourced from the `state_board` frame's structured counts only.
-   * `null` when no state-board snapshot has arrived yet.
-   */
   criteriaLabel: string | null
   todosLabel: string | null
 }
@@ -93,14 +70,6 @@ function formatTokens(tokens: number): string {
 
 const MODEL_LABEL_DOT = '·'
 
-/**
- * `provider/model [ctx·out]` badge — `ctx`/`out` are whatever effective
- * values the caller resolved (modelOverrides > provider default > model
- * base, see `StatusBarPresentationOptions.contextWindow`/`maxOutputTokens`).
- * This function never invents a fallback number itself: a limit that is
- * unknown for the current model renders as `?` rather than silently
- * borrowing another model's value.
- */
 function formatModelLabel(
   provider: string | null | undefined,
   model: string | null | undefined,

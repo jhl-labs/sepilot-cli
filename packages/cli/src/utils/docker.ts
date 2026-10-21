@@ -117,7 +117,6 @@ export async function readContainerLog(): Promise<ContainerLogEntry[]> {
     try {
       out.push(JSON.parse(t) as ContainerLogEntry)
     } catch {
-      // skip malformed lines
     }
   }
   return out

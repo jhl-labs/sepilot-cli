@@ -6,6 +6,7 @@ import { DiffView, UnifiedDiffView } from './DiffView.js'
 import { TerminalOutput } from './TerminalOutput.js'
 import {
   previewTextLines,
+  rowToolMeta,
   summarizeToolInput,
   toolFilePath,
   truncatePreviewItems,
@@ -18,7 +19,6 @@ interface ToolCallProps {
   compact?: boolean
   softenSupersededError?: boolean
   forceExpanded?: boolean
-  /** Render an exact, unpadded line budget for the mutable streaming region. */
   maxRows?: number
 }
 
@@ -62,7 +62,7 @@ function buildToolHeader(
   collapsed = tool.collapsed,
   compact = false,
 ): string {
-  const toggleLabel = collapsed ? '[>]' : '[v]'
+  const toggleLabel = collapsed || compact ? '▸' : '▾'
   const status = toolStatusPresentation(tool.status, {
     superseded: tool.superseded,
     softenSupersededError,
@@ -75,11 +75,8 @@ function buildToolHeader(
     && tool.superseded
   )
     ? SUPERSEDED_ERROR_META
-    : tool.meta
+    : rowToolMeta(tool.meta, tool.status)
 
-  // Compact transcript/activity rows hide their body, so keep the concrete
-  // path/command/arguments ahead of generic result metadata. Otherwise fs.write
-  // collapses into repeated "Execution finished" rows with no useful target.
   if (compact) {
     const summary = linkedToolInputSummary(tool)
     if (summary) {

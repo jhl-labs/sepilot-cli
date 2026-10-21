@@ -119,7 +119,6 @@ export async function suggestKnowledgeOrganization(
   if (!targets.length) return []
   batch?.selected?.(targets)
   const targetIds = new Set(targets.map((r) => r.id))
-  // One metered call per run. Context is bounded too; future runs rotate through all records.
   const references = active
     .filter(
       (r) =>

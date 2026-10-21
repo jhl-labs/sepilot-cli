@@ -11,8 +11,6 @@ export interface FetchedSkill {
   source: SkillSourceRecord
   publisher?: string
   sourceRef?: string
-  // ed25519 signature advertised by the source (frontmatter/manifest). It is
-  // only trusted after the install pipeline verifies it against a trusted key.
   signature?: SkillSignatureRecord
 }
 

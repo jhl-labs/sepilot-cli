@@ -49,7 +49,7 @@ export const pendingApprovalSchema = z.object({
   input: z.record(z.unknown()),
   requestedAt: z.string(),
   expiresAt: z.string(),
-  state: z.enum(['live', 'stale']),
+  state: z.enum(['live', 'stale', 'parked']),
   resumeAvailable: z.boolean().optional(),
 })
 
@@ -224,9 +224,6 @@ const SESSION_EVIDENCE_ARTIFACT_SCHEMA_KIND_VALUES = [
   'session_end',
 ] as const satisfies readonly SessionEvidenceArtifactKind[]
 
-// `satisfies` rejects unknown schema values; this conditional rejects a
-// missing core value. Keep the runtime tuple local so direct daemon tests do
-// not depend on a previously built @sepilotd/core dist artifact.
 export const SESSION_EVIDENCE_ARTIFACT_SCHEMA_KINDS: Exclude<
   SessionEvidenceArtifactKind,
   (typeof SESSION_EVIDENCE_ARTIFACT_SCHEMA_KIND_VALUES)[number]
@@ -819,7 +816,6 @@ export const sessionBranchRequestSchema = z.object({
 
 export const sessionCreateRequestSchema = z.object({
   title: z.string().trim().min(1).max(200).optional(),
-  /** Absolute, existing workspace root copied from the Desktop new-session default. */
   cwd: z.string().trim().min(1).optional(),
 })
 
@@ -854,11 +850,8 @@ export const sessionLocalShellTurnRequestSchema = z.object({
 export const sessionUpdateRequestSchema = z.object({
   title: z.string().trim().min(1).max(200).optional(),
   status: z.enum(['active', 'completed', 'abandoned']).optional(),
-  /** Absolute, existing workspace root bound to this session. */
   cwd: z.string().trim().min(1).nullable().optional(),
-  /** Explicit per-session execution boundary; never inferred from a prompt. */
   workspaceIsolation: z.enum(['policy', 'strict']).optional(),
-  /** Ordered persona roster; an explicit empty array restores the default assistant. */
   personaIds: sessionPersonaIdsSchema.optional(),
   starred: z.boolean().optional(),
   tags: z.array(z.string().trim().min(1).max(64)).max(16).optional(),
@@ -871,21 +864,8 @@ export const sessionsListQuerySchema = z.object({
   page: z.coerce.number().int().min(1).optional(),
   perPage: z.coerce.number().int().min(1).optional(),
   query: z.string().optional(),
-  /** Exact immutable workspace binding used by workspace-scoped resume UIs. */
   workspaceRoot: z.string().trim().min(1).optional(),
-  /**
-   * Opt-in approval counters per item — costs an extra getEvents() per
-   * session in the page, so default off for backward compat. cli
-   * `sessions list` always passes true so the audit column shows up;
-   * web/desktop list views can stay light by leaving it false.
-   */
   metrics: z.coerce.boolean().optional(),
-  /**
-   * Narrow the page to a single status. Filter applies after the
-   * underlying sessions.list() returns, so totalCount reflects the
-   * filtered set — operators eyeballing list output expect "showing 5
-   * of 5 active" not "showing 5 of 247 (filtered from 200 idle)".
-   */
   status: z.enum(['active', 'completed', 'abandoned']).optional(),
 })
 

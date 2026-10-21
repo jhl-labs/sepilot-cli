@@ -22,8 +22,6 @@ export const BROWSER_AGENT_TOOL_ALLOWLIST = [
 export function buildBrowserAgentGraph(deps: Deps) {
   return buildFocusedLoopGraph(deps, {
     systemPrompt: browserAgentPrompt,
-    // Web/UI scope: browser tools, read-only managed-process observation for
-    // local service readiness/log context, plus search/fetch to locate targets.
     toolAllowlist: BROWSER_AGENT_TOOL_ALLOWLIST,
   })
 }

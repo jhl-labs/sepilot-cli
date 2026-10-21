@@ -1,8 +1,3 @@
-/**
- * `ask` always requires human approval regardless of autonomy. `supervised`
- * prompts under supervised-family autonomy but runs without prompting under
- * autonomous autonomy (unless defaults.autonomous_honors_supervised_rules).
- */
 export type ToolPolicyMode = 'autonomous' | 'supervised' | 'ask' | 'blocked'
 
 export interface PolicyRule {
@@ -19,12 +14,21 @@ export interface PolicyRule {
   max_output_bytes?: number
 }
 
+export interface ResourceAccessPolicy {
+  version: 1
+  enabled: boolean
+  tools: { allow: string[]; deny: string[] }
+  urls: { allow: string[]; deny: string[] }
+  paths: { allow: string[]; deny: string[] }
+  internalTools?: string[]
+}
+
 export interface PolicyConfig {
+  access?: ResourceAccessPolicy
   version: number
   defaults: {
     mode: ToolPolicyMode
     unmatched_policy: 'allow' | 'deny'
-    /** Restore legacy behaviour: autonomous treats `supervised` rules as approval-required. Default false. */
     autonomous_honors_supervised_rules?: boolean
     max_timeout_ms: number
     max_output_bytes: number
@@ -36,6 +40,7 @@ export interface PolicyConfig {
 export interface PolicyCheckResult {
   allowed: boolean
   reason?: string
+  code?: 'workspace_confinement_required'
   requiresApproval?: boolean
   sandbox?: boolean
 }

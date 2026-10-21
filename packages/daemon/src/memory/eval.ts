@@ -649,10 +649,6 @@ export async function loadConfiguredMemoryEvalEmbedder(
     throw new Error(`Invalid config: ${validation.errors.join(' ')}`)
   }
 
-  // Install the process-wide egress policy before plugin imports or provider
-  // factories can perform network I/O. A programmatic caller may already own
-  // the daemon dispatcher: reuse an identical policy without closing it, and
-  // refuse to replace a different live policy that cannot be restored safely.
   const requestedNetworkPlan = planProviderDispatcher(config.network)
   const existingNetworkPlan = getProviderDispatcherPlan()
   if (
@@ -671,8 +667,6 @@ export async function loadConfiguredMemoryEvalEmbedder(
     const pluginLoader = createPluginLoader(dataDir)
     const skillRegistry = new FileSkillRegistry(join(dataDir, 'skills'))
     await skillRegistry.init()
-    // pluginLoader is null when the `plugins` feature is disabled in this build;
-    // the eval embedder still works without plugin-contributed providers.
     if (pluginLoader) {
       await pluginLoader.loadAll({
         providers: providerFactoryRegistry,

@@ -1,3 +1,4 @@
+import { boundedGitEnvironment, inspectBoundedGitConfiguration } from './git-transfer.js'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { throwIfAborted } from '../abort.js'
@@ -19,9 +20,8 @@ const STRICT_GIT_GLOBAL_ARGS = [
 const MAX_GIT_DATE_FILTER_LENGTH = 128
 
 export interface GitToolOptions {
-  /** Runner that proves workspace-only filesystem isolation for strict turns. */
+  boundedAccess?: () => boolean
   strictWorkspaceRunner?: TerminalRunner
-  /** Injectable daemon-host clock for deterministic local-day boundaries. */
   now?: () => Date
 }
 
@@ -184,10 +184,12 @@ async function runGit(
 
   try {
     throwIfAborted(signal, 'Git command aborted')
+    if (options.boundedAccess?.()) await inspectBoundedGitConfiguration(repoPath)
     const { stdout, stderr } = await execFileAsync(
       'git',
-      ['-C', repoPath, ...args],
+      [...(options.boundedAccess?.() ? STRICT_GIT_GLOBAL_ARGS : []), '-C', repoPath, ...args],
       {
+        ...(options.boundedAccess?.() ? { env: boundedGitEnvironment() } : {}),
         signal,
         maxBuffer: 10 * 1024 * 1024,
       },
@@ -280,12 +282,10 @@ export function createGitDiffTool(options: GitToolOptions = {}): ToolDefinitionR
         }
       }
       const args = commit
-        ? ['show', '--format=', '--no-color', '--no-ext-diff', '--end-of-options', commit]
-        : ['diff', '--no-color', '--no-ext-diff']
+        ? ['show', '--no-ext-diff', '--no-textconv', '--format=', '--no-color', '--end-of-options', commit]
+        : ['diff', '--no-ext-diff', '--no-textconv', '--no-color']
       if (!commit && input.staged === true) args.push('--staged')
       if (!commit && ref) {
-        // Prevent a ref-shaped value such as --output=/outside/file from
-        // becoming a git option with a filesystem side effect.
         args.push('--end-of-options', ref)
       }
       if (typeof input.path === 'string' && input.path.trim()) {
@@ -358,14 +358,11 @@ export function createGitLogTool(options: GitToolOptions = {}): ToolDefinitionRu
       const args = input.detailed === true
         ? [
             'log',
+            '--no-ext-diff', '--no-textconv',
             '--decorate',
             `-${limit}`,
             '--date=iso-strict',
             '--format=commit %H%d%nAuthor: %an <%ae>%nDate: %ad%n%n%s%n%n%b',
-            // Machine-readable per-file counts prevent models from mistaking
-            // the visual width in --stat for insertions. Keep the aggregate
-            // and create/delete summary so one call still answers overview
-            // and file-lifecycle questions.
             '--numstat',
             '--shortstat',
             '--summary',
@@ -375,10 +372,6 @@ export function createGitLogTool(options: GitToolOptions = {}): ToolDefinitionRu
         args.push('--all')
       }
       if (period === 'today') {
-        // Resolve the named period in the daemon before entering a sandbox.
-        // A workspace-only runner can have a UTC /etc/localtime or TZ even
-        // when the daemon host is in another zone, so relative Git dates such
-        // as "midnight" do not uphold the tool's host-local-day contract.
         const range = hostLocalTodayRange(options)
         args.push(`--since=${range.since}`, `--until=${range.until}`)
       } else {

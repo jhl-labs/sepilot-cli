@@ -174,7 +174,6 @@ function summarizeApp(app: Pick<StoredApp, 'manifest'>): SepilotReadableAppSumma
   }
 }
 
-/** Metadata only: conversational discovery must never preload saved app records. */
 async function listAppCatalog(dataDir: string): Promise<SepilotReadableAppSummary[]> {
   let entries
   try {
@@ -195,6 +194,7 @@ async function listAppCatalog(dataDir: string): Promise<SepilotReadableAppSummar
 }
 
 function appDiscoveryContext(input: string, apps: SepilotReadableAppSummary[]): string {
+  if (apps.length === 0) return ''
   const references = resolveAppReferences(input, apps)
   const bindings = references.slice(0, 12).map(binding => ({ ...binding, appIds: binding.appIds.slice(0, 12), candidateCount: binding.appIds.length }))
   const selectedIds = new Set(bindings.flatMap(binding => binding.appIds))
@@ -411,8 +411,6 @@ async function bestEffortEnsureAppSemanticIndex(
   try {
     await ensureAppSemanticIndex(semanticIndex, app)
   } catch {
-    // App data writes must not fail just because the auxiliary search
-    // index is temporarily unavailable.
   }
 }
 
@@ -429,8 +427,6 @@ async function syncAppsSemanticIndex(
       try {
         await deleteAppSearchDocument(semanticIndex, appId)
       } catch {
-        // Best effort cleanup; current readable-app filtering below still
-        // prevents stale documents from being returned by apps.search.
       }
     }
   }
@@ -442,8 +438,6 @@ async function syncAppsSemanticIndex(
         indexedIds.push(app.manifest.id)
       }
     } catch {
-      // Keep keyword search available even when vector/document indexing
-      // is degraded.
     }
   }
   await writeAppsSearchIndexRoot(dataDir, indexedIds)
@@ -595,8 +589,6 @@ async function searchReadableApps(input: {
   try {
     await syncAppsSemanticIndex(input.dataDir, allApps, input.semanticIndex)
   } catch {
-    // Keep apps.search usable as structured keyword search if the auxiliary
-    // semantic index metadata cannot be written.
   }
   const readableApps = allApps
     .filter((app) => appCapabilities(app).agentTools !== false)

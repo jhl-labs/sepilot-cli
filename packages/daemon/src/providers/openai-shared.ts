@@ -1,4 +1,6 @@
 import type OpenAI from 'openai'
+import { randomUUID } from 'node:crypto'
+import { createLogger } from '../logger.js'
 import type {
   ChatRequest,
   ChatResponse,
@@ -13,6 +15,8 @@ import { extractContent, toApiError, wrapError } from './utils.js'
 import { normalizeToolSchema } from './schema-normalize.js'
 import { partitionSystemMessages } from './system-messages.js'
 
+const streamLogger = createLogger('provider.openai-stream')
+
 type NonStreamingParams = OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming
 type StreamingParams = OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming
 type ChatCompletionChunk = OpenAI.Chat.Completions.ChatCompletionChunk
@@ -22,6 +26,8 @@ type OpenAIThinkingControl = NonNullable<ModelInfo['capabilities']['thinkingCont
 interface OpenAIResponseOptions {
   filterThinkTags?: boolean
   thinkingControl?: OpenAIThinkingControl
+  reasoningEffortOffValue?: NonNullable<ModelInfo['compatibility']>['reasoningEffortOffValue']
+  reasoningEffortAliases?: NonNullable<ModelInfo['compatibility']>['reasoningEffortAliases']
 }
 
 interface ThinkTagState {
@@ -132,8 +138,9 @@ function extractOpenAIReasoningContent(value: unknown): string {
 function addOptionalChatParams(
   params: NonStreamingParams | StreamingParams,
   request: ChatRequest,
-  thinkingControl?: OpenAIThinkingControl,
+  responseOptions: OpenAIResponseOptions,
 ) {
+  const { thinkingControl, reasoningEffortOffValue, reasoningEffortAliases } = responseOptions
   if (request.tools?.length) {
     params.tools = mapOpenAIChatTools(request.tools)
     if (request.toolChoice) {
@@ -152,16 +159,19 @@ function addOptionalChatParams(
     }
     return
   }
-  compatibleParams.reasoning_effort = request.thinkingLevel === 'off'
-    ? 'none'
+  const semanticEffort = request.thinkingLevel === 'off'
+    ? reasoningEffortOffValue ?? 'none'
     : request.thinkingLevel === 'max'
       ? 'high'
       : request.thinkingLevel
+  compatibleParams.reasoning_effort = request.thinkingLevel === 'off'
+    ? semanticEffort
+    : reasoningEffortAliases?.[semanticEffort as 'low' | 'medium' | 'high'] ?? semanticEffort
 }
 
 function createNonStreamingParams(
   request: ChatRequest,
-  thinkingControl?: OpenAIThinkingControl,
+  responseOptions: OpenAIResponseOptions,
 ): NonStreamingParams {
   const params: NonStreamingParams = {
     model: request.model,
@@ -170,13 +180,13 @@ function createNonStreamingParams(
     temperature: request.temperature,
     max_tokens: request.maxTokens,
   }
-  addOptionalChatParams(params, request, thinkingControl)
+  addOptionalChatParams(params, request, responseOptions)
   return params
 }
 
 function createStreamingParams(
   request: ChatRequest,
-  thinkingControl?: OpenAIThinkingControl,
+  responseOptions: OpenAIResponseOptions,
 ): StreamingParams {
   const params: StreamingParams = {
     model: request.model,
@@ -186,7 +196,7 @@ function createStreamingParams(
     temperature: request.temperature,
     max_tokens: request.maxTokens,
   }
-  addOptionalChatParams(params, request, thinkingControl)
+  addOptionalChatParams(params, request, responseOptions)
   return params
 }
 
@@ -196,18 +206,12 @@ function mapToolCalls(
   return toolCalls
     ?.filter((tc): tc is Extract<typeof tc, { type: 'function' }> => tc.type === 'function')
     .map((tc) => ({
-      id: tc.id,
+      id: randomUUID(),
       name: tc.function.name,
       arguments: JSON.parse(tc.function.arguments || '{}'),
     }))
 }
 
-/**
- * Split inline `<think>…</think>` / `<thinking>…</thinking>` reasoning out of
- * a complete (non-streamed) content string, reusing the same tokenizer the
- * streaming path uses. Returns the visible answer text and the extracted
- * reasoning so DeepSeek/Qwen/gpt-oss reasoning does not leak into the answer.
- */
 export function stripInlineThinkTags(content: string): { content: string; thinking: string } {
   const state = createThinkTagState()
   let text = ''
@@ -216,8 +220,6 @@ export function stripInlineThinkTags(content: string): { content: string; thinki
     if (chunk.type === 'text') text += chunk.text
     else if (chunk.type === 'thinking' && chunk.text) thinkingParts.push(chunk.text)
   }
-  // An unterminated block (opened `<think>` with no close) stays buffered —
-  // treat its contents as reasoning rather than dropping it or leaking it.
   if (state.insideBlock && state.buffer.trim()) {
     thinkingParts.push(state.buffer.trim())
   }
@@ -232,7 +234,7 @@ export async function createOpenAIChatResponse(
 ): Promise<ChatResponse> {
   try {
     const response = await client.chat.completions.create(
-      createNonStreamingParams(request, responseOptions.thinkingControl), {
+      createNonStreamingParams(request, responseOptions), {
       signal: options?.signal,
       },
     )
@@ -278,8 +280,6 @@ export async function createOpenAIEmbeddings(
   model = 'text-embedding-3-small',
 ): Promise<number[][]> {
   if (texts.length === 0) return []
-  // Sub-batch large inputs so one oversized request cannot exceed provider
-  // input limits and fail an entire backfill batch at once.
   const subBatchSize = resolveEmbeddingSubBatchSize()
   try {
     if (texts.length <= subBatchSize) {
@@ -392,36 +392,25 @@ function* mapContentDelta(content: string, thinkTagState: ThinkTagState | null):
 
 function* mapToolCallDeltas(
   delta: StreamDelta,
-  toolCallBuffers: Map<number, { id: string; name: string }>,
+  toolCallBuffers: Map<number, { id: string; name: string; started: boolean }>,
 ): Iterable<StreamChunk> {
   if (!delta.tool_calls) {
     return
   }
 
   for (const toolCall of delta.tool_calls) {
-    if (toolCall.id) {
-      toolCallBuffers.set(toolCall.index, {
-        id: toolCall.id,
-        name: toolCall.function?.name ?? '',
-      })
-      yield {
-        type: 'tool_call_start',
-        toolCall: {
-          id: toolCall.id,
-          name: toolCall.function?.name ?? '',
-        },
-      }
+    if (toolCall.id && !toolCallBuffers.has(toolCall.index)) {
+      toolCallBuffers.set(toolCall.index, { id: randomUUID(), name: '', started: false })
     }
-
+    const buffered = toolCallBuffers.get(toolCall.index)
+    if (!buffered) continue
+    if (!buffered.started && toolCall.function?.name) buffered.name += toolCall.function.name
     if (toolCall.function?.arguments) {
-      const buffered = toolCallBuffers.get(toolCall.index)
-      if (buffered) {
-        yield {
-          type: 'tool_call_delta',
-          toolCallId: buffered.id,
-          delta: toolCall.function.arguments,
-        }
+      if (!buffered.started) {
+        buffered.started = true
+        yield { type: 'tool_call_start', toolCall: { id: buffered.id, name: buffered.name } }
       }
+      yield { type: 'tool_call_delta', toolCallId: buffered.id, delta: toolCall.function.arguments }
     }
   }
 }
@@ -432,21 +421,50 @@ export async function* streamOpenAIChatResponse(
   options?: LLMRequestOptions,
   streamOptions: OpenAIResponseOptions = {},
 ): AsyncIterable<StreamChunk> {
+  const startedAt = performance.now()
+  const callId = randomUUID()
+  const stats = {
+    frames: 0, contentChars: 0, reasoningChars: 0,
+    rawToolDeltas: 0, rawToolArgumentChars: 0, mappedToolStarts: 0,
+    firstFrameMs: null as number | null, finishReason: null as string | null,
+    inputTokens: null as number | null, outputTokens: null as number | null,
+    failed: false,
+  }
   try {
+    const params = createStreamingParams(request, streamOptions)
+    const wire = params as unknown as Record<string, unknown>
+    streamLogger.debug('request_metadata', {
+      callId, model: request.model, maxTokens: request.maxTokens,
+      messageCount: params.messages.length, toolCount: params.tools?.length ?? 0,
+      requestedThinking: request.thinkingLevel ?? null,
+      thinkingControl: streamOptions.thinkingControl ?? null,
+      wireReasoningEffort: wire.reasoning_effort ?? null,
+      wireThinkingEnabled: (wire.chat_template_kwargs as { enable_thinking?: boolean } | undefined)?.enable_thinking ?? null,
+    })
     const stream = await client.chat.completions.create(
-      createStreamingParams(request, streamOptions.thinkingControl), {
+      params, {
       signal: options?.signal,
       },
     )
 
-    const toolCallBuffers = new Map<number, { id: string; name: string }>()
+    const toolCallBuffers = new Map<number, { id: string; name: string; started: boolean }>()
     const thinkTagState = streamOptions.filterThinkTags ? createThinkTagState() : null
     let usageEmitted = false
     let pendingDone: Extract<StreamChunk, { type: 'done' }> | undefined
 
     for await (const chunk of stream) {
+      stats.frames += 1
+      stats.firstFrameMs ??= Math.round(performance.now() - startedAt)
       const delta = chunk.choices?.[0]?.delta
+      stats.contentChars += delta?.content?.length ?? 0
+      stats.rawToolDeltas += delta?.tool_calls?.length ?? 0
+      for (const tool of delta?.tool_calls ?? []) stats.rawToolArgumentChars += tool.function?.arguments?.length ?? 0
+      if (chunk.usage) {
+        stats.inputTokens = chunk.usage.prompt_tokens ?? null
+        stats.outputTokens = chunk.usage.completion_tokens ?? null
+      }
       const reasoning = extractOpenAIReasoningContent(delta)
+      stats.reasoningChars += reasoning.length
       if (reasoning) {
         yield { type: 'thinking', text: reasoning }
       }
@@ -456,7 +474,10 @@ export async function* streamOpenAIChatResponse(
       }
 
       if (delta) {
-        yield* mapToolCallDeltas(delta, toolCallBuffers)
+        for (const mapped of mapToolCallDeltas(delta, toolCallBuffers)) {
+          if (mapped.type === 'tool_call_start') stats.mappedToolStarts += 1
+          yield mapped
+        }
       }
 
       const finishReason = chunk.choices?.[0]?.finish_reason
@@ -472,7 +493,12 @@ export async function* streamOpenAIChatResponse(
           : null
 
       if (finishReason) {
+        stats.finishReason = finishReason
         for (const [, buffered] of toolCallBuffers) {
+          if (!buffered.started) {
+            stats.mappedToolStarts += 1
+            yield { type: 'tool_call_start', toolCall: { id: buffered.id, name: buffered.name } }
+          }
           yield { type: 'tool_call_end', toolCallId: buffered.id }
         }
         toolCallBuffers.clear()
@@ -481,15 +507,8 @@ export async function* streamOpenAIChatResponse(
           usageEmitted = true
           yield usageChunk
         }
-        // finish_reason ends content, not the wire stream. OpenAI-compatible
-        // servers can send usage in a subsequent empty-choices frame. Our
-        // guarded consumer stops at done, so it must be the final adapter event.
         pendingDone = { type: 'done', finishReason: mapOpenAIFinishReason(finishReason) }
       } else if (usageChunk) {
-        // Usage often arrives (with stream_options.include_usage) in its own
-        // trailing chunk that has an empty `choices` array and therefore no
-        // finish_reason. Emit it here too, or it is silently dropped for every
-        // OpenAI-compatible provider.
         usageEmitted = true
         yield usageChunk
       }
@@ -498,10 +517,11 @@ export async function* streamOpenAIChatResponse(
         return
       }
     }
-    // Some endpoints omit usage even when requested. Finish at actual EOF,
-    // without inventing a zero-token usage event.
     if (pendingDone) yield pendingDone
   } catch (err) {
+    stats.failed = true
     yield { type: 'error', error: toApiError(err) }
+  } finally {
+    streamLogger.debug('response_metadata', { callId, ...stats, elapsedMs: Math.round(performance.now() - startedAt) })
   }
 }

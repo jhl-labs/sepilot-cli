@@ -18,30 +18,12 @@ import {
   type PlannerWorkingMemoryBoardSections,
 } from './planner-working-memory.js'
 
-/**
- * Unified agent state board (loop-engineering 상태판).
- *
- * The run state used to be injected as separate fragments — seed contract,
- * evidence ledger — while the richest fragments (planner working memory,
- * failed attempts, open questions, todo list) were write-only or turn-local.
- * The board assembles all of them into one structured block that is rebuilt
- * fresh from run state every turn and stripped from compactable history, so
- * it survives context compaction the same way the seed contract already did.
- *
- * Assembly is purely structural: existing typed fields are merged, never
- * parsed out of message content.
- */
-
 export const STATE_BOARD_PREFIX = '[Agent state board]'
 
-/** Rollback knob: `SEPILOTD_STATE_BOARD=0` restores the legacy separate
- *  contract + evidence-ledger injections. Default on. */
 export function isStateBoardEnabled(): boolean {
   return process.env.SEPILOTD_STATE_BOARD !== '0'
 }
 
-/** Most recent failed attempts rendered verbatim; older ones collapse into a
- *  `(+N earlier ...)` digest line so the section stays bounded. */
 export const MAX_BOARD_FAILED_ATTEMPTS = 10
 const MAX_BOARD_PLAN_STEPS = 20
 const MAX_BOARD_TODO_ITEMS = 20
@@ -68,7 +50,6 @@ export function createSteeringNote(
   }
 }
 
-/** Append a user steering note, bounded to `MAX_STEERING_NOTES` FIFO. */
 export function appendSteeringNote(
   state: { steeringNotes?: AgentSteeringNote[] },
   note: { message: string; kind?: 'instruction' | 'question' },
@@ -78,7 +59,6 @@ export function appendSteeringNote(
   return entry
 }
 
-/** Return unconsumed steering notes and mark them consumed. */
 export function takeUnconsumedSteeringNotes(state: {
   steeringNotes?: AgentSteeringNote[]
 }): AgentSteeringNote[] {
@@ -91,39 +71,19 @@ export function takeUnconsumedSteeringNotes(state: {
 }
 
 export interface AgentStateBoard {
-  /** Verbatim contract goal — never compressed or summarized. */
   goal: string
-  /** Verbatim acceptance criteria — never compressed or summarized. */
   completionCriteria: AgentAcceptanceCriterion[]
-  /** Full contract (constraints/out-of-scope/artifacts) for verbatim rendering. */
   contract?: AgentSeedContract
-  /** Planner working-memory plan, flattened with hierarchy depth. */
   plan: AgentStateBoardPlanStep[]
-  /** Session todo list (first-class loop state). */
   todos: TodoItem[]
-  /** Planner decisions already taken (1 line each). */
   decisions: string[]
-  /**
-   * Canonical failed attempts (`AgentFailedAttempt`) merged with
-   * quality-gate backtrack reasons and planner-abandoned alternatives —
-   * re-injected every turn as "do NOT repeat" input.
-   */
   failedAttempts: AgentFailedAttempt[]
-  /** Canonical open questions merged with unverified planner assumptions. */
   openQuestions: AgentOpenQuestion[]
-  /** Pre-rendered evidence-ledger section (counts, gaps, validation runs). */
   evidenceSection: string | null
-  /** Accepted terminal diagnostics; verdicts remain claims until evidence-scoped. */
   completion?: AgentStateBoardCompletion
-  /** User steering notes injected mid-run (bounded FIFO, consume-marked). */
   steeringNotes: AgentSteeringNote[]
 }
 
-/**
- * The structural state fragments the board is assembled from. A `Pick` of
- * `AgentState` so callers that rehydrate from durable session events can
- * build a board without a full run state.
- */
 export type AgentStateBoardSource = Pick<
   AgentState,
   | 'seedContract'
@@ -135,9 +95,7 @@ export type AgentStateBoardSource = Pick<
   | 'todoList'
   | 'completionDiagnostics'
 > & {
-  /** Current run-scoped results used to reject stale completion snapshots. */
   toolCallHistory?: AgentState['toolCallHistory']
-  /** Optional until `AgentState` grows a first-class field for it. */
   steeringNotes?: AgentSteeringNote[]
 }
 
@@ -147,10 +105,6 @@ function projectCompletion(
   const diagnostics = source.completionDiagnostics
   if (!diagnostics) return undefined
 
-  // Presentation diagnostics are emitted only for protocol lines that passed
-  // the terminal presentation boundary. Canonicalize ids against the active
-  // contract so stale, foreign, or fabricated criterion ids cannot enter the
-  // durable board merely because they appeared in model text.
   const contractCriteria = source.seedContract?.acceptanceCriteria ?? []
   const canonicalIds = new Map(
     contractCriteria.map((criterion) => [criterion.id.toUpperCase(), criterion.id]),
@@ -161,12 +115,6 @@ function projectCompletion(
   const snapshotIsCurrent =
     snapshot?.toolResultCount === currentEpisode.toolResultCount
     && snapshot.toolResultFingerprint === currentEpisode.toolResultFingerprint
-  // Once the deterministic gate has produced a current evidence snapshot, it
-  // is the complete authority for durable criterion verdicts. Presentation
-  // diagnostics are model-authored protocol removed from the user-facing
-  // answer; allowing their unlinked MET rows to fill snapshot gaps turns a
-  // partial semantic review into false session evidence. Runs without a
-  // current gate snapshot retain the legacy presentation-only projection.
   const verdictCandidates = snapshotIsCurrent
     ? snapshot.criterionVerdicts
     : diagnostics.presentation?.removedCriterionVerdicts ?? []
@@ -297,11 +245,6 @@ function boardIsEmpty(board: AgentStateBoard): boolean {
   )
 }
 
-/**
- * Render the board as one `[Agent state board]` system block. Goal and
- * acceptance criteria are verbatim (never compressed); every other section
- * is capped and compressed to 1-2 lines per item.
- */
 export function formatStateBoard(board: AgentStateBoard): string | null {
   if (boardIsEmpty(board)) return null
   const lines = [

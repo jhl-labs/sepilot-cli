@@ -27,21 +27,9 @@ export interface AgentLayer {
   sessionUndoStack: SessionUndoStack
 }
 
-/**
- * Agent-execution primitives: LLM response cache, per-provider
- * circuit breaker, concurrent-run limiter, the model router that
- * picks a provider/model for a request, and the run-scoped edit
- * snapshot store used by the qualityGate rollback path.
- */
 export function assembleAgentLayer(args: {
   providerRegistry: ProviderRegistryInstance
-  /** Daemon data dir (~/.sepilotd); enables durable edit checkpoints under sessions/. */
   dataDir?: string
-  /**
-   * Receives every tool outcome so the runtime can emit operational telemetry.
-   * Optional so tests and embedded uses can assemble the layer without an
-   * observability sink.
-   */
   onToolOutcome?: (outcome: ToolOutcomeObservation) => void
 }): AgentLayer {
   const llmCache = buildLlmCache()

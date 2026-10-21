@@ -10,7 +10,6 @@ export const procedureCandidateSchema = z.object({
   evidenceEventIds: z.array(z.string()).min(1).max(20),
 })
 
-/** Repeated independent episodes support a procedure; assistant prose alone cannot. */
 export async function learnProcedure(
   input: unknown, events: SessionEvent[], scopeTags: string[], index: ISemanticIndex,
 ): Promise<boolean> {

@@ -16,14 +16,6 @@ interface RewindBody {
 const idParamsSchema = z.object({ id: z.string().min(1) })
 const rewindBodySchema = z.object({ checkpointId: z.string().min(1), expectedCheckpointIds: z.array(z.string().min(1)).max(100).optional() })
 
-/**
- * Durable edit-checkpoint listing and file rewind (time travel). Every
- * committed agent edit checkpoint is persisted by EditSnapshotStore;
- * rewinding restores all touched files to their state before the chosen
- * checkpoint and drops the rewound history, mirroring Claude Code's
- * /rewind file scope. Conversation rewind is served separately by
- * POST /sessions/:id/branch and /undo.
- */
 export function registerSessionCheckpointRoutes(app: FastifyInstance): void {
   app.get<{ Params: { id: string; checkpointId: string } }>('/sessions/:id/checkpoints/:checkpointId/preview', {
     preValidation: zodRequestValidation({ params: { schema: idParamsSchema.extend({ checkpointId: z.string().min(1) }), message: 'Invalid checkpoint' } }),

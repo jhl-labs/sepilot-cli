@@ -47,9 +47,6 @@ export async function logsCommand(options: { lines?: string; type?: string }) {
         const entry = JSON.parse(line)
         const ts = entry.timestamp ?? entry.ts ?? ''
         const event = entry.event ?? ''
-        // `denied` / `rejected` / `failed` carry the same weight as
-        // `error` / `violation` for an operator skimming the log; lump
-        // them together so red shows on the lines that matter.
         const severity = /error|violation|denied|rejected|failed/i.test(event)
           ? chalk.red
           : /warn|throttle/i.test(event)

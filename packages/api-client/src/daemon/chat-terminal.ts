@@ -208,6 +208,8 @@ export function formatTerminalChatStreamFrame(frame: TerminalChatStreamFrame): s
       return `\n[approval-request] ${frame.preview}\n  decide with: /approve ${frame.requestId} or /deny ${frame.requestId}\n`
     case 'auto_approval':
       return `\n[auto-${frame.decision}] ${frame.toolName} via ${frame.scope} rule '${frame.pattern}'\n`
+    case 'view_still':
+      return `  [view] ${frame.title}${frame.subtitle ? ` — ${frame.subtitle}` : ''}\n`
     case 'tool_result':
       return `\n[tool:${frame.status}${frame.recoveryLabel ? `, ${frame.recoveryLabel}` : ''}${frame.postureLabel ? `, ${frame.postureLabel}` : ''}] ${frame.output}\n`
     case 'done':
@@ -217,8 +219,6 @@ export function formatTerminalChatStreamFrame(frame: TerminalChatStreamFrame): s
     case 'state_change':
       return `\n[state] ${frame.state}\n`
     case 'context_compact':
-      // Render: "[context compacted: 16,000 → 4,000 tokens] <summary>"
-      // Numbers are localized so 16k+ ranges read at a glance.
       return `\n[context compacted: ${frame.beforeTokens.toLocaleString()} → ${frame.afterTokens.toLocaleString()} tokens] ${frame.summary}\n`
     case 'phase_change': {
       const entered = frame.enteredPhase ?? 'finalize'
@@ -354,10 +354,6 @@ export function createTerminalChatStreamPresenter(): TerminalChatStreamPresenter
             fullContent = event.content ?? fullContent
             break
           }
-          // A new non-streamed assistant message supersedes text from an
-          // earlier LLM iteration (often a progress sentence before a tool
-          // call). `getContent()` is the final answer contract used by
-          // one-shot/output-file callers, not a transcript accumulator.
           fullContent = event.content ?? fullContent
           frames.push({
             kind: 'message',
@@ -636,6 +632,18 @@ export function createTerminalChatStreamPresenter(): TerminalChatStreamPresenter
             scope: event.scope,
           })
           break
+        case 'view_still':
+          closeInlineText(frames)
+          frames.push({
+            kind: 'view_still',
+            viewId: event.view.id,
+            title: event.view.title,
+            ...(event.view.subtitle ? { subtitle: event.view.subtitle } : {}),
+            image: event.still.image,
+            width: event.still.width,
+            height: event.still.height,
+          })
+          break
         case 'tool_result':
           closeInlineText(frames)
           frames.push({
@@ -672,10 +680,6 @@ export function createTerminalChatStreamPresenter(): TerminalChatStreamPresenter
           frames.push({ kind: 'state_change', state: event.state })
           break
         case 'context_compact':
-          // Without this case the terminal stream silently swallowed
-          // every compaction event — cli surfaces had no way to tell
-          // the user their token totals just dropped because the
-          // daemon summarised earlier turns.
           closeInlineText(frames)
           frames.push({
             kind: 'context_compact',
@@ -705,9 +709,6 @@ export function createTerminalChatStreamPresenter(): TerminalChatStreamPresenter
           })
           break
         case 'phase_change': {
-          // Surface phase transitions on the cli stream so operators
-          // see live progress through long runs (implementation →
-          // validation → review → finalize).
           closeInlineText(frames)
           const closed = (
             event as {
@@ -731,10 +732,6 @@ export function createTerminalChatStreamPresenter(): TerminalChatStreamPresenter
           break
         }
         case 'post_edit_findings': {
-          // Surface the post-edit analysis to the operator. Splits the
-          // diagnostics list into "broken callers" (`[caller]` prefix)
-          // and "own diagnostics" so surfaces can highlight downstream
-          // damage without re-grepping the summary text.
           closeInlineText(frames)
           const e = event as {
             editedFiles?: string[]

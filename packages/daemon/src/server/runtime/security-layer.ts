@@ -16,11 +16,6 @@ export interface SecurityLayer {
   secretVault: SecretVault
 }
 
-/**
- * Build policy, audit, ACL, and at-rest-encryption services. Pure
- * dataDir + config dependencies; runs as early as possible so other
- * assemblers can consume auditLogger and encryption.
- */
 export async function assembleSecurityLayer(args: {
   config: SepilotdConfig
   dataDir: string

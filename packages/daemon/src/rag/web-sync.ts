@@ -10,7 +10,6 @@ export function webSourceUrl(raw: string): URL {
     throw new Error('웹 자료는 사용자 정보와 fragment가 없는 HTTPS URL을 입력하세요.')
   return url
 }
-/** Explicit first-party source registration may target intranet hosts; no redirects or ambient credentials. */
 export async function readWebSource(
   folder: Pick<RagFolder, 'path' | 'tlsVerify' | 'caCert'>,
 ): Promise<string> {

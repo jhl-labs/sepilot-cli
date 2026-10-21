@@ -6,31 +6,14 @@ import { UNSUPPORTED_MEDIA_MESSAGE } from './media-ack.js'
 const log = createLogger('whatsapp')
 
 export interface WhatsAppChannelConfig {
-  /** Phone number ID from Meta Business */
   phoneNumberId: string
-  /** WhatsApp Business API access token */
   accessToken: string
-  /** Meta app secret used for webhook signature verification */
   appSecret?: string
-  /** Webhook verify token */
   verifyToken: string
-  /** Allowed phone numbers (E.164 format) */
   allowedNumbers?: string[]
   rateLimitPerMinute?: number
 }
 
-/**
- * WhatsApp Business API channel.
- *
- * Uses the official WhatsApp Cloud API (Meta Business Platform).
- * Requires:
- * 1. Meta Business account with WhatsApp Business API access
- * 2. Phone number registered with the API
- * 3. Webhook endpoint configured to receive messages
- *
- * Messages are received via webhook (POST /webhooks/whatsapp)
- * and sent via the Cloud API.
- */
 export class WhatsAppChannel implements IChannel {
   readonly id = 'whatsapp'
   readonly type: ChannelType = 'whatsapp'
@@ -91,7 +74,6 @@ export class WhatsAppChannel implements IChannel {
     }
   }
 
-  /** Verify webhook challenge from Meta */
   verifyWebhook(mode: string, token: string, challenge: string): string | null {
     if (mode !== 'subscribe') return null
     if (typeof this.config.verifyToken !== 'string' || !this.config.verifyToken) {
@@ -134,7 +116,6 @@ export class WhatsAppChannel implements IChannel {
     }
   }
 
-  /** Handle incoming webhook event from Meta */
   async handleWebhook(body: WhatsAppWebhookBody): Promise<void> {
     const entries = body.entry ?? []
 
@@ -146,21 +127,17 @@ export class WhatsAppChannel implements IChannel {
 
         for (const msg of messages) {
           const from = msg.from
-          // Check allowlist
           if (this.allowedNumbers.size > 0 && !this.allowedNumbers.has(from)) {
             log.warn('WhatsApp message from non-allowed number', { from })
             continue
           }
 
-          // Rate limit
           if (!this.checkRateLimit(from)) continue
 
-          // Non-text inbound (image / audio / document / location / …) can't
-          // be processed yet. Ack instead of silently dropping.
           if (msg.type !== 'text' || !msg.text?.body) {
             try {
               await this.sendMessage({ id: from, type: 'user' }, { text: UNSUPPORTED_MEDIA_MESSAGE })
-            } catch { /* best-effort ack */ }
+            } catch {}
             continue
           }
 

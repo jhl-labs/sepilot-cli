@@ -40,11 +40,6 @@ function parseGatewayOrigin(raw: string): string {
   return parsed.origin
 }
 
-/**
- * Apply an operator-owned gateway endpoint without rewriting config.yaml.
- * Container and service deployments need a routable origin while local
- * profiles retain their persisted loopback default.
- */
 export function applyRuntimeGatewayEnvironment(
   config: SepilotdConfig,
   env: Record<string, string | undefined> = process.env,

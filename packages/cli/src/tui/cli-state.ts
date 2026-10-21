@@ -12,7 +12,6 @@ interface CliState {
   projectBindings?: Record<string, string>
   themeId?: ThemeId
   modelMru?: string[]
-  /** End-of-turn recap toggle. Undefined means enabled (default on). */
   recapEnabled?: boolean
 }
 

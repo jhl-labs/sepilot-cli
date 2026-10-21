@@ -36,10 +36,6 @@ export interface MeilisearchMemoryConfig {
   timeoutMs?: number
 }
 
-// Wall-clock cap for a single external vector-backend HTTP request. Without it,
-// a hung backend (qdrant/opensearch/ES/meili down or slow) makes memory search
-// hang forever: the throw never fires, so the keyword fallback never runs and a
-// hybrid Promise.all blocks the whole call. Default 15s, env-tunable.
 export function resolveVectorBackendTimeoutMs(configured?: number): number {
   if (configured !== undefined && configured > 0) return configured
   const env = Number(process.env.SEPILOTD_VECTOR_BACKEND_TIMEOUT_MS)
@@ -193,20 +189,12 @@ export class SqliteVecBackend implements MemoryVectorBackend {
     try {
       const override = process.env.SEPILOTD_SQLITE_VEC_PATH?.trim()
       if (override) {
-        // Compiled single-file binary: the vec0 loadable lives at a temp path,
-        // not under node_modules/sqlite-vec-*. Load it directly.
         this.db.loadExtension(override)
       } else {
-        // SqliteDatabase is a better-sqlite3 instance at runtime; sqlite-vec needs the concrete type
         sqliteVec.load(this.db as never)
       }
       this.available = this.probe()
     } catch (err) {
-      // Loading the loadable extension failed (missing/garbage path, unsupported
-      // platform, or this SQLite build forbids extension loading). Degrade to the
-      // same "vector search unavailable" state as when sqlite-vec isn't installed —
-      // createVectorBackend() then falls back to the sqlite-scan backend — instead
-      // of letting the exception crash daemon startup.
       log.warn('sqlite-vec extension load failed; vector search disabled (falling back to sqlite-scan)', {
         error: err instanceof Error ? err.message : String(err),
         path: process.env.SEPILOTD_SQLITE_VEC_PATH?.trim() || undefined,
@@ -323,7 +311,6 @@ export class SqliteVecBackend implements MemoryVectorBackend {
         }))
       }
     } catch {
-      // Fall back to a deterministic scan when sqlite-vec search is unavailable.
     }
 
     return this.searchByScan(queryEmbedding, limit, model)

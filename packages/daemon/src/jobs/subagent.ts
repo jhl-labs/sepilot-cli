@@ -19,15 +19,27 @@ export interface BackgroundSubagents {
     items: ReturnType<JobsRepo['listCompletedItems']>
   } | null
   cancel(jobId: string, parentSessionId: string): boolean
+  list(parentSessionId: string, limit?: number): BackgroundSubagentJobSummary[]
 }
 
-/** A detached job owns its cancellation; caller cancellation is checked before admission only. */
+export interface BackgroundSubagentJobSummary {
+  jobId: string
+  status: Job['status']
+  createdAt: number
+  childSessionId?: string
+  category?: string
+  agentId?: string
+  summary?: string
+}
+
+const JOB_SUMMARY_CHARS = 240
+const JOB_LIST_SCAN = 100
+
 export function createBackgroundSubagents(deps: {
   dispatcher: SubagentDispatcher
   repo: JobsRepo
   runner: JobRunner
   onFinished?: (job: Job, parentSessionId: string) => void
-  /** Bound active plus queued submissions, not just concurrent engines. */
   maxPending?: number
 }): BackgroundSubagents {
   const pending = new Set<string>()
@@ -52,7 +64,6 @@ export function createBackgroundSubagents(deps: {
         error.code = 'SUBAGENT_TOOL_ESCALATION'
         throw error
       }
-      // Persist only data. Never serialize a live signal/callback or recover authority from daemon defaults.
       const { signal: _signal, onSession: _onSession, onEvent: _onEvent, ...data } = input
       const request = JSON.parse(
         JSON.stringify({ ...data, detached: true }),
@@ -86,7 +97,6 @@ export function createBackgroundSubagents(deps: {
           if (final) deps.onFinished?.(final, input.parentSessionId!)
         })
         .catch(() => {
-          /* execution evidence remains in the durable job even if notification fails */
         })
       return { jobId: job.id, status: job.status, createdAt: job.createdAt }
     },
@@ -103,10 +113,33 @@ export function createBackgroundSubagents(deps: {
       deps.runner.cancel(jobId)
       return true
     },
+    list(parentSessionId, limit = 50) {
+      if (!parentSessionId) return []
+      const summaries: BackgroundSubagentJobSummary[] = []
+      for (const job of deps.repo.list({ kind: 'subagent', limit: JOB_LIST_SCAN })) {
+        if (summaries.length >= Math.max(1, limit)) break
+        const item = deps.repo.listItems(job.id, 0)[0]
+        const request = item?.request as SubagentDispatchInput | undefined
+        if (request?.parentSessionId !== parentSessionId) continue
+        const childSessionId = deps.repo.listActivity(job.id)[0]?.sessionId
+        const result = deps.repo.listCompletedItems(job.id, 0)[0]?.result as { output?: unknown } | undefined
+        summaries.push({
+          jobId: job.id,
+          status: job.status,
+          createdAt: job.createdAt,
+          ...(childSessionId ? { childSessionId } : {}),
+          ...(request.category ? { category: request.category } : {}),
+          ...(request.agentId ? { agentId: request.agentId } : {}),
+          ...(typeof result?.output === 'string' && result.output
+            ? { summary: result.output.slice(0, JOB_SUMMARY_CHARS) }
+            : {}),
+        })
+      }
+      return summaries
+    },
   }
 }
 
-/** Shared execution contract for direct background submissions and work plans. */
 export async function executeSubagentJob(
   dispatcher: SubagentDispatcher,
   repo: JobsRepo,
@@ -124,8 +157,6 @@ export async function executeSubagentJob(
       }),
     onEvent: (event) => {
       if (event.type !== 'subagent_progress') return
-      // Persist bounded structured activity, never prompt, thinking, tool args
-      // or raw outputs. This survives disconnects without creating a second log.
       if (event.inner.type === 'thinking' || event.inner.type === 'message') return
       repo.updateItemProgress(item.jobId, item.idx, {
         sessionId: event.subagentId,

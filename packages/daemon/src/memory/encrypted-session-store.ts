@@ -80,8 +80,11 @@ export class EncryptedSessionStore implements ISessionStore {
 
   async getEvents(sessionId: string): Promise<SessionEvent[]> {
     const events = await this.inner.getEvents(sessionId)
-    // Decrypt encrypted content
     return events.map((event) => this.decryptEvent(event))
+  }
+
+  getToolResult(sessionId: string, toolCallId: string, options?: { signal?: AbortSignal }) {
+    return this.inner.getToolResult(sessionId, toolCallId, options, (event) => this.decryptEvent(event))
   }
 
   async replaceEvents(sessionId: string, events: SessionEvent[]): Promise<void> {
@@ -98,7 +101,6 @@ export class EncryptedSessionStore implements ISessionStore {
       provider?: string
       model?: string
       personaIds?: string[]
-      /** Server-bound isolated persona memory identity. */
       memoryNamespace?: string
       preferPromptReact?: boolean
       starred?: boolean
@@ -106,6 +108,14 @@ export class EncryptedSessionStore implements ISessionStore {
     },
   ): Promise<SessionMeta | null> {
     return this.inner.updateMeta(sessionId, patch)
+  }
+
+  async updateTitleIfUnchanged(
+    sessionId: string,
+    title: string,
+    expected: Pick<SessionMeta, 'title' | 'createdAt'>,
+  ): Promise<SessionMeta | null> {
+    return this.inner.updateTitleIfUnchanged(sessionId, title, expected)
   }
 
   private encryptEvent(event: SessionEvent): SessionEvent {

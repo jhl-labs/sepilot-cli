@@ -1,5 +1,22 @@
 import type { AgentEvent } from '@sepilotd/core'
 
+export function resolveModelOutputAllowance(options: {
+  requested?: number
+  modelMaximum?: number
+  observedMaximum?: number
+  fallback: number
+}): number {
+  const positive = (value: number | undefined): number | undefined =>
+    Number.isSafeInteger(value) && value! > 0 ? value : undefined
+  const model = positive(options.modelMaximum)
+  const observed = positive(options.observedMaximum)
+  return Math.min(
+    positive(options.requested) ?? model ?? observed ?? options.fallback,
+    model ?? Infinity,
+    observed ?? Infinity,
+  )
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message
   if (typeof error === 'string') return error
@@ -12,14 +29,6 @@ function errorMessage(error: unknown): string {
   return ''
 }
 
-/**
- * Recover a provider's real output-token ceiling from a rejected request.
- *
- * Model catalogs and OpenAI-compatible relays are frequently out of sync.
- * Only accept a smaller positive integer from an error that explicitly names
- * max_tokens or a maximum output-token limit. Context-window errors and model
- * retirement messages must not change this per-run capability observation.
- */
 export function detectProviderMaxOutputTokenLimit(
   error: unknown,
   requestedTokens: number | undefined,
@@ -58,4 +67,53 @@ export function buildMaxOutputTokenRecoveryEvent(
       graphMutation: false,
     },
   }
+}
+
+const OBSERVED_MAX_OUTPUT_TOKENS_TTL_MS = 60 * 60_000
+const MAX_OBSERVED_MAX_OUTPUT_TOKEN_ENTRIES = 256
+const observedMaxOutputTokens = new Map<string, { limit: number; at: number }>()
+
+function observedLimitKey(providerId: string | undefined, model: string | undefined): string | null {
+  return providerId && model ? `${providerId}\u0000${model}` : null
+}
+
+export function rememberObservedMaxOutputTokens(
+  providerId: string | undefined,
+  model: string | undefined,
+  limit: number,
+  now = Date.now(),
+): void {
+  const key = observedLimitKey(providerId, model)
+  if (!key || !Number.isSafeInteger(limit) || limit <= 0) return
+  for (const [existingKey, entry] of observedMaxOutputTokens) {
+    if (now - entry.at > OBSERVED_MAX_OUTPUT_TOKENS_TTL_MS) observedMaxOutputTokens.delete(existingKey)
+  }
+  const current = observedMaxOutputTokens.get(key)
+  if (current && current.limit <= limit && now - current.at <= OBSERVED_MAX_OUTPUT_TOKENS_TTL_MS) return
+  while (observedMaxOutputTokens.size >= MAX_OBSERVED_MAX_OUTPUT_TOKEN_ENTRIES) {
+    const oldest = observedMaxOutputTokens.keys().next().value
+    if (oldest === undefined) break
+    observedMaxOutputTokens.delete(oldest)
+  }
+  observedMaxOutputTokens.set(key, { limit, at: now })
+}
+
+export function recallObservedMaxOutputTokens(
+  providerId: string | undefined,
+  model: string | undefined,
+  now = Date.now(),
+): number | undefined {
+  const key = observedLimitKey(providerId, model)
+  if (!key) return undefined
+  const entry = observedMaxOutputTokens.get(key)
+  if (!entry) return undefined
+  if (now - entry.at > OBSERVED_MAX_OUTPUT_TOKENS_TTL_MS) {
+    observedMaxOutputTokens.delete(key)
+    return undefined
+  }
+  return entry.limit
+}
+
+export function resetObservedMaxOutputTokens(): void {
+  observedMaxOutputTokens.clear()
 }

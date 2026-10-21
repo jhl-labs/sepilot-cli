@@ -10,8 +10,6 @@ import { createLogger } from '../logger.js'
 import { tokenCalibration } from '../providers/token-calibration.js'
 import { loadSessionContext, trimMessagesToLimit } from './context-loader.js'
 
-// Re-exported so session entrypoints can size their context windows without
-// importing the raw context loader (see session-context-guard test).
 export { resolveSessionContextMaxMessages } from './context-loader.js'
 import {
   compactSessionMessages,
@@ -25,13 +23,6 @@ const log = createLogger('auto-compaction')
 const DEFAULT_CONTEXT_WINDOW = 8000
 const AUTO_COMPACT_CONTEXT_RATIO = 0.55
 const AUTO_COMPACT_MIN_THRESHOLD = 3000
-// The token estimate (`beforeTokens`) only counts conversation messages, but
-// the request actually sent to the model also carries the system prompt, tool
-// schemas and injected context (memory/state board). If the threshold ignores
-// that fixed overhead, compaction fires too late and the real request overflows
-// the window. Subtract a conservative overhead estimate from the effective
-// window before applying the ratio. Operator-tunable; defaults to a safe
-// (earlier-firing) value.
 const DEFAULT_FIXED_OVERHEAD_TOKENS = 1500
 
 function resolveFixedOverheadTokens(explicit?: number): number {
@@ -43,18 +34,6 @@ function resolveFixedOverheadTokens(explicit?: number): number {
   return DEFAULT_FIXED_OVERHEAD_TOKENS
 }
 
-/**
- * Real prompt overhead observed on this session's latest non-auxiliary
- * provider request.
- *
- * The fixed default is a guess, and it is wrong by an order of magnitude on
- * the transports that matter: a prompt-react system prompt renders every tool
- * manual inline (tens of thousands of characters), and native transport moves
- * the same weight into tool schemas beside the messages. Both halves are
- * already measured on every `llm_request` event, so the threshold can use the
- * session's own observed size instead of a constant. Returns undefined for a
- * session that has not issued a main-loop request yet.
- */
 export async function loadObservedPromptOverheadTokens(
   sessionStore: ISessionStore,
   sessionId: string,
@@ -66,8 +45,6 @@ export async function loadObservedPromptOverheadTokens(
     const event = events[index]
     if (event?.type !== 'llm_request') continue
     const digest = event.requestDigest
-    // Auxiliary calls (routers, judges, summarizers) carry a small bespoke
-    // prompt that says nothing about the main loop's overhead.
     if (!digest || digest.auxiliary) continue
     const chars = (digest.systemPromptChars ?? 0) + (digest.toolSchemaChars ?? 0)
     if (chars > 0) return Math.ceil(chars / safeCharsPerToken)
@@ -81,12 +58,7 @@ export interface AutoCompactionResult {
   compacted: boolean
   beforeTokens: number
   afterTokens?: number
-  /** Messages folded into the summary. Present only when `compacted`. */
   removedMessageCount?: number
-  /**
-   * Inspect mode only: whether a real load would have compacted. Lets a
-   * read-only inspector report the same decision without causing it.
-   */
   wouldCompact?: boolean
 }
 
@@ -94,13 +66,6 @@ function formatApproxTokens(tokens: number): string {
   return tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : String(tokens)
 }
 
-/**
- * User-facing notice for a compaction that already happened.
- *
- * Replacing the conversation with a summary changes what the assistant can
- * recall, so it is not an implementation detail the user should have to infer
- * from a degraded answer. Returns null when nothing was compacted.
- */
 export function formatContextCompactionNotice(
   result: Pick<AutoCompactionResult, 'compacted' | 'beforeTokens' | 'afterTokens' | 'removedMessageCount'>,
 ): string | null {
@@ -123,18 +88,7 @@ export interface AutoCompactionOptions {
   tokenThreshold?: number
   config?: SessionCompactionConfig
   charsPerToken?: number
-  /**
-   * Estimated fixed prompt overhead (system prompt + tool schemas + injected
-   * context) in tokens, subtracted from the effective window before the
-   * compaction ratio is applied. Callers that know their real overhead should
-   * pass it; otherwise a safe env-tunable default is used.
-   */
   fixedOverheadTokens?: number
-  /**
-   * Report the compaction decision without performing it: no summarization
-   * call, no `context_compact` event. Inspectors must not mutate the session
-   * they are describing.
-   */
   inspectOnly?: boolean
 }
 
@@ -147,11 +101,6 @@ export async function loadAutoCompactedSessionContext(
     options.sessionId,
     Number.MAX_SAFE_INTEGER,
   )
-  // Estimating with a flat 4 chars/token silently overstates the remaining
-  // window for anything that does not tokenize like English prose, so the
-  // threshold is reached long after the real request is already too big.
-  // The calibrator learns the real ratio from provider usage; use it unless
-  // the caller has a better number.
   const charsPerToken = options.charsPerToken
     ?? tokenCalibration.charsPerToken(options.provider?.id, options.model)
   const beforeTokens = estimateMessagesTokens(fullMessages, charsPerToken)
@@ -167,9 +116,6 @@ export async function loadAutoCompactedSessionContext(
     fixedOverheadTokens,
   )
 
-  // A message-count overflow is a compaction trigger too: silently slicing
-  // the head off the context loses the user's goal and earlier decisions
-  // without leaving a summary behind.
   const exceedsMessageLimit = options.maxMessages !== undefined
     && fullMessages.length > options.maxMessages
 
@@ -196,6 +142,7 @@ export async function loadAutoCompactedSessionContext(
     }
   }
 
+  const throughEventId = (await options.sessionStore.getEvents(options.sessionId)).at(-1)?.id
   const compaction = await compactSessionMessages({
     messages: fullMessages,
     provider: options.provider,
@@ -206,10 +153,6 @@ export async function loadAutoCompactedSessionContext(
     charsPerToken,
   })
 
-  // When triggered by token pressure the compaction must actually save
-  // tokens. When triggered by a message-count overflow, shrinking the
-  // message list with a summary is the goal even if the summary text costs
-  // as many tokens as the short messages it replaced.
   if (
     !compaction
     || compaction.removedMessageCount === 0
@@ -223,18 +166,6 @@ export async function loadAutoCompactedSessionContext(
     }
   }
 
-  // Build the post-compact in-memory message list FIRST. This
-  // mirrors what loadSessionContext does when it encounters a
-  // context_compact event:
-  //   - drop everything before the compaction
-  //   - push a system message with the continuation summary
-  //   - push preservedMessages (the small recent tail)
-  // Doing this in memory before appendEvent means: if the daemon
-  // restarts or appendEvent fails partway, the agent loop returns
-  // a coherent message list and the compaction simply replays on
-  // the next call. The previous code appended first and re-loaded
-  // from disk; an append-success-then-reload-fail would leave the
-  // user's pending message floating with no in-memory context.
   const continuationMessage: Message = {
     role: 'system',
     content: getCompactContinuationMessage(compaction.summary, {
@@ -259,13 +190,9 @@ export async function loadAutoCompactedSessionContext(
       removedMessageCount: compaction.removedMessageCount,
       preservedMessageCount: compaction.preservedMessageCount,
       preservedMessages: compaction.preservedMessages,
+      ...(throughEventId ? { throughEventId } : {}),
     })
   } catch (err) {
-    // Persistence failed but the in-memory result is still
-    // coherent — the agent loop can keep going on this turn and
-    // the next turn will retry the compaction. Surface the
-    // failure so an operator notices the disk problem rather than
-    // letting the session quietly skip persistence forever.
     log.error('failed to persist context_compact event; continuing with in-memory compaction', {
       sessionId: options.sessionId,
       error: err instanceof Error ? err.message : String(err),
@@ -298,18 +225,16 @@ export function resolveAutoCompactThreshold(
   const modelInfo = model
     ? provider?.models.find((candidate) => candidate.id === model)
     : undefined
-  // Exact match only. `models[0]` is whatever order the provider returned —
-  // alphabetical for Ollama, so an embedding model can sort first — and
-  // borrowing an unrelated model's window sizes the threshold for a model that
-  // is not running. An unknown model gets the conservative default, which
-  // compacts early rather than overflowing.
   const contextWindow = modelInfo?.contextWindow ?? DEFAULT_CONTEXT_WINDOW
   const overhead = resolveFixedOverheadTokens(fixedOverheadTokens)
   const effectiveWindow = Math.max(0, contextWindow - overhead)
-  return Math.max(
-    AUTO_COMPACT_MIN_THRESHOLD,
-    Math.floor(effectiveWindow * AUTO_COMPACT_CONTEXT_RATIO),
-  )
+  const byWindow = Math.floor(effectiveWindow * AUTO_COMPACT_CONTEXT_RATIO)
+  return Math.max(AUTO_COMPACT_MIN_THRESHOLD, Math.min(byWindow, resolveAutoCompactMaxTokens()))
+}
+
+function resolveAutoCompactMaxTokens(): number {
+  const raw = Number(process.env.SEPILOTD_AUTO_COMPACT_MAX_TOKENS)
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : Number.POSITIVE_INFINITY
 }
 
 function limitMessages(messages: Message[], maxMessages: number | undefined): Message[] {
@@ -333,9 +258,57 @@ export async function loadLatestRunContract(
       latestContractIndex = index
     }
   }
-  // A contract is renewed after the user message of every contracted turn.
-  // If a newer user turn completed without emitting one (for example an
-  // instant memory/scheduler action), the older task contract is no longer the
-  // active task and must not leak into subsequent requests.
   return latestContractIndex > latestUserMessageIndex ? latest : undefined
+}
+
+export async function loadLatestRoutedPersona(
+  sessionStore: ISessionStore,
+  sessionId: string,
+): Promise<string | undefined> {
+  const events = await sessionStore.getEvents(sessionId)
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!
+    if (event.type !== 'router_decision') continue
+    const decision = (event as { decision?: { persona?: string; fallback?: boolean } }).decision
+    return decision?.persona && decision.fallback !== true ? decision.persona : undefined
+  }
+  return undefined
+}
+
+const DEFAULT_PREFLIGHT_COMPACTION_MS = 25_000
+const compactionsInFlight = new Set<string>()
+
+export function resolvePreflightCompactionBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.SEPILOTD_PREFLIGHT_COMPACTION_MS
+  if (raw === undefined || raw.trim() === '') return DEFAULT_PREFLIGHT_COMPACTION_MS
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_PREFLIGHT_COMPACTION_MS
+}
+
+export async function loadAutoCompactedSessionContextWithinBudget(
+  options: AutoCompactionOptions,
+  budgetMs = resolvePreflightCompactionBudgetMs(),
+): Promise<AutoCompactionResult & { deferred?: boolean }> {
+  if (options.inspectOnly) return loadAutoCompactedSessionContext(options)
+  if (compactionsInFlight.has(options.sessionId)) {
+    return { ...(await loadAutoCompactedSessionContext({ ...options, inspectOnly: true })), deferred: true }
+  }
+  compactionsInFlight.add(options.sessionId)
+  const compaction = loadAutoCompactedSessionContext(options)
+    .finally(() => compactionsInFlight.delete(options.sessionId))
+  if (budgetMs <= 0) return compaction
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timedOut = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), budgetMs) })
+  try {
+    const first = await Promise.race([compaction, timedOut])
+    if (first !== 'timeout') return first
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+  compaction.catch((error) => log.warn('background compaction failed', {
+    sessionId: options.sessionId,
+    error: error instanceof Error ? error.message : String(error),
+  }))
+  log.info('compaction deferred past the preflight budget', { sessionId: options.sessionId, budgetMs })
+  return { ...(await loadAutoCompactedSessionContext({ ...options, inspectOnly: true })), deferred: true }
 }

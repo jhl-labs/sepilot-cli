@@ -1,14 +1,3 @@
-// Bundles the two single-state slots that the provider setup wizard and
-// the provider delete confirmation share. Each slot is a single object
-// (or null when closed); the open flag is derived from `!== null`.
-//
-// The state shapes (ProviderSetupState, ProviderDeleteConfirmState) live
-// in App.tsx because they reference ProviderSetupStep, ProviderWizard
-// preset types, and ConfiguredProviderRecord — moving them here would
-// either pull a chain of types across or require a separate types module.
-// The generic parameters keep this file shape-agnostic so the hook does
-// not need to know about any of those.
-
 import { useCallback, useState } from 'react'
 
 export interface UseProviderSetupResult<TSetup, TDelete> {

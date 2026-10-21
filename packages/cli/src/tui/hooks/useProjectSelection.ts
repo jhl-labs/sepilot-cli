@@ -1,17 +1,3 @@
-// Three project-selection state slots App.tsx kept inline:
-//
-// - projects — the daemon's configured project list (refreshed via
-//   /project commands and on hydrate)
-// - workspaceProject — what detectWorkspaceProject() found for the
-//   current cwd, used to suggest auto-selection
-// - projectSelectionSource — provenance tag for the *current* project
-//   selection: was it detected from the workspace, derived from a
-//   loaded session, or explicitly chosen by the operator. Drives the
-//   /project info readout.
-//
-// The hook owns nothing but state; consumers in App.tsx still read via
-// the same destructured names.
-
 import { useState } from 'react'
 import type { DaemonProject } from '@sepilotd/api-client'
 import type { WorkspaceProject } from '../utils/projects.js'

@@ -60,13 +60,7 @@ export interface A2APushDelivery {
 
 export interface A2ATaskStoreOptions {
   pushDelivery?: A2APushDelivery
-  /** Hard cap on retained tasks. Oldest terminal tasks are evicted first. */
   maxTasks?: number
-  /**
-   * Terminal tasks older than this (ms) are evicted eagerly. Opt-in: when
-   * unset, only the count cap bounds growth (age-based eviction can surprise
-   * callers that resurrect old tasks by id, so it is not applied by default).
-   */
   terminalRetentionMs?: number
 }
 
@@ -121,9 +115,6 @@ function cloneTask(task: A2ATask): A2ATask {
 }
 
 function stateFromStatus(status: A2ADispatchResult['status']): A2ATaskState {
-  // A truncated run still produced output (it hit an iteration/length limit),
-  // so it maps to COMPLETED (with a truncation flag recorded in metadata) —
-  // not FAILED, which would discard the partial answer.
   return status === 'completed' || status === 'truncated'
     ? 'TASK_STATE_COMPLETED'
     : 'TASK_STATE_FAILED'
@@ -433,12 +424,6 @@ export class A2ATaskStore {
     return saved
   }
 
-  /**
-   * Bound retained tasks by age and count. Terminal tasks past the retention
-   * window are dropped; if still over the cap, the oldest terminal (then oldest
-   * overall) tasks are evicted. The just-saved task id is never evicted, and
-   * tasks with a live push-config are preferentially kept. Returns nothing.
-   */
   protected evict(protectId?: string): void {
     const maxTasks = this.options.maxTasks ?? DEFAULT_A2A_MAX_TASKS
     const retentionMs = this.options.terminalRetentionMs
@@ -463,7 +448,6 @@ export class A2ATaskStore {
         terminal: isTerminalState(task.status.state),
         ts: Date.parse(task.status.timestamp ?? '') || 0,
       }))
-      // Evict terminal tasks before non-terminal, oldest first within each group.
       .sort((a, b) => (a.terminal === b.terminal ? a.ts - b.ts : a.terminal ? -1 : 1))
 
     let over = this.tasks.size - maxTasks
@@ -556,7 +540,6 @@ export class A2ATaskStore {
   }
 
   protected afterPushConfigMutation(): void {
-    // Subclasses with persistence override this hook.
   }
 
   list(input: A2AListTasksRequest = {}): A2AListTasksResponse {
@@ -619,7 +602,6 @@ export class A2ATaskStore {
 export interface A2AServiceOptions {
   taskStore: A2ATaskStore
   dispatch: A2ADispatcher
-  /** Max concurrent in-flight A2A dispatches. Defaults to env / 4. */
   maxConcurrent?: number
 }
 
@@ -641,7 +623,6 @@ export class A2AService {
     this.maxConcurrent = options.maxConcurrent ?? resolveA2AMaxConcurrent()
   }
 
-  /** Reserve a dispatch slot; throws RESOURCE_EXHAUSTED when at capacity. */
   private acquireSlot(): void {
     if (this.inFlight >= this.maxConcurrent) {
       throw new A2AError(
@@ -758,8 +739,6 @@ export class A2AService {
   }
 
   private async sendMessage(input: A2ASendMessageRequest): Promise<A2ASendMessageResponse> {
-    // Cap concurrent dispatches before creating the task so an authenticated
-    // caller cannot accumulate unbounded concurrent agent runs.
     this.acquireSlot()
     let prepared: { task: A2ATask; prompt: string }
     try {
@@ -786,10 +765,6 @@ export class A2AService {
       throw new A2AError(-32602, 'message.parts did not contain prompt content', 'INVALID_PARAMETERS')
     }
     const contextId = input.message.contextId ?? randomUUID()
-    // A caller-supplied taskId must not collide with an existing task: reusing
-    // an arbitrary id would overwrite (hijack) a terminal task or a task owned
-    // by another context, and concurrent runs of the same id would share an
-    // abort controller and interleave saves. Fail closed.
     const providedTaskId = input.message.taskId
     if (providedTaskId !== undefined && this.options.taskStore.get(providedTaskId)) {
       throw new A2AError(
@@ -839,9 +814,6 @@ export class A2AService {
     input: A2ASendMessageRequest,
   ): Promise<A2ATask | null> {
     const { task, prompt } = prepared
-    // Guard against a second run reusing a taskId whose run is still in flight
-    // (would share/replace the abort controller and interleave task saves).
-    // The caller has already reserved a concurrency slot, so release it here.
     if (this.runningTaskAbortControllers.has(task.id)) {
       this.releaseSlot()
       throw new A2AError(
@@ -933,7 +905,6 @@ export class A2AService {
     }
     const queue = new A2AEventQueue()
     const unsubscribe = this.options.taskStore.subscribe(prepared.task.id, (event) => queue.push(event))
-    // Abort the underlying run and end the stream when the client disconnects.
     const onAbort = () => {
       this.runningTaskAbortControllers.get(prepared.task.id)?.abort()
       queue.close()

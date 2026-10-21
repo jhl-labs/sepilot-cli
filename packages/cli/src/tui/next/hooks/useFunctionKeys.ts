@@ -3,7 +3,6 @@ import { useStdin } from 'ink'
 
 export type InspectionFunctionKey = 'f11' | 'f12'
 
-/** Decode the xterm-compatible sequences Ink intentionally drops from useInput(). */
 export function inspectionFunctionKey(input: Buffer | string): InspectionFunctionKey | null {
   const value = Buffer.isBuffer(input) ? input.toString('utf8') : input
   if (/^\u001b\[23(?:;\d+)?~$/.test(value)) return 'f11'
@@ -23,11 +22,6 @@ function isInspectionFunctionKeyPrefix(value: string): boolean {
     || /^\u001b\[2[34];\d*$/.test(value)
 }
 
-/**
- * Decode F11/F12 from a terminal byte stream rather than assuming each stdin
- * event contains exactly one complete escape sequence. PTYs are free to split
- * a sequence across events or coalesce it with neighbouring input.
- */
 export class InspectionFunctionKeyDecoder {
   private pending = ''
 

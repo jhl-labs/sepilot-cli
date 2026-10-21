@@ -77,14 +77,6 @@ function isImageInputUnsupportedApiError(error: ApiError): boolean {
   )
 }
 
-/**
- * Actionable error for a first-run install with no usable LLM provider. The old
- * "No LLM provider configured" / "No provider" strings were a dead end — they
- * did not say where to configure one. This names the config file, the section,
- * and both a local (Ollama) and hosted setup path. Uses the canonical
- * `~/.sepilotd/config.yaml` path (never a resolved home directory) so no real
- * username/host leaks into the response.
- */
 export function buildNoProviderError(
   runtime: { config?: Pick<RuntimeServices['config'], 'providers'> },
 ): NoProviderError {
@@ -260,10 +252,6 @@ export function selectChatProviderCandidates(args: {
     runtime.modelFallbackState?.isAvailable({ providerId, model }) ?? true
 
   if (existingSession) {
-    // Pin the session's model as the head, but attach a router fallback tail so
-    // a follow-up turn is not left with a single terminal candidate (M1), and
-    // skip the pin when its circuit is open so a broken model is not selected
-    // verbatim every turn (M2).
     const pinnedProvider =
       runtime.providerRegistry.get(existingSession.provider) ??
       runtime.providerRegistry.getDefault()
@@ -301,8 +289,6 @@ export function selectChatProviderCandidates(args: {
     if (results.length > 0) {
       return sortVisionPreferred(results)
     }
-    // Nothing available for this session (pin circuit-open, no fallback): fall
-    // through to the general model_router / default selection below.
   }
 
   const configuredDefaultModel =
@@ -401,6 +387,9 @@ export function isAgentAttemptCommitted(event: AgentEvent): boolean {
     event.type !== 'node_trace' &&
     event.type !== 'recovery' &&
     event.type !== 'run_contract' &&
+    event.type !== 'view_attached' &&
+    event.type !== 'view_detached' &&
+    event.type !== 'view_still' &&
     event.type !== 'error'
   )
 }

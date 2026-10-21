@@ -1,4 +1,5 @@
 import type { RuntimeServices } from './runtime.js'
+import type { SessionTitleUpdates } from '../agent/session-title.js'
 import type { RequestAuthContext } from './auth.js'
 import type { DaemonRateLimiter } from './rate-limiter.js'
 import type { ConnectionRegistry } from './runtime/connection-registry.js'
@@ -11,6 +12,7 @@ export interface DaemonShutdownController {
 declare module 'fastify' {
   interface FastifyInstance {
     runtime?: RuntimeServices
+    sessionTitleUpdates?: SessionTitleUpdates
     authToken?: string | null
     authTokenRequired?: boolean
     daemonRateLimiter?: DaemonRateLimiter

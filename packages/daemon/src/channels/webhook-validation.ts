@@ -31,21 +31,6 @@ function firstPublicWebhookRouteSegment(input: string): string {
     .toLowerCase()
 }
 
-/**
- * Validate a user-supplied webhook path. Mirrors the checks in
- * `packages/cli/src/commands/webhooks.ts` `assertSafeWebhookPath`
- * to provide defense-in-depth against direct (non-CLI) HTTP callers.
- *
- * Returns the trimmed path on success. Throws on:
- * - empty / whitespace-only input
- * - any '..' path segment (path traversal)
- * - any whitespace or control char
- * - URL delimiter / escape chars that would make the public route ambiguous
- * - first path segments reserved for built-in webhook or management routes
- *
- * Note: '..foo' / 'foo..' are accepted because they are not '..' segments -
- * matches CLI behavior verbatim.
- */
 export function validateWebhookPath(input: string): string {
   const trimmed = input.trim()
   if (trimmed.length === 0) {
@@ -76,14 +61,6 @@ export function isSafeWebhookPath(input: string): boolean {
   }
 }
 
-/**
- * zod schema that validates a webhook path field. Use as a drop-in
- * replacement for `z.string().min(1)` in any schema that accepts a
- * user-supplied webhook path.
- *
- * Returns the trimmed string on success. On failure, zod produces a
- * standard validation error and Fastify renders 400.
- */
 export const safeWebhookPathSchema = z
   .string()
   .min(1, 'Webhook path cannot be empty')
@@ -106,15 +83,11 @@ export const webhookEndpointConfigSchema = z.object({
   secretValue: z.string().min(1),
   allowedIps: z.array(z.string()).default([]),
   allowedEvents: z.array(z.string()).default([]),
-  /**
-   * Opt-in replay protection. Operators set `requireTimestamp: true`
-   * when the upstream sender includes a timestamp header (and signs it
-   * into the body, e.g. Slack's X-Slack-Request-Timestamp pattern).
-   * Default false to preserve existing integrations that only send a
-   * raw HMAC over the body.
-   */
   requireTimestamp: z.boolean().default(false),
   timestampHeader: z.string().min(1).default('x-webhook-timestamp'),
-  /** Max age in seconds for a delivery before it is treated as replayed. */
   timestampMaxSkewSeconds: z.coerce.number().int().positive().default(300),
+  mode: z.enum(['chat', 'route']).default('chat'),
+  auth: z.enum(['hmac', 'token']).default('hmac'),
+  eventTypeHeader: z.string().min(1).optional(),
+  deliveryIdHeader: z.string().min(1).optional(),
 })

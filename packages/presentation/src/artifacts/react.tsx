@@ -164,9 +164,6 @@ function ArtifactBody({ artifact }: { artifact: ArtifactGalleryItem }) {
         />
       )
     case 'image':
-      // Gate the agent-controlled image source with the same safe-src check the
-      // canvas renderer uses, so a raw <img src> to an arbitrary URL cannot fire
-      // a beacon/exfil GET the moment the artifact is viewed.
       if (!isSafeA2UIImageSrc(artifact.content)) {
         return (
           <div

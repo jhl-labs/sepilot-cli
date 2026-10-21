@@ -252,7 +252,6 @@ async function ensureGitignoreEntry(
   try {
     existing = await readFile(gitignorePath, 'utf-8')
   } catch {
-    // create below
   }
 
   const lines = existing.split(/\r?\n/)

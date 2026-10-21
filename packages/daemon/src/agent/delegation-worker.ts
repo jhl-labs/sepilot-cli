@@ -12,7 +12,7 @@ import type { AgentState } from './graph/types.js'
 import { emptyEvidenceLedger, updateEvidenceLedgerFromToolResult } from './graph/evidence-ledger.js'
 import { extractSubagentFindings, type SubagentFindings } from './subagent-findings.js'
 import { triggerDreamingSessionEnd } from '../memory/dreaming.js'
-import { buildSystemPrompt } from './system-prompt.js'
+import { buildDeferredSystemPrompt } from './system-prompt.js'
 import { persistAgentSessionEvent } from '../server/session-events.js'
 import { createLogger } from '../logger.js'
 import type { QuestionRequestInput } from '../tools/question.js'
@@ -43,11 +43,6 @@ function truncateForComment(text: string, limit = 2_000): string {
   return `${trimmed.slice(0, limit - 1)}…`
 }
 
-/**
- * Serialize a delegate's structured findings as a fenced-JSON protocol block so
- * the delegator can roll them into the parent board (structured, not free text).
- * PLAN_065 T5.
- */
 export function formatDelegationFindingsBlock(findings: SubagentFindings): string {
   return ['```findings', JSON.stringify(findings), '```'].join('\n')
 }
@@ -400,7 +395,7 @@ export class DelegationWorker {
         message: `Picked up by ${workerDevice} (session ${sessionId})`,
       })
 
-      const systemPrompt = await buildSystemPrompt({
+      const { prompt: systemPrompt, systemToolGuidance } = await buildDeferredSystemPrompt({
         config: this.runtime.config,
         tools: this.runtime.toolRegistry,
         skills: this.runtime.skillRegistry,
@@ -413,6 +408,7 @@ export class DelegationWorker {
       })
 
       modeRouter = new AgentModeRouter({
+        systemToolGuidance,
         provider,
         tools: this.runtime.toolRegistry,
         policy: this.runtime.policyEngine,
@@ -427,6 +423,7 @@ export class DelegationWorker {
         hookRegistry: this.runtime.hookRegistry,
         deviceName: workerDevice,
         thinkingLevel: this.runtime.config.agent.thinkingLevel,
+        thinkingLevelSource: 'default',
         llmCache: this.runtime.llmCache,
         providerCircuitBreaker: this.runtime.providerCircuitBreaker,
         defaultMode: this.runtime.config.agent.mode,
@@ -449,9 +446,6 @@ export class DelegationWorker {
 
       const outputTracker = createAgentOutputTracker()
       let totalUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 }
-      // Reconstruct structured board findings from the delegate's tool activity
-      // so they can be handed back up to the parent board (PLAN_065 T5), mirroring
-      // the isolated subagent path.
       const findingsState: Pick<AgentState, 'evidenceLedger'> = {
         evidenceLedger: emptyEvidenceLedger(),
       }

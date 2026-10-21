@@ -9,7 +9,6 @@ import {
   buildStoredToolCallState,
   formatToolInput,
   previewTextLines,
-  summarizeToolInput,
   terminalCommandLabel,
   truncatePreviewItems,
 } from '../utils/tooling.js'
@@ -20,13 +19,9 @@ interface ApprovalModalProps {
   height?: number
   inputActive?: boolean
   compact?: boolean
-  onResolve?: (approved: boolean, scope: ApprovalActionScope, note?: string) => void
-  /**
-   * Fired when the inline comment editor opens/closes so the host can
-   * suspend its global y/s/a/n/Esc keybindings while the user is typing
-   * free text (otherwise typing "yes" would approve mid-sentence).
-   */
+  onResolve?: (approved: boolean, scope: ApprovalActionScope, note?: string, interrupt?: boolean) => void
   onCommentModeChange?: (active: boolean) => void
+  onShowFull?: (text: string) => void
 }
 
 interface ModalRow {
@@ -54,11 +49,41 @@ const APPROVAL_ACTIONS: ApprovalAction[] = [
 ]
 
 const COMMENT_SHORTCUT = 'm'
+const VIEW_FULL_SHORTCUT = 'v'
 const UNKNOWN_KEY_HINT_MS = 2500
 const KNOWN_SHORTCUTS = new Set([
   ...APPROVAL_ACTIONS.map((action) => action.shortcut),
   COMMENT_SHORTCUT,
+  VIEW_FULL_SHORTCUT,
 ])
+const COMPACT_COMMAND_LINES = 8
+const COMPACT_DIFF_LINES = 20
+const COMPACT_INPUT_LINES = 10
+
+export function approvalReviewText(approval: ApprovalRequest): string {
+  if (approval.toolName === 'terminal.run') {
+    const input = approval.input
+    const executable = typeof input.executable === 'string' ? input.executable : ''
+    const args = Array.isArray(input.args) ? input.args.map(String) : []
+    const shellScriptIndex = ['sh', 'bash', 'zsh'].includes(executable.split('/').pop() ?? '')
+      ? args.findIndex((arg) => arg === '-c' || arg === '-lc')
+      : -1
+    const header = typeof input.cwd === 'string' && input.cwd ? [`# cwd: ${input.cwd}`] : []
+    if (shellScriptIndex >= 0 && args[shellScriptIndex + 1] !== undefined) {
+      const script = args[shellScriptIndex + 1]!
+      const lines = script.split('\n').flatMap((line) => line.split(/;\s+(?=\S)/).map((part, index, all) => index < all.length - 1 ? `${part};` : part))
+      return [...header, `$ ${executable} ${args.slice(0, shellScriptIndex + 1).join(' ')}`, ...lines.map((line) => `  ${line}`)].join('\n')
+    }
+    return [...header, `$ ${terminalCommandLabel(input)}`].join('\n')
+  }
+  if (approval.previewDiff) return approval.previewDiff
+  return formatToolInput(approval.input)
+}
+
+function boundedLines(text: string, limit: number): { lines: string[]; hidden: number } {
+  const lines = text.split('\n')
+  return lines.length <= limit ? { lines, hidden: 0 } : { lines: lines.slice(0, limit), hidden: lines.length - limit }
+}
 
 export function ApprovalModal({
   approval,
@@ -67,6 +92,7 @@ export function ApprovalModal({
   compact = false,
   onResolve,
   onCommentModeChange,
+  onShowFull,
 }: ApprovalModalProps) {
   const [selectedActionIndex, setSelectedActionIndex] = useState(0)
   const [commentMode, setCommentMode] = useState(false)
@@ -111,22 +137,19 @@ export function ApprovalModal({
         || (key.ctrl && input.toLowerCase() === 'c')
         || input === '\u0003'
       if (commentMode) {
-        // Esc backs out of the draft so a mistaken press does not discard
-        // written feedback. Ctrl+C is the unconditional escape hatch for the
-        // whole HITL prompt, including while the comment editor is open.
         if (key.escape) {
           setCommentDraft('')
           setCommentModeNotified(false)
         } else if (cancelApproval) {
           setCommentDraft('')
           setCommentModeNotified(false)
-          onResolve(false, 'once')
+          onResolve(false, 'once', undefined, true)
         }
         return
       }
 
       if (cancelApproval) {
-        onResolve(false, 'once')
+        onResolve(false, 'once', undefined, true)
         return
       }
 
@@ -143,6 +166,11 @@ export function ApprovalModal({
       }
 
       const normalized = input.toLowerCase()
+      if (normalized === VIEW_FULL_SHORTCUT) {
+        setUnknownKeyHint(null)
+        onShowFull?.(approvalReviewText(approval))
+        return
+      }
       if (normalized === COMMENT_SHORTCUT) {
         setUnknownKeyHint(null)
         setCommentModeNotified(true)
@@ -161,7 +189,6 @@ export function ApprovalModal({
         return
       }
 
-      // Any other printable key: tell the user instead of silently ignoring.
       if (input && !key.ctrl && !key.meta && !KNOWN_SHORTCUTS.has(normalized)) {
         flashUnknownKey(input)
       }
@@ -174,8 +201,6 @@ export function ApprovalModal({
     setCommentDraft('')
     setCommentModeNotified(false)
     if (!note) return
-    // Free-text feedback: deny this call and hand the note to the agent
-    // so it can revise the approach ([approval:needs-changes] semantics).
     onResolve?.(false, 'once', note)
   }
 
@@ -203,7 +228,6 @@ export function ApprovalModal({
   ]
   const serializedInput = formatToolInput(approval.input)
 
-  // availableRows accounts for the top+bottom borders of the surrounding Box.
   const availableRows = height == null ? Number.POSITIVE_INFINITY : Math.max(1, height - 2)
 
   const structuralRows: ModalRow[] = []
@@ -255,7 +279,7 @@ export function ApprovalModal({
       </Text>
     ) : (
       <Text key="action-hint" color={colors.dimText}>
-        ↑/↓/←/→ move Enter select y/s/r/a/n shortcuts m message Esc/Ctrl+C deny
+        ↑/↓/←/→ move Enter select y/s/r/a/n shortcuts m message Esc/Ctrl+C stop the run
       </Text>
     ),
   })
@@ -320,7 +344,7 @@ export function ApprovalModal({
     priority: 3,
     element: (
       <Text key="tool">
-        {approval.toolName} {approval.state === 'stale' ? '(stale)' : '(live)'}
+        {approval.toolName} ({approval.state})
       </Text>
     ),
   })
@@ -346,14 +370,16 @@ export function ApprovalModal({
   if (compact) {
     const actionRow = structuralRows.find((row) => row.key === 'action')!
     const actionHintRow = structuralRows.find((row) => row.key === 'action-hint')!
-    const compactPreview = approval.toolName === 'terminal.run'
-      ? `$ ${terminalCommandLabel(approval.input)}`
-      : summarizeToolInput(approval.input, approval.toolName)
+    const reviewText = approvalReviewText(approval)
+    const commandPreview = approval.toolName === 'terminal.run' ? boundedLines(reviewText, COMPACT_COMMAND_LINES) : null
+    const inputPreview = !commandPreview && !approval.previewDiff ? boundedLines(reviewText, COMPACT_INPUT_LINES) : null
+    const diffLineCount = approval.previewDiff ? approval.previewDiff.split('\n').length : 0
     const compactDiff = approval.previewDiff ? (
-      <UnifiedDiffView diff={approval.previewDiff} maxLines={10} />
+      <UnifiedDiffView diff={approval.previewDiff} maxLines={COMPACT_DIFF_LINES} />
     ) : approval.toolName === 'fs.edit' && oldText !== undefined && newText !== undefined ? (
-      <DiffView path={path} previousContent={oldText} nextContent={newText} maxLines={10} />
+      <DiffView path={path} previousContent={oldText} nextContent={newText} maxLines={COMPACT_DIFF_LINES} />
     ) : null
+    const hiddenLines = commandPreview?.hidden ?? inputPreview?.hidden ?? Math.max(0, diffLineCount - COMPACT_DIFF_LINES)
 
     return (
       <Box
@@ -375,14 +401,22 @@ export function ApprovalModal({
           </Text>
         ) : null}
         {compactDiff ?? (
-          <Text
-            color={approval.toolName === 'terminal.run' ? colors.info : colors.dimText}
-            wrap="truncate-end"
-          >
-            {compactPreview}
-          </Text>
+          <Box flexDirection="column">
+            {(commandPreview ?? inputPreview)!.lines.map((line, index) => (
+              <Text key={index} color={approval.toolName === 'terminal.run' ? colors.info : colors.text} wrap="wrap">
+                {line}
+              </Text>
+            ))}
+          </Box>
         )}
-        {approval.state === 'stale' ? (
+        {hiddenLines > 0 ? (
+          <Text color={colors.warning}>
+            +{hiddenLines} more lines {symbols.separator} press v to print the full {approval.toolName === 'terminal.run' ? 'command' : approval.previewDiff ? 'diff' : 'input'} above
+          </Text>
+        ) : null}
+        {approval.state === 'parked' ? (
+          <Text color={colors.dimText}>Still waiting for your decision · choose an option to continue</Text>
+        ) : approval.state === 'stale' ? (
           <Text color={colors.dimText}>
             {approval.resumeAvailable
               ? 'Saved checkpoint available for resume'
@@ -398,7 +432,7 @@ export function ApprovalModal({
         {commentMode || unknownKeyHint ? (
           actionHintRow.element
         ) : (
-          <Text color={colors.dimText}>Esc/Ctrl+C deny</Text>
+          <Text color={colors.dimText}>v full {approval.toolName === 'terminal.run' ? 'command' : 'change'} {symbols.separator} n deny, keep going {symbols.separator} Esc stop the run</Text>
         )}
       </Box>
     )

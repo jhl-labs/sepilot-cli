@@ -31,8 +31,6 @@ function isBoundary(prev: string | undefined, current: string): boolean {
 function charBonus(i: number, target: string): number {
   let bonus = SCORE_MATCH
   if (i === 0) bonus += BONUS_FIRST_CHAR
-  // camelCase is treated as a stronger boundary; the two are mutually exclusive
-  // to avoid double-counting a single position.
   if (i > 0 && isLower(target[i - 1]) && isUpper(target[i])) {
     bonus += BONUS_CAMEL
   } else if (isBoundary(target[i - 1], target[i])) {
@@ -51,17 +49,14 @@ export function fuzzyScore(query: string, target: string): FuzzyResult | null {
   const n = target.length
 
   const NEG_INF = -Infinity
-  // dp[qi][ti] = best cumulative score matching first qi+1 query chars, last match at ti
   const dp: number[][] = Array.from({ length: m }, () => Array(n).fill(NEG_INF))
   const prevPos: number[][] = Array.from({ length: m }, () => Array(n).fill(-1))
 
-  // Fill first query character
   for (let ti = 0; ti < n; ti += 1) {
     if (targetLower[ti] !== queryLower[0]) continue
     dp[0][ti] = charBonus(ti, target) + ti * SCORE_GAP_LEADING
   }
 
-  // Fill remaining query characters
   for (let qi = 1; qi < m; qi += 1) {
     for (let ti = qi; ti < n; ti += 1) {
       if (targetLower[ti] !== queryLower[qi]) continue
@@ -79,7 +74,6 @@ export function fuzzyScore(query: string, target: string): FuzzyResult | null {
     }
   }
 
-  // Find best ending position with trailing gap penalty
   let bestScore = NEG_INF
   let bestTi = -1
   for (let ti = m - 1; ti < n; ti += 1) {
@@ -94,7 +88,6 @@ export function fuzzyScore(query: string, target: string): FuzzyResult | null {
 
   if (bestTi === -1) return null
 
-  // Backtrack to collect matched indices
   const indices: number[] = Array(m)
   let ti = bestTi
   for (let qi = m - 1; qi >= 0; qi -= 1) {

@@ -112,7 +112,6 @@ export function SwarmAttachView({
           }
         }
       } catch {
-        // The normal detach path aborts the SSE reader.
       }
     })()
 

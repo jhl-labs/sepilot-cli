@@ -69,9 +69,7 @@ interface GeminiResponse {
     candidatesTokenCount?: number
     thoughtsTokenCount?: number
   }
-  /** Top-level API error surfaced mid-stream by the SSE endpoint. */
   error?: { code?: number; message?: string; status?: string }
-  /** Prompt-level safety block (request blocked before any candidate). */
   promptFeedback?: { blockReason?: string }
 }
 
@@ -106,7 +104,7 @@ export function toGeminiUserParts(msg: Message): GeminiPart[] {
 
 export function mapMessages(messages: Message[], systemPrompt?: string): { contents: GeminiContent[]; systemInstruction?: { parts: GeminiPart[] } } {
   const contents: GeminiContent[] = []
-  const normalized = partitionSystemMessages(messages, systemPrompt)
+  const normalized = partitionSystemMessages(messages, systemPrompt, { turnScopedPlacement: 'system-slot' })
 
   for (const msg of normalized.messages) {
     if (msg.role === 'user') {
@@ -133,10 +131,6 @@ export function mapMessages(messages: Message[], systemPrompt?: string): { conte
         role: 'user',
         parts: [{
           functionResponse: {
-            // Gemini correlates a tool result to its call by function name,
-            // not by an opaque id. Use the original function name captured on
-            // the tool message; fall back to the id only for legacy messages
-            // that predate the `name` field.
             name: msg.name ?? msg.toolCallId ?? 'unknown',
             response: { result: extractContent(msg) },
           },
@@ -162,9 +156,6 @@ function mapTools(tools: ToolDefinition[]): GeminiTool[] {
   }]
 }
 
-// Gemini finishReasons that mean the content was withheld by a policy/safety
-// layer rather than a natural stop. Surface these as content_filter so the
-// caller does not treat a blocked/recited response as a clean answer.
 const GEMINI_CONTENT_FILTER_REASONS = new Set([
   'SAFETY',
   'RECITATION',
@@ -174,8 +165,6 @@ const GEMINI_CONTENT_FILTER_REASONS = new Set([
   'IMAGE_SAFETY',
 ])
 
-// Gemini finishReasons that mean the turn failed outright (not just filtered)
-// and cannot be presented as any kind of completion.
 const GEMINI_ERROR_REASONS = new Set(['MALFORMED_FUNCTION_CALL', 'OTHER', 'UNEXPECTED_TOOL_CALL'])
 
 function mapFinishReason(reason?: string): ChatResponse['finishReason'] {
@@ -189,11 +178,6 @@ function mapFinishReason(reason?: string): ChatResponse['finishReason'] {
   }
 }
 
-/**
- * Returns an error message when a Gemini finishReason means the turn failed
- * outright (malformed tool call, unexpected tool call, generic OTHER) so the
- * stream can surface an error instead of a phantom clean stop.
- */
 function geminiFinishReasonError(reason?: string): string | null {
   if (reason && GEMINI_ERROR_REASONS.has(reason)) {
     return `Gemini stopped with a non-recoverable finish reason: ${reason}`
@@ -254,9 +238,6 @@ export class GeminiProvider implements ILLMProvider {
     })
     if (!response.ok) {
       const text = await response.text()
-      // Preserve the HTTP status so toApiError/circuit-breaker can classify
-      // this (rate-limit / auth / context-length) instead of collapsing it to
-      // a generic PROVIDER_ERROR parsed from the message string.
       const error = new Error(`Gemini API error ${response.status}: ${text}`) as Error & {
         status: number
       }
@@ -397,9 +378,6 @@ export class GeminiProvider implements ILLMProvider {
           try {
             data = JSON.parse(jsonStr) as GeminiResponse
           } catch (parseErr) {
-            // A complete `data:` SSE line that does not parse means the stream
-            // is corrupt — surface it instead of silently swallowing so the
-            // turn does not end as a phantom clean stop.
             yield {
               type: 'error',
               error: {
@@ -412,7 +390,6 @@ export class GeminiProvider implements ILLMProvider {
             return
           }
 
-          // Top-level API error delivered mid-stream (quota, invalid arg, …).
           if (data.error) {
             yield {
               type: 'error',
@@ -426,8 +403,6 @@ export class GeminiProvider implements ILLMProvider {
             return
           }
 
-          // Prompt-level safety block: no candidate is produced, so nothing
-          // else would ever be emitted for this turn.
           if (data.promptFeedback?.blockReason) {
             yield {
               type: 'error',
@@ -477,8 +452,6 @@ export class GeminiProvider implements ILLMProvider {
               return
             }
             sawFinish = true
-            // A turn that produced a functionCall is a tool_use turn even
-            // though Gemini still reports STOP as its finishReason.
             const hasToolCall = parts.some((p) => 'functionCall' in p)
             yield {
               type: 'done',
@@ -490,8 +463,6 @@ export class GeminiProvider implements ILLMProvider {
       }
 
       if (!sawFinish) {
-        // Reader ended without any terminal finishReason — the response was
-        // truncated or dropped. Do not present this as a clean stop.
         yield {
           type: 'error',
           error: {

@@ -16,11 +16,6 @@ export interface MattermostChannelConfig {
   allowedTeams?: string[]
   allowedChannels?: string[]
   allowedUsers?: string[]
-  /**
-   * The bot's own user id (and/or username). Posts authored by the bot are
-   * dropped so the bot cannot trigger itself in a channel it also posts to
-   * (infinite self-reply loop).
-   */
   botUserId?: string
   botUsername?: string
 }
@@ -127,7 +122,6 @@ export class MattermostChannel implements IChannel {
     if (!channelId || !userId) {
       return mattermostAck()
     }
-    // Self-loop guard: never process the bot's own posts.
     if (
       (this.config.botUserId && userId === this.config.botUserId)
       || (this.config.botUsername && userName === this.config.botUsername)
@@ -156,7 +150,7 @@ export class MattermostChannel implements IChannel {
     }
 
     for (const h of this.handlers) {
-      try { await h(msg) } catch { /* handler errors are silently ignored */ }
+      try { await h(msg) } catch {}
     }
 
     return mattermostAck()

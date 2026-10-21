@@ -26,7 +26,6 @@ export interface ModeTransfer {
   constraints: string[]
 }
 
-/** New capability needs may expand visibility; explicit restrictions survive. */
 export function mergeModeTransferContract(
   current: AgentRunContract | undefined,
   transfer: ModeTransfer,
@@ -59,7 +58,6 @@ export function mergeModeTransferContract(
 }
 
 export interface ModeControl {
-  /** Policy-filtered authority, independent of the current mode's schema visibility. */
   readonly delegationToolNames: readonly string[]
   state: NonNullable<import('@sepilotd/core').AgentContext['modeControlState']>
   tools: ToolDefinition[]
@@ -85,7 +83,6 @@ const transferSchema = z.object({
   capabilities: z.array(z.enum(['process', 'service', 'terminal', 'browser', 'filesystem-read', 'filesystem-write', 'network', 'application-state'])).max(8),
 })
 
-/** Internal control messages change execution strategy, never tool authority. */
 export function createModeControl(options: {
   modes: Array<{ id: string; description: string; capabilities?: readonly string[] }>
   currentMode: string
@@ -94,6 +91,7 @@ export function createModeControl(options: {
   transferCount?: number
   turnMaxIterations?: number
   tools: ToolRegistry
+  delegationTools?: ToolRegistry
   canTransfer: boolean
   discoveryContext?: string
   onTransfer(transfer: ModeTransfer, snapshot: ExecutionHandoff): void
@@ -104,6 +102,7 @@ export function createModeControl(options: {
     name: tool.name,
     description: tool.description.slice(0, 200),
     effect: options.tools.securityDescriptor(tool.name).effect,
+    capabilities: options.tools.securityDescriptor(tool.name).executionCapabilities,
     group: toolExposureGroupForTool(tool.name) ?? 'general',
   }))
   const groups = [...new Set(catalog.map((tool) => tool.group))]
@@ -132,10 +131,12 @@ export function createModeControl(options: {
   }, {
     name: TOOL_CATALOG_TOOL,
     description: 'Discover authorized tool names, descriptions and effects without loading every schema. Search by a short capability term with query, or select a group and page by offset. Discovery does not execute tools. You may batch catalog requests with independent ordinary tool calls; only agent.transfer must be called alone.',
-    inputSchema: { type: 'object', properties: { query: { type: 'string', maxLength: 200, description: 'Case-insensitive literal term in an authorized tool name or description; searches all groups when group is omitted.' }, group: { type: 'string', enum: groups }, offset: { type: 'integer', minimum: 0 } }, additionalProperties: false },
+    inputSchema: { type: 'object', properties: { query: { type: 'string', maxLength: 200, description: 'One or more case-insensitive terms separated by spaces; a tool matches when any term occurs in its name or description, and tools matching more terms or matching by name rank first. Searches all groups when group is omitted.' }, group: { type: 'string', enum: groups }, offset: { type: 'integer', minimum: 0 } }, additionalProperties: false },
   }] : []
   return {
-    delegationToolNames: Object.freeze(catalog.map(tool => tool.name)),
+    delegationToolNames: Object.freeze(
+      options.delegationTools ? options.delegationTools.list().map((tool) => tool.name) : catalog.map(tool => tool.name),
+    ),
     state: { mode: options.currentMode, transferCount: options.transferCount ?? 0,
       turnMaxIterations: options.turnMaxIterations ?? 50, visibleToolNames: [...(options.activeToolNames ?? [])] },
     tools,
@@ -157,8 +158,6 @@ export function createModeControl(options: {
     handle(response, snapshot) {
       let calls = response.toolCalls ?? []
       if (!calls.some((call) => tools.some((tool) => tool.name === call.name))) return 'unhandled'
-      // Control calls bypass the ordinary executor, but carry the same
-      // framework-owned progress field. Consume it before strict validation.
       const controlCalls = calls.filter((call) => tools.some((tool) => tool.name === call.name))
       const progress = consumeToolCallActionProgress(controlCalls, tools)
       if (progress) events.push({ type: 'action_progress', ...progress, toolNames: [...new Set(controlCalls.map((call) => call.name))] })
@@ -178,19 +177,21 @@ export function createModeControl(options: {
             output = { error: 'Supply an available group and a nonnegative integer offset.' }
           } else {
             const offset = parsed.data.offset ?? 0
-            const query = parsed.data.query?.trim().toLocaleLowerCase()
-            const page = catalog.filter((tool) => (!parsed.data.group || tool.group === parsed.data.group)
-              && (!query || `${tool.name} ${tool.description}`.toLocaleLowerCase().includes(query)))
+            const page = searchToolCatalog(catalog.filter((tool) => !parsed.data.group || tool.group === parsed.data.group), parsed.data.query)
             output = { tools: page.slice(offset, offset + 16), nextOffset: offset + 16 < page.length ? offset + 16 : null,
               activation: 'These are discovery results, not callable schemas. To use a tool that is not already active, call agent.transfer alone with mode:react, tools:[exact names], and the required semantic capabilities. Preserve the original user goal and constraints.' }
           }
         } else if (calls.length === 1 && call.name === MODE_TRANSFER_TOOL) {
           const parsed = transferSchema.safeParse(call.arguments)
           const target = parsed.success ? options.modes.find((mode) => mode.id === parsed.data.mode) : undefined
+          const unknownTools = parsed.success
+            ? unknownToolNames([...parsed.data.tools, ...(parsed.data.allowedTools ?? []), ...(parsed.data.toolSequence ?? [])], catalog)
+            : []
           if (!parsed.success) output = { error: parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; ') }
           else if (!target) output = { error: 'Requested mode is unavailable.' }
-          else if ([...parsed.data.tools, ...(parsed.data.allowedTools ?? []), ...(parsed.data.toolSequence ?? [])].some((name) => !catalog.some((tool) => tool.name === name))) output = { error: 'Requested tools are outside the authorized catalog.' }
-          else if (target.capabilities && parsed.data.capabilities.some((capability) => !target.capabilities!.includes(capability))) output = { error: 'The requested mode cannot satisfy all required capabilities.' }
+          else if (unknownTools.length > 0) output = { error: describeUnknownToolNames(unknownTools, catalog) }
+          else if (target.capabilities && parsed.data.capabilities.some((capability) => !target.capabilities!.includes(capability))) output = { error: describeUnsatisfiedCapabilities(target, parsed.data.capabilities, options.modes, options.activeToolNames) }
+          else if (unavailableCapabilities(parsed.data.capabilities, catalog).length > 0) output = { error: `No authorized tool in this turn provides: ${unavailableCapabilities(parsed.data.capabilities, catalog).join(', ')}. The current authority (user constraints, run contract or resumed turn) does not include it; transferring would not grant it. Continue with the available tools and report the missing capability as a blocker.` }
           else if (target.id !== 'react' && target.id !== 'instant' && parsed.data.tools.length > 0) output = { error: 'Additional tools are activated in react. Choose the graph default with tools:[] or select react with exact tools.' }
           else if (target.id === 'instant' && parsed.data.tools.some((name) => !(INSTANT_MEMORY_TOOL_NAMES as readonly string[]).includes(name))) output = { error: 'Instant exposes focused memory tools only; select a tool-capable mode.' }
           else if (target.id === options.currentMode
@@ -227,4 +228,69 @@ export function createModeControl(options: {
       return 'transfer'
     },
   }
+}
+
+interface CatalogEntry { name: string; description: string }
+
+export function searchToolCatalog<T extends CatalogEntry>(catalog: readonly T[], query: string | undefined): T[] {
+  const terms = [...new Set((query ?? '').toLocaleLowerCase().split(/\s+/).filter(Boolean))]
+  if (terms.length === 0) return [...catalog]
+  return catalog
+    .map((tool, index) => {
+      const name = tool.name.toLocaleLowerCase()
+      const description = tool.description.toLocaleLowerCase()
+      const nameHits = terms.filter((term) => name.includes(term)).length
+      const hits = terms.filter((term) => name.includes(term) || description.includes(term)).length
+      return { tool, index, nameHits, hits }
+    })
+    .filter((entry) => entry.hits > 0)
+    .sort((a, b) => b.hits - a.hits || b.nameHits - a.nameHits || a.index - b.index)
+    .map((entry) => entry.tool)
+}
+
+function unknownToolNames(names: readonly string[], catalog: readonly CatalogEntry[]): string[] {
+  return [...new Set(names.filter((name) => !catalog.some((tool) => tool.name === name)))]
+}
+
+function describeUnknownToolNames(unknown: readonly string[], catalog: readonly CatalogEntry[]): string {
+  const details = unknown.map((name) => {
+    const suggestions = catalog.filter((tool) => tool.name.endsWith(`.${name}`)).slice(0, 3).map((tool) => tool.name)
+    return suggestions.length > 0 ? `${name} (did you mean ${suggestions.join(' or ')}?)` : name
+  })
+  return `Requested tools are outside the authorized catalog: ${details.join(', ')}. Use exact names returned by agent.tools.`
+}
+
+const CAPABILITY_TOOL_MATCHERS: Partial<Record<string, (name: string) => boolean>> = {
+  terminal: (name) => name === 'terminal.run',
+  process: (name) => name.startsWith('process.'),
+  service: (name) => name.startsWith('service.'),
+  browser: (name) => name.startsWith('browser.'),
+  network: (name) => name === 'web.search' || name === 'webfetch' || name.startsWith('browser.'),
+  'filesystem-read': (name) => ['fs.read', 'fs.list', 'fs.search', 'fs.glob'].includes(name),
+  'filesystem-write': (name) => ['fs.write', 'fs.edit', 'fs.append', 'fs.move', 'apply_patch'].includes(name),
+}
+
+export function describeUnsatisfiedCapabilities(
+  target: { id: string; capabilities?: readonly string[] },
+  requested: readonly string[],
+  modes: ReadonlyArray<{ id: string; capabilities?: readonly string[] }>,
+  activeToolNames: readonly string[] = [],
+): string {
+  const missing = requested.filter((capability) => !target.capabilities!.includes(capability))
+  const covering = modes.filter((mode) => mode.id !== target.id && requested.every((capability) => !mode.capabilities || mode.capabilities.includes(capability))).map((mode) => mode.id)
+  return [
+    `Mode ${target.id} does not provide: ${missing.join(', ')}.`,
+    covering.length > 0 ? `Modes that provide every requested capability: ${covering.join(', ')}.` : 'No mode provides every requested capability; request only the capabilities the remaining work needs.',
+    activeToolNames.length > 0 ? `Your ${activeToolNames.length} active tools remain usable here, including tools that run commands or edit files in another environment; continue with them when they can do the work.` : '',
+  ].filter(Boolean).join(' ')
+}
+
+export function unavailableCapabilities(
+  capabilities: readonly string[],
+  catalog: ReadonlyArray<{ name: string; capabilities?: readonly string[] }>,
+): string[] {
+  return capabilities.filter((capability) => {
+    const matches = CAPABILITY_TOOL_MATCHERS[capability]
+    return matches !== undefined && !catalog.some((tool) => matches(tool.name) || tool.capabilities?.includes(capability))
+  })
 }

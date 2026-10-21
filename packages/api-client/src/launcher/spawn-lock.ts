@@ -2,16 +2,12 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 export interface SpawnLockOptions {
-  /** Absolute path to the lock directory (mkdir-exclusive). */
   lockPath: string
-  /** Stale lock window. If the lock file is older than this and the recorded PID isn't alive, the lock is reclaimed. */
   staleMs?: number
-  /** Owning process pid for stale detection. Defaults to process.pid. */
   pid?: number
 }
 
 export interface AcquiredSpawnLock {
-  /** Release the lock. Idempotent and safe even if the directory was already removed. */
   release(): Promise<void>
 }
 
@@ -41,16 +37,6 @@ async function readLockMeta(lockPath: string): Promise<{ pid: number; ts: number
   }
 }
 
-/**
- * Atomic mkdir-based lock used to serialise concurrent daemon spawns.
- *
- * If two surfaces (desktop + cli, or two desktops) start at the same time and
- * both decide the daemon is missing, only one acquires the lock and runs the
- * spawn. The other returns null and is expected to fall back to health-polling
- * the existing-or-soon-to-exist daemon.
- *
- * Stale locks (process died mid-spawn) are reclaimed once `staleMs` elapses.
- */
 export async function tryAcquireSpawnLock(
   options: SpawnLockOptions,
 ): Promise<AcquiredSpawnLock | null> {
@@ -70,7 +56,6 @@ export async function tryAcquireSpawnLock(
           'utf-8',
         )
       } catch {
-        // Best-effort metadata; the directory itself is the real lock.
       }
       let released = false
       return {
@@ -80,7 +65,6 @@ export async function tryAcquireSpawnLock(
           try {
             await rm(lockPath, { recursive: true, force: true })
           } catch {
-            // Lock dir may have already been reaped (stale-cleanup, OS).
           }
         },
       }
@@ -98,7 +82,6 @@ export async function tryAcquireSpawnLock(
     try {
       await rm(lockPath, { recursive: true, force: true })
     } catch {
-      // Another process may have just won the reclaim race; loop will retry mkdir.
     }
   }
 

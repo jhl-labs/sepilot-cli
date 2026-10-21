@@ -158,7 +158,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
       error: { code: resolved.code, message: resolved.message },
     })
 
-  // GET /api/v1/scheduled-tasks?status=pending|all&channel=<target>
   app.get('/scheduled-tasks', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -168,8 +167,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return { data: store.list({ status: statusFilter, channelTarget: query.channel }) }
   })
 
-  // GET /api/v1/scheduled-tasks/delivery-status
-  // Aggregate counts only: delivery targets, message bodies, and errors remain private.
   app.get('/scheduled-tasks/delivery-status', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -177,7 +174,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return { data: createSchedulerDeliveryOutbox().summary() }
   })
 
-  // POST /api/v1/scheduled-tasks
   app.post('/scheduled-tasks', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -264,7 +260,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return { data: job }
   })
 
-  // PATCH /api/v1/scheduled-tasks/:id
   app.patch<{ Params: IdParams }>('/scheduled-tasks/:id', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -353,9 +348,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     const executionError = taskExecutionError(instruction, metadata)
     if (executionError) return reply.status(400).send({ error: { code: 'INVALID_TASK_EXECUTION', message: executionError } })
 
-    // Display, delivery, authority, and retry-policy edits must not erase the
-    // current execution evidence or silently re-arm a terminal task. Only a
-    // replacement schedule/timezone/instruction changes what will execute.
     const preserveRunState = body.when === undefined
       && body.timezone === undefined
       && body.instruction === undefined
@@ -413,7 +405,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return { data: store.get(existing.id) ?? updated }
   })
 
-  // GET /api/v1/scheduled-tasks/:id
   app.get<{ Params: IdParams }>('/scheduled-tasks/:id', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -424,7 +415,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return { data: resolved.job }
   })
 
-  // GET /api/v1/scheduled-tasks/:id/notifications
   app.get<{ Params: IdParams }>('/scheduled-tasks/:id/notifications', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -435,7 +425,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return { data: describeSchedulerNotificationSubscriptions(resolved.job) }
   })
 
-  // PUT /api/v1/scheduled-tasks/:id/notifications
   app.put<{ Params: IdParams }>('/scheduled-tasks/:id/notifications', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -459,7 +448,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return { data: describeSchedulerNotificationSubscriptions(updated) }
   })
 
-  // POST /api/v1/scheduled-tasks/:id/notifications/subscription
   app.post<{ Params: IdParams }>(
     '/scheduled-tasks/:id/notifications/subscription',
     async (request, reply) => {
@@ -496,7 +484,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     },
   )
 
-  // GET /api/v1/scheduled-tasks/:id/runs?limit=N
   app.get<{ Params: IdParams }>('/scheduled-tasks/:id/runs', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -508,7 +495,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return { data: store.listRuns(resolved.job.id, limit ?? 20) }
   })
 
-  // GET /api/v1/scheduled-tasks/:id/runs/:runId
   app.get<{ Params: RunParams }>('/scheduled-tasks/:id/runs/:runId', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -525,7 +511,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return { data: run }
   })
 
-  // DELETE /api/v1/scheduled-tasks/:id  (soft-cancel — keeps the record + history)
   app.delete<{ Params: IdParams }>('/scheduled-tasks/:id', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -537,7 +522,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return reply.status(204).send()
   })
 
-  // POST /api/v1/scheduled-tasks/:id/pause
   app.post<{ Params: IdParams }>('/scheduled-tasks/:id/pause', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -549,7 +533,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return { data: store.get(resolved.job.id) }
   })
 
-  // POST /api/v1/scheduled-tasks/:id/resume
   app.post<{ Params: IdParams }>('/scheduled-tasks/:id/resume', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -561,7 +544,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     return { data: store.get(resolved.job.id) }
   })
 
-  // POST /api/v1/scheduled-tasks/:id/run  (manual fire — recorded in run history)
   app.post<{ Params: IdParams }>('/scheduled-tasks/:id/run', async (request, reply) => {
     if (!requireRequestSurface(request, reply)) return reply
     const store = requireStore(reply)
@@ -583,8 +565,6 @@ export async function scheduledTasksRoutes(app: FastifyInstance) {
     }
     const result = await trigger(resolved.job.id, parsed.data)
     if (!result.started) {
-      // Reporting ok for a run that never started makes the surface's
-      // "Run now" look like it worked.
       return reply.status(409).send({
         error: {
           code: 'CONFLICT',

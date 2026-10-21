@@ -437,8 +437,6 @@ export class A2AHttpClient {
           await dispatcher.close().catch(() => undefined)
           throw new Error(`${input.label} refused: cross-origin redirects are not allowed`)
         }
-        // Caller/config headers have unknown provenance and may carry secrets
-        // under arbitrary vendor names. Rebuild from a safe client-owned set.
         currentHeaders = input.crossOriginHeaders
         callerHeadersAllowed = false
       }

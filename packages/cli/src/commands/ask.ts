@@ -162,6 +162,8 @@ const ASK_COPY = {
       `Background chat waiting for an answer\n  job: ${jobId}\n  session: ${sessionId}${prompt ? `\n  question: ${prompt}` : ''}${choices?.length ? `\n  choices: ${choices.join(' · ')}` : ''}\n  run: ${command}\n  cancel: ${cancelCommand}`,
     backgroundFailed: (jobId: string, message: string) =>
       `Background chat failed (${jobId}): ${message}`,
+    backgroundIncomplete: (jobId: string, sessionId: string, content: string, nextActions: string[]) =>
+      `${content}\n\nBackground chat stopped incomplete (resumable)\n  job: ${jobId}\n  session: ${sessionId}${nextActions.length ? `\n  next: ${nextActions.join(' · ')}` : ''}`,
     backgroundCancelled: (jobId: string, sessionId: string) =>
       `Background chat cancelled\n  job: ${jobId}\n  session: ${sessionId}`,
     backgroundCancelAlreadyDone: (jobId: string, sessionId: string, status: string) =>
@@ -228,6 +230,8 @@ const ASK_COPY = {
       `백그라운드 채팅이 답변을 기다리는 중\n  job: ${jobId}\n  session: ${sessionId}${prompt ? `\n  질문: ${prompt}` : ''}${choices?.length ? `\n  선택지: ${choices.join(' · ')}` : ''}\n  실행: ${command}\n  취소: ${cancelCommand}`,
     backgroundFailed: (jobId: string, message: string) =>
       `백그라운드 채팅 실패 (${jobId}): ${message}`,
+    backgroundIncomplete: (jobId: string, sessionId: string, content: string, nextActions: string[]) =>
+      `${content}\n\n백그라운드 채팅이 미완료 상태로 멈췄습니다 (재개 가능)\n  job: ${jobId}\n  session: ${sessionId}${nextActions.length ? `\n  다음: ${nextActions.join(' · ')}` : ''}`,
     backgroundCancelled: (jobId: string, sessionId: string) =>
       `백그라운드 채팅 취소됨\n  job: ${jobId}\n  session: ${sessionId}`,
     backgroundCancelAlreadyDone: (jobId: string, sessionId: string, status: string) =>
@@ -253,13 +257,6 @@ const CODE_EXTENSIONS = new Set([
   '.lua', '.pl', '.r', '.jl', '.dart', '.ex', '.exs',
 ])
 
-/**
- * Heuristic: did the agent produce a markdown report (table / heading
- * with no fenced code block) instead of source code? Catches the
- * common failure where `ask --output app.py` saves a system-info
- * table to app.py because the agent ran a tool instead of writing
- * code. Returns null when the payload looks like real code.
- */
 function detectMarkdownNotCode(payload: string): string | null {
   const hasFence = /```/.test(payload)
   if (hasFence) return null
@@ -275,10 +272,6 @@ function detectMarkdownNotCode(payload: string): string | null {
 
 async function writeAskOutput(path: string, payload: string): Promise<void> {
   const copy = ASK_COPY[detectCliLocale()] ?? ASK_COPY.en
-  // Sanity check: if --output points at a code file but the payload
-  // is clearly a markdown report (no fence + table/heading), warn the
-  // user before clobbering the file. This catches the agent-ran-tool
-  // failure mode where a system-info table replaces real code.
   const ext = extname(path).toLowerCase()
   if (CODE_EXTENSIONS.has(ext)) {
     const issue = detectMarkdownNotCode(payload)
@@ -351,6 +344,7 @@ interface AskCommandOptions {
   model?: string
   provider?: string
   persona?: string
+  bot?: string
   mode?: string
   autonomy?: string
   thinkingLevel?: string
@@ -367,17 +361,13 @@ interface AskCommandOptions {
   backgroundListNeedsAction?: boolean
   backgroundListLimit?: string | number
   backgroundStatus?: string
+  backgroundAttach?: string
   backgroundCancel?: string
   pollMs?: string | number
   interactive?: boolean
   backgroundCommandSurface?: BackgroundCommandSurface
 }
 
-/**
- * Strip the first markdown fenced code block out of the response so a piped
- * `ask --output file.py` invocation produces a directly executable file.
- * If the model returned no fence, fall back to the original text untouched.
- */
 export function stripCodeFences(content: string): string {
   const match = content.match(FENCED_BLOCK_REGEX)
   if (!match) return content
@@ -651,6 +641,14 @@ function renderBackgroundStatus(
 ): string {
   const copy = ASK_COPY[detectCliLocale()] ?? ASK_COPY.en
   if (status.status === 'failed') {
+    if (status.stopReason?.kind === 'incomplete' && status.content?.trim()) {
+      return copy.backgroundIncomplete(
+        status.jobId,
+        status.sessionId,
+        status.content.trim(),
+        status.stopReason.nextActions ?? [],
+      )
+    }
     return copy.backgroundFailed(status.jobId, status.error?.message ?? 'unknown error')
   }
   if (status.status === 'cancelled') {
@@ -776,8 +774,6 @@ async function runAskStreamJson(
   let lastTick = Date.now()
   const pendingDecisions = createCliPendingDecisionTracker()
   const watchdog = setInterval(() => {
-    // A run blocked on a pending approval/question is deliberately silent.
-    // Aborting it as an idle stream would report a human wait as a hang.
     if (pendingDecisions.pending()) return
     if (Date.now() - lastTick > STREAM_IDLE_MS) {
       aborter.abort(new Error('stream-idle-timeout'))
@@ -847,10 +843,6 @@ async function runAskStreamJson(
     termination.dispose()
   }
 
-  // Flush the final result line before exiting. process.exit() drops
-  // buffered stdout when piped, which could truncate this terminating
-  // NDJSON line; await the drain, then signal failure via exitCode so
-  // Node flushes naturally instead of a hard exit mid-write.
   const incomplete = termination.interrupted() || isUnsuccessfulAgentResult({ content, stopReason })
   await flushStreamJsonRecord({
     type: 'result',
@@ -868,7 +860,7 @@ async function runAskStreamJson(
 export async function askCommand(question: string | undefined, options: AskCommandOptions) {
   const copy = ASK_COPY[detectCliLocale()] ?? ASK_COPY.en
   const backgroundCommandSurface = options.backgroundCommandSurface ?? 'ask'
-  const quiet = !process.stdout.isTTY  // Output is piped — suppress non-content output
+  const quiet = !process.stdout.isTTY
   const outputFormat = getOutputFormat()
   const warnIgnoredInteractive = (message: string) => {
     if (options.interactive) {
@@ -883,6 +875,48 @@ export async function askCommand(question: string | undefined, options: AskComma
   } catch (err) {
     process.stderr.write(chalk.red(`${err instanceof Error ? err.message : err}\n`))
     process.exit(1)
+  }
+
+  if (options.backgroundAttach) {
+    const jobId = options.backgroundAttach
+    let lastId: number | undefined
+    let endStatus: string | undefined
+    let wroteText = false
+    try {
+      for await (const frame of client.streamBackgroundChatEvents(jobId)) {
+        if (frame.id) lastId = Number(frame.id)
+        if (outputFormat === 'stream-json') {
+          process.stdout.write(`${JSON.stringify(frame)}\n`)
+        } else if (frame.event === 'text_delta') {
+          const text = (frame.data as { text?: unknown }).text
+          if (typeof text === 'string') {
+            process.stdout.write(text)
+            wroteText = true
+          }
+        } else if (frame.event === 'tool_call' && !quiet) {
+          const name = (frame.data as { toolCall?: { name?: unknown } }).toolCall?.name
+          if (typeof name === 'string') process.stderr.write(chalk.dim(`\n· ${name}\n`))
+        } else if (frame.event === 'background_status' && !quiet) {
+          const data = frame.data as { status?: string; sessionId?: string }
+          process.stderr.write(chalk.dim(`Attached to ${jobId} (${data.status ?? 'unknown'}, session ${data.sessionId ?? '?'})\n`))
+        } else if (frame.event === 'background_gap' && !quiet) {
+          process.stderr.write(chalk.yellow('Earlier output is no longer retained; the full transcript is in the session.\n'))
+        }
+        if (frame.event === 'background_end') {
+          endStatus = (frame.data as { status?: string }).status
+        }
+      }
+    } catch (err) {
+      if (wroteText) process.stdout.write('\n')
+      if (printApiError(err, { hint: `Check the job id: ${jobId}` })) process.exit(1)
+      const cursor = lastId ? ` (last event ${lastId})` : ''
+      console.error(chalk.red(`${copy.errorPrefix} ${err instanceof Error ? err.message : String(err)}${cursor}. The job keeps running; attach again, or check it with sepilot ask --background-status ${jobId}.`))
+      process.exit(1)
+    }
+    if (wroteText && outputFormat !== 'stream-json') process.stdout.write('\n')
+    if (!quiet && outputFormat !== 'stream-json') process.stderr.write(chalk.dim(`Job ${jobId} ${endStatus ?? 'ended'}.\n`))
+    if (endStatus === 'failed' || endStatus === 'cancelled') process.exit(1)
+    return
   }
 
   if (options.backgroundStatus) {
@@ -978,7 +1012,6 @@ export async function askCommand(question: string | undefined, options: AskComma
     return
   }
 
-  // Read from stdin if piped
   if (!input && !process.stdin.isTTY) {
     input = await new Promise<string>((resolve) => {
       let data = ''
@@ -995,9 +1028,6 @@ export async function askCommand(question: string | undefined, options: AskComma
   input = composeHangul(stripBracketedPasteDelimiters(input))
 
   let resolvedAgent: string | undefined
-  // Slash command shortcut: '/cmd args ...' is resolved through the daemon
-  // user-command store before the question is dispatched. Mirrors what the
-  // TUI useChat hook already does so the cli/automation path stays consistent.
   const slash = parseAskSlashCommand(input)
   if (slash) {
     try {
@@ -1028,17 +1058,14 @@ export async function askCommand(question: string | undefined, options: AskComma
     process.exit(1)
   }
 
-  const requestedMode = options.mode ?? (panelPreset ? 'persona-panel' : resolvedAgent ?? DEFAULT_CLI_AGENT_MODE)
+  const requestedMode = options.mode ?? (panelPreset ? 'persona-panel' : options.bot ? undefined : resolvedAgent ?? DEFAULT_CLI_AGENT_MODE)
   let chatOptions: ReturnType<typeof buildCliChatOptions>
   try {
     chatOptions = buildCliChatOptions({
       model: options.model,
       provider: options.provider,
       persona: options.persona,
-      // Let the daemon's LLM router pick the right built-in graph for one-shot
-      // asks. Simple requests still fall back to react, while broad coding,
-      // research, or review work can select the specialist graph without making
-      // the user know the mode name first.
+      bot: options.bot,
       mode: requestedMode,
       personaIds: panelPreset ? [...panelPreset.personaIds] : undefined,
       skillRefs: options.skill?.length
@@ -1123,17 +1150,12 @@ export async function askCommand(question: string | undefined, options: AskComma
     return
   }
 
-  // stream-json mode: forward the SSE agent event stream as NDJSON on
-  // stdout and synthesize a final `result` line — the automation contract
-  // for headless callers (Chat Transport Policy: no /chat fallback, a
-  // failed stream surfaces as an error event + non-zero exit).
   if (outputFormat === 'stream-json') {
     warnIgnoredInteractive(copy.interactiveIgnoredFormat('stream-json'))
     await runAskStreamJson(client, input, options, chatOptions)
     return
   }
 
-  // JSON mode: use regular HTTP
   if (outputFormat === 'json') {
     warnIgnoredInteractive(copy.interactiveIgnoredFormat('json'))
     try {
@@ -1143,11 +1165,6 @@ export async function askCommand(question: string | undefined, options: AskComma
         }),
       }
       if (options.output && data.data?.content) {
-        // Under --json + --output, write the full envelope to the file
-        // so jq users can pipe `cat result.json | jq .content`. The
-        // explicit --strip-fences flag still wins (it signals "I want
-        // a directly executable file"), so it short-circuits to plain
-        // content with the fence stripped.
         const payload = options.stripFences
           ? stripCodeFences(data.data.content)
           : JSON.stringify(data.data, null, 2)
@@ -1161,7 +1178,6 @@ export async function askCommand(question: string | undefined, options: AskComma
     return
   }
 
-  // Streaming mode: use SSE
   let activeSessionId = options.session
   try {
     const useInteractivePrinter = Boolean(
@@ -1182,8 +1198,6 @@ export async function askCommand(question: string | undefined, options: AskComma
           questionHintMode: 'cli',
           showArtifacts: true,
           showStateChanges: true,
-          // Auto-selected progress stays compact. The explicit flag is the
-          // opt-in for router/planner/reasoning diagnostics.
           showDiagnostics: Boolean(options.interactive),
           onSessionId: (sessionId) => {
             activeSessionId = sessionId
@@ -1192,21 +1206,12 @@ export async function askCommand(question: string | undefined, options: AskComma
       : createAnswerOnlyCliChatStreamPrinter({
           quiet,
           suppressContent: Boolean(options.output),
-          // `ask` is invoked from a regular shell, not the chat REPL, so
-          // tell the printer to spell the approval hint as `sepilot
-          // approve <id>` rather than `/approve <id>` — slash commands
-          // would mislead an automation user back to a shell that isn't
-          // running.
           approvalHintMode: 'cli',
           questionHintMode: 'cli',
           onSessionId: (sessionId) => {
             activeSessionId = sessionId
           },
         })
-    // Stream watchdog: if no chunk arrives for `STREAM_IDLE_MS`, abort
-    // and surface a friendly hang message. Catches the case where the
-    // daemon finishes (200 OK + close) but the SSE reader doesn't see
-    // EOF — cli would otherwise wait forever.
     const STREAM_IDLE_MS = resolveCliStreamIdleMs()
     const STREAM_CONNECT_MS = resolveCliStreamConnectMs()
     const aborter = new AbortController()
@@ -1214,10 +1219,6 @@ export async function askCommand(question: string | undefined, options: AskComma
       if (activeSessionId) await client.cancelActiveRun(activeSessionId)
     })
     let lastTick = Date.now()
-    // Pending-decision run state: while an approval/question is outstanding the
-    // run is blocked on a human, not hung. The idle watchdog stays quiet and a
-    // periodic notice replaces the dead air so the operator can see the run is
-    // alive and exactly which command unblocks it.
     const pendingDecisions = createCliPendingDecisionTracker()
     let lastPendingNoticeAt = 0
     const PENDING_NOTICE_MS = 30_000
@@ -1255,10 +1256,6 @@ export async function askCommand(question: string | undefined, options: AskComma
         },
       )
       if (!res.ok || !res.body) {
-        // User-visible chat must not hide stream/proxy failures behind a
-        // synchronous /chat fallback. Surface the real transport failure so
-        // operators can fix timeouts, auth, or provider capacity instead of
-        // waiting on a request that may hang until a proxy 504.
         throw new Error(await formatChatStreamFailure(res))
       } else {
         await forwardDaemonStreamWithResumeRecovery(res, {
@@ -1291,9 +1288,6 @@ export async function askCommand(question: string | undefined, options: AskComma
 
     const unresolvedDecision = pendingDecisions.pending()
     if (unresolvedDecision) {
-      // The run did not stall: it ended (or was cut) while still waiting for a
-      // decision this non-interactive invocation cannot make on the user's
-      // behalf. Say so instead of letting a generic timeout take the blame.
       process.stderr.write(
         chalk.yellow(`\n${formatPendingDecisionAbortReason(unresolvedDecision, activeSessionId)}\n`),
       )
@@ -1301,8 +1295,6 @@ export async function askCommand(question: string | undefined, options: AskComma
     }
 
     if (printer.hadError()) {
-      // Daemon already printed the error via the stream printer; just exit
-      // non-zero so callers can detect the failure.
       process.exit(1)
     }
 
@@ -1319,10 +1311,6 @@ export async function askCommand(question: string | undefined, options: AskComma
       process.exit(1)
     }
   } catch (err) {
-    // Stream-failure copy lives in printStreamError (idle watchdog +
-    // half-open SSE drop). Status-aware http copy lives in printApiError.
-    // Both helpers print the friendly message themselves and return true
-    // so we can drop straight into process.exit(1).
     if (printStreamError(err, { sessionId: activeSessionId })) {
       process.exit(1)
     }

@@ -1,10 +1,10 @@
 import { toolExecutionPostureLabel } from '@sepilotd/core'
 import type { SessionEvent, SessionMeta } from '@sepilotd/core'
 import { homedir } from 'node:os'
-import { sanitizeEvent, sanitizeText } from '../sessions/sanitize.js'
+import { credentialValuesFromEnv, sanitizeEvent, sanitizeText } from '../sessions/sanitize.js'
 import { prepareEventForPublicShare, shareIncludesToolOutput } from './payload.js'
 
-const SHARE_SANITIZE_OPTIONS = { home: homedir() }
+const SHARE_SANITIZE_OPTIONS = { home: homedir(), knownSecrets: credentialValuesFromEnv() }
 
 function escapeHtml(value: string): string {
   return value
@@ -135,9 +135,6 @@ function renderEvent(event: SessionEvent): string {
         'Approval',
       )
     case 'approval_response': {
-      // Defensive `approved` fallback for legacy imports — the typed
-      // schema makes decision required, but old jsonl rows could
-      // omit it. (Cast sidesteps TS exhaustive narrowing.)
       const fallbackApproved = (event as { approved?: boolean }).approved
       return renderSystemNote(
         `Approval ${event.decision ?? (fallbackApproved ? 'approved' : 'denied')}`,
@@ -249,19 +246,11 @@ export function renderSharedSessionHtml(
   events: SessionEvent[],
   options: { includeToolOutput?: boolean } = {},
 ): string {
-  // Public share URLs are token-gated but anyone with the URL can read
-  // the full transcript. Strip verbatim tool outputs (default) then run
-  // every event through the same sanitiser the session export uses so
-  // accidentally-pasted bearer tokens / API keys / $HOME paths and raw
-  // tool stdout/file contents don't bleed into the rendered HTML.
   const includeToolOutput = options.includeToolOutput ?? shareIncludesToolOutput()
   const sanitized = events.map((event) =>
     sanitizeEvent(prepareEventForPublicShare(event, includeToolOutput), SHARE_SANITIZE_OPTIONS),
   )
   const transcript = sanitized.map(renderEvent).filter(Boolean).join('\n')
-  // Header fields also pass through sanitizeText so $HOME / bearer
-  // tokens / API keys in user-customised session titles or device
-  // names don't leak.
   const title = escapeHtml(sanitizeText(session.title, SHARE_SANITIZE_OPTIONS))
   const createdAt = escapeHtml(session.createdAt)
   const providerModel = escapeHtml(`${session.provider}/${session.model}`)

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
-import { readFile, stat } from 'node:fs/promises'
+import { lstat, readFile, rm, rmdir, stat } from 'node:fs/promises'
+import { dirname } from 'node:path'
 
 interface FileFingerprint {
   mtimeMs: number
@@ -44,6 +45,7 @@ export interface WorkspaceStaleSignal {
 export class WorkspaceMutationTracker {
   private readonly bySession = new Map<string, Map<string, FileFingerprint>>()
   private readonly observationsBySession = new Map<string, Map<string, CachedReadObservation>>()
+  private readonly scratchBySession = new Map<string, Map<string, FileFingerprint>>()
 
   async recordRead(sessionId: string, path: string): Promise<void> {
     const fingerprint = await this.fingerprint(path)
@@ -78,13 +80,44 @@ export class WorkspaceMutationTracker {
     }
   }
 
-  /**
-   * Record post-write fingerprint so subsequent stale checks compare against
-   * the latest agent-authored state, not the pre-edit baseline.
-   */
   async recordWrite(sessionId: string, path: string): Promise<void> {
     this.invalidateReadObservations(sessionId, path)
     await this.recordRead(sessionId, path)
+    if (this.scratchBySession.get(sessionId)?.has(path)) {
+      await this.recordScratch(sessionId, path)
+    }
+  }
+
+  async recordScratch(sessionId: string, path: string): Promise<void> {
+    const fingerprint = await this.fingerprint(path)
+    if (!fingerprint) return
+    let bucket = this.scratchBySession.get(sessionId)
+    if (!bucket) {
+      bucket = new Map()
+      this.scratchBySession.set(sessionId, bucket)
+    }
+    bucket.set(path, fingerprint)
+  }
+
+  async cleanupScratch(sessionId: string): Promise<string[]> {
+    const owned = this.scratchBySession.get(sessionId)
+    const paths = [...(owned?.keys() ?? [])]
+      .sort((left, right) => right.length - left.length)
+    const removed: string[] = []
+    for (const path of paths) {
+      try {
+        const current = await this.fingerprint(path)
+        const original = owned?.get(path)
+        if (!current || !original || current.contentHash !== original.contentHash
+          || current.mtimeMs !== original.mtimeMs || !(await lstat(path)).isFile()) continue
+        await rm(path, { force: true, recursive: false })
+        removed.push(path)
+      } catch {
+      }
+      await this.removeEmptyScratchParents(path)
+    }
+    this.scratchBySession.delete(sessionId)
+    return removed
   }
 
   async lookupReadObservation(
@@ -155,6 +188,23 @@ export class WorkspaceMutationTracker {
   dispose(sessionId: string): void {
     this.bySession.delete(sessionId)
     this.observationsBySession.delete(sessionId)
+    this.scratchBySession.delete(sessionId)
+  }
+
+  private async removeEmptyScratchParents(path: string): Promise<void> {
+    let current = dirname(path)
+    while (current && current !== dirname(current)) {
+      const normalized = current.replaceAll('\\', '/')
+      const isScratchRoot = normalized.endsWith('/.sepilot-scratch')
+      if (!isScratchRoot && !normalized.includes('/.sepilot-scratch/')) break
+      try {
+        await rmdir(current)
+      } catch {
+        break
+      }
+      if (isScratchRoot) break
+      current = dirname(current)
+    }
   }
 
   private sessionFingerprints(sessionId: string): Map<string, FileFingerprint> {

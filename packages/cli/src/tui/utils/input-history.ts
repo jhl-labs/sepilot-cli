@@ -59,7 +59,6 @@ export async function loadHistory(cwd: string): Promise<string[]> {
         texts.push(parsed.text)
       }
     } catch {
-      // skip malformed line
     }
   }
 

@@ -8,7 +8,6 @@ import {
   type KnowledgeSource,
 } from './schema.js'
 
-/** Canonical snapshots and revisions never participate in Memory eviction. */
 export function createKnowledgeRepo() {
   const db = openDomainDb({ name: 'knowledge' })
   db.exec(`CREATE TABLE IF NOT EXISTS knowledge_records (
@@ -105,7 +104,6 @@ export function createKnowledgeRepo() {
         if (relation.targetId === id || !topologyGet(relation.targetId))
           knowledgeError('관계 대상이 유효하지 않습니다.')
       }
-      // Supersession is directional and acyclic, unlike ordinary related links.
       const pending = input.relations.filter((r) => r.type === 'supersedes').map((r) => r.targetId)
       const visited = new Set<string>()
       while (pending.length) {
@@ -127,7 +125,6 @@ export function createKnowledgeRepo() {
         relations: [
           ...new Map(input.relations.map((r) => [`${r.type}:${r.targetId}`, r])).values(),
         ],
-        // Keep the original source plus recent evidence; older complete snapshots remain in revisions.
         sources: (() => {
           const merged = [
             ...new Map(
@@ -195,7 +192,6 @@ export function createKnowledgeRepo() {
             source,
           ]),
         )
-        // Empty extraction can be retried after changing the model or guidance.
         if (records.length)
           db.prepare('INSERT INTO knowledge_captures VALUES (?, ?)').run(
             fingerprint,

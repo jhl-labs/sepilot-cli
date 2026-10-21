@@ -2,18 +2,6 @@ import type { Dirent } from 'node:fs'
 import { readdir, stat } from 'node:fs/promises'
 import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
 
-/**
- * Turn a filesystem ENOENT into evidence the model can act on in its next
- * turn instead of guessing again.
- *
- * A bare "File not found" costs one more model round trip per guess. Listing
- * the nearest existing ancestor and pointing at same-named files elsewhere in
- * the workspace usually turns the second guess into the right call. All
- * enumeration is bounded (entries, directories, depth, wall clock) and stays
- * inside the caller-supplied root so a hint never widens what the tool could
- * have listed on its own.
- */
-
 const MAX_LISTED_ENTRIES = 24
 const MAX_CANDIDATES = 5
 const MAX_SCAN_DIRS = 400
@@ -36,26 +24,17 @@ const SKIP_DIR_NAMES = new Set([
 ])
 
 export interface MissingPathHintOptions {
-  /**
-   * Ceiling for enumeration. Hints never describe anything outside it, and
-   * without one no enumeration happens at all.
-   */
   root?: string
   signal?: AbortSignal
   now?: () => number
-  /** Test seam for the wall-clock budget. */
   scanTimeBudgetMs?: number
 }
 
 export interface MissingPathHint {
-  /** Nearest existing ancestor directory of the requested path. */
   nearestDirectory?: string
-  /** First path segment (relative to nearestDirectory) that does not exist. */
   missingSegment?: string
-  /** Bounded, sorted entries of nearestDirectory (directories end with "/"). */
   entries: string[]
   omittedEntries: number
-  /** Same-named (or same-stem) files elsewhere under the root, root-relative. */
   candidates: string[]
 }
 
@@ -110,7 +89,6 @@ export async function collectMissingPathHint(
   const deadline = now() + (options.scanTimeBudgetMs ?? SCAN_TIME_BUDGET_MS)
   const aborted = (): boolean => options.signal?.aborted === true || now() > deadline
 
-  // 1. Nearest existing ancestor and the first missing segment below it.
   let nearest = dirname(target)
   let missingChild = target
   while (nearest !== root && isInside(nearest, root) && !(await directoryExists(nearest))) {
@@ -138,8 +116,6 @@ export async function collectMissingPathHint(
   hint.entries = nearestEntries.slice(0, MAX_LISTED_ENTRIES).map(formatEntry)
   hint.omittedEntries = Math.max(0, nearestEntries.length - MAX_LISTED_ENTRIES)
 
-  // 2. Candidates: same name up the ancestor chain, near-name matches in the
-  //    nearest directory, then a bounded breadth-first scan under the root.
   const wanted = basename(target)
   const wantedLower = wanted.toLowerCase()
   const wantedStem = stemOf(wantedLower)
@@ -225,10 +201,6 @@ export function formatMissingPathHint(
   return lines
 }
 
-/**
- * Convenience for tool error paths: message lines to append after the
- * primary "not found" line. Never throws.
- */
 export async function describeMissingPath(
   resolvedPath: string,
   options: MissingPathHintOptions = {},

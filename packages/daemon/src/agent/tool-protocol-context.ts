@@ -19,13 +19,6 @@ function mergeToolCalls(
   ]
 }
 
-/**
- * Session journals persist each member of a parallel tool-call batch as an
- * individual event. On reload that can produce adjacent, empty assistant
- * messages even though providers require one assistant tool-use message
- * followed by all matching tool results. Coalesce only that unambiguous empty
- * fragment shape; substantive adjacent assistant messages remain untouched.
- */
 export function coalesceAdjacentAssistantToolCallMessages(
   messages: readonly Message[],
 ): Message[] {

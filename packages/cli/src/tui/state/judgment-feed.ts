@@ -1,8 +1,3 @@
-// Formats the daemon's judgment/decision events into one-line transcript
-// entries so the operator can see *what the agent decided and why* while a
-// run is otherwise silent (long tool runs, approval waits). Pure so the
-// mapping can be unit-tested without rendering the TUI.
-
 const FEED_LINE_MAX_CHARS = 160
 
 interface ReasoningStepPayload {
@@ -68,21 +63,14 @@ function clip(text: string): string {
   return `${singleLine.slice(0, FEED_LINE_MAX_CHARS - 1)}…`
 }
 
-/**
- * Returns the transcript line for a judgment event, or null when the
- * payload is not a judgment event (callers can pass any stream payload).
- */
 export function formatJudgmentFeedLine(payload: { type: string } & Record<string, unknown>): string | null {
   switch (payload.type) {
     case 'reasoning_step': {
-      // Reasoning is transient progress, already shown in the live status
-      // region. Persisting every step in scrollback makes the final answer
-      // difficult to find and exposes implementation chatter as user output.
       return null
     }
     case 'action_progress': {
       const event = payload as unknown as ActionProgressPayload
-      return clip(`↳ ${event.summary} → ${event.nextStep}`)
+      return [`Now · ${event.summary.trim()}`, event.nextStep?.trim() ? `Next · ${event.nextStep.trim()}` : null].filter(Boolean).join('\n')
     }
     case 'mode_route_decision': {
       const event = payload as unknown as ModeRouteDecisionPayload
@@ -109,6 +97,7 @@ export function formatJudgmentFeedLine(payload: { type: string } & Record<string
     }
     case 'recovery': {
       const event = payload as unknown as RecoveryPayload
+      if (event.recoverable !== false) return null
       return clip(`Recovery: ${event.message}`)
     }
     default:

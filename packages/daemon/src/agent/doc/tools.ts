@@ -1,12 +1,3 @@
-// 글쓰기 모드 (canvas) 전용 LLM tools. fs.* 또는 apply_patch와 달리 daemon-owned
-// in-memory doc session을 직접 다룬다 → desktop renderer가 WS event로 즉시 본다.
-//
-// activeSessionResolver:
-//   채팅 시점에 어떤 session이 활성인지 알려준다. 일반적으로 desktop이
-//   chat-stream payload에 `writingDocSessionId`를 첨부 → daemon이 그 값을
-//   AgentContext에 옮겨놓고, 이 resolver가 그 값을 꺼낸다. resolver가 null을
-//   반환하면 모든 doc.* tool은 "활성 글쓰기 doc 없음" 에러를 낸다.
-
 import type { DocOutlineEntry } from '@sepilotd/core'
 import type { ToolDefinitionRuntime, ToolResult } from '../../tools/registry.js'
 import { strictWorkspacePathViolation } from '../../security/policy-engine.js'
@@ -524,8 +515,6 @@ export function createDocTools(deps: DocToolDeps): ToolDefinitionRuntime[] {
     },
   }
 
-  // outline cache invalidation은 매번 parseOutline 호출이라 불필요 (작은 doc 가정).
-  // 큰 doc은 향후 line-index cache 도입 검토.
   void parseOutline
 
   return [

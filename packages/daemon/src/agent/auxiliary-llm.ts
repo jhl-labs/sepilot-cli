@@ -5,16 +5,26 @@ import type {
   TokenUsage,
   ToolCall,
 } from '@sepilotd/core'
-import { createAbortError } from '../abort.js'
+import { Ajv } from 'ajv'
+import { randomUUID } from 'node:crypto'
+import { createAbortError, throwIfAborted } from '../abort.js'
 import { parseToolCallArguments } from './tool-call-args.js'
 import { extractContent } from '../providers/utils.js'
 import {
   guardedProviderChat,
   guardedProviderStream,
+  extractProviderErrorStatusCode,
   type ProviderCircuitBreaker,
 } from '../providers/circuit-breaker.js'
 import { logLlmCallTraceDetached } from '../observability/agent-trace.js'
-import { resolveCallDeadline } from './control-call-policy.js'
+import { resolveCallDeadline, resolveControlCallTimeoutMs } from './control-call-policy.js'
+import { detectNativeToolTransportRejection } from './tool-transport-recovery.js'
+import { closeTruncatedJson } from './json-repair.js'
+import {
+  detectProviderMaxOutputTokenLimit,
+  recallObservedMaxOutputTokens,
+  rememberObservedMaxOutputTokens,
+} from './max-output-token-recovery.js'
 
 const DEFAULT_AUXILIARY_LLM_TIMEOUT_MS = 25_000
 export const DEFAULT_AUXILIARY_LLM_TURN_BUDGET_MS = 25_000
@@ -35,19 +45,57 @@ export class AuxiliaryLlmTimeoutError extends Error {
   constructor(
     readonly label: string,
     readonly timeoutMs: number,
+    readonly kind: 'inactivity' | 'deadline' = 'deadline',
   ) {
-    super(`${label} timed out after ${timeoutMs}ms`)
+    super(kind === 'inactivity'
+      ? `${label} produced no output for ${timeoutMs}ms`
+      : `${label} timed out after ${timeoutMs}ms`)
     this.name = 'AuxiliaryLlmTimeoutError'
   }
 }
 
-/**
- * One active wall-clock budget shared by every optional LLM call in a turn.
- * Main-model generation and tool execution do not consume this budget: a
- * completion review must still be possible after a long implementation step.
- * A timed-out auxiliary request exhausts the budget and aborts its peers so
- * independent planners/reviewers cannot serially add their full timeouts.
- */
+export class AuxiliaryLlmRepetitionError extends Error {
+  constructor(readonly kind: 'exact-cycle' | 'stagnant-reasoning' = 'exact-cycle') {
+    super(kind === 'exact-cycle'
+      ? 'Required auxiliary control stream repeated an exact cycle without a visible response'
+      : 'Required auxiliary control stream kept restating the same reasoning without a visible response')
+    this.name = 'AuxiliaryLlmRepetitionError'
+  }
+}
+
+const CONTROL_STAGNATION_WINDOW = 12_000
+const CONTROL_STAGNATION_MIN_SENTENCE_CHARS = 24
+const CONTROL_STAGNATION_MIN_SENTENCES = 40
+const CONTROL_STAGNATION_MAX_DISTINCT_RATIO = 0.25
+
+function hasStagnantControlReasoning(thinking: string): boolean {
+  if (thinking.length < CONTROL_STAGNATION_WINDOW / 3) return false
+  const window = thinking.slice(-CONTROL_STAGNATION_WINDOW)
+  const sentences = window
+    .split(/(?<=[.!?])\s+|\n+/u)
+    .map((sentence) => sentence.trim().replace(/\s+/gu, ' ').toLowerCase())
+    .filter((sentence) => sentence.length >= CONTROL_STAGNATION_MIN_SENTENCE_CHARS)
+  if (sentences.length < CONTROL_STAGNATION_MIN_SENTENCES) return false
+  return new Set(sentences).size / sentences.length <= CONTROL_STAGNATION_MAX_DISTINCT_RATIO
+}
+
+const CONTROL_REPETITION_WINDOW = 4_096
+const CONTROL_REPETITION_MAX_PERIOD = 128
+const CONTROL_REPETITION_CHECK_STEP = 256
+
+function hasSustainedControlCycle(thinking: string): boolean {
+  if (thinking.length < CONTROL_REPETITION_WINDOW) return false
+  const suffix = thinking.slice(-CONTROL_REPETITION_WINDOW)
+  const prefixes = new Uint16Array(suffix.length)
+  for (let i = 1; i < suffix.length; i++) {
+    let matched = prefixes[i - 1]!
+    while (matched > 0 && suffix[i] !== suffix[matched]) matched = prefixes[matched - 1]!
+    if (suffix[i] === suffix[matched]) matched++
+    prefixes[i] = matched
+  }
+  return suffix.length - prefixes[suffix.length - 1]! <= CONTROL_REPETITION_MAX_PERIOD
+}
+
 export class AuxiliaryLlmTurnBudget {
   readonly startedAt = Date.now()
   private consumedMs = 0
@@ -72,8 +120,8 @@ export class AuxiliaryLlmTurnBudget {
     return remaining !== null && remaining <= 0
   }
 
-  register(controller: AbortController): () => void {
-    if (this.isExhausted()) {
+  register(controller: AbortController, options: { admitWhenExhausted?: boolean } = {}): () => void {
+    if (!options.admitWhenExhausted && this.isExhausted()) {
       throw new AuxiliaryLlmBudgetExhaustedError(this.budgetMs)
     }
     if (this.controllers.size === 0) this.activeSince = Date.now()
@@ -145,16 +193,23 @@ function reasoningRetryMaxTokens(
     : REASONING_RETRY_MAX_TOKENS
   const next = Math.min(
     ceiling,
-    Math.max(REASONING_RETRY_MAX_TOKENS, current * 12),
+    Math.max(REASONING_RETRY_MAX_TOKENS, Math.ceil(current / 12)),
   )
-  return next > current ? next : null
+  return next !== current ? next : null
 }
 
-function needsReasoningRetry(response: ChatResponse): boolean {
+function needsReasoningRetry(response: ChatResponse, request: ChatRequest): boolean {
   return response.finishReason === 'length'
+    && response.finishDetail !== 'incomplete_stream'
     && extractContent(response.message).trim().length === 0
     && (response.message.toolCalls?.length ?? 0) === 0
-    && Boolean(response.thinking?.trim())
+    && (
+      Boolean(response.thinking?.trim())
+      || (Number.isFinite(request.maxTokens)
+        && (request.maxTokens ?? 0) > 0
+        && Number.isFinite(response.usage.outputTokens)
+        && response.usage.outputTokens >= request.maxTokens!)
+    )
 }
 
 function combineRetryUsage(
@@ -168,6 +223,11 @@ function combineRetryUsage(
       outputTokens: first.usage.outputTokens + retry.usage.outputTokens,
       thinkingTokens: (first.usage.thinkingTokens ?? 0)
         + (retry.usage.thinkingTokens ?? 0) || undefined,
+      cacheReadTokens: sumOptionalUsage(first.usage.cacheReadTokens, retry.usage.cacheReadTokens),
+      cacheCreationTokens: sumOptionalUsage(first.usage.cacheCreationTokens, retry.usage.cacheCreationTokens),
+      estimatedCost: first.usage.estimatedCost !== undefined && retry.usage.estimatedCost !== undefined
+        ? first.usage.estimatedCost + retry.usage.estimatedCost
+        : undefined,
     },
   }
 }
@@ -196,17 +256,6 @@ export function resolveAuxiliaryLlmTurnBudgetMs(): number | null {
     : DEFAULT_AUXILIARY_LLM_TURN_BUDGET_MS
 }
 
-/**
- * Bounded cooldown for an optional auxiliary stage (contract planner,
- * grounding audit) on one provider/model. An auxiliary call that times out
- * consumed its whole wall-clock allowance and produced nothing; a second
- * consecutive timeout for the same stage on the same model is evidence that
- * this model cannot answer the stage inside its budget right now, so paying
- * the full timeout again on every turn only adds latency before the fallback
- * the stage would have returned anyway. The circuit is in-memory, keyed by
- * stage + provider + model, closes on the first success, and expires on its
- * own — it is a runtime breaker, not a persisted compatibility profile.
- */
 export class AuxiliaryStageCircuit {
   private readonly entries = new Map<string, { consecutiveTimeouts: number; openUntil: number }>()
 
@@ -235,7 +284,6 @@ export class AuxiliaryStageCircuit {
     if (!entry) return false
     if (entry.openUntil > this.now()) return true
     if (entry.openUntil > 0) {
-      // Cooldown elapsed: allow one probe; another timeout re-opens at once.
       entry.openUntil = 0
       entry.consecutiveTimeouts = Math.max(0, this.threshold() - 1)
     }
@@ -291,32 +339,81 @@ export async function runAuxiliaryLlmChat(input: {
   maxRetries?: number
   transport?: AuxiliaryLlmTransport
   sessionId?: string
+  controlResponseAccepted?: (response: ChatResponse) => boolean
 }): Promise<ChatResponse> {
-  const first = await runSingleAuxiliaryLlmChat(input)
-  if (input.allowReasoningRetry === false || !needsReasoningRetry(first)) {
+  const model = input.provider.models.find(model => model.id === input.request.model)
+  const fallback = model?.capabilities?.thinking
+    ? model.compatibility?.auxiliaryThinkingOffFallback
+    : undefined
+  const effectiveInput = input.request.thinkingLevel === 'off' && fallback
+    ? {
+        ...input,
+        requestedThinkingLevel: input.request.thinkingLevel,
+        request: { ...input.request, thinkingLevel: fallback as ChatRequest['thinkingLevel'] },
+      }
+    : input
+  const first = await runSingleAuxiliaryLlmChat(effectiveInput)
+  if (first.raw?.auxiliaryToolTransportRecovery || input.allowReasoningRetry === false) {
+    return first
+  }
+  const exhausted = needsReasoningRetry(first, effectiveInput.request)
+  const unaccepted = !exhausted && needsStructureRetry(first, input.controlResponseAccepted)
+  if (!exhausted && !unaccepted) {
     return first
   }
 
-  const maxTokens = reasoningRetryMaxTokens(input.provider, input.request)
+  const maxTokens = reasoningRetryMaxTokens(effectiveInput.provider, effectiveInput.request)
   if (maxTokens === null) {
     return first
   }
 
   const retry = await runSingleAuxiliaryLlmChat({
-    ...input,
+    ...effectiveInput,
+    admitWhenExhausted: true,
     request: {
-      ...input.request,
+      ...effectiveInput.request,
       maxTokens,
       messages: [
-        ...input.request.messages,
+        ...effectiveInput.request.messages,
         {
           role: 'system',
-          content: 'The previous attempt used its output budget on hidden reasoning. Return the requested compact answer now, with no preamble or analysis.',
+          content: exhausted
+            ? 'The previous attempt exhausted its output budget without returning the required visible response. Return the requested compact answer now, with no preamble or analysis.'
+            : 'The previous reply did not contain the required structured response. Return only the requested compact answer now, starting immediately with it, with no preamble or analysis.',
         },
       ],
     },
   })
   return combineRetryUsage(first, retry)
+}
+
+function needsStructureRetry(
+  response: ChatResponse,
+  accepted: ((response: ChatResponse) => boolean) | undefined,
+): boolean {
+  if (!accepted || accepted(response)) return false
+  return extractContent(response.message).trim().length > 0
+    && (response.message.toolCalls?.length ?? 0) === 0
+}
+
+function hasExplicitControlDeadlineConfiguration(): boolean {
+  return Boolean(process.env.SEPILOTD_AUX_LLM_TIMEOUT_MS?.trim())
+    || Boolean(process.env.SEPILOTD_AUX_LLM_TURN_BUDGET_MS?.trim())
+}
+
+const CHAT_DEADLINE_FLOOR_TOKENS_PER_SECOND = 8
+
+export function resolveChatAllowanceDeadlineMs(
+  configuredLimitMs: number | null,
+  maxTokens: number | undefined,
+  controlCeilingMs: number | null = resolveControlCallTimeoutMs(),
+): number | null {
+  if (configuredLimitMs === null) return null
+  const allowanceMs = Number.isSafeInteger(maxTokens) && maxTokens! > 0
+    ? Math.ceil(maxTokens! / CHAT_DEADLINE_FLOOR_TOKENS_PER_SECOND) * 1000
+    : 0
+  const deadline = Math.max(configuredLimitMs, allowanceMs)
+  return controlCeilingMs === null ? deadline : Math.min(deadline, Math.max(configuredLimitMs, controlCeilingMs))
 }
 
 async function runSingleAuxiliaryLlmChat(input: {
@@ -330,15 +427,24 @@ async function runSingleAuxiliaryLlmChat(input: {
   maxRetries?: number
   transport?: AuxiliaryLlmTransport
   sessionId?: string
+  requestedThinkingLevel?: ChatRequest['thinkingLevel']
+  admitWhenExhausted?: boolean
 }): Promise<ChatResponse> {
+  throwIfAborted(input.signal, `${input.label} aborted`)
   const remainingBudgetMs = input.budget?.remainingMs() ?? null
-  if (remainingBudgetMs !== null && remainingBudgetMs <= 0) {
+  if (remainingBudgetMs !== null && remainingBudgetMs <= 0 && !input.admitWhenExhausted) {
     input.budget?.exhaust()
     throw new AuxiliaryLlmBudgetExhaustedError(input.budget?.budgetMs ?? null)
   }
-  const timeoutMs = resolveCallDeadline(input.timeoutMs, resolveAuxiliaryLlmTimeoutMs(), remainingBudgetMs)
+  const streaming = (input.transport ?? 'chat') !== 'chat'
+  const configuredLimitMs = input.timeoutMs === undefined ? resolveAuxiliaryLlmTimeoutMs() : input.timeoutMs
+  const timeoutMs = streaming
+    ? configuredLimitMs
+    : input.timeoutMs === undefined && !hasExplicitControlDeadlineConfiguration()
+      ? resolveChatAllowanceDeadlineMs(configuredLimitMs, input.request.maxTokens)
+      : resolveCallDeadline(input.timeoutMs, resolveAuxiliaryLlmTimeoutMs(), remainingBudgetMs)
   const controller = new AbortController()
-  const unregisterBudget = input.budget?.register(controller) ?? (() => {})
+  const unregisterBudget = input.budget?.register(controller, { admitWhenExhausted: input.admitWhenExhausted }) ?? (() => {})
   const finishActiveRequest = input.budget?.beginRequest({
     providerId: input.provider.id,
     request: input.request,
@@ -355,9 +461,8 @@ async function runSingleAuxiliaryLlmChat(input: {
     input.signal?.addEventListener('abort', abortFromParent, { once: true })
   }
 
-  // The trace write must stay outside the timeout race below: writeEntry
-  // serializes on a shared queue, so awaiting it here could push an otherwise
-  // successful auxiliary call past its deadline.
+  let traceRequest = input.request
+  let recoveredTransport = false
   const traceCall = (response?: ChatResponse, error?: unknown): void => {
     logLlmCallTraceDetached({
       source: 'auxiliary',
@@ -366,14 +471,32 @@ async function runSingleAuxiliaryLlmChat(input: {
       provider: input.provider.name,
       model: input.request.model,
       iteration: 0,
-      request: input.request,
+      request: traceRequest,
       response,
-      error: formatAuxiliaryTraceError(error),
-      meta: { label: input.label, node: input.label },
+      error: formatAuxiliaryTraceError(error ?? response?.raw?.auxiliaryToolTransportError),
+      meta: {
+        label: input.label,
+        node: input.label,
+        ...(recoveredTransport ? { recovery: 'required-tool-prompt' } : {}),
+        ...(input.requestedThinkingLevel ? {
+          requestedThinkingLevel: input.requestedThinkingLevel,
+          effectiveThinkingLevel: input.request.thinkingLevel,
+          compatibilityPolicy: 'auxiliary-thinking-off-fallback',
+        } : {}),
+      },
     })
   }
 
-  const chatPromise = executeAuxiliaryProviderRequest(input, controller.signal)
+  let progressHook: (() => void) | null = null
+  const chatPromise = executeAuxiliaryProviderRequest(
+    { ...input, onProgress: () => progressHook?.() },
+    controller,
+    (error, request) => {
+      traceCall(undefined, error)
+      traceRequest = request
+      recoveredTransport = true
+    },
+  )
 
   if (timeoutMs === null) {
     return await chatPromise.then(
@@ -394,25 +517,38 @@ async function runSingleAuxiliaryLlmChat(input: {
 
   return await new Promise<ChatResponse>((resolve, reject) => {
     let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
     const finish = (fn: () => void) => {
       if (settled) {
         return
       }
       settled = true
+      progressHook = null
       clearTimeout(timer)
       unregisterBudget()
       finishActiveRequest()
       input.signal?.removeEventListener('abort', abortFromParent)
       fn()
     }
-    const timer = setTimeout(() => {
-      const error = new AuxiliaryLlmTimeoutError(input.label, timeoutMs)
+    const onTimeout = () => {
+      const error = new AuxiliaryLlmTimeoutError(input.label, timeoutMs, streaming ? 'inactivity' : 'deadline')
       controller.abort(createAbortError(error.message))
       input.breaker?.noteExternalFailure(input.provider.id, input.request.model, error.message)
       input.budget?.exhaust(error)
       finish(() => reject(error))
-    }, timeoutMs)
-    timer.unref?.()
+    }
+    const arm = () => {
+      timer = setTimeout(onTimeout, timeoutMs)
+      timer.unref?.()
+    }
+    arm()
+    if (streaming) {
+      progressHook = () => {
+        if (settled) return
+        clearTimeout(timer)
+        arm()
+      }
+    }
 
     chatPromise.then(
       (response) => {
@@ -422,13 +558,76 @@ async function runSingleAuxiliaryLlmChat(input: {
       (error) => {
         traceCall(undefined, error)
         finish(() => reject(
-        input.budget?.isExhausted()
-          ? new AuxiliaryLlmBudgetExhaustedError(input.budget.budgetMs)
-          : error,
+          controller.signal.aborted && !input.signal?.aborted && input.budget?.isExhausted()
+            ? new AuxiliaryLlmBudgetExhaustedError(input.budget.budgetMs)
+            : error,
         ))
       },
     )
   })
+}
+
+const NATIVE_TOOL_SERIALIZATION_REJECTION_TTL_MS = 60 * 60_000
+const MAX_NATIVE_TOOL_SERIALIZATION_REJECTIONS = 256
+const nativeToolSerializationRejections = new Map<string, { at: number; reason: string }>()
+
+function nativeToolSerializationKey(input: {
+  provider: ILLMProvider
+  request: ChatRequest
+  sessionId?: string
+}): string | null {
+  if (!input.sessionId || input.request.toolChoice !== 'required' || !input.request.tools?.length) return null
+  return JSON.stringify([
+    input.sessionId,
+    input.provider.id,
+    input.request.model,
+    input.request.tools.map((tool) => tool.name).sort(),
+  ])
+}
+
+function recallNativeToolSerializationRejection(key: string, now = Date.now()): string | null {
+  const entry = nativeToolSerializationRejections.get(key)
+  if (!entry) return null
+  if (now - entry.at > NATIVE_TOOL_SERIALIZATION_REJECTION_TTL_MS) {
+    nativeToolSerializationRejections.delete(key)
+    return null
+  }
+  return entry.reason
+}
+
+function rememberNativeToolSerializationRejection(key: string, reason: string, now = Date.now()): void {
+  for (const [existingKey, entry] of nativeToolSerializationRejections) {
+    if (now - entry.at > NATIVE_TOOL_SERIALIZATION_REJECTION_TTL_MS) nativeToolSerializationRejections.delete(existingKey)
+  }
+  while (nativeToolSerializationRejections.size >= MAX_NATIVE_TOOL_SERIALIZATION_REJECTIONS) {
+    const oldest = nativeToolSerializationRejections.keys().next().value
+    if (oldest === undefined) break
+    nativeToolSerializationRejections.delete(oldest)
+  }
+  nativeToolSerializationRejections.set(key, { at: now, reason })
+}
+
+export function resetNativeToolSerializationRejections(): void {
+  nativeToolSerializationRejections.clear()
+}
+
+function buildRequiredToolRecoveryRequest(request: ChatRequest): ChatRequest {
+  return {
+    ...request,
+    tools: undefined,
+    toolChoice: undefined,
+    messages: [...request.messages, {
+      role: 'user',
+      content: [
+        '[Internal required-tool transport recovery]',
+        'The server rejected native tool serialization before producing a response. Continue the SAME assessment using the retained evidence; do not restart work.',
+        'Return exactly one JSON object: {"name":"advertised tool name","arguments":{...}}. No markdown or other text.',
+        'Select only an advertised tool. All original schema constraints, evidence requirements, and blocking outcomes still apply. Do not claim execution or approval merely because transport failed.',
+        'The application validates this selection before its ordinary policy/approval/execution or decision handler. This response does not execute a tool.',
+        JSON.stringify(request.tools),
+      ].join('\n'),
+    }],
+  }
 }
 
 async function executeAuxiliaryProviderRequest(
@@ -438,24 +637,113 @@ async function executeAuxiliaryProviderRequest(
     breaker?: ProviderCircuitBreaker
     maxRetries?: number
     transport?: AuxiliaryLlmTransport
+    sessionId?: string
+    onProgress?: () => void
   },
-  signal: AbortSignal,
+  controller: AbortController,
+  onRecovery: (error: unknown, request: ChatRequest) => void,
 ): Promise<ChatResponse> {
-  const chat = () => guardedProviderChat({
+  const signal = controller.signal
+  const remembered = recallObservedMaxOutputTokens(input.provider.id, input.request.model)
+  if (remembered !== undefined && input.request.maxTokens !== undefined && input.request.maxTokens > remembered) {
+    input = { ...input, request: { ...input.request, maxTokens: remembered } }
+  }
+  const chat = (request = input.request, maxRetries = input.maxRetries) => guardedProviderChat({
     provider: input.provider,
-    request: input.request,
+    request,
     signal,
     breaker: input.breaker,
-    maxRetries: input.maxRetries,
+    maxRetries,
   })
-  if ((input.transport ?? 'chat') === 'chat') return await chat()
+  const recoverWithEnvelope = async (
+    error: unknown,
+    source: 'rejected' | 'remembered',
+  ): Promise<ChatResponse> => {
+    const request = buildRequiredToolRecoveryRequest(input.request)
+    onRecovery(error, request)
+    const response = (input.transport ?? 'chat') === 'chat'
+      ? await chat(request, 0)
+      : await collectAuxiliaryStream({ ...input, request, maxRetries: 0, transport: 'stream', requiredControlResponse: true, onChunk: input.onProgress }, controller)
+    throwIfAborted(signal)
+    const tagged = { ...response, raw: {
+      ...response.raw, auxiliaryToolTransportRecovery: true, auxiliaryToolTransportRecoverySource: source,
+    } }
+    if (response.finishReason !== 'stop') return {
+      ...tagged, message: { role: 'assistant', content: '' },
+    }
+    try {
+      const rawEnvelope = extractContent(response.message).trim()
+      let envelope: unknown
+      try {
+        envelope = JSON.parse(rawEnvelope)
+      } catch {
+        envelope = JSON.parse(closeTruncatedJson(rawEnvelope))
+      }
+      if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) throw new Error()
+      const record = envelope as Record<string, unknown>
+      if (Object.keys(record).length !== 2 || typeof record.name !== 'string'
+        || !record.arguments || typeof record.arguments !== 'object' || Array.isArray(record.arguments)
+        || response.message.toolCalls?.length) throw new Error()
+      const tool = input.request.tools?.find(tool => tool.name === record.name)
+      if (!tool) throw new Error()
+      const validate = new Ajv({ strict: true }).compile(tool.inputSchema)
+      if (('$async' in validate && validate.$async) || validate(record.arguments) !== true) throw new Error()
+      return { ...tagged, finishReason: 'tool_use', message: {
+        role: 'assistant', content: '', toolCalls: [{ id: randomUUID(), name: tool.name,
+          arguments: record.arguments as Record<string, unknown> }],
+      } }
+    } catch {
+      return { ...tagged, message: { role: 'assistant', content: '' }, raw: {
+        ...tagged.raw, auxiliaryToolTransportError: 'Invalid required-tool recovery response',
+      } }
+    }
+  }
 
-  const streamed = await collectAuxiliaryStream(input, signal)
+  const memoryKey = nativeToolSerializationKey(input)
+  const rememberedRejection = memoryKey ? recallNativeToolSerializationRejection(memoryKey) : null
+  if (rememberedRejection !== null) {
+    return await recoverWithEnvelope(
+      new Error(`Native tool serialization was already rejected in this run: ${rememberedRejection}`),
+      'remembered',
+    )
+  }
+  let receivedChunk = false
+  let streamed: ChatResponse
+  try {
+    if ((input.transport ?? 'chat') === 'chat') return await chat()
+    streamed = await collectAuxiliaryStream({ ...input, onChunk: () => { receivedChunk = true; input.onProgress?.() } }, controller)
+  } catch (error) {
+    if (signal.aborted) throw error
+    const observedLimit = receivedChunk
+      ? null
+      : detectProviderMaxOutputTokenLimit(error, input.request.maxTokens)
+    if (observedLimit) {
+      rememberObservedMaxOutputTokens(input.provider.id, input.request.model, observedLimit)
+      const clamped = { ...input.request, maxTokens: observedLimit }
+      return (input.transport ?? 'chat') === 'chat'
+        ? await chat(clamped)
+        : await collectAuxiliaryStream({ ...input, request: clamped, onChunk: input.onProgress }, controller)
+    }
+    const status = extractProviderErrorStatusCode(error)
+    const grammarRejected = status === 400 && error instanceof Error
+      && /(?:failed to parse|invalid|unsupported) grammar|grammar (?:compilation|initialization) failed/i.test(error.message)
+    if (receivedChunk || input.request.toolChoice !== 'required' || !input.request.tools?.length
+      || (status !== undefined && status !== 400 && status !== 422)
+      || (!grammarRejected && !detectNativeToolTransportRejection(error))) throw error
+    if (memoryKey) {
+      rememberNativeToolSerializationRejection(
+        memoryKey,
+        error instanceof Error ? error.message.slice(0, 200) : 'native tool serialization rejected',
+      )
+    }
+    return await recoverWithEnvelope(error, 'rejected')
+  }
   if (
     input.transport === 'auto'
+    && streamed.finishReason === 'stop'
     && !hasUsefulAuxiliaryResponse(streamed, input.request)
   ) {
-    return await chat()
+    return combineRetryUsage(streamed, await chat())
   }
   return streamed
 }
@@ -467,10 +755,6 @@ function hasUsefulAuxiliaryResponse(
   const satisfiesVisibleResponseContract =
     extractContent(response.message).trim().length > 0
     || (response.message.toolCalls?.length ?? 0) > 0
-  // Hidden reasoning is useful for ordinary auxiliary prose, but it cannot
-  // satisfy a request that structurally requires a tool selection. In auto
-  // mode, retry that incomplete transport through chat so the provider gets
-  // one chance to return the required visible/tool envelope.
   if (request.toolChoice === 'required') {
     return satisfiesVisibleResponseContract
   }
@@ -483,8 +767,11 @@ async function collectAuxiliaryStream(
     request: ChatRequest
     breaker?: ProviderCircuitBreaker
     maxRetries?: number
+    transport?: AuxiliaryLlmTransport
+    onChunk?: () => void
+    requiredControlResponse?: boolean
   },
-  signal: AbortSignal,
+  controller: AbortController,
 ): Promise<ChatResponse> {
   let text = ''
   let thinking = ''
@@ -494,23 +781,41 @@ async function collectAuxiliaryStream(
   let finishReason: ChatResponse['finishReason'] = 'stop'
   let sawDone = false
   let sawNonTerminalChunk = false
+  let sawActionableChunk = false
+  let lastRepetitionCheck = 0
 
   for await (const chunk of guardedProviderStream({
     provider: input.provider,
     request: input.request,
-    signal,
+    signal: controller.signal,
     breaker: input.breaker,
     maxRetries: input.maxRetries,
+    allowEmptyStreamFallback: input.transport === 'auto',
   })) {
+    input.onChunk?.()
     if (chunk.type !== 'done') sawNonTerminalChunk = true
     switch (chunk.type) {
       case 'text':
+        sawActionableChunk = true
         text += chunk.text
         break
       case 'thinking':
         thinking += chunk.text
+        if ((input.requiredControlResponse || input.request.toolChoice === 'required') && !sawActionableChunk
+          && thinking.length - lastRepetitionCheck >= CONTROL_REPETITION_CHECK_STEP) {
+          lastRepetitionCheck = thinking.length
+          const repetition = hasSustainedControlCycle(thinking)
+            ? 'exact-cycle'
+            : hasStagnantControlReasoning(thinking) ? 'stagnant-reasoning' : null
+          if (repetition) {
+            const error = new AuxiliaryLlmRepetitionError(repetition)
+            controller.abort(error)
+            throw error
+          }
+        }
         break
       case 'tool_call_start': {
+        sawActionableChunk = true
         const { id, name } = chunk.toolCall
         if (!id || !name) break
         toolCalls.push({ id, name, arguments: {} })
@@ -518,12 +823,14 @@ async function collectAuxiliaryStream(
         break
       }
       case 'tool_call_delta':
+        sawActionableChunk = true
         toolCallArgs.set(
           chunk.toolCallId,
           (toolCallArgs.get(chunk.toolCallId) ?? '') + chunk.delta,
         )
         break
       case 'tool_call_end':
+        sawActionableChunk = true
         break
       case 'usage':
         usage.inputTokens += chunk.usage.inputTokens

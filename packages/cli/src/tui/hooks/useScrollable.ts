@@ -23,17 +23,12 @@ export function useScrollable(
   viewportLines: number,
 ): ScrollableApi {
   const [rawOffset, setRawOffset] = useState(0)
-  // Track whether the user has intentionally scrolled away from bottom.
-  // A ref avoids creating spurious effect dependencies.
   const userScrolledRef = useRef(false)
 
   const maxOffset = Math.max(0, totalLines - viewportLines)
 
-  // Derive the effective offset synchronously during render so clamps are
-  // visible immediately (no effect batching delay in the probe-component test).
   const offset = Math.min(rawOffset, maxOffset)
 
-  // Auto-follow bottom when new content arrives and the user hasn't scrolled.
   useEffect(() => {
     if (!userScrolledRef.current) {
       setRawOffset(0)

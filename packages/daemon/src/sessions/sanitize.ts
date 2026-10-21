@@ -1,5 +1,17 @@
 export interface SanitizeOptions {
   home: string
+  knownSecrets?: readonly string[]
+}
+
+const CREDENTIAL_ENV_NAME_RE = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY)$/i
+const MIN_KNOWN_SECRET_LENGTH = 8
+
+export function credentialValuesFromEnv(env: NodeJS.ProcessEnv = process.env): string[] {
+  const values = new Set<string>()
+  for (const [name, value] of Object.entries(env)) {
+    if (value && value.length >= MIN_KNOWN_SECRET_LENGTH && CREDENTIAL_ENV_NAME_RE.test(name)) values.add(value)
+  }
+  return [...values].sort((a, b) => b.length - a.length)
 }
 
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g
@@ -19,6 +31,9 @@ function escapeRegExp(s: string): string {
 
 export function sanitizeText(input: string, opts: SanitizeOptions): string {
   let out = input
+  for (const secret of opts.knownSecrets ?? []) {
+    if (secret.length >= MIN_KNOWN_SECRET_LENGTH && out.includes(secret)) out = out.split(secret).join('<secret>')
+  }
   if (opts.home) {
     out = out.replace(new RegExp(escapeRegExp(opts.home), 'g'), '<HOME>')
   }
@@ -36,11 +51,6 @@ export function sanitizeText(input: string, opts: SanitizeOptions): string {
     .replace(JWT_RE, '<token>')
 }
 
-// Walk an object/array tree and run sanitizeText on every string leaf. Used
-// for session-event sanitisation so secret-shaped strings cannot ride out via
-// nested fields (tool_call.input, tool_result.output, cowork_*.result/summary,
-// delegation_state.detail, provider_attempt.errorMessage, etc.) that the old
-// content-only sanitiser was leaving untouched.
 function sanitizeValueDeep(value: unknown, opts: SanitizeOptions): unknown {
   if (typeof value === 'string') return sanitizeText(value, opts)
   if (Array.isArray(value)) return value.map((v) => sanitizeValueDeep(v, opts))

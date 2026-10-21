@@ -2,13 +2,6 @@ import { getDocRegistry } from '../../agent/doc/session.js'
 import { parseOutline } from '../../agent/doc/parse.js'
 import { strictWorkspacePathViolation } from '../../security/policy-engine.js'
 
-/**
- * Shell 모드(mode='shell') 시스템 프롬프트 prefix.
- * desktop의 Shell AI 패널은 LLM 응답 안의 ```bash / ```sh / ```pwsh 등 펜스
- * 코드블록을 자동 추출해 활성 터미널에 Run 버튼으로 dispatch 한다. LLM이
- * 그 포맷에 맞게 응답하지 않으면 추출 정확도가 떨어지고 자동 실행 토글이
- * 무의미해지므로, 모드 진입 시점에 응답 형식을 명시적으로 가이드한다.
- */
 export function buildShellModePrefix(mode: string | undefined): string {
   if (mode !== 'shell') return ''
   return [
@@ -40,12 +33,6 @@ export function buildShellModePrefix(mode: string | undefined): string {
   ].join('\n')
 }
 
-/**
- * 글쓰기 모드(mode='writing') 자동 컨텍스트 prefix.
- * 활성 doc이 있을 때 system prompt에 outline + (작은 doc) 본문 + 도구 안내를
- * prepend. 사용자가 별도 button 안 눌러도 LLM이 활성 문서를 인지하고
- * doc.outline/doc.replace_section 등을 호출하게 함.
- */
 export function buildWritingDocPrefix(
   mode: string | undefined,
   writingDocId: string | undefined,
@@ -77,7 +64,6 @@ export function buildWritingDocPrefix(
         .map((e) => `[${e.index}] ${'#'.repeat(e.level)} ${e.title}  (chars ${e.start}..${e.end})`)
         .join('\n')
     : '(no headings)'
-  // 큰 문서는 outline + 앞 4000자만, 작은 문서는 전체.
   const INLINE_LIMIT = 8000
   const inlineBody =
     session.content.length <= INLINE_LIMIT

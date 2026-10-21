@@ -99,8 +99,6 @@ export async function containersPruneImpl(
 export async function containersRmImpl(deps: ContainersDeps, idOrName: string): Promise<void> {
   const copy = containersCopy()
   if (!(await requireDocker(deps))) return
-  // Resolve the container's name up front: `idOrName` may be a short ID, but
-  // the containers.jsonl metadata is keyed by name.
   const match = (await deps.listManagedContainers()).find(
     (c) => c.id === idOrName || c.name === idOrName,
   )

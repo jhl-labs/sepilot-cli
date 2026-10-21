@@ -130,11 +130,6 @@ export type PowerPointSlideNavigation =
   | { direction: 'next' | 'previous' }
   | { direction: 'index'; index: number }
 
-/**
- * Read-only PowerPoint review capability. It is separate from OfficeBridge so
- * consumers that only need the established document/edit contract do not have
- * to implement presentation window state or slide inspection.
- */
 export interface PowerPointReviewBridge {
   openReadOnly(input: { path: string }): Promise<PowerPointPresentationSnapshot>
   navigateSlide(
@@ -147,7 +142,6 @@ export interface PowerPointReviewBridge {
   }): Promise<PowerPointSlideSnapshot>
 }
 
-/** Optional visual renderer kept separate from the structured review bridge. */
 export interface PowerPointSlideCaptureBridge {
   captureSlide(input: {
     expectedPath: string
@@ -236,8 +230,6 @@ async function resolveWorkspacePresentationPath(
     const workspaceRoot = await realpath(lexicalWorkspaceRoot)
     const candidate = resolveToolPath(rawPath.trim(), context?.cwd ?? lexicalWorkspaceRoot)
 
-    // Check before and after realpath. The second check rejects a symlink inside
-    // the workspace that resolves to a file outside it.
     if (!pathIsContained(candidate, lexicalWorkspaceRoot)) {
       return presentationPathError(
         'OFFICE_OUTSIDE_WORKSPACE_USER',

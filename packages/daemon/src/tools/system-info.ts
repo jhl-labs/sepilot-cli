@@ -87,9 +87,7 @@ export interface SystemInfoSeries {
   sampleCount: number
   sampleIntervalMs: number
   observationDurationMs: number
-  /** Full first snapshot supplies constant host/capacity metadata once. */
   baseline: SystemInfoSnapshot
-  /** Dynamic values only, so long observations do not repeat host metadata. */
   samples: SystemInfoSeriesSample[]
   summary: SystemInfoSeriesSummary
 }
@@ -311,9 +309,6 @@ export function createSystemInfoTool(): ToolDefinitionRuntime {
     name: 'system.info',
     description: 'Collect current host OS CPU, memory, storage, uptime, and optional GPU information. For a bounded observation window, set sampleCount and sampleIntervalMs; the tool waits asynchronously, returns every sample plus min/max/average summaries, and is preferred over shell sleep loops or interactive monitors that need a TTY. Host-only: do not use for Kubernetes, pod, container, cluster, node, GitHub Actions runner, or orchestrated workload resource usage. Use only when the user wants current host values or a report of those values; do not use for code/program/script/dashboard/monitor implementation requests.',
     resumeSafety: 'replay-safe',
-    // Read-only OS introspection. Safe to run alongside other parallel-safe
-    // tools — pulls from /proc, statfs, and an optional nvidia-smi probe;
-    // none of these mutate host state.
     scheduling: { mode: 'parallel-safe', resource: 'system-info' },
     inputSchema: {
       type: 'object',

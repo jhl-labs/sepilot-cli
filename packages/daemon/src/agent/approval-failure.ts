@@ -4,22 +4,11 @@ import { CURRENT_AGENT_TURN_USER_METADATA_KEY } from './turn-context.js'
 export type ApprovalFailureStatus = 'denied'
 
 export const APPROVAL_FAILURE_STATUS_METADATA_KEY = 'approvalFailureStatus'
-/** Operator chose "deny & stop": the denial ends the run immediately. */
 export const APPROVAL_STOP_REQUESTED_METADATA_KEY = 'approvalStopRequested'
-/** Free-text note the operator attached to a denial. */
 export const APPROVAL_DENIAL_NOTE_METADATA_KEY = 'approvalDenialNote'
-/**
- * Provenance of a tool result that was refused before execution. Policy
- * blocks (deny rules, autonomy, workspace boundary) and approval outcomes
- * (denied, timed out, cancelled, missing handler) are friction the model must
- * route around, not evidence that the action itself fails. Loop-control
- * counters (stuck-repeat failure bucket, failed-attempt guard) skip entries
- * carrying this key; only the exact-repeat threshold still sees them.
- */
 export const TOOL_RESULT_BLOCK_SOURCE_METADATA_KEY = 'toolResultBlockSource'
 export type ToolResultBlockSource = 'policy' | 'approval'
 
-/** Number of policy/approval blocks in one run after which the model is told to stop probing. */
 export const POLICY_FRICTION_WARNING_THRESHOLD = 3
 
 export function blockSourceFromMetadata(
@@ -39,7 +28,6 @@ export function approvalFailureStatusFromDecision(
 export interface TrustedApprovalDenial {
   toolCallId?: string
   toolName?: string
-  /** True when the operator asked for the run to stop with this denial. */
   stop?: boolean
   note?: string
 }
@@ -63,7 +51,6 @@ export function isTrustedApprovalDenialResult(result: {
     && /^\s*\[approval:denied\]/iu.test(result.output)
 }
 
-/** Denial details carried on a trusted denial tool result's metadata. */
 export function trustedApprovalDenialDetails(
   metadata: ToolResultMetadata | undefined,
 ): Pick<TrustedApprovalDenial, 'stop' | 'note'> {
@@ -74,12 +61,6 @@ export function trustedApprovalDenialDetails(
   }
 }
 
-/**
- * Mutable per-run approval state shared by the react loop's tool-batch sites.
- * `denial` is set once a plain denial grants the side-effect-free turn;
- * `toolTurnsRemaining` bounds how many read-only tool turns that grace may
- * spend before the model must answer.
- */
 export interface ApprovalGraceState {
   denial: TrustedApprovalDenial | null
   toolTurnsRemaining: number
@@ -92,15 +73,6 @@ export function createApprovalGraceState(): ApprovalGraceState {
 
 export type ApprovalOutcomeAfterTools = 'terminate' | 'grace_started' | null
 
-/**
- * Inspect the tool results just appended and update the grace state:
- * - `terminate`: a `deny & stop` denial, or a second denial while a grace turn
- *   is already open — the run must end with `approval_denied`.
- * - `grace_started`: first plain denial — the grace system message was pushed
- *   and the caller should continue with a read-only catalog.
- * Also injects the policy-friction warning once the block count crosses the
- * threshold. Pure bookkeeping: no text parsing, only trusted metadata.
- */
 export function observeApprovalOutcomeAfterTools(
   messages: Message[],
   state: ApprovalGraceState,
@@ -130,11 +102,6 @@ export function observeApprovalOutcomeAfterTools(
   return outcome
 }
 
-/**
- * Return the latest operator denial in this user turn. Both the trusted
- * metadata and the bracketed status tag are required so an ordinary tool
- * cannot stop a run by spoofing denial-shaped output.
- */
 function currentTurnMessages(messages: readonly Message[]): readonly Message[] {
   let turnStart = -1
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -159,11 +126,6 @@ function currentTurnMessages(messages: readonly Message[]): readonly Message[] {
   return turnStart >= 0 ? messages.slice(turnStart) : messages
 }
 
-/**
- * Count tool results in the current user turn that were refused by policy or
- * by a human before execution. This is the run's "friction" — distinct from
- * tool failures, which the stuck/failed-attempt guards own.
- */
 export function countBlockedToolResultsInCurrentTurn(messages: readonly Message[]): number {
   let count = 0
   for (const message of currentTurnMessages(messages)) {
@@ -187,11 +149,6 @@ export function buildPolicyFrictionMessage(count: number): Message {
   }
 }
 
-/**
- * System message for the single side-effect-free turn a denial grants. The
- * tool catalog offered alongside it is filtered to read-only tools, so the
- * text and the catalog enforce the same boundary.
- */
 export function buildApprovalDenialGraceMessage(denial: TrustedApprovalDenial): Message {
   const tool = denial.toolName ?? 'the requested tool'
   return {

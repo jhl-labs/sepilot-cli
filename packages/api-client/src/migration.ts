@@ -1,13 +1,3 @@
-/**
- * Standalone factory client for the daemon's `/api/v1/migration/*`
- * routes. Mirrors the shape of `createJobsClient`: a small, fetch-
- * injectable surface intended for the CLI `migrate` facade.
- *
- * URL convention matches the rest of the api-client: every path is
- * prefixed with `/api/v1` so it lines up with how the daemon
- * registers routes (`registerMigrationRoutes(..., { prefix: '/api/v1' })`).
- */
-
 import { ApiHttpClient } from './http.js'
 
 const API_PREFIX = '/api/v1'

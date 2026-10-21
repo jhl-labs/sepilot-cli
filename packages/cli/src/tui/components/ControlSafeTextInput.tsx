@@ -130,7 +130,6 @@ export function ControlSafeTextInput({
       return
     }
 
-    // Ink 5 calls the DEL byte used by Linux Backspace `delete`.
     if (key.backspace || key.delete) {
       if (cursor > 0) {
         const previousOffset = previousGraphemeOffset(current, cursor)

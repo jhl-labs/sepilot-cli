@@ -9,10 +9,6 @@ import { setAgentTraceRotation } from './agent-trace.js'
 
 const ALLOWED_LEVELS: ReadonlyArray<LogLevel> = ['debug', 'info', 'warn', 'error']
 
-// Pushes the `logging.*` block from config.yaml (or a Settings UI PUT) into
-// the live logger module state. Called from bootstrap on startup and from
-// the settings-json mutation path so the UI can change rotation/level
-// without a daemon restart.
 export function applyLoggingConfig(
   config: LoggingConfig,
   options: { envLogLevel?: string } = {},

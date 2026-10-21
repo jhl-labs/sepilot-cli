@@ -47,11 +47,6 @@ export class ChannelRouter {
     }
   }
 
-  /**
-   * Fire the `pre:channel:msg` gate. Returns `true` when a hook aborted the
-   * message (so the caller drops it before the agent pipeline). Hook failures
-   * fail open — an errored moderation hook must not silently swallow traffic.
-   */
   private async preChannelMsgAborted(msg: IncomingMessage): Promise<boolean> {
     if (!this.runtime.hookRegistry) return false
     try {
@@ -80,7 +75,6 @@ export class ChannelRouter {
     }
   }
 
-  /** Wire a channel: messages → agent → reply back to channel */
   wireChannel(channel: IChannel): void {
     if (this.subscriptions.has(channel)) {
       return
@@ -88,9 +82,6 @@ export class ChannelRouter {
 
     const subscription = channel.onMessage(async (msg: IncomingMessage) => {
       log.info(`Message received on ${msg.channelType}`, { sender: msg.sender.id, text: msg.text.slice(0, 80) })
-      // pre:channel:msg gate — fires before the message enters the agent
-      // pipeline so a moderation/redaction hook can drop it. Previously
-      // advertised in the command-hook schema but never emitted (silent no-op).
       if (await this.preChannelMsgAborted(msg)) {
         log.info('Channel message blocked by pre:channel:msg hook', {
           channelType: msg.channelType,
@@ -109,7 +100,6 @@ export class ChannelRouter {
     this.subscriptions.delete(channel)
   }
 
-  /** Wire all channels in runtime */
   wireAll(): void {
     for (const channel of this.runtime.channels) {
       this.wireChannel(channel)

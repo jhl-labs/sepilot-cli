@@ -9,7 +9,6 @@ export function personaMemoryTags(namespace: string): string[] {
   return [`scope:user:persona-${namespace}`, `${PERSONA_MEMORY_PREFIX}${namespace}`]
 }
 
-/** A persona owns a separate memory identity for each durable caller. */
 export function resolvePersonaMemoryScope(
   baseTags: string[],
   selection: { persona?: string; personaIds?: readonly string[] },
@@ -30,7 +29,6 @@ export function resolvePersonaMemoryScope(
     : { scopeTags: baseTags }
 }
 
-/** Background runs inherit the persisted boundary, never a transport's default owner. */
 export function inheritedPersonaMemory(session: { memoryNamespace?: string; personaIds?: readonly string[] } | null | undefined, catalog: readonly Persona[]) {
   if (!session?.memoryNamespace) return undefined
   const persona = session.personaIds?.length === 1 ? catalog.find(item => item.id === session.personaIds![0] && item.memoryScope === 'isolated') : undefined

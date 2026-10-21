@@ -108,7 +108,6 @@ async function expandModeSpecificRoots(
   }
   const roots: string[] = []
   for (const entry of entries) {
-    // Do not follow symlinked mode-specific skill roots (supply-chain escape).
     if (!entry.isDirectory()) continue
     if (/^skills-[a-z0-9-]+$/i.test(entry.name)) {
       roots.push(join(configRoot, entry.name))

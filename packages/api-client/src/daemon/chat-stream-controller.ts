@@ -1,5 +1,5 @@
 import type { DaemonChatStreamPayload, DaemonMemoryContextItem } from './types.js'
-import type { RunStopReason } from '@sepilotd/core'
+import type { LiveViewRecord, RunStopReason } from '@sepilotd/core'
 import type {
   AgentState,
   ActivityItem,
@@ -20,6 +20,12 @@ import {
   summarizeMemoryContextItems,
   toolMetaFromResultStatus,
 } from './chat-surface-utils.js'
+
+export const MODEL_STREAM_WAITING_NOTICE = 'Still waiting for the model stream...'
+
+export function isModelStreamWaitingNotice(content: string | undefined): boolean {
+  return content?.trim() === MODEL_STREAM_WAITING_NOTICE
+}
 
 const INTERIM_PROGRESS_PATTERNS = [
   /\b(?:i['’]ll|i will|let me|i am going to|i'm going to)\s+(?:check|collect|gather|fetch|look|inspect|review|read|run|verify|describe|analyze|diagnose)\b/i,
@@ -126,10 +132,10 @@ export function createStreamEventController(
   options: StreamEventControllerOptions,
 ): {
   getAssistantContent: () => string
-  /** Structured stop cause of the last terminal event, if the daemon sent one. */
   getStopReason: () => RunStopReason | null
   updateAssistant: (content: string, usage?: Message['usage']) => void
   handleEvent: (event: DaemonChatStreamPayload) => void
+  settleLiveViews: () => void
 } {
   const maxActivityItems = options.maxActivityItems ?? 24
   let assistantContent = ''
@@ -231,13 +237,6 @@ export function createStreamEventController(
     bindings.setActivities((prev) => [...prev.slice(-(maxActivityItems - 1)), nextItem])
   }
 
-  // Tool/state/phase activities are pushed with a `running` (or `pending`)
-  // status and never get a terminal update — `tool_result` etc. push a fresh
-  // `result` item rather than reconciling the original. Once the run reaches a
-  // terminal state nothing is actually running anymore, so leaving those items
-  // as `running`/`pending` makes the activity summary report nonsense like
-  // "14 running · 2 waiting" long after the run finished. Settle them to a
-  // neutral status so the footer reflects reality.
   const settleLingeringActivities = () => {
     bindings.setActivities((prev) => {
       let changed = false
@@ -432,20 +431,54 @@ export function createStreamEventController(
     )
   }
 
+  const liveViews = new Map<string, LiveViewRecord>()
+  const liveViewIds = new Set<string>()
+  let liveViewsTouched = false
+  const syncLiveViews = () => {
+    liveViewsTouched = true
+    bindings.setMessages((prev) =>
+      prev.map((message) =>
+        message.id === options.assistantId
+          ? {
+              ...message,
+              views: liveViews.size > 0 ? [...liveViews.values()] : undefined,
+              liveViewIds: [...liveViewIds],
+            }
+          : message,
+      ),
+    )
+  }
+  const settleLiveViews = () => {
+    if (!liveViewsTouched) return
+    liveViewIds.clear()
+    for (const [id, record] of liveViews) {
+      if (record.still.image === '') liveViews.delete(id)
+    }
+    syncLiveViews()
+  }
+  const toLiveViewRecord = (
+    view: { id: string; kind: LiveViewRecord['kind']; title: string; subtitle?: string },
+    still: LiveViewRecord['still'],
+  ): LiveViewRecord => ({
+    id: view.id,
+    kind: view.kind,
+    title: view.title,
+    ...(view.subtitle ? { subtitle: view.subtitle } : {}),
+    still,
+  })
+
   const handleEvent = (event: DaemonChatStreamPayload) => {
     if (!('type' in event)) {
       return
     }
 
+    if (event.type === 'thinking' && isModelStreamWaitingNotice(event.content)) {
+      bindings.setStatus('Waiting for model response…')
+      return
+    }
+
     if (event.type === 'thinking') {
       bindings.setProviderWait?.(null)
-      // Reasoning providers commonly stream one token (sometimes one
-      // character) per SSE frame. Updating Ink/React state three times for
-      // every frame can saturate the terminal renderer while the model/GPU is
-      // healthy. Preserve every delta in the transport and trace, but render a
-      // bounded rolling segment at most once per interval. The first delta is
-      // immediate and the last pending delta is flushed before the next
-      // non-thinking event, so sparse streams and final text are never lost.
       thinkingSegment = `${thinkingSegment}${event.content ?? ''}`.slice(-2_000)
       thinkingUiDirty = true
       flushThinkingUi(false)
@@ -587,21 +620,29 @@ export function createStreamEventController(
         })
         break
       }
-      case 'router_decision':
-        bindings.setStatus(`Router: ${event.decision.mode}/${event.decision.persona}`)
+      case 'router_decision': {
+        const decision = event.decision
+        const routedPersona = decision.persona && decision.persona !== 'default'
+          ? decision.persona
+          : undefined
+        const routeLabel = routedPersona
+          ? `Routed to: ${routedPersona} · ${decision.mode}`
+          : `Router: ${decision.mode}`
+        bindings.setStatus(routeLabel)
         pushActivity({
           id: options.createId(),
           kind: 'state',
-          label: `Router: ${event.decision.mode}/${event.decision.persona}`,
-          detail: summarizeText(event.decision.reason || 'No router rationale provided.'),
-          status: event.decision.fallback ? 'error' : 'neutral',
+          label: routeLabel,
+          detail: summarizeText(decision.reason || 'No router rationale provided.'),
+          status: decision.fallback ? 'error' : 'neutral',
           meta: [
-            event.decision.confidence,
-            event.decision.fallback ? 'fallback' : '',
-            formatSkillMeta(event.decision.skillIds) ?? '',
+            decision.confidence,
+            decision.fallback ? 'fallback' : '',
+            formatSkillMeta(decision.skillIds) ?? '',
           ].filter(Boolean).join(' · '),
         })
         break
+      }
       case 'mode_route_decision':
         bindings.setStatus(`Mode route: ${event.chosen}${event.persona ? `/${event.persona}` : ''}`)
         pushActivity({
@@ -788,12 +829,7 @@ export function createStreamEventController(
         })
         break
       case 'subagent_progress': {
-        // Nested activity from a dispatched subagent. Surface it as its own
-        // activity row so a long (or parallel) subagent isn't a silent gap.
         const inner = event.inner
-        // Keep consent actionable in the parent view, but route the response
-        // to the child session. Namespace display ids (providers may reuse
-        // tool-call ids across isolated engines); never change requestId.
         if (inner.type === 'approval_request') {
           handleEvent({ ...inner, sessionId: event.subagentId, toolCall: {
             ...inner.toolCall, id: `${event.subagentId}:${inner.toolCall.id}`,
@@ -908,10 +944,6 @@ export function createStreamEventController(
         break
       }
       case 'auto_approval': {
-        // Surface a positive activity item so the operator sees *why* a
-        // tool ran without a consent prompt — without it accumulated
-        // session/always rules look like the daemon silently skipped
-        // consent.
         const toolName = event.toolCall?.name ?? 'tool'
         const verdict = event.decision === 'approved' ? 'auto-approved' : 'auto-denied'
         pushActivity({
@@ -955,9 +987,6 @@ export function createStreamEventController(
           status: event.status === 'success' ? 'success' : 'error',
           detail: summarizeText(event.output),
         }
-        // A completed tool must immediately cease to be the live activity.
-        // Otherwise the footer keeps saying "Running fs.glob…" while the
-        // graph is actually waiting on its next model/planner node.
         settleToolActivity(lastToolOutcome.toolName, lastToolOutcome.status)
         bindings.setStatus(
           lastToolOutcome.status === 'success'
@@ -1143,12 +1172,6 @@ export function createStreamEventController(
         break
       }
       case 'post_edit_findings': {
-        // Splits diagnostics into `[caller]`-prefixed (downstream files
-        // the edit broke) and the rest (the edited file's own LSP
-        // issues). Activity panels highlight broken callers because
-        // those are the strongest "you broke something" signal —
-        // without surfacing it the operator only sees the eventual
-        // model self-correction one turn later.
         const findings = event as {
           editedFiles?: string[]
           reverseCallers?: string[]
@@ -1178,6 +1201,32 @@ export function createStreamEventController(
         })
         break
       }
+      case 'view_attached':
+        liveViewIds.add(event.view.id)
+        if (!liveViews.has(event.view.id)) {
+          liveViews.set(
+            event.view.id,
+            toLiveViewRecord(event.view, {
+              viewId: event.view.id,
+              image: '',
+              width: 0,
+              height: 0,
+              capturedAt: 0,
+            }),
+          )
+        }
+        syncLiveViews()
+        break
+      case 'view_still':
+        liveViewIds.add(event.view.id)
+        liveViews.set(event.view.id, toLiveViewRecord(event.view, event.still))
+        syncLiveViews()
+        break
+      case 'view_detached':
+        liveViewIds.delete(event.viewId)
+        if (liveViews.get(event.viewId)?.still.image === '') liveViews.delete(event.viewId)
+        syncLiveViews()
+        break
       case 'message':
         assistantContent = event.content ?? assistantContent
         bindings.setStatus(null)
@@ -1187,14 +1236,11 @@ export function createStreamEventController(
         if (completionHandled) break
         completionHandled = true
         recordStopReason(event.stopReason)
-        // Bare-empty run: mirrors the final branch of
-        // buildCompletionAssistantContent (nothing streamed, no tool outcome,
-        // no superseded progress) — the placeholder fallback text is all the
-        // user would get, so let the surface escalate to an error/retry state.
         const bareEmpty =
           !assistantContent.trim() && !lastToolOutcome && !lastSupersededProgress
         bindings.setAgentState('done')
         bindings.setStatus(null)
+        settleLiveViews()
         updateAssistant(
           buildCompletionAssistantContent(),
           normalizeUsage(event.usage),
@@ -1216,11 +1262,13 @@ export function createStreamEventController(
       }
       case 'error': {
         const detail = event.error?.message ?? options.errorFallbackText
+        const shown = options.formatErrorMessage?.(detail) ?? detail
         recordStopReason(event.error?.stopReason)
         bindings.setAgentState('error')
         bindings.setStatus(null)
-        bindings.setError(options.formatErrorMessage?.(detail) ?? detail)
-        updateAssistant(assistantContent || options.errorFallbackText)
+        bindings.setError(shown)
+        settleLiveViews()
+        updateAssistant(assistantContent || (event.error?.message ? `${options.errorFallbackText.replace(/[.。]$/, '')}: ${shown}` : options.errorFallbackText))
         settleLingeringActivities()
         pushActivity({
           id: options.createId(),
@@ -1241,5 +1289,6 @@ export function createStreamEventController(
     getStopReason: () => stopReason,
     updateAssistant,
     handleEvent,
+    settleLiveViews,
   }
 }

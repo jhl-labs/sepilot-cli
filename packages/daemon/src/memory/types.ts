@@ -391,17 +391,7 @@ export interface SemanticMemoryStore
   runMaintenance(options?: MemoryMaintenanceOptions): Promise<MemoryMaintenanceResult>
   recordAudit(input: MemoryAuditRecordInput): Promise<MemoryAuditEntry>
   listAudit(options?: MemoryAuditListOptions): Promise<MemoryAuditEntry[]>
-  /**
-   * Delete every memory row (and its vector rows) derived from a given session.
-   * Used by complete session deletion so a removed session leaves no orphaned
-   * memory entries or embeddings behind. Returns the number of rows removed.
-   */
   deleteBySession(sessionId: string): Promise<number>
-  /**
-   * Delete every memory row (and its vector rows) last updated before an ISO
-   * cutoff. Used by the retention sweeper to age out old memory. Returns the
-   * number of rows removed.
-   */
   deleteOlderThan(cutoffIso: string): Promise<number>
   backfill(batchSize?: number): Promise<number>
   reindex(batchSize?: number): Promise<number>

@@ -22,6 +22,8 @@ import type { ScheduledAgentSkillRef } from '@sepilotd/api-client'
 import type { SepilotdConfig } from '../../config/schema.js'
 import { resolveRunIterationBudget } from '../../agent/iteration-budget.js'
 import { AgentEngine } from '../../agent/engine.js'
+import { stopReasonProviderError } from '../../agent/stop-reason.js'
+import { buildProviderInstance, createProviderFactoryRegistry } from './providers.js'
 import { createAgentOutputTracker } from '../../agent/event-output.js'
 import { registerBuiltinGraphs, builtinGraphBuilders } from '../../agent/graph/presets/index.js'
 import {
@@ -30,6 +32,7 @@ import {
   type BaseGraphBuilders,
 } from '../../agent/user-agents/loader.js'
 import { UserCommandStore } from '../../agent/user-commands/loader.js'
+import { RoleBotRegistry } from '../../agent/bots/registry.js'
 import { GraphAgentRegistry } from '../../agent/graph/registry.js'
 import { YamlGraphAgentLoader } from '../../agent/graph/yaml-loader.js'
 import { MdnsDiscovery } from '../../discovery/mdns.js'
@@ -54,6 +57,7 @@ import { SchedulerEngine, type JobExecutionResult } from '../../scheduler/engine
 import { ScheduledDeliveryTracker } from '../../scheduler/delivery-control.js'
 import { createSchedulerExecutor, type ChannelLookup } from '../../scheduler/executor.js'
 import { createScriptMonitorRunner, scriptMonitorConfigFromMetadata } from '../../scheduler/script-monitor.js'
+import type { SchedulerRunFinished } from '../../event-routing/producers/scheduler.js'
 import { scheduledAgentExecutionResult } from '../../scheduler/agent-outcome.js'
 import {
   createSchedulerDeliveryOutbox,
@@ -62,7 +66,7 @@ import {
 } from '../../scheduler/delivery-outbox.js'
 import { createInternalJobRunner, ensureInternalJobs } from '../../scheduler/internal-jobs.js'
 import { schedulerNotificationAudience } from '../../scheduler/notification-subscriptions.js'
-import { nextRecurringRun, parseWhen, SchedulerParseError } from '../../scheduler/time-parser.js'
+import { nextScheduledRun, parseWhen, SchedulerParseError } from '../../scheduler/time-parser.js'
 import { createNotificationsRepo } from '../../notifications/repo.js'
 import { SessionInbox } from './session-inbox.js'
 import { createObservabilityRepo } from '../../observability/events.js'
@@ -168,9 +172,8 @@ export function buildUpdater(): UpdateChecker {
 export interface SchedulerStackDeps {
   channels: IChannel[]
   channelPipelineCapabilities: ChannelPipelineCapabilities
-  providerRegistry: Pick<ProviderRegistry, 'getDefault'>
+  providerRegistry: Pick<ProviderRegistry, 'getDefault'> & Partial<Pick<ProviderRegistry, 'get' | 'register'>>
   toolRegistry: ToolRegistry
-  /** Registry used to rehydrate explicitly selected skills for scheduled runs. */
   skillRegistry?: ISkillRegistry
   policyEngine: PolicyEngine
   sessions: ISessionStore
@@ -179,18 +182,7 @@ export interface SchedulerStackDeps {
   dreaming: DreamingEngine
   semanticIndex: SemanticMemoryStore
   config: SepilotdConfig
-  /**
-   * Re-establish the standing approval an unattended job carries. The
-   * `unattended` column survives restarts; the in-memory grant does not, so the
-   * executor replays it before each fire.
-   */
   grantUnattendedApproval?: (schedulerSessionId: string) => void
-  /**
-   * Resolve a tool approval for a headless scheduled run. Without it the
-   * engine has no approval handler at all, so every tool that needs consent
-   * fails outright — including on an unattended job, whose whole point is a
-   * standing grant the registry already holds.
-   */
   waitForApproval?: (args: {
     sessionId: string
     toolCall: ToolCall
@@ -199,6 +191,7 @@ export interface SchedulerStackDeps {
     forcePrompt?: boolean
     signal?: AbortSignal
   }) => ApprovalDecision | Promise<ApprovalDecision>
+  onRunFinished?: (finished: SchedulerRunFinished) => void
 }
 
 export interface SchedulerStack {
@@ -206,7 +199,6 @@ export interface SchedulerStack {
   engine: SchedulerEngine
   deliveryWorker: SchedulerDeliveryWorker
   parseWhen: typeof parseWhen
-  /** IANA timezone applied to cron jobs that don't carry their own. */
   defaultTimezone: string
   triggerSchedulerJob: (id: string, options?: ManualJobRunOptions) => Promise<ManualJobRunResult>
 }
@@ -218,7 +210,6 @@ function resolveDefaultTimezone(config: SepilotdConfig): string {
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
     if (tz) return tz
   } catch {
-    /* fall through */
   }
   return 'UTC'
 }
@@ -233,6 +224,7 @@ function normalizeManualSchedulerResult(
   output: string | void
   outcome: 'complete' | 'incomplete'
   failureReason?: string
+  stopReason?: RunStopReason
 } {
   if (typeof result === 'string' || result == null) {
     return { output: result ?? undefined, outcome: 'complete' }
@@ -243,6 +235,7 @@ function normalizeManualSchedulerResult(
     ...(result.outcome === 'incomplete' && result.failureReason?.trim()
       ? { failureReason: result.failureReason.trim() }
       : {}),
+    ...(result.stopReason ? { stopReason: result.stopReason } : {}),
   }
 }
 
@@ -259,7 +252,31 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
     dreaming,
     semanticIndex,
     config,
+    onRunFinished,
   } = deps
+
+  const notifyRunFinished = (
+    job: ScheduledJob,
+    run: { id: string; durationMs: number | null; error: string | null; outputExcerpt: string | null; stopReason?: string | null; agentSessionId?: string | null },
+    status: SchedulerRunFinished['status'],
+    trigger: SchedulerRunFinished['trigger'],
+    willRetry?: boolean,
+  ): void => {
+    if (!onRunFinished) return
+    if (job.instruction.startsWith('__internal:')) return
+    if (scriptMonitorConfigFromMetadata(job.metadata)) return
+    try {
+      onRunFinished({
+        job: { id: job.id, name: job.name, kind: job.kind, channelType: job.channelType },
+        run,
+        status,
+        trigger,
+        ...(willRetry !== undefined ? { willRetry } : {}),
+      })
+    } catch (error) {
+      log.error('scheduler onRunFinished listener threw', { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
 
   const jobStore = createJobStore()
   const deliveryOutbox = createSchedulerDeliveryOutbox()
@@ -339,18 +356,12 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
     },
     retention: {
       prune() {
-        // Observability prune honours the configured retentionDays; notification
-        // prune uses its own age ceiling + newest-K cap.
         createObservabilityRepo().prune()
         notifications.prune()
       },
     },
   })
 
-  /**
-   * A scheduled run has no per-request model, so it must fall back to the same
-   * model the user actually configured rather than an arbitrary catalog entry.
-   */
   const resolveHeadlessModelId = (
     provider: { models: ReadonlyArray<{ id: string }> },
   ): string => {
@@ -374,7 +385,19 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       suppressDelivery?: boolean
     },
   ): Promise<string | void | JobExecutionResult> => {
-    const provider = providerRegistry.getDefault()
+    const configuredProviderId = config.agent.defaultProvider?.trim()
+    let provider = configuredProviderId
+      ? providerRegistry.get?.(configuredProviderId)
+      : providerRegistry.getDefault()
+    if (!provider && configuredProviderId) {
+      const configuredProvider = config.providers.find((entry) => entry.id === configuredProviderId)
+      if (configuredProvider) {
+        const built = buildProviderInstance(configuredProvider, createProviderFactoryRegistry())
+        if (built.provider) {
+          provider = providerRegistry.register?.(configuredProviderId, built.provider) ?? built.provider
+        }
+      }
+    }
     if (!provider) {
       throw new Error('SCHEDULER_NO_PROVIDER: no default provider configured')
     }
@@ -449,19 +472,11 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       auditLogger,
       deviceName: config.device.name,
       usageTracker: deps.channelPipelineCapabilities.usageTracker,
-      // A scheduled run collects before it reports, so it needs more turns than
-      // an interactive chat answer. On the engine default of 10 a nightly
-      // briefing over 13 tickers exhausted the budget and reported INCOMPLETE
-      // with its report already written to disk.
       maxIterations: schedulerBudget.maxIterations,
       maxContinuationCycles: schedulerBudget.maxContinuationCycles,
       strictFinalAnswerProtocol:
         process.env.SEPILOTD_STRICT_ANSWER_PROTOCOL === '1'
         || Boolean(skillContext.systemPrompt?.trim()),
-      // Nobody is at the screen for a scheduled run, but the registry still
-      // holds the standing grant an unattended job carries, and a job without
-      // one should reach the surface's approval prompt rather than fail on the
-      // spot with "no approval handler".
       ...(waitForApproval
         ? {
             approvalCallback: (toolCall, requestId, options) =>
@@ -479,6 +494,8 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
     const deliveryTracker = new ScheduledDeliveryTracker()
     const usage: TokenUsage = { inputTokens: 0, outputTokens: 0 }
     let runStopReason: RunStopReason | undefined
+    let runError: string | undefined
+    let observedDone = false
     const stopOnAbort = (): void => {
       void engine.stop().catch(() => undefined)
     }
@@ -486,15 +503,8 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       opts.signal?.throwIfAborted()
       opts.signal?.addEventListener('abort', stopOnAbort, { once: true })
       for await (const event of engine.run(instruction, {
-        // Approval authority remains stable per job, but all execution-scoped
-        // tool state and evidence use the unique persisted run session.
         sessionId: opts.agentSessionId ?? opts.sessionId,
         provider: provider.id,
-        // `models[0]` is whatever order the provider returned — alphabetical for
-        // Ollama — so a scheduled run could execute on a completely different
-        // model from the one the user configured, including one that cannot call
-        // tools. Prefer the configured default and fall back only if it is not
-        // in the catalog.
         model: selectedModel,
         channelContext: opts.channelContext,
         ...(parentMemory ? { scopeTags: parentMemory.scopeTags } : {}),
@@ -518,7 +528,11 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
         }
         outputTracker.consume(event)
         deliveryTracker.consume(event)
+        if (event.type === 'error') {
+          runError = `${event.error.code}: ${event.error.message}`
+        }
         if (event.type === 'done') {
+          observedDone = true
           usage.inputTokens = event.usage.inputTokens
           usage.outputTokens = event.usage.outputTokens
           runStopReason = event.stopReason
@@ -526,12 +540,24 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       }
       opts.signal?.throwIfAborted()
     } catch (error) {
-      await abandonAuditSession()
-      throw error
+      if (opts.signal?.aborted) {
+        await abandonAuditSession()
+        throw error
+      }
+      runError = error instanceof Error ? error.message : String(error)
     } finally {
       opts.signal?.removeEventListener('abort', stopOnAbort)
     }
-    const finalContent = outputTracker.finalContent().trim()
+    if (runError || !observedDone) {
+      runStopReason = stopReasonProviderError({
+        layer: 'scheduler',
+        summary: runError ?? 'Scheduled agent ended without a terminal done event.',
+      })
+    }
+    const failed = runStopReason?.kind === 'error'
+    const finalContent = failed
+      ? `INCOMPLETE: ${runStopReason?.summary ?? 'Scheduled agent failed.'}`
+      : outputTracker.finalContent().trim()
     if (opts.agentSessionId) {
       try {
         if (finalContent) {
@@ -560,18 +586,16 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
         throw error
       }
     }
-    // These two exits also end a run, so they carry the cause as well —
-    // otherwise a job that produced no final answer records nothing to explain
-    // why. Recording it does not by itself reclassify the run.
     const headlessExit = (): JobExecutionResult | undefined => {
       const carriesUsage = hasSchedulerUsage(usage)
       if (!carriesUsage && !runStopReason) return undefined
-      return {
+      return scheduledAgentExecutionResult({
+        rawOutput: '',
         ...(carriesUsage ? { usage } : {}),
         ...(runStopReason ? { stopReason: runStopReason } : {}),
-      }
+      })
     }
-    if (deliveryTracker.shouldSuppress()) {
+    if (!failed && deliveryTracker.shouldSuppress()) {
       return headlessExit()
     }
     if (!finalContent) {
@@ -592,12 +616,6 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
             origin: 'scheduler',
           })
         } else {
-          // The chat the job was created from was deleted while the job stayed
-          // enabled. Restore it under the same id rather than dropping the
-          // output: the job is still live, so the conversation it belongs to
-          // should come back with it — that is where the user asked for this
-          // and where they will look for it. Dropping the result instead left
-          // a job that ran forever with nowhere to report.
           const now = new Date().toISOString()
           await sessions.create({
             id: opts.parentSessionId,
@@ -630,8 +648,6 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       }
     }
 
-    // A job with no channel binding runs through this headless path, so without
-    // carrying the stop reason here the common case records no cause at all.
     return scheduledAgentExecutionResult({
       rawOutput: finalContent,
       usage,
@@ -651,11 +667,12 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       updateMetadata(jobId, metadata) {
         jobStore.updateMetadata(jobId, metadata)
       },
-      notify(input) {
+      async notify(input) {
         const job = jobStore.get(input.jobId)
         if (job?.parentSessionId && !job.channelType && !job.channelTarget) {
           new SessionInbox().tryPublish({ sessionId: job.parentSessionId, source: 'monitor', sourceId: job.id,
             eventKey: input.id, title: input.title, body: input.body })
+          await appendSchedulerChatProgress(job, input.body)
         }
         publishSchedulerRunNotification({
           ...input,
@@ -684,16 +701,27 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
     enabled: () => config.scheduler?.enabled !== false,
     dailyTokenBudget: () => config.scheduler?.dailyTokenBudget,
     onEvent: (event) => {
-      // Surface scheduler outcomes as in-app notifications. We notify on:
-      //   - permanent failure (any kind of job)
-      //   - missed one-shots (one-shot is implicit for `missed`)
-      //   - successful completion of a one-shot job
-      //   - successful completion of a parent-chat recurring job that produced output
-      // Internal maintenance jobs (__internal:*) log on their own — skip those
-      // across the board.
       try {
-        if (event.type === 'failed' && !event.willRetry) {
+        if (event.type === 'failed') {
           const job = jobStore.get(event.jobId)
+          if (job) {
+            const run = jobStore.getRun(job.id, event.runId)
+            notifyRunFinished(
+              job,
+              {
+                id: event.runId,
+                durationMs: event.durationMs,
+                error: event.reason,
+                outputExcerpt: run?.outputExcerpt ?? null,
+                stopReason: run?.stopKind ?? null,
+                agentSessionId: run?.agentSessionId ?? null,
+              },
+              'failed',
+              'scheduled',
+              event.willRetry,
+            )
+          }
+          if (event.willRetry) return
           if (job?.instruction.startsWith('__internal:')) return
           publishSchedulerRunNotification({
             title: `Scheduled task failed: ${job?.name ?? event.jobId}`,
@@ -732,22 +760,36 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
             audience: null,
             priority: 'high',
           })
+        } else if (event.type === 'interrupted') {
+          const job = jobStore.get(event.jobId)
+          if (!job) return
+          notifyRunFinished(
+            job,
+            { id: event.runId, durationMs: null, error: event.reason, outputExcerpt: null },
+            'interrupted',
+            'scheduled',
+          )
         } else if (event.type === 'completed') {
           const job = jobStore.get(event.jobId)
           if (!job) return
+          const latestRun = jobStore.getRun(job.id, event.runId) ?? jobStore.listRuns(job.id, 1)[0]
+          notifyRunFinished(
+            job,
+            {
+              id: event.runId,
+              durationMs: event.durationMs,
+              error: latestRun?.error ?? null,
+              outputExcerpt: latestRun?.outputExcerpt ?? null,
+              stopReason: latestRun?.stopKind ?? null,
+              agentSessionId: latestRun?.agentSessionId ?? null,
+            },
+            job.status === 'cancelled' ? 'cancelled' : 'succeeded',
+            'scheduled',
+          )
           if (job.instruction.startsWith('__internal:')) return
-          // Script monitors own transition/reminder delivery. A generic
-          // completion notification on every probe would defeat deduplication.
           if (scriptMonitorConfigFromMetadata(job.metadata)) return
           const seconds = Math.max(1, Math.round(event.durationMs / 1000))
-          const latestRun = jobStore.listRuns(job.id, 1)[0]
           const output = latestRun?.outputExcerpt?.trim()
-          // A recurring run that produced nothing to read stays quiet — there is
-          // no result to deliver and a heartbeat every few minutes is noise.
-          // But anything the run did produce has to reach the user: a job
-          // created from the scheduler UI has no parent chat to fall back on,
-          // so gating on `parentSessionId` made every such job run invisibly
-          // forever, which is indistinguishable from a scheduler that is broken.
           if (job.kind !== 'oneshot' && !output) return
           publishSchedulerRunNotification({
             title: `Scheduled task completed: ${job.name ?? event.jobId}`,
@@ -761,14 +803,10 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
           })
         }
       } catch {
-        // notifications are best-effort — never let one break the scheduler tick.
       }
     },
   })
 
-  // Reconcile internal recurring jobs to configuration. LLM-backed memory
-  // work is opt-in; only the bounded retention sweep remains on by default.
-  // "6h" → "0 */6 * * *" via scheduleToCron.
   const dreamingSchedule = memoryDreaming.schedule ?? '6h'
   const maintenanceSchedule = memoryMaintenance.schedule ?? '1d'
   const userProfile = config.memory.userProfile ?? { enabled: false, schedule: '1d', section: 'User Profile' }
@@ -811,7 +849,7 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
     }
 
     try {
-      const next = nextRecurringRun(job.cron, Date.now(), timezoneForJob(job))
+      const next = nextScheduledRun(job.cron, Date.now(), timezoneForJob(job), job.metadata)
       if (error) jobStore.rescheduleAfterFailure(job.id, next, startedAt, error)
       else jobStore.updateNextRun(job.id, next, startedAt)
     } catch (err) {
@@ -829,16 +867,14 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
     job: ScheduledJob,
     startedAt: number,
     error: string | null,
-  ): void => {
-    // A late manual result must not undo cancellation or a definition edit.
-    // Pause retains running status and its enabled=false flag survives finalization.
-    if (jobStore.get(job.id)?.status !== 'running') return
+  ): boolean => {
+    if (jobStore.get(job.id)?.status !== 'running') return false
     const scheduledFireWasDue = job.nextRunAt <= startedAt
 
     if (!scheduledFireWasDue) {
       if (error) jobStore.rescheduleAfterFailure(job.id, job.nextRunAt, startedAt, error)
       else jobStore.updateNextRun(job.id, job.nextRunAt, startedAt)
-      return
+      return false
     }
 
     if (!error) {
@@ -847,7 +883,7 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       } else {
         advanceManualRecurringJob(job, startedAt, null)
       }
-      return
+      return false
     }
 
     const attemptNo = job.attempt + 1
@@ -858,7 +894,7 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
     })
     if (retryAt != null) {
       jobStore.markRetry(job.id, retryAt, attemptNo, error)
-      return
+      return true
     }
 
     if (job.kind === 'oneshot') {
@@ -866,6 +902,7 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
     } else {
       advanceManualRecurringJob(job, startedAt, error)
     }
+    return false
   }
 
   const executeManualSchedulerJob = async (
@@ -875,9 +912,10 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
     options: ManualJobRunOptions,
   ): Promise<ManualJobRunResult> => {
     try {
-      const { output, outcome, failureReason } = normalizeManualSchedulerResult(
+      const { output, outcome, failureReason, stopReason } = normalizeManualSchedulerResult(
         await executor(job, {
           runId,
+          forceReport: true,
           ...(options.suppressDelivery ? { suppressDelivery: true } : {}),
         }),
       )
@@ -890,8 +928,26 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
           outputExcerpt: typeof output === 'string' && output.trim().length > 0
             ? output
             : null,
+          ...(stopReason ? { stopReason } : {}),
         })
-        finalizeManualSchedulerJob(job, startedAt, reason)
+        const willRetry = finalizeManualSchedulerJob(job, startedAt, reason)
+        {
+          const finishedRun = jobStore.getRun(job.id, runId)
+          notifyRunFinished(
+            job,
+            {
+              id: runId,
+              durationMs,
+              error: reason,
+              outputExcerpt: finishedRun?.outputExcerpt ?? null,
+              stopReason: finishedRun?.stopKind ?? null,
+              agentSessionId: finishedRun?.agentSessionId ?? null,
+            },
+            'failed',
+            'manual',
+            willRetry,
+          )
+        }
         if (!options.suppressDelivery && !job.instruction.startsWith('__internal:')) {
           try {
             publishSchedulerRunNotification({
@@ -902,7 +958,6 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
               audience: schedulerNotificationAudience(job),
             })
           } catch {
-            // notification is best-effort
           }
         }
         return {
@@ -916,9 +971,26 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       jobStore.recordRunFinish(runId, 'success', {
         durationMs,
         outputExcerpt: typeof output === 'string' && output.trim().length > 0 ? output : null,
+        ...(stopReason ? { stopReason } : {}),
       })
       finalizeManualSchedulerJob(job, startedAt, null)
-      if (!options.suppressDelivery && !job.instruction.startsWith('__internal:')) {
+      {
+        const finishedRun = jobStore.getRun(job.id, runId)
+        notifyRunFinished(
+          job,
+          {
+            id: runId,
+            durationMs,
+            error: null,
+            outputExcerpt: finishedRun?.outputExcerpt ?? null,
+            stopReason: finishedRun?.stopKind ?? null,
+            agentSessionId: finishedRun?.agentSessionId ?? null,
+          },
+          jobStore.get(job.id)?.status === 'cancelled' ? 'cancelled' : 'succeeded',
+          'manual',
+        )
+      }
+      if (!options.suppressDelivery && !job.instruction.startsWith('__internal:') && !scriptMonitorConfigFromMetadata(job.metadata)) {
         try {
           const outputText = typeof output === 'string' ? output.trim() : ''
           const seconds = Math.max(1, Math.round(durationMs / 1000))
@@ -932,7 +1004,6 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
             audience: schedulerNotificationAudience(job),
           })
         } catch {
-          // notification is best-effort
         }
       }
       return {
@@ -946,7 +1017,24 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
       const reason = err instanceof Error ? err.message : String(err)
       const durationMs = Date.now() - startedAt
       jobStore.recordRunFinish(runId, 'failed', { durationMs, error: reason })
-      finalizeManualSchedulerJob(job, startedAt, reason)
+      const willRetry = finalizeManualSchedulerJob(job, startedAt, reason)
+      {
+        const finishedRun = jobStore.getRun(job.id, runId)
+        notifyRunFinished(
+          job,
+          {
+            id: runId,
+            durationMs,
+            error: reason,
+            outputExcerpt: finishedRun?.outputExcerpt ?? null,
+            stopReason: finishedRun?.stopKind ?? null,
+            agentSessionId: finishedRun?.agentSessionId ?? null,
+          },
+          'failed',
+          'manual',
+          willRetry,
+        )
+      }
       if (!options.suppressDelivery && !job.instruction.startsWith('__internal:')) {
         try {
           publishSchedulerRunNotification({
@@ -957,7 +1045,6 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
             audience: schedulerNotificationAudience(job),
           })
         } catch {
-          // notification is best-effort
         }
       }
       return {
@@ -970,12 +1057,6 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
     }
   }
 
-  /**
-   * Returns a rejected result when the job could not be locked for a run — it
-   * is already running, or paused/disabled. Every started run returns its
-   * canonical persisted identity. Callers may observe completion through run
-   * history instead of holding one heartbeat-free HTTP request open.
-   */
   const triggerSchedulerJob = async (
     id: string,
     options: ManualJobRunOptions = {},
@@ -1064,6 +1145,7 @@ export interface GraphRegistryServices {
   graphAgentLoader?: YamlGraphAgentLoader
   userAgentLoader?: UserAgentLoader
   userCommandStore?: UserCommandStore
+  roleBots: RoleBotRegistry
 }
 
 const baseBuilderAdapter: BaseGraphBuilders = {
@@ -1076,8 +1158,11 @@ export async function buildGraphRegistry(
 ): Promise<GraphRegistryServices> {
   const graphRegistry = new GraphAgentRegistry()
   registerBuiltinGraphs(graphRegistry)
+  const knownEngines = () => graphRegistry.list().map((graph) => graph.id)
   if (!dataDir) {
-    return { graphRegistry }
+    const roleBots = new RoleBotRegistry({ knownEngines })
+    await roleBots.init()
+    return { graphRegistry, roleBots }
   }
 
   const graphAgentLoader = new YamlGraphAgentLoader(
@@ -1098,11 +1183,15 @@ export async function buildGraphRegistry(
   })
   await userCommandStore.loadAll()
 
+  const roleBots = new RoleBotRegistry({ botsDir: join(dataDir, 'bots'), knownEngines })
+  await roleBots.init()
+
   return {
     graphRegistry,
     graphAgentLoader,
     userAgentLoader,
     userCommandStore,
+    roleBots,
   }
 }
 

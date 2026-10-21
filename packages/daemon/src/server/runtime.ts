@@ -1,11 +1,13 @@
 import { createJournalTools } from '../tools/journal.js'
 import { forgetAllOwnedMemory } from '../memory/forget-all.js'
+import { forgetSelectedMemory } from '../memory/forget-selected.js'
 import { readFile } from 'node:fs/promises'
 import type { SepilotdConfig } from '../config/schema.js'
 import { parseConfig } from '../config/loader.js'
 import { applyRuntimeChannelEnvironment } from '../config/runtime-channel-env.js'
 import { applyRuntimeGatewayEnvironment } from '../config/runtime-gateway-env.js'
 import { ChannelRouter } from '../channels/router.js'
+import { externalCliFromEngine } from '../external-cli/executor.js'
 import { createLogger } from '../logger.js'
 import { createNotificationRelayDeliveryWorker } from '../notifications/publish.js'
 import { planProviderDispatcher } from '../providers/http-timeout.js'
@@ -23,6 +25,7 @@ import {
 import { buildSkillRegistry, buildSkillStore, buildMarketplaceCatalog } from './runtime/storage.js'
 import { assembleStorageLayer } from './runtime/storage-layer.js'
 import { assembleSecurityLayer } from './runtime/security-layer.js'
+import { applyBrowserSitePolicy, prepareToolPolicyUpdate } from './runtime/security.js'
 import { assembleAgentLayer } from './runtime/agent-layer.js'
 import { assembleIntegrationLayer } from './runtime/integration-layer.js'
 import { assembleMcpLayer } from './runtime/mcp-layer.js'
@@ -43,6 +46,7 @@ import { MarketplaceSource } from '../skills/sources/marketplace.js'
 import { createInstallPipeline } from '../skills/install-pipeline.js'
 import { SkillSourceUrlPolicy } from '../skills/source-url-policy.js'
 import { buildToolRegistry } from './runtime/tools.js'
+import { createToolOutputReadTool } from '../tools/tool-output-read.js'
 import {
   registerDelegationRuntimeTool,
   registerMicroAppsRuntimeTools,
@@ -162,7 +166,7 @@ import {
   removeTmuxSession,
 } from '../agent/swarm/reaper.js'
 import { cleanAnsi } from '../agent/swarm/tmux/capture.js'
-import { buildSystemPrompt } from '../agent/system-prompt.js'
+import { buildDeferredSystemPrompt } from '../agent/system-prompt.js'
 import { buildSwarmSupervisorTaskPrompt } from '../agent/swarm/system-prompt.js'
 import { evaluateSwarmKeyForwarding } from '../security/swarm-key-policy.js'
 import { randomBytes } from 'node:crypto'
@@ -202,10 +206,6 @@ export async function buildRuntime(
     secretVault,
   } = await assembleSecurityLayer({ config, dataDir })
 
-  // Independent I/O-bound builders — run concurrently so a slow gateway probe
-  // does not serialize ahead of the skill-registry scan (both are needed before
-  // the tool registry below). Promise.all preserves fail-fast: a builder that
-  // throws still rejects boot, exactly as the serial awaits did.
   const [gatewayClient, skillRegistry] = await Promise.all([
     buildGatewayClient(config, dataDir),
     buildSkillRegistry(dataDir, { trustProjectSkills: config.skills?.trustProjectSkills ?? false }),
@@ -218,26 +218,24 @@ export async function buildRuntime(
     gatewayClient,
     skillRegistry,
     {
+      getAccessPolicy: () => policyEngine.describe().access,
       dataDir,
       serviceSupervisor,
       getWebSearchTrustedDomains: () =>
         runtimeRef?.config.webSearch.trustedDomains ?? config.webSearch.trustedDomains,
     },
   )
-  // Wire validator into skill registry (after toolRegistry + policyEngine exist)
   skillRegistry.setValidator({
     toolRegistry,
     policyEngine,
     autonomy: () => resolveAutonomy(config),
   })
 
-  // marketplace catalog and graph registry are independent of each other and
-  // of the code between here and their first use; build them concurrently.
   const [marketplaceCatalog, graphBuild] = await Promise.all([
     buildMarketplaceCatalog(dataDir),
     buildGraphRegistry(dataDir),
   ])
-  const { graphRegistry, graphAgentLoader, userAgentLoader, userCommandStore } = graphBuild
+  const { graphRegistry, graphAgentLoader, userAgentLoader, userCommandStore, roleBots } = graphBuild
   const skillSourceUrlPolicy = new SkillSourceUrlPolicy(config.security.skillSources)
   const installPipeline = createInstallPipeline({
     registry: skillRegistry,
@@ -252,8 +250,6 @@ export async function buildRuntime(
     auditLogger,
     deviceName: config.device.name,
   })
-  // Managed children can outlive the tool call that created them, so their
-  // start/exit notifications are emitted by the lifecycle owner itself.
   managedProcesses.setHookRegistry(hookRegistry)
   registerHostSystemInfoCapability({
     config,
@@ -320,10 +316,7 @@ export async function buildRuntime(
     encryption,
     providerRegistry,
   })
-  // Second-pass feature tool registration (delegation w/ session append, apps
-  // tools w/ semantic index, a2a runtime). Routed through the generated
-  // manifest so disabled features drop from the bundle. a2aTaskStore is null
-  // when the a2a feature is disabled.
+  toolRegistry.register(createToolOutputReadTool(sessions))
   const featureRuntimeDeps: FeatureRuntimeToolDeps = {
     dataDir,
     delegator,
@@ -359,8 +352,6 @@ export async function buildRuntime(
   const swarmRunRegistry = new SwarmRunRegistry(swarmStore, swarmAgentRuntime, (worktree) =>
     swarmWorktreeManager.remove(worktree),
   )
-  // Track per-run worktrees so cancel/cleanup paths (which don't run the
-  // engine.run finally block) can still tear them down.
   const swarmRunWorktrees = new Map<string, ReturnType<WorktreeManager['create']>>()
   void reapOrphanSwarmResources({
     listTmuxSessions: listTmuxSessionNames,
@@ -390,33 +381,21 @@ export async function buildRuntime(
     resolveRunId: (sid) => (typeof sid === 'string' && sid.startsWith('swarm_') ? sid : null),
   })
 
-  // Task 20: real swarm run + key forwarding implementations.
-  // The closures capture the locals built so far in buildRuntime; they're only
-  // invoked from HTTP handlers after the runtime object is fully constructed.
   const startSwarmRun: RuntimeServices['startSwarmRun'] = async (run, opts) => {
-    // 0) Verify the supervisor engine has a provider before doing any side
-    //    effects (tmux sessions are expensive to roll back). noSupervisor
-    //    sessions are user-driven, so they only need the external agent CLIs.
     const supervisorProvider = opts.noSupervisor ? null : providerRegistry.getDefault()
     if (!opts.noSupervisor && !supervisorProvider) {
       throw new Error('SWARM_NO_PROVIDER: no LLM provider configured')
     }
 
-    // 1) Transition the run state machine into 'running' FIRST so the jsonl gets
-    //    `run.started` as the first event (before any agent.spawned/active lines).
     run.start()
 
     let launchCwd = run.snapshot().worktree.path
     try {
-      // 2) Create a worktree (git worktree on a repo, fall back to the cwd as-is on
-      //    non-git directories). All warm-pool launches use the worktree path so
-      //    parallel agents don't trample each other's checkouts.
       const wt = swarmWorktreeManager.create(run.snapshot().worktree.path, run.id)
       run.setWorktree(wt)
       swarmRunWorktrees.set(run.id, wt)
       launchCwd = wt.path
 
-      // 3) Spawn warm pool agents up front so the supervisor has something to drive.
       for (const agent of opts.warmPool) {
         const handleId = `a_${randomBytes(3).toString('hex')}`
         const startedAt = Date.now()
@@ -466,9 +445,6 @@ export async function buildRuntime(
         if (!run.snapshot().activeHandle) run.setActive(handle.handle)
       }
 
-      // 4a) "noSupervisor" mode: the user is driving via the keys endpoint
-      //     directly (or via attach). Skip the engine kickoff and the
-      //     accompanying cleanup-on-finish; the run lives until DELETE.
       if (opts.noSupervisor) {
         return
       }
@@ -478,12 +454,6 @@ export async function buildRuntime(
       }
       const model = config.agent.defaultModel ?? provider.models[0]?.id ?? 'default'
 
-      // 4) Kick off the supervisor agent loop asynchronously. The engine drives
-      //    the goal forward via the swarm.* tools registered above; we just drain
-      //    its event stream and finish the run when it completes.
-
-      // Create a daemon session matching the run id so the swarm system-prompt
-      // extension fires (it keys off `sessionId.startsWith('swarm_')`).
       const createdAt = new Date().toISOString()
       try {
         await sessions.create({
@@ -498,21 +468,19 @@ export async function buildRuntime(
           tags: ['swarm'],
         })
       } catch {
-        // Session may already exist on a retry — non-fatal.
       }
 
-      // Build the supervisor system prompt up front. The swarm extension only
-      // fires when sessionId starts with `swarm_` (see swarmSystemPromptExtension).
-      const systemPrompt = await buildSystemPrompt({
+      const { prompt: systemPrompt, systemToolGuidance } = await buildDeferredSystemPrompt({
         config,
         tools: toolRegistry,
         skills: skillRegistry,
-        fileMemory: undefined, // swarm runs have no per-session memory yet
+        fileMemory: undefined,
         sessionId: run.id,
         cwd: launchCwd,
       })
 
       const engine = new AgentEngine({
+        systemToolGuidance,
         provider,
         tools: toolRegistry,
         policy: policyEngine,
@@ -551,13 +519,10 @@ export async function buildRuntime(
           })
           run.finish('error')
         } finally {
-          // Tear down all warm-pool tmux sessions, remove the worktree, and
-          // deregister the run from the in-memory map so we don't leak.
           for (const agent of run.snapshot().agents) {
             try {
               await swarmAgentRuntime.stop(agent)
             } catch {
-              /* swallow — best effort */
             }
           }
           const trackedWt = swarmRunWorktrees.get(run.id)
@@ -565,7 +530,6 @@ export async function buildRuntime(
             try {
               swarmWorktreeManager.remove(trackedWt)
             } catch {
-              /* swallow */
             }
             swarmRunWorktrees.delete(run.id)
           }
@@ -577,7 +541,6 @@ export async function buildRuntime(
         try {
           await swarmAgentRuntime.stop(agent)
         } catch {
-          /* best-effort */
         }
       }
       const trackedWt = swarmRunWorktrees.get(run.id)
@@ -585,7 +548,6 @@ export async function buildRuntime(
         try {
           swarmWorktreeManager.remove(trackedWt)
         } catch {
-          /* best-effort */
         }
         swarmRunWorktrees.delete(run.id)
       }
@@ -664,18 +626,13 @@ export async function buildRuntime(
       try {
         await swarmAgentRuntime.stop(agent)
       } catch {
-        /* best-effort */
       }
     }
-    // Worktree was created in startSwarmRun and would normally be removed by
-    // the engine's finally block. In noSupervisor mode (or any cancel path
-    // that races the engine), this is the last hook we have to clean it up.
     const wt = swarmRunWorktrees.get(runId)
     if (wt) {
       try {
         swarmWorktreeManager.remove(wt)
       } catch {
-        /* best-effort */
       }
       swarmRunWorktrees.delete(runId)
     }
@@ -705,10 +662,6 @@ export async function buildRuntime(
   )
   toolRegistry.register(createQuestionTool({ store: questionStore }))
 
-  // FileMemory bucket factory: per-user/channel scoping. The existing
-  // `fileMemory` from assembleStorageLayer reads `${dataDir}/memory` and is
-  // exposed below as the registry's `global()` bucket; user/channel-scoped
-  // writes land under `${dataDir}/memory/scopes/<key>/`.
   const fileMemoryRegistry = new ScopedFileMemoryRegistryImpl(`${dataDir}/memory`)
   await semanticIndex.configureFileMemory?.(fileMemoryRegistry)
 
@@ -721,6 +674,7 @@ export async function buildRuntime(
   toolRegistry.register(createMemoryListTool({ fileMemoryRegistry, semanticIndex }))
   toolRegistry.register(createMemoryForgetTool({
     fileMemoryRegistry,
+    forgetSelected: (ids, scopeTags, options) => dreaming.withMemoryReset(() => forgetSelectedMemory(semanticIndex, ids, scopeTags, options)),
     forgetAll: (scopeTags, options) => dreaming.withMemoryReset(() => forgetAllOwnedMemory(semanticIndex, fileMemoryRegistry, scopeTags, options)),
   }))
   toolRegistry.register(createMemorySearchTool({ semanticIndex }))
@@ -766,8 +720,6 @@ export async function buildRuntime(
         await deliverReminder(reminder)
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        // Re-throw so the scheduler keeps the reminder pending instead of
-        // marking it fired when delivery failed.
         throw new Error(`reminder ${reminder.id} delivery failed: ${message}`)
       }
     },
@@ -791,9 +743,6 @@ export async function buildRuntime(
     }),
   )
 
-  // Dreaming engine is built later (depends on agentLayer); capture a
-  // deferred reference here so memory.tag.suggest / memory.conflicts.find
-  // can call into it.
   const dreamingRef: {
     current?: {
       suggestTags(content: string): Promise<string[]>
@@ -878,9 +827,6 @@ export async function buildRuntime(
       getClient: (lang) => lspLayer.get(lang),
     }),
   )
-  // Re-register code.symbols (registered LSP-unaware in buildToolRegistry,
-  // before lspLayer existed) so a supplied `language` uses precise
-  // workspace/symbol results, falling back to ripgrep otherwise.
   toolRegistry.register(createCodeSymbolsTool({ getClient: (lang) => lspLayer.get(lang) }))
 
   const { telemetry, mdns, updater } = await assembleIntegrationLayer({ config })
@@ -897,11 +843,6 @@ export async function buildRuntime(
   } = assembleAgentLayer({
     providerRegistry,
     dataDir,
-    // The observability schema has always defined tool.succeeded/tool.failed and
-    // aggregated them into the tool_succeeded/tool_failed metrics, but nothing
-    // ever emitted them — so tool reliability read as a flat zero no matter how
-    // many calls failed. Emit identity and timing only; outputs can carry user
-    // content and stay in the session record.
     onToolOutcome: (outcome) => {
       observability.recordEvents([
         {
@@ -967,8 +908,6 @@ export async function buildRuntime(
 
   await enableJsonLoggingIfNeeded(config)
 
-  // Top-level config sections the file-watcher reload hot-applies (via
-  // onConfigReloaded / onMcpChange). Changes to these do NOT require a restart.
   const FILE_WATCH_HOT_APPLIED_SECTIONS = new Set<string>([
     'network',
     'providers',
@@ -979,6 +918,7 @@ export async function buildRuntime(
     'security',
     'webSearch',
     'device',
+    'eventRouting',
   ])
 
   let watcherDeps: import('./runtime/config-watcher.js').ConfigWatcherDeps | undefined
@@ -997,9 +937,6 @@ export async function buildRuntime(
         await mcpManager.configureServers(mcp.servers, toolRegistry, mcpPromptsRegistry, mcp.client)
       },
       onOtherChange: (sections) => {
-        // Sections reconfigured live by onConfigReloaded/onMcpChange no longer
-        // need a restart; only warn for the ones that genuinely do (ports,
-        // gateway URL, memory/vector backend, telemetry).
         for (const s of sections) {
           if (!FILE_WATCH_HOT_APPLIED_SECTIONS.has(s)) {
             log.warn(`Config change in '${s}' requires daemon restart`)
@@ -1060,7 +997,6 @@ export async function buildRuntime(
     channelRouter: null!,
     delegationWorker: null!,
     notificationRelayWorker: createNotificationRelayDeliveryWorker(),
-    // Scheduler fields — populated by startRuntime() via buildSchedulerStack()
     jobStore: null!,
     schedulerEngine: null!,
     parseWhen: null!,
@@ -1081,6 +1017,7 @@ export async function buildRuntime(
     graphAgentLoader,
     userAgentLoader,
     userCommandStore,
+    roleBots,
     dreaming,
     skillStore,
     channelPipelineMonitor,
@@ -1108,14 +1045,13 @@ export async function buildRuntime(
     }),
     subagentDispatcher: null!,
     externalAcpAgentDispatcher: null,
+    externalCliDispatcher: null,
     a2aTaskStore,
     swarmRunRegistry,
     swarmRunStore: swarmStore,
     swarmTmuxPool,
     swarmLauncher,
     swarmAgentRuntime,
-    // Task 20: real engine kickoff + tmux key forwarder (defined above so they
-    // can close over the locals built in this scope).
     startSwarmRun,
     forwardSwarmKeys,
     captureSwarmAgent,
@@ -1124,15 +1060,12 @@ export async function buildRuntime(
   }
   runtimeRef = runtime
 
-  // Subagent dispatcher — built after the runtime object exists so the
-  // engine factory closure can read live providerRegistry/autonomy state.
   const subagentDispatcher = new SubagentDispatcher({
     sessions: runtime.sessions,
     onLifecycle: async (event, data) => {
       try {
         await runtime.hookRegistry.trigger({ event: event === 'started' ? 'post:subagent:start' : 'post:subagent:stop', data })
       } catch (error) {
-        // Observational hooks cannot change the child's completion classification.
         log.warn('subagent lifecycle hook failed', { error: error instanceof Error ? error.message : String(error) })
       }
     },
@@ -1140,8 +1073,8 @@ export async function buildRuntime(
       runtime.approvalRegistry.cancelForSession(sessionId, 'Subagent run ended', options)
       runtime.activeRuns.finish(sessionId)
     },
-    engineFactory: ({ tools, maxIterations, executionPolicy, sessionId, onEvent }) => {
-      const provider = runtime.providerRegistry.getDefault()
+    engineFactory: ({ tools, maxIterations, executionPolicy, sessionId, onEvent, providerId, reviewOutcomes }) => {
+      const provider = (providerId ? runtime.providerRegistry.get(providerId) : undefined) ?? runtime.providerRegistry.getDefault()
       if (!provider) {
         throw new Error('SUBAGENT_NO_PROVIDER: no LLM provider configured')
       }
@@ -1152,6 +1085,8 @@ export async function buildRuntime(
         autonomy: executionPolicy?.autonomy ?? resolveAutonomy(runtime.config),
         maxIterations,
         hardMaxIterations: true,
+        reviewOutcomes: reviewOutcomes ?? false,
+        reviewToollessFinals: reviewOutcomes ?? false,
         saveRunCheckpoint: checkpoint => runtime.runCheckpoints.save(checkpoint),
         clearRunCheckpoint: id => runtime.runCheckpoints.delete(id),
         saveApprovalCheckpoint: checkpoint => runtime.approvalCheckpoints.save(checkpoint),
@@ -1191,31 +1126,54 @@ export async function buildRuntime(
         defaultModel: runtime.config.agent.defaultModel ?? provider.models[0]?.id ?? 'default',
       }
     },
+    modelContextWindow: (model) =>
+      runtime.providerRegistry.getDefault()?.models.find((candidate) => candidate.id === model)?.contextWindow,
     resolveUserAgent: async (id, cwd, workspaceRoot) => {
       const custom = (await runtime.customDefs.agentsForCwd(cwd, workspaceRoot)).find((agent) => agent.id === id)
       if (custom) {
         assertCustomAgentUsable(custom)
-        return { id: custom.id, name: custom.description ?? custom.id, systemPrompt: custom.systemPrompt, model: custom.model, allowedTools: custom.allowedTools, deniedTools: custom.deniedTools, isolation: custom.isolation }
+        return { id: custom.id, name: custom.description ?? custom.id, systemPrompt: custom.systemPrompt, model: custom.model, maxIterations: custom.maxIterations, allowedTools: custom.allowedTools, deniedTools: custom.deniedTools, isolation: custom.isolation }
       }
       const record = runtime.userAgentLoader?.get(id)
-      if (!record) return null
+      if (record) {
+        return {
+          id: record.spec.id,
+          name: record.spec.name,
+          systemPrompt: record.spec.systemPrompt,
+          model: record.spec.model,
+          maxIterations: record.spec.maxIterations,
+        }
+      }
+      const bot = runtime.roleBots?.get(id)
+      if (!bot) return null
+      const cli = externalCliFromEngine(bot.engine)
       return {
-        id: record.spec.id,
-        name: record.spec.name,
-        systemPrompt: record.spec.systemPrompt,
-        model: record.spec.model,
-        maxIterations: record.spec.maxIterations,
+        id: bot.id,
+        name: bot.name,
+        systemPrompt: bot.systemPrompt,
+        maxIterations: bot.maxIterations,
+        ...(bot.allowedTools ? { allowedTools: [...bot.allowedTools] } : {}),
+        ...(bot.deniedTools ? { deniedTools: [...bot.deniedTools] } : {}),
+        ...(cli ? { external: { cli } } : {}),
       }
     },
+    externalCli: () => runtime.externalCliDispatcher,
   })
   runtime.subagentDispatcher = subagentDispatcher
   runtime.toolRegistry.register(
     createSubagentDispatchTool(subagentDispatcher, () =>
       runtime.toolRegistry.list().map((t) => t.name),
       () => runtime.backgroundSubagents,
+      {
+        toolEffect: (name) =>
+          runtime.toolRegistry.get(name) ? runtime.toolRegistry.securityDescriptor(name).effect : undefined,
+      },
     ),
   )
-  runtime.toolRegistry.register(createSubagentJobTool(() => runtime.backgroundSubagents))
+  runtime.toolRegistry.register(createSubagentJobTool(
+    () => runtime.backgroundSubagents,
+    () => runtime.subagentDispatcher ?? undefined,
+  ))
   runtime.toolRegistry.register(
     createSelfInfoTool({
       config: () => runtime.config,
@@ -1255,14 +1213,16 @@ export async function buildRuntime(
     }),
   )
 
-  // acp runtime (dispatcher + external_acp.run tool) — built after the runtime
-  // object exists so it can read live sessions/dreaming. Null when the acp
-  // feature is disabled in this build.
-  runtime.externalAcpAgentDispatcher = createAcpRuntime(runtime.toolRegistry, {
-    ...featureRuntimeDeps,
-    sessions: runtime.sessions,
-    dreaming: runtime.dreaming,
-  })
+  {
+    const external = createAcpRuntime(runtime.toolRegistry, {
+      ...featureRuntimeDeps,
+      sessions: runtime.sessions,
+      dreaming: runtime.dreaming,
+      usageTracker: runtime.usageTracker,
+    })
+    runtime.externalAcpAgentDispatcher = external?.acp ?? null
+    runtime.externalCliDispatcher = external?.cli ?? null
+  }
 
   runtime.configMutationService.configure({
     readRevision: () => runtime.config.configRevision,
@@ -1324,16 +1284,8 @@ export async function buildRuntime(
 
   if (watcherDeps) {
     watcherDeps.onConfigReloaded = async (newConfig: SepilotdConfig) => {
-      // Keep config and live services in lockstep. Previously this only swapped
-      // runtime.config and reconfigured autonomy/skillSources, so a disk edit to
-      // providers/channels/hooks left GET /config showing new values while the
-      // running services (registry, channels, webhooks) stayed on the old
-      // config — half-old/half-new until restart. Reconfigure the same services
-      // the API mutation path rebuilds (mcp is handled by onMcpChange).
-      // Validate filesystem-backed network inputs before publishing the new
-      // config snapshot. In particular, an invalid/removed CA must leave both
-      // runtime.config and the current effective dispatcher untouched.
       planProviderDispatcher(newConfig.network)
+      const nextPolicy = prepareToolPolicyUpdate(runtime.config, newConfig, runtime.dataDir)
 
       const channelTypesToRebuild = new Set<string>([
         ...(newConfig.channels ?? []).map((channel) => channel.type),
@@ -1341,6 +1293,8 @@ export async function buildRuntime(
       ])
       deepFreeze(newConfig)
       runtime.config = newConfig
+      if (nextPolicy) runtime.policyEngine.updateConfig(nextPolicy)
+      else applyBrowserSitePolicy(runtime.policyEngine, newConfig)
       runtime.configMutationService.configure({
         deviceName: newConfig.device.name,
       })

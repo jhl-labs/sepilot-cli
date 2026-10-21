@@ -26,8 +26,6 @@ export function providedUserPremises(state: Partial<Pick<AgentState, 'messages'>
 function reviewPacket(state: ReviewState, candidate: string) {
   return {
     request: state.input,
-    // User premises can span turns. Generated assistant reasoning and internal
-    // recovery messages are not a source of factual evidence for this judge.
     userPremises: providedUserPremises(state),
     contract: state.seedContract,
     candidate: candidate.replace(/^CRITERION\s+[^\n]+\n?/gmu, '').replace(/^\s*ANSWER:\s*/u, '').trim(),
@@ -62,6 +60,6 @@ export function parseProvidedContextVerdict(content: string): 'accepted' | 'reje
     if (!value || typeof value.reason !== 'string' || !value.reason.trim()) return 'invalid'
     if (value.status === 'satisfied') return 'accepted'
     if (['unsatisfied', 'needs-observation'].includes(value.status)) return 'rejected'
-  } catch { /* malformed or truncated judgment is not evidence */ }
+  } catch {}
   return 'invalid'
 }

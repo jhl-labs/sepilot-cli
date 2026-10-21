@@ -491,17 +491,9 @@ type PreparedSpeechText = {
   inputChars: number
   spokenChars: number
   truncated: boolean
-  // Sentence-boundary chunks covering the full text. Long replies are
-  // synthesized as multiple clips and concatenated instead of silently dropping
-  // everything past the single-clip cap.
   chunks: string[]
 }
 
-/**
- * Split speech text into <= maxChars chunks at sentence boundaries so long
- * replies can be synthesized as multiple clips rather than truncated. Falls back
- * to a hard cut only when no boundary exists within a window.
- */
 function splitSpeechIntoChunks(text: string, maxChars: number): string[] {
   const trimmed = text.trim()
   if (!trimmed) return []
@@ -535,9 +527,6 @@ function prepareSpeechText(text: string): PreparedSpeechText {
   const stripped = stripForSpeech(text)
   const inputChars = countSpeechChars(stripped)
   const chunks = splitSpeechIntoChunks(stripped, speechTextSynthesisMaxChars)
-  // The full stripped text is spoken across the chunks; `text` keeps the
-  // first-clip content for callers that synthesize a single WAV, while `chunks`
-  // covers everything for the multi-clip path.
   const spoken = chunks.join(' ')
   const spokenChars = countSpeechChars(spoken)
   return {
@@ -549,11 +538,6 @@ function prepareSpeechText(text: string): PreparedSpeechText {
   }
 }
 
-/**
- * Synthesize a (possibly multi-clip) reply into a single WAV at outputPath.
- * Long replies are split into sentence-boundary chunks, each synthesized under
- * the media.speech concurrency limit, then concatenated — no silent truncation.
- */
 async function synthesizeReplyClips(
   chunks: string[],
   outputPath: string,
@@ -593,22 +577,6 @@ function websocketTokenFromUrl(url: string): string | null {
   return parsed.searchParams.get('token') || parsed.searchParams.get('access_token')
 }
 
-/**
- * Parse the `SEPILOTD_VOICE_WEBRTC_ADAPTER` env value into a command + args
- * pair. Two accepted forms:
- *
- *   1. `"/path/to/bin --flag value"` — plain shell-style string. Split on
- *      whitespace, but only if no shell metacharacters are present. This
- *      stays backward-compatible with existing operator configs.
- *   2. `'["/path with spaces/bin","--flag","value"]'` — JSON array form for
- *      paths/args that need quoting (whitespace, special characters).
- *
- * Strings that contain `<>|&;`$()\\` are refused outright — the previous
- * implementation passed `shell: true` to `spawn`, which interpreted those
- * metacharacters. Now that we run the binary directly, any operator who
- * relied on shell features must switch to the JSON form so the intent is
- * explicit instead of relying on an implicit shell interpreter.
- */
 function parseAdapterCommand(envValue: string): { command: string; args: string[] } {
   const trimmed = envValue.trim()
   if (trimmed.startsWith('[')) {
@@ -622,7 +590,6 @@ function parseAdapterCommand(envValue: string): { command: string; args: string[
         return { command: parsed[0] as string, args: (parsed as string[]).slice(1) }
       }
     } catch {
-      // fall through to the error below
     }
     throw new Error('SEPILOTD_VOICE_WEBRTC_ADAPTER JSON form must be a non-empty string array')
   }
@@ -644,9 +611,6 @@ function createVoiceWebRtcBridge(options: {
   onEvent: (event: Record<string, unknown>) => void
   onError: (message: string) => void
 }): VoiceWebRtcBridge {
-  // Run the adapter binary directly (no shell), parsing the env value into
-  // a command + args pair. Dropping `shell: true` eliminates the implicit
-  // shell-metacharacter interpretation that the previous version trusted.
   const { command, args } = parseAdapterCommand(options.command)
   const child: ChildProcessWithoutNullStreams = spawn(command, args, {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -1158,9 +1122,6 @@ async function executeVoiceTurnStreaming(
     fallbackToken?: string | null
     onTranscript: (prepared: PreparedVoiceTurn) => void
     onAssistantDelta: (event: { sessionId: string; text: string }) => void
-    // Barge-in: aborting this signal cancels the in-flight chat stream fetch so
-    // an interrupt (or a closed socket) stops the turn instead of running the
-    // full LLM turn + TTS to completion.
     signal?: AbortSignal
   },
 ): Promise<VoiceTurnResult> {
@@ -1284,9 +1245,6 @@ export const __voiceRouteTesting = {
 }
 
 export async function voiceRoutes(app: FastifyInstance) {
-  // Apply configured retention and reap orphaned WAVs left by a prior process.
-  // The in-memory registry does not survive restart, so every WAV on disk from
-  // a previous run is orphaned (its fileId would 404). Best-effort, non-blocking.
   const voiceCfg = voiceConfig(app)
   configureVoiceRetention({
     ttlMs: voiceCfg.fileRetentionMs,
@@ -1299,7 +1257,6 @@ export async function voiceRoutes(app: FastifyInstance) {
       void sweepOrphanVoiceFiles(voiceDir)
     }
   } catch {
-    /* best-effort boot sweep */
   }
 
   const meetingQueueRepo = createJobsRepo()
@@ -1357,8 +1314,6 @@ export async function voiceRoutes(app: FastifyInstance) {
     let closed = false
     let busy = false
     let webrtcBridge: VoiceWebRtcBridge | null = null
-    // Barge-in: the controller for the currently running turn, so an interrupt
-    // or a socket close aborts the in-flight chat stream fetch.
     let currentTurnAbort: AbortController | null = null
     const token = websocketTokenFromUrl(request.url)
     if (
@@ -1380,7 +1335,6 @@ export async function voiceRoutes(app: FastifyInstance) {
       try {
         if (!closed && socket.readyState === 1) socket.send(JSON.stringify(payload))
       } catch {
-        /* socket may have closed */
       }
     }
 
@@ -1413,8 +1367,6 @@ export async function voiceRoutes(app: FastifyInstance) {
 
     socket.on('close', () => {
       closed = true
-      // Cancel any in-flight turn so a client that hangs up does not leave the
-      // full LLM turn + TTS running (previously the fetch was never cancelled).
       currentTurnAbort?.abort()
       closeWebRtcBridge()
     })
@@ -1453,8 +1405,6 @@ export async function voiceRoutes(app: FastifyInstance) {
 
       if (message.type === 'playback.interrupt') {
         const turnId = typeof message.turnId === 'string' ? message.turnId : null
-        // Abort the in-flight turn so an interrupt actually stops the running
-        // LLM turn + TTS instead of only echoing an acknowledgement.
         currentTurnAbort?.abort()
         if (webrtcBridge) {
           webrtcBridge.send({ type: 'playback.interrupt', turnId })
@@ -1584,8 +1534,6 @@ export async function voiceRoutes(app: FastifyInstance) {
           })
         }
       } catch (error) {
-        // A barge-in / socket close aborts the fetch; surface that as an
-        // interruption rather than a failure.
         if (turnAbort.signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
           safeSend({ type: 'voice.interrupted', turnId })
         } else {

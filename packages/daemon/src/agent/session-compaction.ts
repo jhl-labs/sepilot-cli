@@ -45,25 +45,10 @@ export async function compactSessionMessages(options: {
   provider?: ILLMProvider
   model?: string
   config?: SessionCompactionConfig
-  /**
-   * Optional hook registry. When supplied:
-   *  - `pre:context:compact` fires before any compaction work; an `abort`
-   *    result skips compaction entirely (returns null).
-   *  - `post:context:compact` fires after a successful compaction with
-   *    `eventCountBefore` / `eventCountAfter` (preserved tail length) /
-   *    `summary`. Skipped runs (no work needed) fire neither.
-   */
   hooks?: IHookRegistry
-  /**
-   * Optional session id forwarded to hook payloads so handlers can scope
-   * decisions per session. Compaction itself does not need it.
-   */
   sessionId?: string
-  /** Calibrated chars-per-token ratio for token estimation. Default 4. */
   charsPerToken?: number
-  /** Cancels the summarization LLM call when the caller aborts. */
   signal?: AbortSignal
-  /** Provider circuit breaker so a provider outage fast-fails summarization. */
   breaker?: ProviderCircuitBreaker
 }): Promise<SessionCompactionResult | null> {
   const messages = options.messages
@@ -77,11 +62,6 @@ export async function compactSessionMessages(options: {
     return null
   }
 
-  // pre:context:compact — Claude-Code parity hook. Fires once we know
-  // there is real compaction work to do; an abort result skips compaction
-  // and leaves the caller to decide what to do with the still-large
-  // message list. We deliberately do NOT fire this when the run is too
-  // short to compact (above), since there is nothing to gate.
   if (options.hooks) {
     const preResult = await options.hooks.trigger({
       event: 'pre:context:compact',
@@ -142,9 +122,6 @@ export async function compactSessionMessages(options: {
   }
 
   if (options.hooks) {
-    // post:context:compact — observation-only by contract. We ignore the
-    // returned action so a noisy handler can't accidentally drop a
-    // successful compaction we just paid LLM tokens to produce.
     await options.hooks.trigger({
       event: 'post:context:compact',
       data: {
@@ -261,10 +238,6 @@ async function buildCompactionCandidate(options: {
     breaker: options.breaker,
   })
   const merged = mergeCompactionSummaries(options.existingSummary, removedSummary)
-  // Re-condense when the rolling summary grows past its cap. Without this, every
-  // compaction appended the prior summary verbatim (mergeCompactionSummaries),
-  // so a long session's summary grew unbounded and eventually dominated the
-  // window it was meant to shrink.
   const summary = await condenseRollingSummary(merged, {
     provider: options.provider,
     model: options.model,
@@ -343,9 +316,6 @@ async function summarizeCompactedMessages(options: {
   }
 
   try {
-    // Bounded timeout + breaker: compaction is a mid-run internal call, so a
-    // stalled provider must fail fast to a deterministic fallback summary
-    // rather than hang the whole turn.
     const response = await runAuxiliaryLlmChat({
       provider: options.provider,
       request: {
@@ -462,13 +432,6 @@ function mergeCompactionSummaries(existingSummary: string | undefined, newSummar
   return lines.join('\n')
 }
 
-/**
- * Character cap for the rolling compaction summary. Once the merged
- * previous+new summary exceeds it, the summary is re-condensed (LLM if
- * available, otherwise a deterministic head+tail trim) so it cannot grow
- * without bound across repeated compactions. Operator-tunable; floored so it
- * always leaves room for real content.
- */
 function rollingSummaryCharCap(): number {
   const raw = Number(process.env.SEPILOTD_COMPACTION_SUMMARY_CHAR_CAP)
   if (Number.isFinite(raw) && raw >= 1000) return Math.floor(raw)
@@ -511,22 +474,14 @@ async function condenseRollingSummary(
         breaker: options.breaker,
       })
       const condensed = completedCompactionSummary(response)
-      // Guard against a provider that echoed the input back or expanded it.
       if (condensed && condensed.length <= cap) return condensed
     } catch {
-      // fall through to deterministic trim
     }
   }
 
-  // Deterministic fallback: keep the summary header and head+tail of the body
-  // so the earliest durable context and the most recent points both survive.
   return formatCompactionSummary(headTailTruncate(summary.replace(/^Summary:\s*/i, ''), cap))
 }
 
-// A summary replaces source messages, so incomplete output must not become
-// durable context. In particular, a token-limited response can drop pending
-// work while retaining only the earlier investigation. Use source evidence
-// for the fallback, never the incomplete provider draft.
 function completedCompactionSummary(response: ChatResponse): string | null {
   if (!canPublishUserFacingText(response.finishReason)) return null
   const content = typeof response.message.content === 'string'
@@ -572,14 +527,6 @@ function extractExistingCompactedSummary(message: Message | undefined): string |
   return formatCompactionSummary(summary)
 }
 
-/**
- * Per-line char budget for the compaction summarizer *input* (the text handed
- * to the LLM/fallback that produces the rolling summary). Tool results get a
- * much larger, head+tail budget: fs.read/search/terminal output carries the
- * concrete values, line numbers and error messages the summary must preserve,
- * and errors typically sit at the *end* of the output — a plain 700-char head
- * truncation dropped them before the summarizer ever saw them.
- */
 function compactionToolResultBudget(): number {
   const raw = Number(process.env.SEPILOTD_COMPACTION_TOOL_RESULT_BUDGET)
   if (Number.isFinite(raw) && raw >= 700) return Math.floor(raw)
@@ -592,10 +539,6 @@ function compactionLineBudget(): number {
   return 1200
 }
 
-/**
- * Truncate keeping both the head and the tail so trailing error lines / final
- * values survive. Used for the compaction summarizer input only.
- */
 function headTailTruncate(content: string, maxChars: number): string {
   if (content.length <= maxChars) return content
   const elided = content.length - maxChars

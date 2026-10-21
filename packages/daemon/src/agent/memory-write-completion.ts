@@ -18,9 +18,6 @@ type ToolCallHistoryEntry = {
   status: 'success' | 'error'
 }
 
-// This is deliberately an intent classifier only. It never extracts a memory
-// payload and never writes anything itself: the model must still choose safe,
-// durable content and call memory.remember through the normal policy/tool path.
 const EXPLICIT_MEMORY_WRITE_PATTERNS = [
   /(?:^|[.!?]\s+|\band\s+)(?:please\s+)?remember\s+(?!to\b)(?:that\b|this\b|these\b|those\b|it\b|my\b|the\b)/iu,
   /\b(?:save|store|record|commit|add)\b[\s\S]{0,120}\b(?:in|to)\s+(?:your\s+)?(?:long[-\s]?term\s+)?memory\b/iu,
@@ -36,11 +33,6 @@ const NEGATED_MEMORY_WRITE_PATTERNS = [
   /(?:记住|記住|覚えて)[^.!?\n]{0,12}(?:不要|しないで)/u,
 ]
 
-// Mentions of a memory command are not themselves memory commands. These
-// patterns intentionally prefer a false negative when a user is asking what a
-// phrase means or reporting what happened after they typed it. The model may
-// still choose memory.remember normally; only the mandatory completion guard
-// is disabled for ambiguous meta-language.
 const MEMORY_WRITE_META_MENTION_PATTERNS = [
   /(?:기억\s*(?:해|하여)\s*(?:줘|주세요|주십시오|둬|두세요)|(?:메모리|장기\s*기억)(?:에|로)[^.!?。！？\n]{0,80}(?:저장|기록|등록|추가|남겨))[.!?。！？]\s*(?:라고|하고)\s*(?:했|말|입력|요청|썼|보냈|하니|했더니)/u,
   /기억\s*(?:해|하여)\s*(?:줘|주세요|주십시오|둬|두세요)\s*\?\s*(?:무슨|어떤)\s*(?:뜻|의미)|기억해줘\s*\?\s*(?:뭐|왜|어떻게)/u,
@@ -57,10 +49,6 @@ const MEMORY_WRITE_META_MENTION_PATTERNS = [
 export function isExplicitMemoryWriteRequest(input: string): boolean {
   const normalized = input.normalize('NFKC').trim()
   if (!normalized) return false
-  // A bug report or explanation often quotes the exact phrase that triggered
-  // the behavior (for example: `"기억해줘"라고 하니...`). Quoted/code text is
-  // mention data, not an instruction to the current agent, so exclude it from
-  // this conservative completion guard.
   const directiveText = normalized
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`[^`]*`/g, ' ')
@@ -147,11 +135,6 @@ function memoryWritePayloadKey(
     : fallback
 }
 
-/**
- * Persist structured result evidence on the matching tool message. This keeps
- * the completion decision robust across run checkpoints without parsing a
- * human-readable tool output.
- */
 export function recordToolResultStatus(
   messages: Message[],
   toolCallId: string,
@@ -240,12 +223,6 @@ const NON_MEMORY_RESPONSE_WORK_PATTERNS = [
   /(?:説明|要約|整理|分析|比較|計算|翻訳|回答|作成|検索)(?:して|し、|した)/u,
 ]
 
-/**
- * A failed pure memory command has no trustworthy prose result to preserve.
- * Keep a draft only when the user separately requested user-facing work such
- * as an explanation or summary; this prevents a hallucinated save promise
- * from surviving merely because it used indirect wording.
- */
 function requestsNonMemoryResponseWork(input: string): boolean {
   return NON_MEMORY_RESPONSE_WORK_PATTERNS.some((pattern) => pattern.test(input.normalize('NFKC')))
 }
@@ -286,12 +263,6 @@ function isMemoryWriteAcknowledgementOnly(candidate: string): boolean {
     .test(residual)
 }
 
-/**
- * Text emitted alongside the tool call is buffered while the write is still
- * unverified. If the post-tool response is only a save acknowledgement, put
- * the substantive buffered answer back so compound requests (for example,
- * "explain this and remember it") do not lose their explanation.
- */
 export function restoreSuppressedMemoryWriteDraft(
   messages: readonly Message[],
   candidate: string,

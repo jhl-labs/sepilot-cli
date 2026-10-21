@@ -40,7 +40,6 @@ interface PersistedManifest {
   files: Array<{
     path: string
     hadFileBefore: boolean
-    /** Relative blob filename inside the checkpoint dir, when content was captured. */
     blob: string | null
     postHash?: string | null
     postParent?: string
@@ -56,13 +55,9 @@ export class RewindConflictError extends Error {
 function readCurrentContent(path: string): Buffer | null {
   let fd: number | undefined
   try {
-    // Pin the object before inspecting/reading it. Opening by path again after
-    // lstat lets a replacement symlink change which bytes establish trust.
     fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
     const opened = fstatSync(fd)
     const named = lstatSync(path)
-    // The inode check also rejects replacement/reparse points on platforms
-    // without O_NOFOLLOW. No bytes are read until the opened object is checked.
     if (!opened.isFile() || !named.isFile() || opened.dev !== named.dev || opened.ino !== named.ino) {
       throw new Error(`Not the same regular file: ${path}`)
     }
@@ -84,12 +79,6 @@ function currentHash(path: string): string | null {
 }
 
 export interface EditSnapshotStoreOptions {
-  /**
-   * Root directory for durable checkpoint snapshots (one subtree per
-   * session). When omitted the store behaves like the historical
-   * in-memory implementation: committed checkpoints are discarded and
-   * nothing can be rewound after the turn ends.
-   */
   persistDir?: string
   maxCommittedPerSession?: number
 }
@@ -97,10 +86,6 @@ export interface EditSnapshotStoreOptions {
 export interface RewindFilesResult {
   checkpoint: EditCheckpointSummary
   restoredFiles: string[]
-  /**
-   * True when a checkpoint persist failed for this session, so the
-   * durable history the rewind ran against may be missing edits.
-   */
   incompleteHistory: boolean
 }
 
@@ -116,10 +101,6 @@ export interface EditCheckpointDeltaFile {
   status: 'created' | 'modified' | 'deleted' | 'unchanged'
   bytesBefore: number
   bytesAfter: number
-  /**
-   * Bounded textual before/after evidence for semantic quality review.
-   * Binary files deliberately omit this field; their status and sizes remain.
-   */
   unifiedDiff?: string
 }
 
@@ -183,11 +164,6 @@ export class EditSnapshotStore {
     return record ? toSummary(record) : undefined
   }
 
-  /**
-   * Compare an open checkpoint's captured pre-edit bytes with the current
-   * workspace. Tool success records attempted writes; this method reports the
-   * durable net mutation that remains after later corrections or reversions.
-   */
   async inspectCheckpointDelta(
     sessionId: string,
     checkpointId: string,
@@ -233,8 +209,6 @@ export class EditSnapshotStore {
 
   commitCheckpoint(sessionId: string, checkpointId: string): EditCheckpointSummary {
     const record = this.requireOpen(sessionId, checkpointId)
-    // Capture before returning control to another edit; never lazily sample the
-    // postimage from the asynchronous persistence queue after a user edit.
     for (const file of record.files.values()) {
       try {
         file.postHash = currentHash(file.path)
@@ -245,15 +219,10 @@ export class EditSnapshotStore {
     record.closedAt = new Date().toISOString()
     const summary = toSummary(record)
     if (this.persistDir && record.files.size > 0) {
-      // Persist asynchronously on a serialized chain; readers
-      // (listCheckpoints / rewindFiles) flush the chain before reading.
       this.pendingPersist = this.pendingPersist
         .then(() => this.persistCommitted(sessionId, record))
         .then(() => this.pruneSession(sessionId))
         .catch((err) => {
-          // A swallowed persist failure would make listCheckpoints/rewind
-          // operate on incomplete history while still reporting success.
-          // Record it so callers can warn that a rewind may be partial.
           this.persistFailures.set(sessionId, (this.persistFailures.get(sessionId) ?? 0) + 1)
           log.error('failed to persist edit checkpoint', {
             sessionId,
@@ -286,24 +255,14 @@ export class EditSnapshotStore {
     return summary
   }
 
-  /** Wait for all scheduled checkpoint persists to settle. */
   async flush(): Promise<void> {
     await this.pendingPersist
   }
 
-  /**
-   * True when a committed checkpoint failed to persist for this session.
-   * Such a session's durable history is incomplete, so a rewind cannot be
-   * trusted to restore every edit — callers should surface a warning.
-   */
   hasPersistFailures(sessionId: string): boolean {
     return (this.persistFailures.get(sessionId) ?? 0) > 0
   }
 
-  /**
-   * Durable committed checkpoints for a session, oldest first. Empty
-   * when the store was constructed without a persistDir.
-   */
   async listCheckpoints(sessionId: string): Promise<EditCheckpointSummary[]> {
     const manifests = await this.loadManifests(sessionId)
     return manifests.map(manifestToSummary)
@@ -329,8 +288,6 @@ export class EditSnapshotStore {
         const before = readCurrentContent(path)
         conflict = expected.postHash === undefined || contentHash(before) !== expected.postHash
           || realpathSync(dirname(path)) !== expected.postParent
-        // A mismatched path may be a replacement symlink. Never follow it for
-        // display. Old snapshots without postimages are deliberately not safe.
         if (!conflict && diffBudget > 0) {
           const after = file.hadFileBefore && file.blob
             ? await readFile(join(this.checkpointDir(sessionId, manifest.checkpointId), file.blob)) : null
@@ -346,13 +303,6 @@ export class EditSnapshotStore {
     return { checkpoint: manifestToSummary(manifests[index]), checkpointIds: manifests.slice(index).map(manifest => manifest.checkpointId), files, incompleteHistory: this.hasPersistFailures(sessionId) }
   }
 
-  /**
-   * Restore every touched file to its state *before* the given committed
-   * checkpoint: for each file across the target and all later
-   * checkpoints, the earliest captured snapshot wins. The rewound
-   * checkpoints are deleted afterwards — like `git reset`, history past
-   * the rewind point no longer describes the working tree.
-   */
   async rewindFiles(sessionId: string, checkpointId: string, expectedCheckpointIds?: string[]): Promise<RewindFilesResult> {
     if (this.rewinding.has(sessionId)) throw new RewindConflictError(['rewind already in progress'])
     this.rewinding.add(sessionId)
@@ -380,8 +330,6 @@ export class EditSnapshotStore {
         && expected.postParent === realpathSync(dirname(path)) ? [] : [path] }
       catch { return [path] }
     })
-    // Preflight every target before changing any: a conflict in the last file
-    // must not rewind the first files and then fail halfway through.
     if (conflicts.length) throw new RewindConflictError(conflicts)
     const earliestByPath = new Map<
       string,
@@ -395,8 +343,6 @@ export class EditSnapshotStore {
       }
     }
 
-    // Read all blobs before the first mutation so missing snapshot data does
-    // not leave an otherwise valid multi-file rewind half applied.
     const restoreContents = new Map<string, Buffer | null>()
     for (const { manifest, file } of earliestByPath.values()) {
       restoreContents.set(file.path, file.hadFileBefore && file.blob
@@ -498,7 +444,6 @@ export class EditSnapshotStore {
     }
   }
 
-  /** Flush scheduled persists, then read manifests oldest → newest. */
   private async loadManifests(sessionId: string): Promise<PersistedManifest[]> {
     if (!this.persistDir) return []
     await this.flush()
@@ -521,7 +466,6 @@ export class EditSnapshotStore {
         )
         manifests.push(JSON.parse(raw) as PersistedManifest)
       } catch {
-        // Skip torn/partial checkpoint dirs (e.g. crash mid-persist).
       }
     }
     manifests.sort((a, b) =>

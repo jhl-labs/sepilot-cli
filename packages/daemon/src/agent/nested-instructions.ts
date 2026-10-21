@@ -1,20 +1,6 @@
 import { open, realpath, stat } from 'node:fs/promises'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 
-/**
- * Lazily surface directory-scoped instruction files (AGENTS.md / CLAUDE.md)
- * that live *below* the session cwd.
- *
- * The system prompt already carries the instruction files on the cwd → home
- * chain. Instruction files in subdirectories are only relevant once the agent
- * works there, and models trained on nested-instruction conventions otherwise
- * spend tool calls probing `packages/x/CLAUDE.md` to find out whether one
- * exists. Injecting the file with the first tool result that touches its
- * directory makes that probe unnecessary and keeps the injection scoped to
- * the directories actually visited. Each directory is checked at most once
- * per session.
- */
-
 export const NESTED_INSTRUCTION_FILENAMES = ['AGENTS.md', 'CLAUDE.md'] as const
 
 const DEFAULT_PER_FILE_LIMIT = 4000
@@ -22,7 +8,6 @@ const DEFAULT_MAX_SESSIONS = 256
 const MAX_DIRECTORIES_PER_CALL = 8
 const TRUNCATED_SUFFIX = '\n… [truncated]'
 
-/** Tools whose arguments name a filesystem location worth scoping to. */
 const FILESYSTEM_TOOL_PREFIX = 'fs.'
 
 export interface NestedInstructionFile {
@@ -33,7 +18,6 @@ export interface NestedInstructionFile {
 
 export interface NestedInstructionLookup {
   sessionId: string
-  /** Absolute or cwd-relative path the tool call targeted. */
   targetPath: string
   cwd?: string
   workspaceRoot?: string
@@ -77,11 +61,6 @@ async function readBounded(
   }
 }
 
-/**
- * Resolve the filesystem location a tool call is about, or null when the
- * tool is not filesystem-scoped. `path` wins over `cwd` so fs.read/fs.edit
- * scope to the file's directory while fs.list/fs.glob scope to their cwd.
- */
 export function nestedInstructionTargetPath(
   toolName: string,
   args: Record<string, unknown> | undefined,
@@ -111,7 +90,6 @@ export class NestedInstructionInjector {
   private sessionSet(sessionId: string): Set<string> {
     const existing = this.checkedDirectories.get(sessionId)
     if (existing) {
-      // Refresh insertion order so long-lived sessions are not evicted first.
       this.checkedDirectories.delete(sessionId)
       this.checkedDirectories.set(sessionId, existing)
       return existing
@@ -126,11 +104,6 @@ export class NestedInstructionInjector {
     return created
   }
 
-  /**
-   * Instruction files for every not-yet-checked directory strictly below cwd
-   * on the way to `targetPath`, least specific first. Directories above or
-   * equal to cwd are the system prompt's responsibility and are skipped.
-   */
   async collect(lookup: NestedInstructionLookup): Promise<NestedInstructionFile[]> {
     if (!lookup.cwd) return []
     let cwd: string
@@ -154,7 +127,6 @@ export class NestedInstructionInjector {
     try {
       if ((await stat(target)).isDirectory()) targetDir = target
     } catch {
-      // A missing target still scopes to the directories that do exist.
     }
 
     const directories: string[] = []

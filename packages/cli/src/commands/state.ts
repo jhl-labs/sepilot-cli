@@ -9,11 +9,6 @@ export interface StateCommandOptions {
   json?: boolean
 }
 
-/**
- * `sepilot state [sessionId]` — render the agent state board for a run.
- * Without a sessionId, the most recent session is used. `--json` (or the
- * global `--json`/`--output-format json`) prints the raw board response.
- */
 export async function stateCommand(
   sessionId: string | undefined,
   options: StateCommandOptions = {},

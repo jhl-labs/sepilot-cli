@@ -344,6 +344,7 @@ export function buildStoredSessionState(session: DaemonSessionDetail): StoredSes
           timestamp: event.timestamp,
           branchFromEventIndex,
           citations: assistantCitations,
+          ...(event.views ? { views: event.views } : {}),
         })
         if (event.thinking) {
           activities.push({
@@ -355,20 +356,27 @@ export function buildStoredSessionState(session: DaemonSessionDetail): StoredSes
           })
         }
         break
-      case 'router_decision':
+      case 'router_decision': {
+        const decision = event.decision
+        const routedPersona = decision.persona && decision.persona !== 'default'
+          ? decision.persona
+          : undefined
         activities.push({
           id: `${event.id}-router`,
           kind: 'state',
-          label: `Router: ${event.decision.mode}/${event.decision.persona}`,
-          detail: summarizeText(event.decision.reason || 'No router rationale provided.'),
-          status: event.decision.fallback ? 'error' : 'neutral',
+          label: routedPersona
+            ? `Routed to: ${routedPersona} · ${decision.mode}`
+            : `Router: ${decision.mode}`,
+          detail: summarizeText(decision.reason || 'No router rationale provided.'),
+          status: decision.fallback ? 'error' : 'neutral',
           meta: [
-            event.decision.confidence,
-            event.decision.fallback ? 'fallback' : '',
-            formatSkillMeta(event.decision.skillIds) ?? '',
+            decision.confidence,
+            decision.fallback ? 'fallback' : '',
+            formatSkillMeta(decision.skillIds) ?? '',
           ].filter(Boolean).join(' · '),
         })
         break
+      }
       case 'mode_route_decision':
         activities.push({
           id: `${event.id}-mode-route`,
@@ -656,11 +664,6 @@ export function buildStoredSessionState(session: DaemonSessionDetail): StoredSes
         break
       }
       case 'approval_response': {
-        // Defensive ?? on event.approved kept around for older
-        // imported sessions where the legacy schema omitted decision;
-        // (event as any) sidesteps TS's exhaustive narrowing — the
-        // typed schema makes decision required, but old jsonl rows
-        // can still arrive without it.
         const fallbackApproved = (event as { approved?: boolean }).approved
         const decision = event.decision ?? (fallbackApproved ? 'approved' : 'denied')
         const toolCallId = requestToToolCallId.get(event.requestId)
@@ -686,12 +689,6 @@ export function buildStoredSessionState(session: DaemonSessionDetail): StoredSes
         break
       }
       case 'auto_approval': {
-        // Stored counterpart of the live AgentEvent — replay it so a
-        // session reconstructed from history shows the same positive
-        // signal a live operator saw. Without this case, opening an
-        // older session in desktop/web would show tool_call/tool_result
-        // pairs with no consent trail and the operator would have to
-        // open the json view to figure out *why* each tool ran.
         activities.push({
           id: `${event.id}-auto-approval`,
           kind: 'approval',
@@ -967,8 +964,6 @@ export function buildStoredSessionState(session: DaemonSessionDetail): StoredSes
     }
   }
 
-  // Restored event records are session-scoped, so carry that source session on
-  // each surface message for approval/question actions after shell state changes.
   for (const message of messages) {
     message.sessionId ??= session.id
   }

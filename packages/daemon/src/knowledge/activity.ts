@@ -27,7 +27,6 @@ export function createKnowledgeActivityStore() {
     started_at INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER, data TEXT NOT NULL,
     FOREIGN KEY(activity_id) REFERENCES knowledge_activity(id)
   ); CREATE INDEX IF NOT EXISTS knowledge_calls_activity ON knowledge_llm_calls(activity_id);`)
-  // Additive migration for activity databases created before indexed usage columns.
   const columns = new Set(
     (db.prepare('PRAGMA table_info(knowledge_llm_calls)').all() as { name: string }[]).map(
       (r) => r.name,
@@ -170,7 +169,6 @@ export function createKnowledgeActivityStore() {
             })
       }
     },
-    /** Observe each actual chat attempt, including guarded retries and late responses after timeout. */
     observe(
       provider: ILLMProvider,
       activityId: string,
@@ -210,7 +208,6 @@ export function createKnowledgeActivityStore() {
             }
             const automatic = get(activityId)?.trigger === 'automatic'
             if (automatic) {
-              // UTF-8 bytes plus bounded output is a conservative admission estimate, not measured usage.
               const reservation =
                 Buffer.byteLength(requestText, 'utf8') + (request.maxTokens ?? 3500)
               try {
@@ -239,7 +236,6 @@ export function createKnowledgeActivityStore() {
             const usage = response.usage
             const input = number(usage?.inputTokens),
               output = number(usage?.outputTokens)
-            // Some adapters synthesize 0/0 for absent provider usage. Never present that as measured zero.
             const reported = input !== null && output !== null && input + output > 0
             const completed: KnowledgeLlmCall = {
               ...call,

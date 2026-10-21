@@ -46,8 +46,8 @@ export const scriptMonitorConfigSchema = z.object({
   anomalyConsecutiveSamples: z.number().int().min(1).max(100).default(2),
   recoveryConsecutiveSamples: z.number().int().min(1).max(100).default(2),
   errorConsecutiveSamples: z.number().int().min(1).max(100).default(2),
-  /** Optional periodic status report. Transitions are always delivered immediately. */
   reportEveryMs: z.number().int().min(5 * 60_000).max(30 * 24 * 60 * 60_000).nullable().default(null),
+  notifyOnChange: z.boolean().default(false),
 }).strict()
 
 export type ScriptMonitorConfig = z.infer<typeof scriptMonitorConfigSchema>
@@ -70,13 +70,14 @@ const observationSchema = z.object({
 
 interface ScriptMonitorRuntimeState {
   lastReportAt?: number
+  lastObservationHash?: string
 }
 
 export interface ScriptMonitorRunResult {
   output: string
   evaluation: MonitorEvaluationResult
   notified: boolean
-  notificationKind: 'transition' | 'periodic' | null
+  notificationKind: 'transition' | 'periodic' | 'change' | 'manual' | null
 }
 
 export interface ScriptMonitorRunnerDeps {
@@ -88,7 +89,7 @@ export interface ScriptMonitorRunnerDeps {
     priority: 'normal' | 'high' | 'critical'
     jobId: string
     runId?: string
-  }): void
+  }): void | Promise<void>
   now?: () => number
 }
 
@@ -113,8 +114,11 @@ function monitorEnvironment(): NodeJS.ProcessEnv {
 function runtimeState(metadata: Record<string, unknown> | null): ScriptMonitorRuntimeState {
   const value = metadata?.scriptMonitorState
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
-  const lastReportAt = (value as Record<string, unknown>).lastReportAt
-  return Number.isFinite(lastReportAt) ? { lastReportAt: Number(lastReportAt) } : {}
+  const { lastReportAt, lastObservationHash } = value as Record<string, unknown>
+  return {
+    ...(Number.isFinite(lastReportAt) ? { lastReportAt: Number(lastReportAt) } : {}),
+    ...(typeof lastObservationHash === 'string' ? { lastObservationHash } : {}),
+  }
 }
 
 export function scriptMonitorLaunch(config: ScriptMonitorConfig): { command: string; args: string[]; cwd: string } {
@@ -145,7 +149,6 @@ async function executeProbe(
   const launch = scriptMonitorLaunch(config)
   const result = await runBoundedCommand({
     ...launch,
-    // Scheduled probes do not inherit provider tokens or daemon credentials.
     env: monitorEnvironment(),
     signal,
     timeoutMs: config.timeoutMs,
@@ -175,7 +178,7 @@ function notificationTitle(job: ScheduledJob, evaluation: MonitorEvaluationResul
 export function createScriptMonitorRunner(deps: ScriptMonitorRunnerDeps) {
   return async (
     job: ScheduledJob,
-    context?: { runId?: string; signal?: AbortSignal; suppressDelivery?: boolean },
+    context?: { runId?: string; signal?: AbortSignal; suppressDelivery?: boolean; forceReport?: boolean },
   ): Promise<ScriptMonitorRunResult> => {
     const config = scriptMonitorConfigFromMetadata(job.metadata)
     if (!config) throw new Error('script monitor configuration is missing')
@@ -240,25 +243,40 @@ export function createScriptMonitorRunner(deps: ScriptMonitorRunnerDeps) {
     })
 
     const state = runtimeState(job.metadata)
+    const observationHash = hash(JSON.stringify({
+      status,
+      severity,
+      metrics: Object.fromEntries(Object.entries(metrics).sort(([a], [b]) => a.localeCompare(b))),
+    }))
+    const changed = config.notifyOnChange
+      && state.lastObservationHash !== undefined
+      && state.lastObservationHash !== observationHash
+      && evaluation.outcome !== 'duplicate'
     const periodic = config.reportEveryMs !== null
       && now - (state.lastReportAt ?? 0) >= config.reportEveryMs
-    const notificationKind = evaluation.shouldNotify ? 'transition' : periodic ? 'periodic' : null
+    const notificationKind = evaluation.shouldNotify ? 'transition' : changed ? 'change' : context?.forceReport ? 'manual' : periodic ? 'periodic' : null
     const notified = Boolean(notificationKind && !context?.suppressDelivery)
     if (notified) {
       const deliveryIdentity = evaluation.notificationDedupKey
-        ?? `${job.id}:periodic:${Math.floor(now / config.reportEveryMs!)}`
+        ?? (changed || context?.forceReport ? `${job.id}:report:${sampleId}` : `${job.id}:periodic:${Math.floor(now / config.reportEveryMs!)}`)
       const id = `script-monitor:${hash(`${job.id}\0${deliveryIdentity}`).slice(0, 32)}`
-      deps.notify({
+      await deps.notify({
         id,
-        title: notificationTitle(job, evaluation, periodic && !evaluation.shouldNotify),
+        title: notificationKind === 'manual' ? `Monitor result: ${job.name}` : notificationKind === 'change' ? `Monitor changed: ${job.name}` : notificationTitle(job, evaluation, periodic && !evaluation.shouldNotify),
         body: summary,
         priority: priorityFor(evaluation),
         jobId: job.id,
         ...(context?.runId ? { runId: context.runId } : {}),
       })
+    }
+    if (notified || (config.notifyOnChange && !context?.suppressDelivery && evaluation.outcome !== 'duplicate')) {
       deps.updateMetadata(job.id, {
         ...(job.metadata ?? {}),
-        scriptMonitorState: { lastReportAt: now },
+        scriptMonitorState: {
+          ...state,
+          ...(notified ? { lastReportAt: now } : {}),
+          ...(config.notifyOnChange ? { lastObservationHash: observationHash } : {}),
+        },
       })
     }
     const metricText = Object.entries(metrics).map(([name, value]) => `${name}=${value}`).join(', ')

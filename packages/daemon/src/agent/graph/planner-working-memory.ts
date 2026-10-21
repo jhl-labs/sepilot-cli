@@ -6,18 +6,8 @@ import type {
   PlannerWorkingMemory,
 } from '@sepilotd/core'
 
-/**
- * Default cap for each planner scratch list (abandonedAlternatives /
- * openAssumptions). Generous — normal runs never hit it; only runaway
- * accumulation gets bounded. Overridable via `SEPILOTD_PLANNER_SCRATCH_CAP`.
- */
 export const MAX_PLANNER_SCRATCH = 30
 
-/**
- * Resolve the effective planner-scratch cap. Defaults to
- * `MAX_PLANNER_SCRATCH`; `SEPILOTD_PLANNER_SCRATCH_CAP` overrides it (clamped
- * to a safe range). General knob — no model/dataset/graphId branching.
- */
 export function resolvePlannerScratchCap(): number {
   const raw = process.env.SEPILOTD_PLANNER_SCRATCH_CAP
   if (!raw) return MAX_PLANNER_SCRATCH
@@ -26,19 +16,11 @@ export function resolvePlannerScratchCap(): number {
   return Math.max(5, Math.min(200, parsed))
 }
 
-/** Read the folded count we previously stamped into a rollup digest entry. */
 function digestFoldedCount(text: string): number {
   const match = text.match(/(\d+)/)
   return match ? Number(match[1]) : 1
 }
 
-/**
- * FIFO cap with oldest-into-digest rollup. Structure-only: the decision uses
- * array length and the explicit `digest` flag — never content meaning. Never
- * fully deletes: overflow entries are folded into a single `{ digest: true }`
- * summary kept at the front, and a pre-existing digest contributes its recorded
- * count so the running total survives repeated caps.
- */
 export function capScratchWithDigest<T extends { digest?: boolean }>(
   items: T[],
   max: number,
@@ -56,11 +38,6 @@ export function capScratchWithDigest<T extends { digest?: boolean }>(
   return [makeDigest(foldedCount), ...kept]
 }
 
-/**
- * Cap a text-bearing planner scratch list (e.g. openAssumptions). Exposed as
- * the tested public API; wiring for the concrete lists uses dedicated digest
- * factories so board rendering stays sensible.
- */
 export function capPlannerScratch<T extends { text: string; digest?: boolean }>(
   items: T[],
   max: number = resolvePlannerScratchCap(),
@@ -96,7 +73,6 @@ function capOpenAssumptions(
   return capScratchWithDigest(
     items,
     max,
-    // verified:true keeps the digest out of open-question promotion/surfacing.
     (foldedCount) => ({ text: `earlier: ${foldedCount} more (folded)`, verified: true, digest: true }),
     (item) => item.text,
   )
@@ -153,13 +129,6 @@ const PayloadSchema = z.object({
 
 const FENCE_REGEX = /```(?:planner|json:planner)\s*\n([\s\S]*?)\n?```/i
 
-/**
- * Extract a planner-authored working memory snapshot from a model response.
- *
- * The planner is asked to emit a fenced ```planner ... ``` block whenever it
- * has a non-trivial plan. We parse the most recent such block per response and
- * merge with the previous snapshot so partial updates are additive.
- */
 export function extractPlannerWorkingMemory(
   content: string,
   prev?: PlannerWorkingMemory,
@@ -180,8 +149,6 @@ export function extractPlannerWorkingMemory(
     at: d.at ?? now,
     text: d.text,
   }))
-  // Abandoned alternatives are append-only by description: never let a
-  // new partial update silently drop ones the planner already recorded.
   const abandonedFromPayload = payload.abandonedAlternatives ?? []
   const mergedAbandoned = [
     ...(prev?.abandonedAlternatives ?? []),
@@ -193,9 +160,6 @@ export function extractPlannerWorkingMemory(
     ),
   ]
 
-  // Open assumptions: payload may flip `verified=true`; preserve any
-  // assumption the previous snapshot held unless the payload re-states
-  // it (with possibly new `verified`).
   const assumptionsFromPayload = payload.openAssumptions ?? []
   const mergedAssumptions = (() => {
     if (assumptionsFromPayload.length === 0) {
@@ -235,15 +199,10 @@ export interface PlannerBoardPlanStep {
 }
 
 export interface PlannerWorkingMemoryBoardSections {
-  /** Hierarchical plan flattened with depth so the board can render it. */
   plan: PlannerBoardPlanStep[]
-  /** Decision texts already taken (1 line each). */
   decisions: string[]
-  /** Approaches the planner tried and dropped — feeds failed-attempts. */
   abandoned: Array<{ description: string; reason: string }>
-  /** All held assumptions with their verification state. */
   assumptions: Array<{ text: string; verified: boolean }>
-  /** Unverified assumption texts — feeds the board's open questions. */
   openQuestions: string[]
 }
 
@@ -259,12 +218,6 @@ function flattenSteps(
   return out
 }
 
-/**
- * Map a planner working-memory snapshot (previously 100% write-only — parsed
- * and persisted but never shown back to the model) into the sections the
- * state board re-injects every turn: plan hierarchy, decisions, abandoned
- * alternatives, and open (unverified) assumptions.
- */
 export function formatPlannerWorkingMemory(
   pwm: PlannerWorkingMemory | undefined,
 ): PlannerWorkingMemoryBoardSections {

@@ -9,11 +9,6 @@ import { tailWrappedText } from '../utils/transcript.js'
 interface MessageBubbleProps {
   message: Message
   compactTools?: boolean
-  /**
-   * When provided, assistant markdown is pre-wrapped to this column budget
-   * (CJK-width aware, hanging indents) and rendered line-by-line so Ink does
-   * not re-wrap and break list/quote indentation.
-   */
   contentWidth?: number
 }
 
@@ -210,12 +205,12 @@ export const MessageBubble = React.memo(function MessageBubble({
             <AssistantMarkdownBody content={normalizedContent} contentWidth={contentWidth} />
             {(message.citations?.length ?? 0) > 0 && (
               <Box flexDirection="column" marginTop={1}>
-                <Text color={colors.info}>Sources used</Text>
+                <Text color={colors.dimText}>Sources used</Text>
                 {message.citations?.map((citation) => (
-                  <Box key={`${message.id}:${citation.id}`} flexDirection="column" marginTop={1}>
-                    <Text color={colors.info}>- {citation.citationLabel}</Text>
-                    <Text color={colors.dimText}>{citation.snippet}</Text>
-                  </Box>
+                  <Text key={`${message.id}:${citation.id}`} color={colors.dimText} wrap="truncate-end">
+                    - <Text color={colors.info}>{citation.citationLabel}</Text>
+                    {citation.snippet ? ` · ${citation.snippet.replace(/\s+/g, ' ').trim()}` : ''}
+                  </Text>
                 ))}
               </Box>
             )}

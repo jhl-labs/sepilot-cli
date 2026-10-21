@@ -79,8 +79,24 @@ export const modelCapabilitiesSchema = z.object({
 
 export const modelCompatibilitySchema = z.object({
   toolTransport: z.enum(['auto', 'native', 'prompt-react', 'adaptive']).optional(),
+  reasoningEffortOffValue: z.enum(['none', 'minimal']).optional(),
+  reasoningEffortAliases: z.record(z.enum(['low', 'medium', 'high']), z.string().trim().min(1)).optional(),
+  auxiliaryThinkingOffFallback: z.enum(['low', 'medium', 'high', 'max']).optional(),
+  repairThinkingOffFallback: z.enum(['low', 'medium', 'high', 'max']).optional(),
   answerProtocol: z.enum(['auto', 'repair-left-truncated-answer-stem']).optional(),
   notes: z.array(z.string()).optional(),
+}).refine(value => !value.reasoningEffortOffValue || Boolean(value.notes?.length), {
+  message: 'An Off wire mapping requires endpoint/model evidence in compatibility.notes.',
+  path: ['notes'],
+}).refine(value => !value.auxiliaryThinkingOffFallback || Boolean(value.notes?.length), {
+  message: 'An auxiliary thinking fallback requires endpoint/model evidence in compatibility.notes.',
+  path: ['notes'],
+}).refine(value => !value.repairThinkingOffFallback || Boolean(value.notes?.length), {
+  message: 'A repair thinking fallback requires endpoint/model evidence in compatibility.notes.',
+  path: ['notes'],
+}).refine(value => !value.reasoningEffortAliases || Boolean(value.notes?.length), {
+  message: 'Reasoning-effort aliases require endpoint/model evidence in compatibility.notes.',
+  path: ['notes'],
 })
 
 export const modelInfoSchema = z.object({
@@ -509,6 +525,13 @@ export const webhookEndpointSummarySchema = z.object({
   hasSecretValue: z.boolean(),
   allowedIps: z.array(z.string()),
   allowedEvents: z.array(z.string()),
+  mode: z.enum(['chat', 'route']),
+  auth: z.enum(['hmac', 'token']),
+  eventTypeHeader: z.string().optional(),
+  deliveryIdHeader: z.string().optional(),
+  requireTimestamp: z.boolean(),
+  timestampHeader: z.string(),
+  timestampMaxSkewSeconds: z.number().int(),
 })
 
 export const telegramChannelSummarySchema = z.object({

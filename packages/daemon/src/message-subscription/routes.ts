@@ -567,13 +567,11 @@ export async function registerMessageSubscriptionRoutes(
         return
       }
     } catch {
-      // Fall back to a hard close below.
     }
 
     try {
       await connection.close()
     } catch {
-      // Ignore close races.
     }
   }
 
@@ -595,7 +593,6 @@ export async function registerMessageSubscriptionRoutes(
         active.terminate()
       }
     } catch {
-      // Ignore close races.
     }
   }
 

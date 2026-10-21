@@ -1,3 +1,4 @@
+import { resolveRunWallClock } from '../progress-signal.js'
 import type { AgentEvent } from '@sepilotd/core'
 import { isAbortError } from '../../abort.js'
 import {
@@ -13,7 +14,7 @@ import { buildStateBoard, type AgentSteeringNote } from './state-board.js'
 import {
   captureContinuationProgress,
   hasContinuationProgress,
-  resolveRunMaxWallMs,
+
 } from './continuation-progress.js'
 import type {
   AgentState,
@@ -57,12 +58,6 @@ export interface GraphChildErrorInfo {
   message: string
 }
 
-/**
- * Thrown by a subgraph node after its child graph already surfaced a terminal
- * error event. The parent engine treats it as a halt-without-duplicate: the
- * child's error was forwarded once, so the parent stops as an error without
- * re-emitting a second error event.
- */
 export class GraphChildHaltError extends Error {
   constructor(readonly childError: GraphChildErrorInfo) {
     super(childError.message)
@@ -70,7 +65,6 @@ export class GraphChildHaltError extends Error {
   }
 }
 
-/** Thrown when a conditional edge router returns a target it never declared. */
 export class GraphRoutingError extends Error {
   constructor(message: string) {
     super(message)
@@ -78,9 +72,6 @@ export class GraphRoutingError extends Error {
   }
 }
 
-// Bounds for the item snapshots included in the `state_board` stream event so
-// a large board can never bloat the live stream; the full board stays in the
-// journal and the /state endpoint.
 const MAX_STATE_BOARD_EVENT_ITEMS = 20
 const MAX_STATE_BOARD_EVENT_TEXT_CHARS = 120
 
@@ -139,10 +130,6 @@ async function* observeAuxiliaryLlmRequests<T>(
     return await promise
   }
 
-  // A node starts executing synchronously until its first await before this
-  // observer receives the returned promise. That lets a convergence node
-  // lazily create its bounded control budget and still expose the request on
-  // the same live event stream as ordinary auxiliary work.
   const budgets = [context.auxiliaryLlmBudget, context.controlLlmBudget]
     .filter((budget, index, all): budget is NonNullable<typeof budget> => (
       Boolean(budget) && all.indexOf(budget) === index
@@ -323,9 +310,6 @@ export class StateGraph<
     }
 
     const next = edge.router(state, context)
-    // A conditional router that declared its targets must return one of them
-    // (or the terminal '__end__'). Anything else is a router bug — surface it
-    // instead of letting an undefined/typo target break to a silent "success".
     if (edge.targets.length > 0) {
       if (next === undefined || next === null) {
         throw new GraphRoutingError(
@@ -351,42 +335,22 @@ export class StateGraph<
       : this.startNode
     let nodeExecutions = 0
     const maxNodeExecutions = options?.maxNodeExecutions ?? state.maxIterations * 10
-    // No-progress cycle detection: count how often the run revisits the exact
-    // same (node, progress-signature). A run that makes progress mints fresh
-    // signatures; a tight A→B oscillation revisits the same handful and trips
-    // the limit long before it burns the whole (possibly multiplied) budget.
     const noProgressLimit = Math.max(6, state.maxIterations * 2)
     const signatureCounts = new Map<string, number>()
     const maxContinuationCycles = isGraphExecutionContext(context)
       ? resolveMaxContinuationCycles(context.maxContinuationCycles)
       : resolveMaxContinuationCycles()
     let continuationCycle = 0
-    // Once a control/guard node explicitly routes an exhausted run into a
-    // lifecycleState='done' reporter, that terminal handoff is authoritative.
-    // The reporter must run exactly once and the generic continuation
-    // supervisor must not reset the graph behind its back.
     let terminalHandoffCommitted = false
     let terminalStatus: 'success' | 'error' | 'aborted' | 'incomplete' = 'success'
     let terminalError: string | undefined
     let lastRunContractKey: string | undefined
-    // A board describes durable semantic run state, not the graph cursor.
-    // Persisting and streaming the same board at every graph node made long
-    // runs grow linearly with internal orchestration (often hundreds of
-    // duplicate events). Keep node lifecycle in state_change/node_trace and
-    // emit the board only when its semantic payload actually changes.
     let lastStateBoardFingerprint: string | undefined
-    // A graph can stop from an acting/observing node (for example after an
-    // explicit approval denial) without reaching a lifecycleState='done'
-    // node. Track message payloads already placed on the stream so the
-    // terminal output is never lost, while preserving exactly-once delivery
-    // when a streaming node already surfaced the same text.
     const emittedMessageContents = new Set<string>()
-    const wallDeadlineMs = resolveRunMaxWallMs()
     const wallStartedAt = Date.now()
-    // Progress-gated continuation: another continuation cycle is granted only
-    // when the cycle that just ended advanced the run (verified evidence,
-    // executed tool call, artifact mutation). The baseline is taken at run
-    // start so a first cycle that did nothing stops as no_progress too.
+    const wallClock = resolveRunWallClock(wallStartedAt, isGraphExecutionContext(context) ? context.agentContext.deadlineAt : undefined)
+    const wallDeadlineMs = wallClock.budgetMs
+    if (isGraphExecutionContext(context) && wallDeadlineMs !== undefined) context.agentContext = { ...context.agentContext, deadlineAt: wallStartedAt + wallDeadlineMs }
     if (maxContinuationCycles > 0) {
       const agentState = state as Partial<AgentState>
       agentState.continuationProgressSnapshot = captureContinuationProgress(
@@ -447,9 +411,6 @@ export class StateGraph<
 
     try {
     while (current && current !== '__end__') {
-      // Honor an abort at the very top of the loop so a stop request takes
-      // effect immediately — before running the next (possibly bookkeeping)
-      // node — instead of leaking one more node execution past the abort.
       if (contextAbortSignal(context)?.aborted) {
         terminalStatus = 'aborted'
         yield { type: 'done', usage: state.totalUsage, stopReason: stopReasonUserAbort() }
@@ -475,12 +436,6 @@ export class StateGraph<
         }
         break
       }
-      // Honor shouldStop, but always allow a terminal 'done' node (e.g.
-      // reporter / finalizer) to run once before exiting. Otherwise a
-      // node like iteration_guard that signals stop while routing to the
-      // reporter would skip the reporter entirely and starve any
-      // post-run hook (skill auto-discovery, final summary writes, etc.)
-      // attached there.
       if (state.shouldStop) {
         const definition = this.nodes.get(current)
         const meta = definition ? this.resolveNodeMeta(definition) : null
@@ -563,8 +518,6 @@ export class StateGraph<
         break
       }
 
-      // Expose the remaining budget so a nested subgraph node can descend from
-      // it instead of restarting a full budget (shared, not multiplied).
       if (isGraphExecutionContext(context)) {
         context.remainingNodeBudget = Math.max(0, maxNodeExecutions - nodeExecutions + 1)
       }
@@ -645,17 +598,11 @@ export class StateGraph<
             pendingToolExecution,
           ),
         )
-        // Journal a lightweight board snapshot at the same cadence as the
-        // heavy checkpoint when its semantic content changes, so
-        // restart/resume can replay the latest board without storing one
-        // identical copy per internal graph node.
         const stateBoard = buildStateBoard(agentState, context)
         const stateBoardFingerprint = JSON.stringify(stateBoard)
         if (stateBoardFingerprint !== lastStateBoardFingerprint) {
           lastStateBoardFingerprint = stateBoardFingerprint
           await context.journalStateBoard?.(stateBoard)
-          // Also surface changed board content so CLI/GUI surfaces can update
-          // their durable plan/todo view. Node progress has its own events.
           yield {
             type: 'state_board',
             criteriaTotal: stateBoard.completionCriteria.length,
@@ -666,8 +613,6 @@ export class StateGraph<
             currentNode: nodeName,
             nodeState: meta.lifecycleState,
             iteration: agentState.iteration,
-            // Bounded item snapshots so surfaces can render a live todo/plan
-            // list (not just counts) — the user-facing "what is it doing now".
             todos: stateBoard.todos.length > 0
               ? stateBoard.todos.slice(0, MAX_STATE_BOARD_EVENT_ITEMS).map((todo) => ({
                   content: truncateBoardEventText(todo.content),
@@ -733,10 +678,6 @@ export class StateGraph<
             }
             state = result.value
           } finally {
-            // If this run generator is abandoned (client close / abort) while
-            // suspended at a `yield`, close the node's generator so its finally
-            // blocks run and provider streams / subprocesses / locks are freed.
-            // A no-op once the node has already completed.
             await execution.return?.(undefined as never).catch(() => {})
           }
         } else {
@@ -800,8 +741,6 @@ export class StateGraph<
         }
         yield buildNodeTraceEvent(nodeName, nodeStartedAt)
         if (error instanceof GraphChildHaltError) {
-          // A child subgraph already surfaced its terminal error event; halt the
-          // parent as an error without emitting a duplicate error frame.
           terminalStatus = 'error'
           terminalError = error.childError.message
         } else if (
@@ -850,9 +789,6 @@ export class StateGraph<
         continue
       }
 
-      // No-progress cycle guard: bail early if the run keeps revisiting the same
-      // (node, progress-signature) far past the limit — an oscillation that
-      // would otherwise burn the entire budget without advancing.
       const signature = progressSignature(nodeName, state)
       const repeated = (signatureCounts.get(signature) ?? 0) + 1
       signatureCounts.set(signature, repeated)
@@ -1016,12 +952,6 @@ export class StateGraph<
     }
 
     if (context && isGraphExecutionContext(context)) {
-      // The regular checkpoint cadence journals the board before each node.
-      // Finalizer/reporter nodes populate completion diagnostics during their
-      // execution and then terminate, so without this post-node projection the
-      // accepted criterion verdicts exist only in debug traces. Journal one
-      // final snapshot when semantic state changed; the fingerprint keeps
-      // ordinary runs and budget stops from writing duplicate boards.
       const terminalStateBoard = buildStateBoard(state as unknown as AgentState, context)
       const terminalStateBoardFingerprint = JSON.stringify(terminalStateBoard)
       if (terminalStateBoardFingerprint !== lastStateBoardFingerprint) {
@@ -1086,12 +1016,6 @@ export class StateGraph<
   }
 }
 
-/**
- * Derive the structured stop reason for a graph run's terminal `done` event.
- * A node that ended the run explicitly records `state.stopReason`; otherwise
- * the reason is derived from the graph's own loop-control state so every
- * termination path is classified without parsing the assistant prose.
- */
 export function resolveGraphStopReason(
   state: Partial<AgentState>,
   terminalStatus: string,
@@ -1102,10 +1026,19 @@ export function resolveGraphStopReason(
   if (terminalStatus === 'error') {
     return stopReasonProviderError({ layer: 'graph', summary: terminalError })
   }
-  if (state.stopReason) return state.stopReason
-  // Tool execution already attested an operator denial. Ending the graph
-  // successfully is not evidence that the requested work was completed.
+  if (state.stopReason && !(
+    state.stopReason.kind === 'completed' && state.qualityGateDecision === 'incomplete'
+  )) return state.stopReason
   if (state.approvalDenied) return stopReasonApprovalDenied(state.approvalDenied.toolName ?? 'tool')
+  if (state.qualityGateDecision === 'incomplete') {
+    return {
+      ...stopReasonCompletionGate({
+        source: 'quality_phase',
+        unmet: [state.qualityGateSummary || 'The required quality phase did not establish acceptance.'],
+      }),
+      nextActions: ['resume', 'retry'],
+    }
+  }
   const contract = state.seedContract
   const incomplete = isIncompleteOutput(state.output)
   if (state.completionDiagnostics?.gate?.budgetExhausted === true) {
@@ -1113,11 +1046,10 @@ export function resolveGraphStopReason(
   }
   const forced = state.forcedFinalSynthesisReason
   const gateUnmet = (state.completionDiagnostics?.gate?.unmet?.length ?? 0) > 0
-  if (forced && !incomplete && !state.budgetExhausted && !gateUnmet) {
-    // Tool access was closed for a final synthesis turn and the model still
-    // produced a complete answer: the run completed, the closure is context.
-    // Unmet acceptance criteria recorded by the completion gate keep a forced
-    // final classified by its forcing layer below, never as completed.
+  const implementationWithoutChange = state.phaseUsageStart?.phase === 'implementation'
+    && contract?.executionIntent?.workspaceMutation !== 'forbidden'
+    && !(state.evidenceLedger?.artifactWrites ?? []).some((entry) => entry.status === 'success')
+  if (forced && !incomplete && !state.budgetExhausted && !gateUnmet && !implementationWithoutChange) {
     return stopReasonCompleted({ layer: forced })
   }
   if (state.budgetExhausted || forced) {
@@ -1165,9 +1097,6 @@ function updateActiveRun<State extends GraphRuntimeState>(
     tokensInput: state.totalUsage.inputTokens,
     tokensOutput: state.totalUsage.outputTokens,
   })
-  // Keep a reference to the LIVE state object (not a clone) so routes such as
-  // `POST /sessions/:id/steer` can append to `steeringNotes` and have this
-  // in-flight run observe it on a later turn.
   context.activeRuns?.registerLiveState?.(
     context.agentContext.sessionId,
     state as unknown as { steeringNotes?: AgentSteeringNote[] },

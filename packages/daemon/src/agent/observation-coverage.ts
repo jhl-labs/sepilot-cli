@@ -1,4 +1,4 @@
-import type { Message, ToolCall } from '@sepilotd/core'
+import type { Message, ToolCall, ToolSecurityEffect } from '@sepilotd/core'
 import type {
   ToolInputNormalizationContext,
   ToolRegistry,
@@ -6,7 +6,7 @@ import type {
 import { TOOL_RESULT_STATUS_METADATA_KEY } from './memory-write-completion.js'
 import { CURRENT_AGENT_TURN_USER_METADATA_KEY } from './turn-context.js'
 import { resolveToolPath } from '../tools/path-utils.js'
-import { FS_READ_OBSERVATION_EOF_LINE } from '../tools/fs-read.js'
+import { FS_READ_OBSERVATION_EOF_LINE, fsReadHasUnreadTail } from '../tools/fs-read.js'
 import { summarizeToolOutputForAgentContext } from './tool-output.js'
 
 export interface CoveredObservationCall {
@@ -31,17 +31,12 @@ export interface ObservationHistoryEntry {
   tool: string
   input: Record<string, unknown>
   status: 'success' | 'error'
+  securityEffect?: ToolSecurityEffect
+  executionObserved?: boolean
   ts?: number
   output?: string
 }
 
-/**
- * Store exactly the bounded evidence that was eligible for the model context.
- * `fs.read` pages carry an explicit agent-visible line range, so truncating
- * them a second time can leave a header that claims more lines than the
- * retained body actually contains. Other tool outputs keep the compact
- * ledger cap because they do not participate in line-range coverage.
- */
 export function observationHistoryOutput(
   toolName: string,
   output: string,
@@ -100,13 +95,6 @@ function parseFsReadLines(output: string): FsReadLine[] {
   return lines
 }
 
-/**
- * A cache hit should answer the range the model requested, not replay every
- * page that happened to prove coverage. Reconstruct only exact numbered
- * source lines. If compaction removed any line from a bounded requested range,
- * fail open so the real read executes instead of presenting a misleading
- * head/tail summary as complete evidence.
- */
 function projectFsReadEvidence(
   output: string,
   requested: ToolCall,
@@ -137,12 +125,6 @@ function fsReadObservationEofLine(call: ToolCall): number | undefined {
     : undefined
 }
 
-/**
- * Return the exact bounded evidence that can be replayed on the next model
- * turn. Coverage is only an optimization: if compaction removed an output, or
- * a collective result would itself exceed a bounded tool-result unit, fail
- * open and execute a fresh observation instead of hiding the requested read.
- */
 function replayableEvidenceForCalls(
   messages: readonly Message[],
   history: readonly ObservationHistoryEntry[] | undefined,
@@ -235,13 +217,6 @@ const FS_READ_VISIBLE_RANGE_PATTERN = /\[fs\.read agent-visible range: lines (\d
 const FS_READ_PAST_EOF_PATTERN = /^\[fs\.read:\s*offset \d+ is past (?:the scanned )?end of file \((\d+) lines? total\)\]$/iu
 const FS_READ_NON_CONTENT_RESULT_PATTERN = /^\[fs\.read:\s.*(?:is a directory|appears to be binary|requires a non-empty)/iu
 
-/**
- * Observation reuse must be bounded by evidence the model actually received,
- * not by the wider range the filesystem tool read before context compaction.
- * Large fs.read results carry an explicit contiguous visible-range marker;
- * narrow the cached call to that range. Non-content sentinels and legacy
- * generic summaries provide no safe range and therefore are not reusable.
- */
 function agentVisibleObservationCall(
   call: ToolCall,
   output: string | undefined,
@@ -294,7 +269,7 @@ function agentVisibleObservationCall(
   if (parsedLines.length === 0) return call
   const firstLine = parsedLines[0]!.number
   const lastLine = parsedLines.at(-1)!.number
-  const hasUnreadTail = /call fs\.read again\b[^\]]*\bto continue\]/iu.test(visibleOutput)
+  const hasUnreadTail = fsReadHasUnreadTail(visibleOutput)
   return {
     ...call,
     arguments: {
@@ -308,13 +283,6 @@ function agentVisibleObservationCall(
   }
 }
 
-/**
- * A successful mutation does not make every earlier file observation stale.
- * Keep exact-file reads when a known single-path write changed some other
- * file, but retain the conservative full barrier for patches, moves, shell
- * commands, plugins, and other mutations whose affected paths are not encoded
- * by this small stable contract.
- */
 function retainObservationsAcrossMutation(
   observations: readonly ToolCall[],
   mutation: ToolCall,
@@ -329,10 +297,6 @@ function retainObservationsAcrossMutation(
         && !Array.isArray(network)
         && (network as Record<string, unknown>).mode === 'external',
       )
-    // The normal terminal sandbox mounts the workspace read-only, so tests,
-    // builds, and inspection commands cannot stale filesystem observations.
-    // The explicit external-network mode is the exception: it is the audited
-    // workspace-writing sandbox used by generators/installers/crawlers.
     return writesWorkspace ? [] : [...observations]
   }
   if (!SINGLE_PATH_FILE_MUTATION_TOOLS.has(mutation.name)) return []
@@ -372,10 +336,6 @@ function currentTurnMessages(messages: readonly Message[]): readonly Message[] {
   return start >= 0 ? messages.slice(start) : messages
 }
 
-/**
- * Successful observations since the latest successful state-changing tool.
- * Unknown/plugin tools form a conservative barrier through isReadOnlyTool.
- */
 export function reusableObservationsInCurrentTurn(
   messages: readonly Message[],
   tools: ToolRegistry,
@@ -416,16 +376,6 @@ export function reusableObservationsInCurrentTurn(
   return observations
 }
 
-/**
- * Rebuild reusable observations from the structured execution ledger.
- *
- * Message compaction is allowed to summarize or remove old assistant/tool
- * protocol pairs, so messages alone are not a durable record of which reads
- * already succeeded in the active run. The execution ledger survives that
- * compaction and is scoped to the current graph/React run. Process it in
- * order so successful mutations invalidate observations with exactly the
- * same semantics as the message-backed path.
- */
 export function reusableObservationsFromHistory(
   history: readonly ObservationHistoryEntry[],
   tools: ToolRegistry,
@@ -466,9 +416,6 @@ export function partitionCallsCoveredByCurrentTurnObservations(
   isReadOnlyTool: (toolName: string) => boolean,
   history?: readonly ObservationHistoryEntry[],
 ): ObservationCoveragePartition {
-  // A non-empty structured ledger is authoritative because compaction can
-  // remove protocol messages while retaining the executed-call history. Fall
-  // back to messages for callers that do not maintain such a ledger yet.
   const observations = history?.length
     ? reusableObservationsFromHistory(history, tools, isReadOnlyTool, context)
     : reusableObservationsInCurrentTurn(messages, tools, isReadOnlyTool, context)
@@ -488,8 +435,6 @@ export function partitionCallsCoveredByCurrentTurnObservations(
           try {
             return coverage.covers(candidate.arguments, requested.arguments, context)
           } catch {
-            // Coverage is an optimization contract. A buggy comparator must
-            // fail open and execute the requested tool, never hide evidence.
             return false
           }
         })
@@ -503,7 +448,6 @@ export function partitionCallsCoveredByCurrentTurnObservations(
           context,
         )
       } catch {
-        // As with pairwise coverage, fail open and execute the request.
         collectivelyCovered = false
       }
     }
@@ -537,8 +481,6 @@ export function partitionCallsCoveredByCurrentTurnObservations(
           context,
         )
       } catch {
-        // Subtraction is an optimization contract. Any comparator failure
-        // executes the original request so missing evidence is never hidden.
         uncoveredInputs = undefined
       }
     }
@@ -603,14 +545,6 @@ export function buildObservationReuseMessage(
   }
 }
 
-/**
- * Preserve the assistant/tool protocol when a read is satisfied from current-
- * turn evidence without executing it again. A silent cache hit leaves weaker
- * models waiting for a tool result that never arrives and can create a loop.
- * These messages explicitly say that no new execution occurred; they are not
- * marked as successful tool executions, so ledgers and validation gates do
- * not double-count them.
- */
 export function buildObservationReuseToolResultMessages(
   coveredCalls: readonly CoveredObservationCall[],
 ): Message[] {
@@ -640,8 +574,6 @@ export function buildObservationReuseToolResultMessages(
   }))
 }
 
-/** Keep the assistant/tool protocol consistent after a requested observation
- * is replaced by smaller uncovered slices. */
 export function applyObservationNarrowingToLatestAssistantMessage(
   messages: Message[],
   narrowedCalls: readonly NarrowedObservationCall[],

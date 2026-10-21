@@ -1,5 +1,5 @@
 import chalk from 'chalk'
-import type { DaemonWebhookEndpointSummary } from '@sepilotd/api-client'
+import type { DaemonWebhookEndpointConfig, DaemonWebhookEndpointSummary } from '@sepilotd/api-client'
 import { DaemonClient } from '../client/http.js'
 import { output } from '../output/formatter.js'
 import { detectCliLocale } from '../utils/locale.js'
@@ -21,6 +21,7 @@ const WEBHOOKS_COPY = {
     endpointEnabledWith: (id: string, summary: string) => `Generic webhook endpoint enabled: ${id}\n${summary}`,
     endpointDisabled: (id: string) => `Generic webhook endpoint disabled: ${id}`,
     endpointDisabledWith: (id: string, summary: string) => `Generic webhook endpoint disabled: ${id}\n${summary}`,
+    addRequiresHeaderAndSecret: 'Creating a new webhook endpoint requires both --header and --secret.',
   },
   ko: {
     invalidPathDotDot: (path: string) => `잘못된 웹훅 경로: ${path} ('..' 포함)`,
@@ -38,6 +39,7 @@ const WEBHOOKS_COPY = {
     endpointEnabledWith: (id: string, summary: string) => `일반 웹훅 엔드포인트 활성화됨: ${id}\n${summary}`,
     endpointDisabled: (id: string) => `일반 웹훅 엔드포인트 비활성화됨: ${id}`,
     endpointDisabledWith: (id: string, summary: string) => `일반 웹훅 엔드포인트 비활성화됨: ${id}\n${summary}`,
+    addRequiresHeaderAndSecret: '새 웹훅 엔드포인트를 만들려면 --header와 --secret이 모두 필요합니다.',
   },
 } as const
 
@@ -59,20 +61,22 @@ export interface WebhooksMutationOptions {
 }
 
 export interface WebhooksAddOptions extends WebhooksMutationOptions {
-  header: string
-  secret: string
+  header?: string
+  secret?: string
   event?: string[]
   ip?: string[]
   disabled?: boolean
+  mode?: 'chat' | 'route'
+  auth?: 'hmac' | 'token'
+  eventTypeHeader?: string
+  deliveryIdHeader?: string
+  requireTimestamp?: boolean
+  timestampHeader?: string
+  timestampMaxSkew?: number
 }
 
 function assertSafeWebhookPath(path: string): void {
   const copy = webhooksCopy()
-  // Reject path-traversal segments and other characters that have no
-  // legitimate use in a public webhook route. Without this guard,
-  // `webhooks add "../../etc/passwd"` would round-trip to the daemon
-  // as `/webhooks/../../etc/passwd` — a route the user definitely
-  // didn't intend to expose.
   if (/(?:^|\/)\.\.(?:\/|$)/.test(path)) {
     throw new Error(copy.invalidPathDotDot(path))
   }
@@ -124,7 +128,7 @@ function normalizeWebhookPath(path: string): string {
   return `/hook/${withLeadingSlash.replace(/^\/+/, '')}`.replace(/\/+/g, '/')
 }
 
-function webhookEndpointId(path: string): string {
+export function webhookEndpointId(path: string): string {
   return `webhook-endpoint:${normalizeWebhookPath(path).slice('/hook/'.length)}`
     .replace(/[^a-zA-Z0-9:/._-]/g, '_')
 }
@@ -134,7 +138,11 @@ function formatWebhookEndpointSummary(
 ): string {
   const copy = webhooksCopy()
   const status = endpoint.enabled ? chalk.green(copy.enabled) : chalk.gray(copy.disabled)
-  const extras: string[] = [`header=${endpoint.secretHeader}`]
+  const extras: string[] = [
+    `header=${endpoint.secretHeader}`,
+    `mode=${endpoint.mode ?? 'chat'}`,
+    `auth=${endpoint.auth ?? 'hmac'}`,
+  ]
   if (endpoint.allowedEvents.length > 0) {
     extras.push(`events=${endpoint.allowedEvents.join(',')}`)
   }
@@ -159,18 +167,59 @@ export async function webhooksListCommand(options: WebhooksMutationOptions) {
   })
 }
 
+export interface MergeableWebhookEndpointFields {
+  enabled?: boolean
+  secretHeader?: string
+  allowedEvents?: string[]
+  allowedIps?: string[]
+  mode?: 'chat' | 'route'
+  auth?: 'hmac' | 'token'
+  requireTimestamp?: boolean
+  timestampHeader?: string
+  timestampMaxSkewSeconds?: number
+  eventTypeHeader?: string
+  deliveryIdHeader?: string
+}
+
+export function mergeWebhookEndpointInput(
+  path: string,
+  options: WebhooksAddOptions,
+  existing: MergeableWebhookEndpointFields | undefined,
+): DaemonWebhookEndpointConfig {
+  const body: DaemonWebhookEndpointConfig = {
+    enabled: options.disabled ? false : (existing?.enabled ?? true),
+    path,
+    secretHeader: options.header ?? existing?.secretHeader ?? '',
+    secretValue: options.secret ?? (existing ? '***redacted***' : ''),
+    allowedEvents: options.event ?? existing?.allowedEvents ?? [],
+    allowedIps: options.ip ?? existing?.allowedIps ?? [],
+    mode: options.mode ?? existing?.mode ?? 'chat',
+    auth: options.auth ?? existing?.auth ?? 'hmac',
+    requireTimestamp: options.requireTimestamp ?? existing?.requireTimestamp ?? false,
+    timestampHeader: options.timestampHeader ?? existing?.timestampHeader ?? 'x-webhook-timestamp',
+    timestampMaxSkewSeconds: options.timestampMaxSkew ?? existing?.timestampMaxSkewSeconds ?? 300,
+  }
+  const eventTypeHeader = options.eventTypeHeader ?? existing?.eventTypeHeader
+  if (eventTypeHeader) body.eventTypeHeader = eventTypeHeader
+  const deliveryIdHeader = options.deliveryIdHeader ?? existing?.deliveryIdHeader
+  if (deliveryIdHeader) body.deliveryIdHeader = deliveryIdHeader
+  return body
+}
+
 export async function webhooksAddCommand(path: string, options: WebhooksAddOptions) {
   const copy = webhooksCopy()
   const client = new DaemonClient(options.url)
   const endpointId = webhookEndpointId(path)
-  await client.upsertWebhookEndpoint({
-    enabled: options.disabled ? false : true,
-    path,
-    secretHeader: options.header,
-    secretValue: options.secret,
-    allowedEvents: options.event ?? [],
-    allowedIps: options.ip ?? [],
-  })
+  const existingEndpoints = await client.webhookEndpoints()
+  const existing = existingEndpoints.find((entry) => entry.id === endpointId)
+
+  if (!existing && (!options.header || !options.secret)) {
+    throw new Error(copy.addRequiresHeaderAndSecret)
+  }
+
+  const body = mergeWebhookEndpointInput(path, options, existing)
+
+  await client.upsertWebhookEndpoint(body)
 
   const endpoint = (await client.webhookEndpoints()).find(
     (entry) => entry.id === endpointId,

@@ -60,14 +60,6 @@ export function redactChannelConfigValue(value: unknown, key?: string): unknown 
   return value
 }
 
-/**
- * When the desktop UI sends a channel update with `***redacted***` literals
- * (because the input was prefilled from a redacted GET response), substitute
- * the existing stored value back so the secret is not clobbered.
- *
- * Matches by channel `type` + (when present) `id`. If no matching existing
- * channel is found the redacted literal is dropped (treated as unset).
- */
 function restoreSensitiveStrings(
   existingValue: unknown,
   nextValue: unknown,
@@ -108,9 +100,6 @@ export function restoreChannelConfigSecrets<
 >(existing: readonly T[] | undefined, next: readonly T[]): T[] {
   const existingArr = existing ?? []
   return next.map((channel, index) => {
-    // Prefer id-based match when both sides agree on an id. The
-    // current persisted schema has no id field but downstream code
-    // may grow one; matching by id stays correct under reorder.
     let match: T | undefined
     if (channel.id != null) {
       match = existingArr.find(
@@ -118,12 +107,6 @@ export function restoreChannelConfigSecrets<
           candidate.type === channel.type && candidate.id === channel.id,
       )
     }
-    // Fall back to position-based match (same index, same type).
-    // This is the realistic default because the desktop UI submits
-    // the whole channel array verbatim. Matching purely by `type`
-    // would alias multiple same-type channels (e.g. two telegram
-    // bots) onto the first existing entry, leaking that bot's
-    // secrets into a sibling channel's update.
     if (!match) {
       const positional = existingArr[index]
       if (positional && positional.type === channel.type) {
@@ -132,10 +115,6 @@ export function restoreChannelConfigSecrets<
     }
     return {
       ...channel,
-      // Walk regardless of match: when there is a match, redacted literals
-      // are restored; when there is no match (e.g. a brand-new channel that
-      // somehow contains a `***redacted***` placeholder), the literal is
-      // cleared rather than being persisted as the secret value.
       config: restoreSensitiveStrings(match?.config, channel.config),
     }
   })
@@ -219,6 +198,13 @@ export function listWebhookEndpointSummaries(
     hasSecretValue: endpoint.secretValue.length > 0,
     allowedIps: [...(endpoint.allowedIps ?? [])],
     allowedEvents: [...(endpoint.allowedEvents ?? [])],
+    mode: endpoint.mode ?? 'chat',
+    auth: endpoint.auth ?? 'hmac',
+    ...(endpoint.eventTypeHeader ? { eventTypeHeader: endpoint.eventTypeHeader } : {}),
+    ...(endpoint.deliveryIdHeader ? { deliveryIdHeader: endpoint.deliveryIdHeader } : {}),
+    requireTimestamp: endpoint.requireTimestamp ?? false,
+    timestampHeader: endpoint.timestampHeader ?? 'x-webhook-timestamp',
+    timestampMaxSkewSeconds: endpoint.timestampMaxSkewSeconds ?? 300,
   }))
 }
 

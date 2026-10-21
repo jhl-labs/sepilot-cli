@@ -93,18 +93,18 @@ function parseForwardEnvMarker(raw: string | undefined): string[] {
   )
 }
 
-// Non-secret, fixed-shape flags that are safe to always forward: they carry
-// no ambient-shell secret material and CLAUDE.md's Operational Knobs
-// document setting them on the same `sepilot start|restart` invocation that
-// spawns the daemon (e.g. `SEPILOT_DEBUG=1 sepilot restart`). Without this,
-// the child-env allowlist silently drops them and the documented workflow
-// produces a daemon that never writes the trace file the docs promise.
 const ALWAYS_FORWARDED_DAEMON_FLAGS = new Set(['SEPILOT_VERSION', 'SEPILOT_DEBUG'])
 
+const DAEMON_CHILD_ENV_ALLOWLIST_WIN32_UPPER = new Set(
+  [...DAEMON_CHILD_ENV_ALLOWLIST].map((name) => name.toUpperCase()),
+)
+
 function shouldForwardDaemonChildEnv(key: string): boolean {
-  return DAEMON_CHILD_ENV_ALLOWLIST.has(key)
-    || key.startsWith('SEPILOTD_')
-    || ALWAYS_FORWARDED_DAEMON_FLAGS.has(key)
+  if (DAEMON_CHILD_ENV_ALLOWLIST.has(key)) return true
+  if (process.platform === 'win32' && DAEMON_CHILD_ENV_ALLOWLIST_WIN32_UPPER.has(key.toUpperCase())) {
+    return true
+  }
+  return key.startsWith('SEPILOTD_') || ALWAYS_FORWARDED_DAEMON_FLAGS.has(key)
 }
 
 function buildDaemonChildEnvForNames(
@@ -285,11 +285,13 @@ export async function prepareDaemonEnvironment(options: {
 
   const unavailable = names.filter((name) => typeof sourceEnv[name] !== 'string')
   if (unavailable.length > 0) {
-    throw new Error(
-      `Cannot preserve daemon forwarding for ${unavailable.join(', ')}. `
-        + 'Export the missing variable(s) and retry with --forward-env, or intentionally remove '
-        + 'the saved forwarding contract with `sepilot restart --clear-forward-env`.',
+    console.warn(
+      `Skipping unavailable saved daemon environment variables: ${unavailable.join(', ')}. `
+        + 'Starting without them; integrations that need them may be unavailable.',
     )
+    const available = names.filter((name) => typeof sourceEnv[name] === 'string')
+    const prepared = buildDaemonChildEnvForNames(sourceEnv, options.overrides ?? {}, available)
+    return { ...prepared, forwardNames: names }
   }
   return buildDaemonChildEnvForNames(sourceEnv, options.overrides ?? {}, names)
 }

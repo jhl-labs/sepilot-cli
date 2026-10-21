@@ -1,6 +1,5 @@
 import type { ToolDefinitionRuntime, ToolRegistry } from '../tools/registry.js'
 
-/** Per-turn cache; projection is recomputed after each narrowing of authority. */
 export function createToolDiscoveryContext(input: string) {
   const cache = new Map<ToolDefinitionRuntime, Promise<string>>()
   return async (tools: ToolRegistry, context: { cwd?: string; workspaceRoot?: string }): Promise<string> => {

@@ -14,17 +14,11 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import type { SessionAttachmentRef } from '@sepilotd/core'
 import { isSafeId, isUuid } from '../../utils/safe-id.js'
 
-// Must match UPLOAD_DIR_NAME in files.ts (uploads live under the data dir).
 const UPLOAD_DIR_NAME = 'uploads'
 const UPLOAD_METADATA_DIR_NAME = '.metadata'
 const UPLOAD_METADATA_VERSION = 1
 export const ORPHAN_UPLOAD_GRACE_MS = 24 * 60 * 60 * 1000
 
-/**
- * Roots a client-controlled attachment path may resolve into: the uploads dir
- * and the current run workspace. Empty when neither is known (fail-closed —
- * only fileId-referenced uploads then pass).
- */
 export function attachmentAllowedRoots(options: { dataDir?: string; cwd?: string }): string[] {
   const roots: string[] = []
   if (options.dataDir) roots.push(join(options.dataDir, UPLOAD_DIR_NAME))
@@ -39,22 +33,11 @@ export interface UploadedFile {
   size: number
   path: string
   uploadedAt: string
-  /**
-   * Session that owns this upload, when known. Lets complete session deletion
-   * remove a session's uploaded files instead of leaking them on disk.
-   */
   sessionId?: string
-  /**
-   * 'voice' marks a server-synthesized WAV that is subject to TTL/LRU eviction
-   * and disk reaping. 'upload' (default) is a user-provided upload that is kept
-   * until explicit deletion.
-   */
   kind?: 'upload' | 'voice'
 }
 
 interface RegistryEntry extends UploadedFile {
-  // Runtime bookkeeping for retention (not persisted, not part of the public
-  // record shape callers pass in).
   storedAt: number
   lastAccess: number
 }
@@ -72,9 +55,7 @@ interface PersistedUploadedFile {
 }
 
 interface VoiceRetentionConfig {
-  // Time after last access before a voice WAV is evicted + unlinked.
   ttlMs: number
-  // Max retained voice WAVs; oldest-by-last-access are LRU-evicted past this.
   maxEntries: number
 }
 
@@ -90,7 +71,6 @@ export function configureVoiceRetention(config: Partial<VoiceRetentionConfig>): 
   }
 }
 
-// Best-effort unlink: a missing/locked file must never crash the caller.
 function unlinkQuietly(path: string): void {
   void unlink(path).catch(() => {})
 }
@@ -99,9 +79,6 @@ function isExpiredVoiceEntry(entry: RegistryEntry, now: number): boolean {
   return entry.kind === 'voice' && now - entry.lastAccess >= voiceRetention.ttlMs
 }
 
-// Evict expired voice entries (unlink disk), then LRU-evict the oldest voice
-// entries past the max count. Only 'voice' entries are affected — user uploads
-// are never reaped here.
 function enforceVoiceRetention(now: number): void {
   for (const [id, entry] of uploadedFiles) {
     if (isExpiredVoiceEntry(entry, now)) {
@@ -192,11 +169,6 @@ function isPersistedUploadedFile(value: unknown): value is PersistedUploadedFile
   )
 }
 
-/**
- * Persist only the metadata required to recover an upload after a daemon
- * restart. The manifest stores a direct child filename, never an absolute
- * path; the session journal separately keeps only an opaque file id.
- */
 export async function persistUploadedFileMetadata(
   uploadDir: string,
   file: UploadedFile,
@@ -240,7 +212,6 @@ export async function deleteUploadedFileMetadata(uploadDir: string, id: string):
   await rm(metadataPath, { force: true }).catch(() => {})
 }
 
-/** Rehydrate daemon-managed uploads from validated, path-free manifests. */
 export async function restoreUploadedFiles(uploadDir: string): Promise<number> {
   const metadataDir = uploadMetadataDir(uploadDir)
   let names: string[]
@@ -281,8 +252,6 @@ export async function restoreUploadedFiles(uploadDir: string): Promise<number> {
       })
       restored += 1
     } catch {
-      // A partial/corrupt manifest or missing payload must not block daemon
-      // startup. Leave it unavailable rather than trusting unvalidated data.
     }
   }
   return restored
@@ -292,21 +261,13 @@ export interface OrphanUploadSweepOptions {
   referencedFileIds: ReadonlySet<string>
   now?: number
   graceMs?: number
-  /** Injectable filesystem boundary used to verify fail-closed deletion. */
   removePath?: (path: string) => Promise<void>
 }
 
 export interface UploadedFileRemovalOptions {
-  /** Injectable filesystem boundary used by deletion failure tests. */
   removePath?: (path: string) => Promise<void>
 }
 
-/**
- * Remove payload bytes before their recovery sidecars, restoring the registry
- * entry when Windows or another filesystem boundary rejects payload removal.
- * The registry is detached synchronously before I/O so a concurrent chat send
- * observes a clean miss instead of journaling a file that is being deleted.
- */
 export async function removeUploadedFilesByIds(
   fileIds: ReadonlySet<string>,
   options: UploadedFileRemovalOptions = {},
@@ -328,11 +289,6 @@ export async function removeUploadedFilesByIds(
   return results.filter((file): file is UploadedFile => file !== null)
 }
 
-/**
- * Remove durable uploads that are old enough and absent from every readable
- * session journal. Only validated upload sidecars are eligible, so generated
- * files and voice retention continue to use their existing policies.
- */
 export async function sweepOrphanUploadedFiles(
   uploadDir: string,
   options: OrphanUploadSweepOptions,
@@ -384,11 +340,6 @@ export async function sweepOrphanUploadedFiles(
       )
       if (!Number.isFinite(newestTimestamp) || now - newestTimestamp < graceMs) continue
 
-      // Re-read after every async validation. A request that resolved this
-      // upload while the sweep was inspecting disk refreshes lastAccess and
-      // protects it for another grace period. Otherwise remove the registry
-      // entry synchronously before awaiting I/O, so a later request observes
-      // a clean miss rather than racing a disappearing payload.
       const currentEntry = uploadedFiles.get(parsed.id)
       if (
         currentEntry !== entry ||
@@ -400,8 +351,6 @@ export async function sweepOrphanUploadedFiles(
       const deleted = await removeUploadedFilesByIds(new Set([parsed.id]), { removePath })
       if (deleted.length > 0) removed += 1
     } catch {
-      // Fail closed per entry: invalid or inaccessible paths are never
-      // trusted as cleanup candidates.
     }
   }
   return removed
@@ -425,11 +374,6 @@ export function resolveSessionAttachmentRefs(fileIds: readonly string[]): Sessio
   return refs
 }
 
-/**
- * Remove every registry entry owned by a session and return the removed
- * records so the caller can unlink the backing files from disk. Only entries
- * that carry a matching `sessionId` are affected.
- */
 export function deleteUploadedFilesBySession(sessionId: string): UploadedFile[] {
   if (!sessionId) return []
   const removed: UploadedFile[] = []
@@ -442,11 +386,6 @@ export function deleteUploadedFilesBySession(sessionId: string): UploadedFile[] 
   return removed
 }
 
-/**
- * Snapshot uploads owned by a session without mutating retention state.
- * Cleanup callers can then complete their cross-session reference check
- * before atomically removing only the ids that are safe to delete.
- */
 export function listUploadedFilesBySession(sessionId: string): UploadedFile[] {
   if (!sessionId) return []
   return [...uploadedFiles.values()].filter((file) => file.sessionId === sessionId)
@@ -473,8 +412,6 @@ export function resolveFileIds(
       type: file.mimeType,
       path: file.path,
       filename: file.filename,
-      // The path is server-generated (inside the uploads dir), so it bypasses
-      // the client-path containment guard.
       trusted: true,
     }))
 }
@@ -483,13 +420,6 @@ export function resolveUploadedFileNames(fileIds: string[]): string[] {
   return fileIds.map((id) => getUploadedFile(id)?.filename ?? id)
 }
 
-/**
- * Boot-time sweep of the voice WAV directory. Unlinks any `*.wav` that is not in
- * the registry (orphaned by a previous process — the in-memory registry does
- * not survive restart, so every WAV on disk from a prior run is orphaned) or is
- * older than the TTL. Best-effort: filesystem errors are swallowed so a failed
- * sweep never blocks boot. Returns the number of files unlinked.
- */
 export async function sweepOrphanVoiceFiles(voiceDir: string): Promise<number> {
   let removed = 0
   let names: string[]
@@ -518,7 +448,6 @@ export async function sweepOrphanVoiceFiles(voiceDir: string): Promise<number> {
       await unlink(full)
       removed += 1
     } catch {
-      /* ignore unlink failure */
     }
   }
   return removed

@@ -9,12 +9,7 @@ export type DaemonWsChatOptions = ChatStreamOptions
 export interface DaemonWsClientOptions {
   baseUrl?: string
   token?: string | null
-  /** UI/client surface label sent as X-Sepilotd-Surface for routing and diagnostics. */
   surface?: string | null
-  /**
-   * Memory scope sent as X-Memory-Scope-* handshake headers. Resolved lazily
-   * when connecting so callers can discover daemon-owned scope at runtime.
-   */
   memoryScope?: Resolvable<MemoryScope | null | undefined>
   pairedDevice?: {
     deviceId: string
@@ -56,10 +51,6 @@ export class DaemonWsClient {
   private ws: WebSocket | null = null
   private connectPromise: Promise<void> | null = null
   private connectionGeneration = 0
-  // A single WebSocket multiplexes all messages into one queue, so two
-  // concurrent chats on the same connection would cross-talk (one chat's
-  // agent.done would end the other). Enforce a single in-flight chat per
-  // connection to keep event streams correlated.
   private chatInFlight = false
   readonly baseUrl: string
   private readonly token: string | null
@@ -143,13 +134,10 @@ export class DaemonWsClient {
         clearSocket()
         try {
           if (socket.readyState === WebSocket.CONNECTING) {
-            // ws reports termination during the opening handshake as an
-            // `error`; retain a listener after connect handlers are removed.
             socket.once('error', () => {})
           }
           socket.terminate()
         } catch {
-          // The socket may already have closed while the attempt was settling.
         }
       }
 
@@ -162,8 +150,6 @@ export class DaemonWsClient {
           return
         }
         settle(() => {
-          // Keep lifecycle listeners after the handshake so a close between
-          // chats invalidates the cached socket and the next connect retries.
           socket.once('close', clearSocket)
           socket.on('error', () => {})
           resolve()
@@ -227,9 +213,6 @@ export class DaemonWsClient {
     let resolve: (() => void) | null = null
     let done = false
     let error: Error | null = null
-    // Whether a terminal event (agent.done/agent.error/error) arrived before
-    // the socket closed. A close without one is a premature truncation, not a
-    // clean end, and must surface as an error instead of a silent stop.
     let terminalSeen = false
 
     const wake = () => {
@@ -248,7 +231,6 @@ export class DaemonWsClient {
           terminalSeen = true
         }
       } catch {
-        // Ignore malformed JSON from the server.
       }
       wake()
     }

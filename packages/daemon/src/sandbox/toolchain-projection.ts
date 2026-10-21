@@ -74,11 +74,6 @@ async function existingFile(path: string): Promise<string | null> {
   }
 }
 
-/**
- * Select PATH entries already covered by immutable system mounts. Canonical
- * containment prevents a symlink under /usr or /opt from projecting an
- * arbitrary host directory into the sandbox.
- */
 export async function discoverSystemToolchainPathEntries(hostPath: string): Promise<string[]> {
   const entries: string[] = []
   for (const rawEntry of hostPath.split(delimiter)) {
@@ -272,23 +267,9 @@ function describeOptToolchain(entry: string): HomeToolchainDescriptor | null {
   return null
 }
 
-/**
- * Build a conservative, read-only projection of host development toolchains.
- *
- * System PATH entries are accepted only below immutable /usr, /bin, or /sbin
- * mounts. Known /opt and home-managed runtimes are remounted individually
- * under /run/sepilotd/toolchains; the rest of /opt, the host home path, SSH
- * material, npmrc, cloud credentials, and arbitrary PATH directories remain
- * invisible.
- */
 export async function discoverSandboxToolchainProjection(
   options: SandboxToolchainDiscoveryOptions = {},
 ): Promise<SandboxToolchainProjection> {
-  // A systemd user service commonly starts with a minimal PATH even when the
-  // interactive shell that installed it has Go, NVM, Cargo, Conda, etc. The
-  // installer records only the candidate PATH; all entries still pass the
-  // conservative system/known-home-toolchain checks below before any bind or
-  // sandbox PATH entry is created.
   const hostPath = options.hostPath
     ?? process.env.SEPILOTD_HOST_TOOLCHAIN_PATH
     ?? process.env.PATH
@@ -325,14 +306,6 @@ export async function discoverSandboxToolchainProjection(
     )
     Object.assign(env, descriptor.env ?? {})
 
-    // Home-managed Python distributions commonly compile OpenSSL with an
-    // absolute certificate path below their original installation prefix.
-    // The runtime is intentionally remounted at a neutral sandbox path, so
-    // that compiled-in location no longer exists even though the distribution
-    // and its public CA bundle are both present. Project the bundle location
-    // through standard TLS environment variables when it exists. This keeps
-    // HTTPS package managers, crawlers, and test clients functional without
-    // mounting the host home or weakening certificate verification.
     if (descriptor.id === 'python') {
       const certificateFile = await existingFile(join(canonicalSource, 'ssl', 'cert.pem'))
       const certificateDirectory = await existingDirectory(join(canonicalSource, 'ssl', 'certs'))
@@ -361,8 +334,6 @@ export async function discoverSandboxToolchainProjection(
     }
   }
 
-  // uv is commonly installed as one self-contained executable in ~/.local/bin.
-  // Bind only that file, never the surrounding arbitrary user-script directory.
   const localBin = join(home, '.local', 'bin')
   const hostPathEntries = hostPath.split(delimiter).map((entry) => resolve(entry))
   if (hostPathEntries.includes(localBin)) {
@@ -375,9 +346,6 @@ export async function discoverSandboxToolchainProjection(
     }
   }
 
-  // Debian/Ubuntu JDKs keep java.security below /etc and link to it from the
-  // otherwise read-only /usr/lib/jvm tree. Project only that versioned Java
-  // configuration directory so Gradle/Maven work without exposing all /etc.
   const javaCandidates = unique([
     ...hostPathEntries.map((entry) => join(entry, 'java')),
     '/usr/bin/java',
@@ -405,7 +373,6 @@ export async function discoverSandboxToolchainProjection(
   }
 }
 
-/** One immutable inventory per daemon process; all runner profiles reuse it. */
 export function defaultSandboxToolchainProjection(): Promise<SandboxToolchainProjection> {
   defaultProjectionPromise ??= discoverSandboxToolchainProjection()
   return defaultProjectionPromise

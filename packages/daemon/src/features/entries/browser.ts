@@ -7,10 +7,12 @@ import {
   createBrowserScreenshotTool,
 } from '../../tools/browser.js'
 import type { FeatureToolRegistrar } from '../types.js'
+import { browserObservations } from '../../tools/browser-observation.js'
 
 export const registerTools: FeatureToolRegistrar = (registry, deps) => {
   for (const tool of createRemoteBrowserTools(remoteBrowserBridge(registry))) registry.register(tool)
   const browserOptions = {
+    observations: browserObservations(registry),
     egressAllowlist: deps.config.security.egressAllowlist,
     isLocalhostAllowed: deps.isManagedLoopbackUrl,
     managedLoopbackSocketForUrl: deps.managedLoopbackSocketForUrl,
@@ -22,6 +24,5 @@ export const registerTools: FeatureToolRegistrar = (registry, deps) => {
     registry.register(createBrowserEvaluateTool(browserOptions))
     registry.register(createBrowserExtractTool(browserOptions))
   } catch {
-    // Playwright is optional at runtime.
   }
 }

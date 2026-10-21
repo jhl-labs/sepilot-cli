@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto'
-import type { AgentEvent, ApprovalDecision, ILLMProvider } from '@sepilotd/core'
+import type { AgentEvent, ApprovalDecision, ApprovalScope, ILLMProvider } from '@sepilotd/core'
 import { createLogger } from '../../logger.js'
 import type { ToolRegistry } from '../../tools/registry.js'
 import type { ApprovalRunCheckpoint } from '../runtime/checkpoints.js'
 import type { PendingApproval } from '../runtime/approvals.js'
+import { isApprovalParkedError, resolveApprovalTimeoutMs } from '../runtime/approvals.js'
 import { resolveResumeAutonomy } from '../runtime/resume-autonomy.js'
 import type { RuntimeServices } from '../runtime/types.js'
 import type { FastifyInstance } from 'fastify'
@@ -22,7 +23,7 @@ import {
 } from '../runtime/run-limiter.js'
 import { createSessionBusyLeaseLifecycle } from '../runtime/session-busy.js'
 import { resolveApiActor } from '../request-actor.js'
-import { buildSseResponseHeaders } from '../sse-response.js'
+import { buildSseResponseHeaders, createSseLifecycle, describePendingDecisionTimeout } from '../sse-response.js'
 import { createQuestionRequester } from '../../tools/question.js'
 import { createAgentStreamOutputTracker } from './agent-stream-output.js'
 import { checkpointMatchesSessionWorkspace } from './request-cwd.js'
@@ -65,13 +66,6 @@ function validatedParkedApprovalTools(
   return tools
 }
 
-/**
- * A parked approval was just answered: its run already unwound and released
- * its lease, so continue it from the checkpoint the way `/approvals/resume`
- * does — without a client holding a stream. Events persist into the session
- * journal, where every surface watching it picks them up. Returns whether a
- * resume was actually started.
- */
 async function resumeParkedApproval(input: {
   runtime: RuntimeServices
   requestId: string
@@ -91,9 +85,6 @@ async function resumeParkedApproval(input: {
 
   let checkpointTools: ToolRegistry
   try {
-    // respond() has already durably journaled the answer, so this request is
-    // intentionally no longer "pending" in the journal. Bind the checkpoint
-    // to the exact registry-owned request returned by that successful respond.
     checkpointTools = validatedParkedApprovalTools(runtime, checkpoint, input.pending)
   } catch (error) {
     return {
@@ -190,7 +181,6 @@ export async function approvalRoutes(app: FastifyInstance) {
       }
       if (checkpoint && livePending.state === 'parked') {
         try {
-          // Reject a changed checkpoint before consuming/journaling consent.
           validatedParkedApprovalTools(runtime, checkpoint, livePending)
         } catch (error) {
           return reply.status(409).send({
@@ -208,8 +198,6 @@ export async function approvalRoutes(app: FastifyInstance) {
 
     if (respondResult.resolved) {
       const parkedState = respondResult.parked ? 'parked' : 'live'
-      // The prompt outlived its run: the decision is journaled, now continue
-      // the parked run from its checkpoint. Nothing else is waiting on it.
       const resume = respondResult.parked
         ? await resumeParkedApproval({ runtime, requestId, decision, requestActor, pending: respondResult.parked })
         : undefined
@@ -235,11 +223,6 @@ export async function approvalRoutes(app: FastifyInstance) {
           resolved: respondResult.resolved,
           state: parkedState,
           ...(resume ? { resumed: resume.resumed, ...(resume.reason ? { resumeReason: resume.reason } : {}) } : {}),
-          // Surface the derived rule when this respond persisted a
-          // session/always decision — the cli prints it as part of
-          // the success line so the operator sees the exact pattern
-          // future rounds will short-circuit on, without having to
-          // grep `decisions list` afterwards.
           ...(respondResult.rule ? { rule: respondResult.rule } : {}),
         },
       }
@@ -384,9 +367,6 @@ export async function approvalRoutes(app: FastifyInstance) {
       })
     }
 
-    // Register disconnect cleanup before waiting for the session lease. A
-    // cancelled request must not acquire and orphan a lease after the grace
-    // wait finishes. Once the resumed run starts, its finally owns cleanup.
     const sessionLeaseLifecycle = createSessionBusyLeaseLifecycle()
     request.raw.once('aborted', sessionLeaseLifecycle.releasePreflight)
     reply.raw.once('finish', sessionLeaseLifecycle.releasePreflight)
@@ -498,18 +478,24 @@ export async function approvalRoutes(app: FastifyInstance) {
         reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
       }
 
-      await executeApprovalResume({
-        runtime,
-        checkpoint,
-        checkpointTools,
-        provider,
-        decision,
-        requestId,
-        requestActor,
-        send,
-        recordDecision: true,
-      })
-      reply.raw.end()
+      const lifecycle = createSseLifecycle({ reply })
+      try {
+        await executeApprovalResume({
+          runtime,
+          checkpoint,
+          checkpointTools,
+          provider,
+          decision,
+          requestId,
+          requestActor,
+          send,
+          recordDecision: true,
+          scope: body.scope,
+        })
+      } finally {
+        lifecycle.dispose()
+        reply.raw.end()
+      }
     } finally {
       runLease?.release()
       sessionLeaseLifecycle.releaseRun()
@@ -619,18 +605,9 @@ export async function approvalRoutes(app: FastifyInstance) {
     Querystring: {
       scope?: 'session' | 'always'
       sessionId?: string
-      /** When 'true' (string from query), only remove entries that
-       * match isStaleRememberedDecision. Lets cli `decisions clear
-       * --stale` prune cleanup candidates without nuking active
-       * rules. */
       stale?: string
-      /** Exact tool name. Pairs with `decisions list --tool` so the
-       * operator can preview-then-prune the same set. */
       tool?: string
-      /** Exact derived rule pattern. When present with tool/scope,
-       * delete exactly one remembered rule instead of bulk clearing. */
       pattern?: string
-      /** Optional outcome filter for bulk clearing. */
       approved?: string
     }
   }>('/approvals/decisions', async (request, reply) => {
@@ -702,36 +679,33 @@ interface ApprovalResumeRuntime {
   decision: ApprovalDecision
   requestId: string
   requestActor: string
-  /** Emit a stream event; a background resume passes a no-op. */
   send: (event: string, data: unknown) => void
-  /**
-   * False when the decision was already journaled (a parked prompt answered
-   * through `/approvals/respond`), so the resume does not record it twice.
-   */
   recordDecision: boolean
+  scope?: ApprovalScope
 }
 
-/**
- * Drive a run from its approval checkpoint to completion. Shared by the SSE
- * `/approvals/resume` route and the background resume that a parked approval
- * triggers when it is finally answered.
- */
 async function executeApprovalResume(input: ApprovalResumeRuntime): Promise<void> {
   const { runtime, checkpoint, checkpointTools, provider, decision, requestId, requestActor, send } = input
+  const parked = runtime.approvalRegistry.getParked?.(requestId)
   if (input.recordDecision) {
-    await runtime.sessions.appendEvent(checkpoint.sessionId, {
-      type: 'approval_response',
-      id: randomUUID(),
-      timestamp: new Date().toISOString(),
-      requestId,
-      decision: decision.decision,
-      approved: decision.approved,
-      note: decision.note,
-      approvedBy: requestActor,
-    })
-    // Keep a parked request answerable if validation, admission, or durable
-    // consent recording fails. Only the successful resume consumes it.
-    runtime.approvalRegistry.releaseParked?.(requestId)
+    if (parked) {
+      const result = await runtime.approvalRegistry.respond(requestId, decision, {
+        scope: input.scope, approvedBy: requestActor,
+      })
+      if (!result.resolved) throw new Error('Approval was already handled')
+    } else {
+      await runtime.sessions.appendEvent(checkpoint.sessionId, {
+        type: 'approval_response',
+        id: randomUUID(),
+        timestamp: new Date().toISOString(),
+        requestId,
+        decision: decision.decision,
+        approved: decision.approved,
+        note: decision.note,
+        approvedBy: requestActor,
+      })
+      runtime.approvalRegistry.releaseParked?.(requestId)
+    }
   }
 
   const approvalCallback: ApprovalCallback = (toolCall, nextRequestId, options) =>
@@ -739,8 +713,9 @@ async function executeApprovalResume(input: ApprovalResumeRuntime): Promise<void
       sessionId: checkpoint.sessionId,
       toolCall,
       requestId: nextRequestId,
+      runId: parked?.runId,
       forcePrompt: options?.forcePrompt,
-        signal: options?.signal,
+      signal: options?.signal,
     })
   const requestQuestion = createQuestionRequester(runtime.questions)
   if (checkpoint.autonomy !== undefined && checkpoint.autonomy !== runtime.autonomy) checkpoint.requireToolApproval = true
@@ -758,15 +733,18 @@ async function executeApprovalResume(input: ApprovalResumeRuntime): Promise<void
     hookRegistry: runtime.hookRegistry,
     deviceName: runtime.config.device.name,
     thinkingLevel: checkpoint.thinkingLevel,
+    thinkingLevelSource: checkpoint.thinkingLevelSource,
     textDeltaMode: checkpoint.textDeltaMode,
     llmCache: runtime.llmCache,
     providerCircuitBreaker: runtime.providerCircuitBreaker,
     graphRegistry: runtime.graphRegistry,
+    activeRuns: runtime.activeRuns,
     approvalCallback,
     evaluateAutoApproval: (toolCall) =>
       runtime.approvalRegistry.tryAutoApproval({
         sessionId: checkpoint.sessionId,
         toolCall,
+        runId: parked?.runId,
       }),
     requestQuestion,
     saveApprovalCheckpoint: (nextCheckpoint) =>
@@ -797,18 +775,30 @@ async function executeApprovalResume(input: ApprovalResumeRuntime): Promise<void
   const outputTracker = createAgentStreamOutputTracker()
   let terminalDoneEvent: Extract<AgentEvent, { type: 'done' }> | null = null
   let terminalStateChangeEvent: Extract<AgentEvent, { type: 'state_change' }> | null = null
-  for await (const event of modeRouter.resumeFromApprovalCheckpoint(checkpoint, decision)) {
-    outputTracker.consume(event)
-    if (event.type === 'done') {
-      terminalDoneEvent = event
-      continue
+  try {
+    for await (const event of modeRouter.resumeFromApprovalCheckpoint(checkpoint, decision)) {
+      outputTracker.consume(event)
+      if (event.type === 'done') {
+        terminalDoneEvent = event
+        continue
+      }
+      if (event.type === 'state_change' && event.state === 'done') {
+        terminalStateChangeEvent = event
+        continue
+      }
+      send(event.type, event)
+      await persistAgentSessionEvent(runtime.sessions, checkpoint.sessionId, event)
     }
-    if (event.type === 'state_change' && event.state === 'done') {
-      terminalStateChangeEvent = event
-      continue
-    }
-    send(event.type, event)
-    await persistAgentSessionEvent(runtime.sessions, checkpoint.sessionId, event)
+  } catch (error) {
+    if (!isApprovalParkedError(error)) throw error
+    const frame = describePendingDecisionTimeout({
+      decisionTimeoutMs: resolveApprovalTimeoutMs(),
+      pending: { kind: 'approval', id: error.requestId, label: error.tool, since: Date.now() },
+    })
+    send('error', { type: 'error', error: frame })
+    send('done', { type: 'done', usage: { inputTokens: 0, outputTokens: 0 }, stopReason: frame.stopReason })
+    send('close', {})
+    return
   }
 
   let finalContent = outputTracker.finalContent()

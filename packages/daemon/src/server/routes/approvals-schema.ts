@@ -12,10 +12,6 @@ export const approvalRequestSchema = z.object({
   approved: z.boolean().optional(),
   decision: z.enum(['approved', 'feedback', 'denied']).optional(),
   note: z.string().trim().min(1).optional(),
-  /**
-   * With a denial: stop the run immediately instead of granting the model
-   * its one read-only turn to propose another approach ("deny & stop").
-   */
   stop: z.boolean().optional(),
   approvedBy: z.string().optional(),
   sessionId: z.string().optional(),
@@ -54,7 +50,9 @@ export const approvalResolutionResponseSchema = z.object({
     approved: z.boolean(),
     note: z.string().optional(),
     resolved: z.boolean(),
-    state: z.enum(['live', 'stale']),
+    state: z.enum(['live', 'stale', 'parked']),
+    resumed: z.boolean().optional(),
+    resumeReason: z.string().optional(),
     rule: z.object({
       tool: z.string(),
       pattern: z.string(),

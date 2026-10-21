@@ -77,12 +77,6 @@ export function findAutonomyOption(query: string): AutonomyOption | null {
 }
 
 export function formatAutonomyBadge(level: AutonomyLevel): string {
-  // The status bar redraws in place every frame, so this must use only
-  // unambiguous-width glyphs. Emoji like 🛡 / ⚡ / 🔒 (no VS16) measure 1 or 2
-  // columns depending on terminal and font; when Ink's count disagrees with
-  // what the terminal actually drew, its in-place erase is off by a column
-  // and stale characters bleed into neighbouring rows. Colour + label carry
-  // the signal in the status bar; the picker overlay still shows the icons.
   return getAutonomyOption(level).label
 }
 

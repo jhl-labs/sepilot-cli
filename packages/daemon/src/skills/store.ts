@@ -39,10 +39,6 @@ interface SkillRatingRow {
   rating_count: number | null
 }
 
-/**
- * SQLite-backed skill marketplace store.
- * Implements the server side of the SkillStoreClient API.
- */
 export class SkillStore {
   private db: SqliteDatabase
 
@@ -136,7 +132,6 @@ export class SkillStore {
 
     if (!row) return null
 
-    // Increment download count
     this.db.prepare('UPDATE skills SET downloads = downloads + 1 WHERE id = ?').run(id)
 
     return this.rowToSkill(row)
@@ -159,7 +154,6 @@ export class SkillStore {
 
       return rows.map(r => this.rowToMetadata(r))
     } catch {
-      // FTS5 fallback
       const rows = this.db.prepare(`
         SELECT * FROM skills WHERE name LIKE ? OR description LIKE ? LIMIT ?
       `).all(`%${query}%`, `%${query}%`, limit) as SkillRow[]

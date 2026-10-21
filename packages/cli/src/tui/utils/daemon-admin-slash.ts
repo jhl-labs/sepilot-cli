@@ -31,12 +31,14 @@ import type {
   DaemonTeamDocsConfig,
   DaemonTeamDocsDocument,
   DaemonTelegramChannelSummary,
+  DaemonWebhookEndpointConfig,
   DaemonWebhookEndpointSummary,
   JobsClient,
   MigrationClient,
 } from '@sepilotd/api-client'
 import { hasPendingScheduledRun } from '../../utils/scheduler-state.js'
 import { runTasksCommand, type TasksClient } from '../../commands/tasks.js'
+import { mergeWebhookEndpointInput, webhookEndpointId } from '../../commands/webhooks.js'
 import { maskSecretValue, truncateJsonOutput } from './admin-output.js'
 
 export interface DaemonAdminSlashClient {
@@ -117,14 +119,7 @@ export interface DaemonAdminSlashClient {
   setSecret(key: string, value: string): Promise<{ ok: boolean }>
   removeSecret(key: string): Promise<{ removed: boolean }>
   webhookEndpoints(): Promise<DaemonWebhookEndpointSummary[]>
-  upsertWebhookEndpoint(input: {
-    path: string
-    secretHeader: string
-    secretValue: string
-    allowedEvents?: string[]
-    allowedIps?: string[]
-    enabled?: boolean
-  }): Promise<unknown>
+  upsertWebhookEndpoint(input: DaemonWebhookEndpointConfig): Promise<unknown>
   deleteWebhookEndpoint(id: string): Promise<unknown>
   setWebhookEndpointEnabled(id: string, enabled: boolean): Promise<unknown>
   telegramChannel(): Promise<DaemonTelegramChannelSummary | null>
@@ -2150,14 +2145,38 @@ async function runWebhooksCommand(client: DaemonAdminSlashClient, args: string[]
   if (action === 'add') {
     const parsed = parseArgs(args.slice(1))
     const path = requireArg(parsed.positional[0], usage('/webhooks'))
-    await client.upsertWebhookEndpoint({
+    const endpointId = webhookEndpointId(path)
+    const existingEndpoints = await client.webhookEndpoints()
+    const existing = existingEndpoints.find((entry) => entry.id === endpointId)
+    const header = flag(parsed, 'header')
+    const secret = flag(parsed, 'secret')
+    if (!existing && (!header || !secret)) {
+      throw new Error(usage('/webhooks'))
+    }
+    const mode = flag(parsed, 'mode')
+    if (mode !== undefined && mode !== 'chat' && mode !== 'route') return usage('/webhooks')
+    const auth = flag(parsed, 'auth')
+    if (auth !== undefined && auth !== 'hmac' && auth !== 'token') return usage('/webhooks')
+    const timestampMaxSkewRaw = flag(parsed, 'timestamp-max-skew')
+    const body = mergeWebhookEndpointInput(
       path,
-      secretHeader: requireArg(flag(parsed, 'header'), usage('/webhooks')),
-      secretValue: requireArg(flag(parsed, 'secret'), usage('/webhooks')),
-      allowedEvents: flagList(parsed, 'event'),
-      allowedIps: flagList(parsed, 'ip'),
-      enabled: !hasFlag(parsed, 'disabled'),
-    })
+      {
+        header,
+        secret,
+        event: flagList(parsed, 'event'),
+        ip: flagList(parsed, 'ip'),
+        disabled: hasFlag(parsed, 'disabled'),
+        mode,
+        auth,
+        eventTypeHeader: flag(parsed, 'event-type-header'),
+        deliveryIdHeader: flag(parsed, 'delivery-id-header'),
+        requireTimestamp: hasFlag(parsed, 'require-timestamp') ? true : undefined,
+        timestampHeader: flag(parsed, 'timestamp-header'),
+        timestampMaxSkew: timestampMaxSkewRaw ? Number(timestampMaxSkewRaw) : undefined,
+      },
+      existing,
+    )
+    await client.upsertWebhookEndpoint(body)
     const endpoint = (await client.webhookEndpoints()).find((entry) => entry.path === path)
     return endpoint
       ? `Webhook endpoint saved:\n${formatWebhookEndpoint(endpoint)}`

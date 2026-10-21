@@ -24,11 +24,6 @@ export interface ProviderCatalog {
   }): Promise<{ ok: boolean; latencyMs?: number; reason?: string }>
 }
 
-/**
- * 기본 카탈로그 — daemon의 기존 providers 모듈이 직접 provide하기 전까지
- * 비어 있는 목록을 반환한다. desktop은 `/llm/providers`가 200 빈 배열이면
- * "등록된 공급자 없음" 상태를 표시한다.
- */
 export const emptyProviderCatalog: ProviderCatalog = {
   list: async () => [],
   test: async () => ({ ok: false, reason: 'no provider registered' }),

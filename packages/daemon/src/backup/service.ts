@@ -126,9 +126,6 @@ export async function createBackup(): Promise<BackupItem> {
     stream.on('finish', res)
     stream.on('error', rej)
   })
-  // Backups contain config.yaml (provider apiKey) + all session
-  // transcripts in cleartext — refuse to leave them at the default
-  // 0644 where any other OS user can read them.
   secureFile(file)
   const buf = readFileSync(file)
   const sha = createHash('sha256').update(buf).digest('hex')

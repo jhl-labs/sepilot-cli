@@ -13,16 +13,10 @@ export interface ReadOnlyObservationEvidenceInput {
   executionPosture?: ToolExecutionPosture
 }
 
-/**
- * Decide whether one successful result may be cited as read-only observation
- * evidence. Static observe tools need the executor marker. Dynamic evidence is
- * limited to the two built-ins whose runtimes enforce and attest immutable
- * filesystem capabilities; a plugin cannot become evidence by returning a
- * lookalike posture object or declaring its own dynamic effect.
- */
 export function isExecutorConfirmedReadOnlyObservation(
   input: ReadOnlyObservationEvidenceInput,
 ): boolean {
+  if (input.tool === 'tool.output.read') return false
   if (input.executionObserved === true && input.securityEffect === 'observe') {
     return true
   }

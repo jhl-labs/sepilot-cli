@@ -6,13 +6,6 @@ import type { ISessionStore } from '@sepilotd/core'
 import type { RuntimeServices } from './types.js'
 import type { SessionWatchBroker } from './session-watch.js'
 
-/**
- * Build the `journalStateBoard` callback shared by every AgentModeRouter
- * construction site. Kept as a standalone helper (rather than only inline in
- * {@link createRuntimeBackedModeRouterOptions}) so sites that can't pull in
- * the full `RuntimeServices`-backed option set (e.g. narrow capability types)
- * can still wire up identical journaling instead of duplicating the logic.
- */
 export function createJournalStateBoard(
   sessions: ISessionStore,
 ): NonNullable<ModeRouterOptions['journalStateBoard']> {
@@ -22,11 +15,6 @@ export function createJournalStateBoard(
       : Promise.resolve()
 }
 
-/**
- * Build the `journalSteeringConsumed` callback shared by every AgentModeRouter
- * construction site. See {@link createJournalStateBoard} for why this is a
- * standalone export.
- */
 export function createJournalSteeringConsumed(
   sessions: ISessionStore,
   sessionWatchBroker?: SessionWatchBroker,

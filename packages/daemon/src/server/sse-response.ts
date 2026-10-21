@@ -15,60 +15,28 @@ export const MODEL_STREAM_WAITING_THINKING = 'Still waiting for the model stream
 
 export interface SseLifecycleOptions {
   reply: FastifyReply
-  /** Override keepalive cadence. Defaults to SEPILOTD_SSE_KEEPALIVE_MS or 15000. */
   keepaliveMs?: number
-  /** If set, fires `onInactivity` once when no `recordEvent` call has happened in the window. */
   inactivityMs?: number
-  /** Called once when the inactivity window elapses. */
   onInactivity?: () => void
-  /**
-   * Reports whether the run is currently blocked on a human decision
-   * (approval / question). A blocked run is NOT a stalled run: while this
-   * returns a descriptor the inactivity watchdog is suppressed and only the
-   * separate decision timeout applies.
-   */
   pendingDecision?: () => PendingDecision | null
-  /**
-   * Upper bound on how long a run may stay blocked on a human decision.
-   * `0` disables the bound (wait indefinitely). Defaults to
-   * `resolvePendingDecisionTimeoutMs()` when `pendingDecision` is supplied.
-   */
   decisionTimeoutMs?: number
-  /** Called once when the decision timeout elapses with a decision outstanding. */
   onDecisionTimeout?: (pending: PendingDecision) => void
 }
 
-/**
- * A run blocked on a human decision is a first-class run state, distinct from
- * a stalled run. `since` is the moment the block began, so the decision bound
- * is measured from the request rather than from the last stream event.
- */
 export interface PendingDecision {
   kind: 'approval' | 'question'
-  /** Approval requestId or question questionId — what the operator resolves. */
   id: string
-  /** Tool name for an approval, question prompt for a question. */
   label?: string
   since: number
 }
 
 export interface SseLifecycle {
-  /** Reset the inactivity counter — call on every meaningful agent event. */
   recordEvent(): void
-  /** True if the inactivity watchdog (or the decision timeout) has already fired. */
   isInactivityTripped(): boolean
-  /** True if the run was aborted because a human decision never arrived. */
   isDecisionTimedOut(): boolean
-  /** Tear down all timers. Idempotent. */
   dispose(): void
 }
 
-/**
- * Standardised SSE keepalive + inactivity watchdog used by every long-lived
- * agent stream (chat-stream, cowork, session-resume). Keepalive comment frames
- * stop intermediaries from idling the connection; the inactivity timer detects
- * a genuinely stuck agent loop so the run lease and socket can be released.
- */
 export function createSseLifecycle(opts: SseLifecycleOptions): SseLifecycle {
   const requestedKeepaliveMs = opts.keepaliveMs
     ?? Number.parseInt(process.env.SEPILOTD_SSE_KEEPALIVE_MS ?? String(DEFAULT_KEEPALIVE_MS), 10)
@@ -91,7 +59,6 @@ export function createSseLifecycle(opts: SseLifecycleOptions): SseLifecycle {
     keepalivePending = true
     void writeSseComment(opts.reply.raw, `keepalive ${Date.now()}`)
       .catch(() => {
-        /* best-effort */
       })
       .finally(() => {
         keepalivePending = false
@@ -105,12 +72,11 @@ export function createSseLifecycle(opts: SseLifecycleOptions): SseLifecycle {
       if (opts.reply.raw.writableEnded) return
       const pending = opts.pendingDecision?.() ?? null
       if (pending) {
-        // Deliberately blocked on a human decision — never a stall.
         if (decisionTimeoutMs > 0 && Date.now() - pending.since > decisionTimeoutMs) {
           if (!decisionTimedOut) {
             decisionTimedOut = true
             inactivityTripped = true
-            try { opts.onDecisionTimeout?.(pending) } catch { /* best-effort */ }
+            try { opts.onDecisionTimeout?.(pending) } catch {}
           }
         }
         return
@@ -118,7 +84,7 @@ export function createSseLifecycle(opts: SseLifecycleOptions): SseLifecycle {
       if (Date.now() - lastEventAt > inactivityMs) {
         if (!inactivityTripped) {
           inactivityTripped = true
-          try { opts.onInactivity!() } catch { /* best-effort */ }
+          try { opts.onInactivity!() } catch {}
         }
       }
     }, tickMs)
@@ -129,15 +95,14 @@ export function createSseLifecycle(opts: SseLifecycleOptions): SseLifecycle {
     isInactivityTripped() { return inactivityTripped },
     isDecisionTimedOut() { return decisionTimedOut },
     dispose() {
-      try { clearInterval(keepaliveTimer) } catch { /* noop */ }
+      try { clearInterval(keepaliveTimer) } catch {}
       if (inactivityTimer) {
-        try { clearInterval(inactivityTimer) } catch { /* noop */ }
+        try { clearInterval(inactivityTimer) } catch {}
       }
     },
   }
 }
 
-/** Inactivity window resolved from env, with the documented default. */
 export function resolveAgentInactivityMs(): number {
   const parsed = Number.parseInt(
     process.env.SEPILOTD_AGENT_INACTIVITY_MS ?? String(DEFAULT_INACTIVITY_MS),
@@ -148,14 +113,6 @@ export function resolveAgentInactivityMs(): number {
     : DEFAULT_INACTIVITY_MS
 }
 
-/**
- * Bound on how long a run may stay blocked waiting for a human approval or
- * answer. This is the same delay the approval registry uses to park a run
- * (`SEPILOTD_APPROVAL_TIMEOUT_MS`, default 10 min; legacy
- * `SEPILOTD_PENDING_DECISION_TIMEOUT_MS` overrides when set, `0` = wait
- * indefinitely). Kept separate from `SEPILOTD_AGENT_INACTIVITY_MS` because a
- * blocked run is not a stalled run.
- */
 export function resolvePendingDecisionTimeoutMs(): number {
   return resolveApprovalTimeoutMs()
 }
@@ -168,7 +125,6 @@ export interface PendingDecisionTimeoutFrame {
   model?: string
   lastEventType?: string
   pendingDecision: PendingDecision
-  /** Structured stop cause so surfaces can offer "approve pending"/"resume". */
   stopReason: RunStopReason
 }
 
@@ -179,18 +135,11 @@ export interface AgentInactivityFrame {
   provider?: string
   model?: string
   lastEventType?: string
-  /** Structured stop cause so surfaces can offer "retry"/"resume". */
   stopReason: RunStopReason
 }
 
 export type AgentTimeoutFrame = AgentInactivityFrame | PendingDecisionTimeoutFrame
 
-/**
- * Build the error payload for a run aborted because a *pending human decision*
- * never arrived. This is intentionally not an `AGENT_INACTIVITY` frame: nothing
- * stalled, so the remedy is to answer the outstanding decision (or run on a
- * surface that can answer it), not to retry or split the request.
- */
 export function describePendingDecisionTimeout(input: {
   decisionTimeoutMs: number
   pending: PendingDecision
@@ -247,23 +196,11 @@ export interface AgentInactivityFrameInput {
   inactivityMs: number
   provider?: string
   model?: string
-  /** True if the run emitted any model output (token/tool/message/error) before going silent. */
   sawModelOutput?: boolean
-  /** Type of the last agent event seen before the run went silent. */
   lastEventType?: string
-  /** Human label for the activity that stalled — e.g. "Agent", "Resume". */
   activityLabel?: string
 }
 
-/**
- * Build the structured `AGENT_INACTIVITY` error payload sent on the SSE
- * `error` frame when the inactivity watchdog fires. `reason` is the
- * machine-readable cause; `message` is operationally framed English that
- * surfaces may localise/soften. The important distinction: a run that
- * produced *no* model output almost always means the provider/model call
- * itself never returned — point at provider health, not at a stuck tool or
- * an over-long request.
- */
 export function describeAgentInactivity(input: AgentInactivityFrameInput): AgentInactivityFrame {
   const label = input.activityLabel ?? 'Agent'
   const modelLabel = input.provider && input.model
@@ -300,17 +237,8 @@ export function describeAgentInactivity(input: AgentInactivityFrameInput): Agent
   }
 }
 
-/**
- * Watches an agent event stream and, if the inactivity watchdog later fires,
- * lets the route describe *why* it stalled: a run that never produced a token
- * or tool call (`reason: 'no_model_output'` — the provider/model call itself
- * hung) versus one that made progress and then went quiet (`reason: 'stalled'`).
- * Call `note()` for every event consumed, then `describe()` from the catch
- * block that handles `isInactivityTripped()`.
- */
 export interface AgentInactivityProbe {
   note(event: AgentEvent): void
-  /** The outstanding human decision blocking the run, if any. */
   pendingDecision(): PendingDecision | null
   describe(opts: {
     inactivityMs: number
@@ -321,11 +249,6 @@ export interface AgentInactivityProbe {
   }): ReturnType<typeof describeAgentInactivity> | PendingDecisionTimeoutFrame
 }
 
-/**
- * Provider-stream heartbeat events keep the user informed, but they do not
- * prove that the provider produced a token or completed a step. Counting them
- * as activity would let a dead model request refresh the watchdog forever.
- */
 export function isSubstantiveAgentActivity(event: AgentEvent): boolean {
   if (event.type === 'subagent_progress') return isSubstantiveAgentActivity(event.inner)
   return !(
@@ -337,8 +260,6 @@ export function isSubstantiveAgentActivity(event: AgentEvent): boolean {
 export function createAgentInactivityProbe(): AgentInactivityProbe {
   let sawModelOutput = false
   let lastEventType: string | undefined
-  // Parent and child consent are separate. A sibling's activity must not clear
-  // another child's pending approval, nor may keepalives extend its deadline.
   let pending: PendingDecision | null = null
   const children = new Map<string, PendingDecision>()
   const currentPending = () => pending ?? children.values().next().value ?? null
@@ -360,8 +281,6 @@ export function createAgentInactivityProbe(): AgentInactivityProbe {
         }
         return
       }
-      // Root tool results are emitted only after the owned execution/batch
-      // settles. This also releases a child canceled without a response event.
       if (event.type === 'tool_result' || event.type === 'done' || event.type === 'error') children.clear()
       if (event.type === 'approval_request') {
         pending = {
@@ -425,20 +344,6 @@ export function buildSseResponseHeaders(
   return buildDaemonCorsHeaders(request, headers)
 }
 
-/**
- * Track a long-lived SSE response in the daemon's `connectionRegistry` so
- * `/system/clients` and the desktop tray "N connected" indicator reflect
- * agent streams (chat-stream, cowork, session-resume, notifications-watch)
- * the same way they reflect WebSocket clients.
- *
- * Self-unregistering: the helper attaches its own listeners to `aborted`,
- * `close`, and `finish` so call sites don't need to remember to clean up.
- * Returns a manual `unregister` for tests / unusual teardown flows; safe to
- * ignore in normal route code.
- *
- * No-op (returns a stub handle) when the registry isn't wired — useful for
- * hand-built test Fastify instances.
- */
 export function trackSseConnection(
   app: FastifyInstance,
   request: FastifyRequest,

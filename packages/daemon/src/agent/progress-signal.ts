@@ -1,19 +1,6 @@
 import type { Message } from '@sepilotd/core'
 import { observeWorkProgress, type WorkProgress } from './work-progress.js'
 
-/**
- * Pure progress accounting shared by the react engine and (later) the graph
- * runtime. Dependency-free on purpose: only message metadata conventions are
- * read, so callers can pass any transcript slice.
- *
- * Conventions read here (all daemon-owned, never copied from tool output):
- * - tool results tagged `toolResultStatus: 'success'` are evidence;
- * - results tagged `toolResultBlockSource: 'policy' | 'approval'` are
- *   friction, never evidence;
- * - artifact mutation tools are the file-edit family;
- * - model-authored completion prose is never execution evidence.
- */
-
 export const CONTINUATION_MARKER_METADATA_KEY = 'continuationCycle'
 export const CURRENT_TURN_USER_METADATA_KEY = 'currentAgentTurnUserInput'
 const TOOL_RESULT_STATUS_KEY = 'toolResultStatus'
@@ -24,9 +11,6 @@ const ARTIFACT_MUTATION_TOOLS: ReadonlySet<string> = new Set([
   'fs.edit',
   'apply_patch',
 ])
-
-/** Default absolute wall-clock ceiling for one run when the env is unset. */
-export const DEFAULT_RUN_MAX_WALL_MS = 30 * 60 * 1000
 
 export interface ProgressSignal {
   newToolEvidence: number
@@ -39,11 +23,6 @@ export function isArtifactMutationTool(name: string | undefined): boolean {
   return name !== undefined && ARTIFACT_MUTATION_TOOLS.has(name)
 }
 
-/**
- * Index of the message that starts the current progress window: the latest
- * continuation marker, else the current-turn user message, else the latest
- * user message, else -1 (whole transcript).
- */
 export function findProgressMarkerIndex(messages: readonly Message[]): number {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const cycle = messages[index]?.metadata?.[CONTINUATION_MARKER_METADATA_KEY]
@@ -68,10 +47,6 @@ function messageText(message: Message): string {
     .join('')
 }
 
-/**
- * Count fresh progress after `marker` (a message index, exclusive). Pass the
- * result of `findProgressMarkerIndex` or an explicit index.
- */
 export function evaluateProgressSince(
   messages: readonly Message[],
   marker: number = findProgressMarkerIndex(messages),
@@ -116,13 +91,37 @@ export function evaluateProgressSince(
   }
 }
 
-/**
- * Parse `SEPILOTD_RUN_MAX_WALL_MS`: unset/invalid → 30 minutes, `0` (or a
- * negative value) → disabled (`undefined`).
- */
 export function parseRunWallClockBudgetMs(raw: string | undefined): number | undefined {
-  if (raw === undefined || raw.trim() === '') return DEFAULT_RUN_MAX_WALL_MS
+  if (raw === undefined || raw.trim() === '') return undefined
   const parsed = Number(raw)
-  if (!Number.isFinite(parsed)) return DEFAULT_RUN_MAX_WALL_MS
+  if (!Number.isFinite(parsed)) return undefined
   return parsed > 0 ? Math.floor(parsed) : undefined
+}
+
+export function resolveWallClockSynthesisReserveMs(
+  budgetMs: number,
+  raw: string | undefined = process.env.SEPILOTD_RUN_WALL_SYNTHESIS_RESERVE_MS,
+): number {
+  const configured = raw === undefined || raw.trim() === '' ? Number.NaN : Number(raw)
+  const reserve = Number.isFinite(configured)
+    ? Math.max(0, Math.floor(configured))
+    : Math.min(Math.max(Math.floor(budgetMs * 0.15), 60_000), 300_000)
+  return Math.min(reserve, Math.floor(budgetMs / 2))
+}
+
+export function resolveRunWallClock(
+  startedAt: number,
+  deadlineAt?: number,
+  raw: string | undefined = process.env.SEPILOTD_RUN_MAX_WALL_MS,
+): { startedAt: number; budgetMs?: number } {
+  const host = parseRunWallClockBudgetMs(raw)
+  if (deadlineAt !== undefined && (!Number.isSafeInteger(deadlineAt) || deadlineAt <= 0)) throw new RangeError('deadlineAt must be a positive safe integer')
+  const caller = deadlineAt === undefined ? undefined : Math.max(0, deadlineAt - startedAt)
+  return { startedAt, budgetMs: caller === undefined ? host : host === undefined ? caller : Math.min(host, caller) }
+}
+
+export function runRequestTimeoutMs(clock: { startedAt: number; budgetMs?: number }, preferred?: number, now = Date.now()): number | undefined {
+  if (clock.budgetMs === undefined) return preferred
+  const remaining = Math.max(1, Math.floor(clock.startedAt + clock.budgetMs - now))
+  return preferred !== undefined && preferred > 0 ? Math.min(preferred, remaining) : remaining
 }

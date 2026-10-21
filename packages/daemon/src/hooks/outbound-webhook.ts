@@ -7,31 +7,15 @@ import type {
   IHookRegistry,
 } from '@sepilotd/core'
 import { createHash, randomUUID } from 'node:crypto'
-import type { Dispatcher } from 'undici'
 import { DEFAULT_OUTBOUND_WEBHOOK_RETRY_CONFIG } from '../config/schema.js'
 import type { HookRegistry } from '../hook/registry.js'
 import { createLogger } from '../logger.js'
 import { DAEMON_VERSION } from '../version.js'
-import { assertPublicUrl, createPinnedLookupDispatcher } from '../utils/ssrf-guard.js'
+import { isPermanentDeliveryError, postWithEgressGuard } from '../utils/egress-post.js'
 
 const logger = createLogger('webhook-out')
 const OUTBOUND_WEBHOOK_TIMEOUT_MS = 10_000
-const OUTBOUND_WEBHOOK_MAX_REDIRECTS = 5
 
-type FetchInitWithDispatcher = RequestInit & { dispatcher?: Dispatcher }
-
-/**
- * Egress guard for outbound webhooks. Conversation content, prompts and tool
- * results flow through these deliveries, so a URL pointing at loopback, an
- * RFC1918/link-local host, or the cloud metadata endpoint (169.254.169.254) is
- * both an SSRF vector and a data-exfil channel. Reuses the shared SSRF guard
- * (resolves DNS, rejects private targets). Operators who intentionally post to
- * an intranet collector can set SEPILOTD_OUTBOUND_WEBHOOK_ALLOW_PRIVATE=1.
- */
-async function assertOutboundWebhookAllowed(url: string): Promise<void> {
-  if (process.env.SEPILOTD_OUTBOUND_WEBHOOK_ALLOW_PRIVATE === '1') return
-  await assertPublicUrl(url, AbortSignal.timeout(OUTBOUND_WEBHOOK_TIMEOUT_MS))
-}
 export const OUTBOUND_WEBHOOK_DELIVERY_AUDIT_EVENT = 'hook.outbound_webhook.delivery'
 
 export interface OutboundWebhookConfig {
@@ -99,12 +83,7 @@ function isRetryableStatusCode(statusCode: number | undefined): boolean {
 }
 
 function isRetryableError(error: unknown): boolean {
-  if (
-    typeof error === 'object'
-    && error
-    && 'retryable' in error
-    && (error as { retryable?: unknown }).retryable === false
-  ) {
+  if (isPermanentDeliveryError(error)) {
     return false
   }
   const statusCode = typeof error === 'object' && error && 'statusCode' in error
@@ -112,96 +91,6 @@ function isRetryableError(error: unknown): boolean {
     ? (error as { statusCode: number }).statusCode
     : undefined
   return statusCode == null || isRetryableStatusCode(statusCode)
-}
-
-function permanentDeliveryError(message: string): Error & { retryable: false } {
-  return Object.assign(new Error(message), { retryable: false as const })
-}
-
-async function discardResponseBody(response: Response): Promise<void> {
-  await response.body?.cancel().catch(() => undefined)
-}
-
-async function postOutboundWebhook(
-  initialUrl: string,
-  init: { headers: Record<string, string>; body: string; signal: AbortSignal },
-): Promise<{ ok: boolean; status: number | undefined }> {
-  const allowPrivate = process.env.SEPILOTD_OUTBOUND_WEBHOOK_ALLOW_PRIVATE === '1'
-  let parsedInitial: URL
-  try {
-    parsedInitial = new URL(initialUrl)
-  } catch {
-    throw permanentDeliveryError('invalid webhook URL')
-  }
-  if (
-    (parsedInitial.protocol !== 'http:' && parsedInitial.protocol !== 'https:')
-    || parsedInitial.username
-    || parsedInitial.password
-  ) {
-    throw permanentDeliveryError('webhook URL must be credential-free http(s)')
-  }
-
-  const allowedOrigin = parsedInitial.origin
-  let currentUrl = parsedInitial.toString()
-  for (let redirects = 0; ; redirects += 1) {
-    let dispatcher: Dispatcher | undefined
-    let requestUrl = currentUrl
-    if (!allowPrivate) {
-      try {
-        const resolution = await assertPublicUrl(currentUrl, init.signal)
-        requestUrl = resolution.url.toString()
-        dispatcher = createPinnedLookupDispatcher(resolution)
-      } catch (error) {
-        throw permanentDeliveryError(
-          `blocked by egress guard: ${error instanceof Error ? error.message : String(error)}`,
-        )
-      }
-    }
-
-    let response: Response
-    try {
-      response = await fetch(requestUrl, {
-        method: 'POST',
-        headers: init.headers,
-        body: init.body,
-        signal: init.signal,
-        redirect: 'manual',
-        ...(dispatcher ? { dispatcher } : {}),
-      } as FetchInitWithDispatcher)
-    } catch (error) {
-      await dispatcher?.close().catch(() => undefined)
-      throw error
-    }
-
-    try {
-      const isPreservingRedirect = response.status === 307 || response.status === 308
-      const location = isPreservingRedirect ? response.headers?.get('location') : null
-      if (!location) return { ok: response.ok, status: response.status }
-      if (redirects >= OUTBOUND_WEBHOOK_MAX_REDIRECTS) {
-        throw permanentDeliveryError(
-          `too many webhook redirects (${OUTBOUND_WEBHOOK_MAX_REDIRECTS})`,
-        )
-      }
-
-      let nextUrl: URL
-      try {
-        nextUrl = new URL(location, requestUrl)
-      } catch {
-        throw permanentDeliveryError('invalid webhook redirect URL')
-      }
-      if (
-        nextUrl.origin !== allowedOrigin
-        || nextUrl.username
-        || nextUrl.password
-      ) {
-        throw permanentDeliveryError('cross-origin webhook redirects are not allowed')
-      }
-      currentUrl = nextUrl.toString()
-    } finally {
-      await discardResponseBody(response)
-      await dispatcher?.close().catch(() => undefined)
-    }
-  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -231,7 +120,7 @@ function extractSessionId(payload: HookPayload): string | undefined {
 
 export class OutboundWebhookHandler implements IHookHandler {
   readonly id: string
-  readonly priority = 100  // Run after other handlers
+  readonly priority = 100
   private config: OutboundWebhookConfig
   private readonly observer: OutboundWebhookObserverOptions
 
@@ -245,7 +134,6 @@ export class OutboundWebhookHandler implements IHookHandler {
   }
 
   async handle(payload: HookPayload): Promise<HookResult> {
-    // Fire and forget — don't block the main flow
     void deliverOutboundWebhook(this.config, payload, this.observer)
       .then((result) => {
         if (result.deliveryStatus !== 'error') {
@@ -313,52 +201,9 @@ export async function deliverOutboundWebhook(
 
   let result: OutboundWebhookDeliveryResult | null = null
 
-  // Egress guard runs before any attempt so conversation content is never sent
-  // to a private/loopback/metadata target. A blocked URL is a permanent error
-  // (no retry) — retrying the same private URL cannot help.
-  try {
-    await assertOutboundWebhookAllowed(config.url)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    const blockedResult: OutboundWebhookDeliveryResult = {
-      timestamp: new Date().toISOString(),
-      deliveryId,
-      webhookId: outboundWebhookIdFromUrl(config.url),
-      url: config.url,
-      hookEvent: payload.event,
-      deliveryStatus: 'error',
-      attemptCount: 0,
-      durationMs: Date.now() - startedAt,
-      error: `blocked by egress guard: ${message}`,
-      sessionId: extractSessionId(payload),
-      ...(options.replayedFromDeliveryId
-        ? { replayedFromDeliveryId: options.replayedFromDeliveryId }
-        : {}),
-    }
-    logger.warn('Outbound webhook blocked by egress guard', {
-      url: config.url,
-      deliveryId,
-      error: message,
-    })
-    await logDelivery(payload, observer, {
-      deliveryId: blockedResult.deliveryId,
-      webhookId: blockedResult.webhookId,
-      url: blockedResult.url,
-      hookEvent: blockedResult.hookEvent,
-      deliveryStatus: blockedResult.deliveryStatus,
-      attemptCount: blockedResult.attemptCount,
-      statusCode: blockedResult.statusCode,
-      durationMs: blockedResult.durationMs,
-      error: blockedResult.error,
-      payload,
-      replayedFromDeliveryId: blockedResult.replayedFromDeliveryId,
-    })
-    return blockedResult
-  }
-
   for (let attempt = 1; attempt <= retryPolicy.maxAttempts; attempt += 1) {
     try {
-      const res = await postOutboundWebhook(config.url, {
+      const res = await postWithEgressGuard(config.url, {
         headers: {
           ...headers,
           'X-SePilot-Delivery-Attempt': String(attempt),
@@ -447,7 +292,6 @@ export async function deliverOutboundWebhook(
   return result
 }
 
-/** Register outbound webhooks from config */
 export function registerOutboundWebhooks(
   hookRegistry: IHookRegistry,
   webhooks: readonly OutboundWebhookConfig[],

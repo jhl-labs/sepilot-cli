@@ -1,21 +1,8 @@
-/**
- * Single source of truth for build-time opt-in features. Consumed by the
- * bundle build script (validation + manifest generation + binary exclusion
- * scan) and by tests. Runtime code never reads this to alter behavior —
- * exclusion is purely a build-time decision (traceless at runtime).
- */
 export interface FeatureDescriptor {
   id: string
   description: string
-  /** Always included; disabling fails the build. */
   locked?: boolean
-  /** Feature ids that must stay enabled while this one is enabled. */
   requires?: string[]
-  /**
-   * Distinctive strings guaranteed to appear in this feature's compiled
-   * code (tool names, route paths). Used to prove exclusion: when the
-   * feature is disabled none of these may appear in the final binary.
-   */
   binaryMarkers: string[]
 }
 
@@ -32,14 +19,6 @@ const CHANNEL_IDS = [
   'github-issue',
 ] as const
 
-/**
- * Each channel factory's `registerChannelFactory` in
- * `features/entries/channel-<name>.ts` returns this literal `skipReason`
- * string when required config is missing. Unlike the channel class name
- * (imported unconditionally by shared webhook route plumbing for several
- * channels) or a `sepilot-channel-*` placeholder (never existed in source),
- * this string is confined to that channel's own entries file.
- */
 const CHANNEL_SKIP_REASONS: Record<(typeof CHANNEL_IDS)[number], string> = {
   telegram: 'botToken is required',
   slack: 'botToken and signingSecret are required',
@@ -81,31 +60,12 @@ export const FEATURE_CATALOG: FeatureDescriptor[] = [
   ...CHANNEL_IDS.map((channel) => ({
     id: `channels.${channel}`,
     description: `${channel} channel integration`,
-    // Each channel factory's own `skipReason` string (returned when required
-    // config is missing) is a literal confined to that channel's
-    // `features/entries/channel-<name>.ts` and nowhere else in the daemon —
-    // unlike the channel class name or a `sepilot-channel-*` placeholder,
-    // which either leak into shared webhook route plumbing or never existed
-    // in source at all.
     binaryMarkers: [CHANNEL_SKIP_REASONS[channel]],
   })),
   {
     id: 'voice',
     description: 'Whisper/Piper voice routes and speech tools',
     requires: ['media'],
-    // NOTE: `server/routes/voice.ts` (and everything it imports, including
-    // `media/speech.ts`) is a bad marker source — `server/app.ts` statically
-    // imports `voiceOpenApiComponents`/`voiceOpenApiOverrides` from that file
-    // for OpenAPI docs regardless of the `voice` feature flag, and bun's
-    // bundler does not tree-shake unused exports out of an already-imported
-    // module, so any literal there (route paths, `media/speech.ts`'s own
-    // "locally-installed `piper` CLI" comment, etc.) leaks into the binary
-    // even when voice is disabled. This marker instead comes from the
-    // `media.transcribe`/`media.speak` tool descriptions in `tools/media.ts`,
-    // which is exclusively imported by `features/entries/voice.ts` — its
-    // wording ("locally-installed whisper CLI") intentionally does not match
-    // `media/speech.ts`'s own comment text ("locally-installed
-    // `openai-whisper`"), so it stays confined to the voice-gated import.
     binaryMarkers: ['locally-installed whisper CLI'],
   },
   {
@@ -160,12 +120,6 @@ export const FEATURE_CATALOG: FeatureDescriptor[] = [
   {
     id: 'acp',
     description: 'External ACP agent runner',
-    // NOTE: `/acp/agents/run` (the route path) is a bad marker — it also appears
-    // in `packages/api-client`'s daemon HTTP client, which the standalone binary
-    // always bundles, so it can never prove exclusion. This marker instead comes
-    // from the `external_acp.run` tool description in `tools/external-acp-run.ts`,
-    // which is imported exclusively by `features/entries/acp-runtime.ts` and is
-    // absent from the client, so it stays confined to the acp-gated import.
     binaryMarkers: ['Run a configured external ACP coding agent such as opencode or Codex'],
   },
   {
@@ -185,12 +139,12 @@ export const FEATURE_CATALOG: FeatureDescriptor[] = [
   {
     id: 'plugins',
     description: 'Daemon plugin loader + routes',
-    // The `List plugins` summary lives in the plugin OpenAPI override
-    // (`server/routes/plugins-openapi.ts`). `server/app.ts` no longer imports it
-    // statically — it is routed through the generated manifest
-    // (`getPluginsOpenApiOverrides`) so both the route handler and its OpenAPI
-    // docs drop from the binary when plugins are disabled.
     binaryMarkers: ['List plugins'],
+  },
+  {
+    id: 'event-routing',
+    description: 'Event routing service, management routes and LLM rule runner',
+    binaryMarkers: ['CREATE TABLE IF NOT EXISTS event_delivery_outbox'],
   },
   {
     id: 'memory',

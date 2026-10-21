@@ -54,7 +54,6 @@ export function journalTasks(content: string): Array<{ id: string; text: string;
     return [{ id: createHash('sha256').update(text).digest('hex').slice(0, 20), text, completed: match[1] !== ' ', lineNumber }]
   })
 }
-/** Caller holds the bucket lock. Restoring before editing preserves the complete source. */
 export async function restoreJournal(root: string, date: string): Promise<void> {
   validateJournalDate(date)
   const archive = await optionalRead(archivePath(root, date))
@@ -91,7 +90,6 @@ export async function inspectJournal(root: string, date: string) {
   return { date, found: content !== undefined, tasks: journalTasks(content ?? ''),
     consolidation: checkpoint ? JSON.parse(checkpoint.toString('utf8')) : null }
 }
-/** Archive is lossless; no automatic permanent deletion. Unprocessed/open notes remain active. */
 export async function maintainJournals(root: string, options: { now?: Date; archiveAfterDays?: number; apply?: boolean } = {}) {
   const days = options.archiveAfterDays ?? JOURNAL_ARCHIVE_AFTER_DAYS
   if (!Number.isInteger(days) || days < 2 || days > 3650) throw new Error('archiveAfterDays must be an integer between 2 and 3650')
@@ -103,7 +101,7 @@ export async function maintainJournals(root: string, options: { now?: Date; arch
     const eligible = (await journalInventory(root)).filter((entry) => !entry.archived && entry.date < cutoffDate)
     const cursorPath = join(root, 'journal-maintenance.json')
     let offset = 0
-    try { const cursor = await optionalRead(cursorPath); const saved = cursor ? JSON.parse(cursor.toString('utf8')) : null; if (Number.isInteger(saved?.offset) && saved.offset >= 0) offset = saved.offset } catch { /* Reset a corrupt scan cursor, never discard journal data. */ }
+    try { const cursor = await optionalRead(cursorPath); const saved = cursor ? JSON.parse(cursor.toString('utf8')) : null; if (Number.isInteger(saved?.offset) && saved.offset >= 0) offset = saved.offset } catch {}
     if (offset >= eligible.length) offset = 0
     const entries = eligible.slice(offset, offset + 100)
     for (const { date } of entries) {
@@ -113,14 +111,13 @@ export async function maintainJournals(root: string, options: { now?: Date; arch
       if (journalTasks(raw.toString('utf8')).some((task) => !task.completed)) { results.push({ date, action: 'kept-open-tasks' }); continue }
       const checkpoint = await optionalRead(join(root, 'consolidation', `${date}.json`))
       let processed = false
-      try { const saved = checkpoint ? JSON.parse(checkpoint.toString('utf8')) : null; processed = saved?.rem === true && saved?.promotion === true && saved?.journalHash === createHash('sha256').update(raw).digest('hex') } catch { /* Keep invalid checkpoints visible for repair. */ }
+      try { const saved = checkpoint ? JSON.parse(checkpoint.toString('utf8')) : null; processed = saved?.rem === true && saved?.promotion === true && saved?.journalHash === createHash('sha256').update(raw).digest('hex') } catch {}
       if (!processed) { results.push({ date, action: 'kept-unprocessed' }); continue }
       if (options.apply) {
         await mkdir(join(root, 'journal-archive'), { recursive: true })
         const previous = await optionalRead(archivePath(root, date))
         if (previous && !gunzipSync(previous, { maxOutputLength: MAX_ARCHIVE_BYTES }).equals(raw)) throw new Error(`Conflicting journal archive for ${date}`)
         await atomicWrite(archivePath(root, date), gzipSync(raw))
-        // Check both the persisted archive and the current source before removal.
         if (!gunzipSync(await readFile(archivePath(root, date)), { maxOutputLength: MAX_ARCHIVE_BYTES }).equals(raw)
           || !(await readFile(rawPath(root, date))).equals(raw)) throw new Error(`Journal changed during archival: ${date}`)
         await rm(rawPath(root, date))
@@ -137,8 +134,6 @@ type OpenJournalTask = ReturnType<typeof journalTasks>[number] & { date: string 
 const taskIndexes = new Map<string, Map<string, { stamp: string; tasks: OpenJournalTask[] }>>()
 const taskRotations = new Map<string, number>()
 
-/** Derived in-process index; disk remains authoritative. Refresh changed files and
- * evict removed dates, including after reset. Rebuild safely on process restart. */
 export async function openJournalTasks(root: string): Promise<OpenJournalTask[]> {
   const key = resolve(root)
   let cache = taskIndexes.get(key)

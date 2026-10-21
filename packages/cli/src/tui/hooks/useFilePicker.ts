@@ -1,13 +1,3 @@
-// Bundles the file picker overlay's six pieces of state and its trivial
-// close handler. Mirrors useUsageDashboard / useMemorySearch so all three
-// overlays share a shape.
-//
-// openFilePicker stays in App.tsx for now because it has to consult the
-// overlay-state coordinator (other pickers open) plus state.isStreaming /
-// state.pendingApproval before flipping the open flag — that decision
-// crosses overlay boundaries and belongs at the app level until we add a
-// shared overlay coordinator.
-
 import { useCallback, useState } from 'react'
 import type { FilePickerItem } from '../components/FilePicker.js'
 

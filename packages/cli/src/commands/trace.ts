@@ -68,7 +68,6 @@ async function readTraceFiles(path: string): Promise<string> {
     try {
       parts.push(await readFile(candidate, 'utf-8'))
     } catch {
-      // Rotation files are optional. The caller handles the all-missing case.
     }
   }
   if (parts.length === 0) {
@@ -85,8 +84,6 @@ function parseEntries(content: string): TraceEntry[] {
     try {
       entries.push(JSON.parse(trimmed) as TraceEntry)
     } catch {
-      // Skip malformed lines rather than aborting — a partial last
-      // write or a manual edit shouldn't make the whole trace unreadable.
     }
   }
   return entries
@@ -264,7 +261,6 @@ function printEntry(entry: TraceEntry, full: boolean): void {
     return
   }
 
-  // Unknown event type — dump compactly.
   const tool = typeof entry.data?.tool === 'string' ? entry.data.tool : ''
   const state = entry.data?.state && typeof entry.data.state === 'object'
     ? entry.data.state as Record<string, unknown>

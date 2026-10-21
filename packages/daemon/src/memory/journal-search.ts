@@ -23,9 +23,6 @@ const integer = (value: number | undefined, fallback: number, min: number, max: 
   return value
 }
 
-/** Search every retained date, with bounded IO and an explicit continuation.
- * The cursor is a position, not a snapshot: concurrent edits require a fresh search.
- */
 export async function searchJournalPage(root: string, query: string, options: JournalSearchOptions = {}) {
   const normalized = query.trim().toLowerCase()
   if (!normalized) throw new Error('A query is required')

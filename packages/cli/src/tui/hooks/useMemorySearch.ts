@@ -1,13 +1,3 @@
-// Bundles the six pieces of state, the request-ref, and the close handler
-// for the memory-search overlay. Mirrors useUsageDashboard so the two
-// overlays share a shape — that lets a future useExclusivePanel
-// coordinator absorb their mutual exclusion without per-overlay forks.
-//
-// loadMemorySearch() in App.tsx still has cross-overlay coupling (it has
-// to dismiss the usage dashboard before opening, and vice versa); pulling
-// that orchestration up is the next step. For now this hook owns the
-// per-overlay plumbing only.
-
 import { useCallback, useRef, useState } from 'react'
 import type {
   DaemonMemoryEntry,
@@ -51,9 +41,6 @@ export function useMemorySearch(): UseMemorySearchResult {
   )
   const memoryRequestRef = useRef(0)
 
-  // Bumping memoryRequestRef invalidates any in-flight loadMemorySearch()
-  // call so a late-arriving response can no longer reopen / re-render the
-  // panel after the user has dismissed it.
   const closeMemorySearchPanel = useCallback(() => {
     memoryRequestRef.current += 1
     setMemorySearchOpen(false)

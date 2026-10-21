@@ -24,11 +24,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/**
- * Normalize the durable skill identity list without guessing from prompt text.
- * Duplicate ids are collapsed in first-seen order; malformed or over-broad
- * selections fail closed instead of being silently truncated.
- */
 export function normalizeScheduledAgentSkillRefs(
   refs: readonly ScheduledAgentSkillRef[],
 ): ScheduledAgentSkillRef[] {
@@ -56,7 +51,6 @@ export function normalizeScheduledAgentSkillRefs(
   return names.map((name) => ({ name }))
 }
 
-/** Parse the reserved scheduler metadata namespace. Unknown versions fail closed. */
 export function scheduledAgentSkillRefsFromMetadata(
   metadata: Record<string, unknown> | null | undefined,
 ): ScheduledAgentSkillRef[] {
@@ -76,10 +70,6 @@ export function scheduledAgentSkillRefsFromMetadata(
   return normalizeScheduledAgentSkillRefs(profile.skillRefs as ScheduledAgentSkillRef[])
 }
 
-/**
- * Replace only the scheduler-owned profile while preserving unrelated
- * notification, delivery, and app metadata. An empty list clears the profile.
- */
 export function withScheduledAgentSkillRefs(
   metadata: Record<string, unknown> | null | undefined,
   refs: readonly ScheduledAgentSkillRef[],

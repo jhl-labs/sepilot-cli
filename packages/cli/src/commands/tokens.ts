@@ -61,7 +61,6 @@ function formatTokenSummary(summary: DaemonExtensionTokenSummary): string {
     : chalk.gray(summary.revokedAt ? 'revoked' : 'inactive')
   const scopes = summary.scopes.join(',')
   const expires = summary.expiresAt ? ` expires=${summary.expiresAt}` : ''
-  // Surface the id so `tokens revoke <id>` is discoverable from the list.
   return `  ${chalk.bold(summary.id.padEnd(12))} ${summary.label.padEnd(20)} ${status.padEnd(16)} scopes=${scopes}${expires}`
 }
 

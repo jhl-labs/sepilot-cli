@@ -1,6 +1,6 @@
 import { stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, relative, resolve } from 'node:path'
 
 function normalizeOptionalPath(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined
@@ -25,6 +25,23 @@ export function resolveToolPath(
   return resolve(baseCwd ?? process.cwd(), expanded)
 }
 
+export function resolveSessionScratchPath(
+  rawPath: string,
+  baseDir: string | undefined,
+  sessionId: string,
+): { path: string; root: string } {
+  const safeSessionId = sessionId.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'session'
+  const root = resolve(baseDir ?? process.cwd(), '.sepilot-scratch', safeSessionId)
+  const expanded = expandHomePath(rawPath.trim())
+  const scratchInput = isAbsolute(expanded) ? basename(expanded) : expanded
+  const candidate = resolve(root, scratchInput || 'artifact')
+  const relativePath = relative(root, candidate)
+  if (relativePath.startsWith('../') || relativePath === '..' || isAbsolute(relativePath)) {
+    throw new Error('temporary fs.write path must stay within the session scratch directory')
+  }
+  return { path: candidate, root }
+}
+
 export function resolveToolCwd(rawCwd: unknown, contextCwd?: string): string {
   const fallback = normalizeOptionalPath(contextCwd)
   const requested = normalizeOptionalPath(rawCwd)
@@ -42,7 +59,6 @@ export async function directoryExists(path: string): Promise<boolean> {
 
 export type ToolCwdKind = 'directory' | 'file' | 'missing'
 
-/** Distinguish "not a directory" from "does not exist": they need different corrections. */
 export async function classifyToolCwd(path: string): Promise<ToolCwdKind> {
   try {
     const info = await stat(path)
@@ -52,12 +68,6 @@ export async function classifyToolCwd(path: string): Promise<ToolCwdKind> {
   }
 }
 
-/**
- * Error payload for a directory-scoped tool that received an unusable `cwd`.
- * A file path is a common model slip ("search in this file"); telling the
- * model only that the path "does not exist" sends it guessing. Name the exact
- * correction instead so the next call is the right one.
- */
 export function rejectToolCwd(
   cwd: string,
   kind: Exclude<ToolCwdKind, 'directory'>,

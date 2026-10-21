@@ -100,11 +100,6 @@ function loadPersistedPayload(filePath: string): PersistedA2ATasks {
 }
 
 export interface A2AFileTaskStoreOptions extends A2ATaskStoreOptions {
-  /**
-   * When > 0, coalesce persists that happen within the window into a single
-   * whole-file write (mitigates O(n^2) rewrite on bursty save+update). Default
-   * 0 keeps the durable synchronous write after every mutation.
-   */
   persistDebounceMs?: number
 }
 
@@ -146,7 +141,6 @@ export class A2AFileTaskStore extends A2ATaskStore {
     this.schedulePersist()
   }
 
-  /** Force any pending debounced write to disk immediately. */
   flush(): void {
     if (this.persistTimer) {
       clearTimeout(this.persistTimer)

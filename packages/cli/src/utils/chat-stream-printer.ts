@@ -11,6 +11,13 @@ import {
   type TerminalChatStreamFrame,
 } from '@sepilotd/api-client'
 import { formatRunStopCard, type RunStopHintMode } from '../tui/utils/run-stop-card.js'
+import { terminalSafeText, terminalSafeValue } from './terminal-safe-text.js'
+import {
+  detectTerminalImageProtocol,
+  encodeTerminalImage,
+  terminalAcceptsImageMime,
+  type TerminalImageMime,
+} from './terminal-image.js'
 
 interface Writer {
   write(text: string): void
@@ -20,44 +27,23 @@ interface BaseCliChatStreamPrinterOptions {
   onSessionId?: (sessionId: string) => void
   stdout?: Writer
   stderr?: Writer
-  /** Fires when the daemon emits an `approval_request` frame so the host
-   * shell can update a pending-counter or visual cue. */
+  env?: NodeJS.ProcessEnv
   onApprovalRequested?: (requestId: string, toolName: string, sessionId?: string) => void
-  /** Fires when the daemon emits a `question_request` frame so the host
-   * shell can update a pending-counter or visual cue. */
   onQuestionRequested?: (questionId: string, sessionId?: string) => void
 }
 
 export interface InteractiveCliChatStreamPrinterOptions extends BaseCliChatStreamPrinterOptions {
   showArtifacts?: boolean
   showStateChanges?: boolean
-  /** Show router, planner, reasoning, and per-LLM diagnostics. Defaults to true for API compatibility. */
   showDiagnostics?: boolean
-  /**
-   * How to spell approval hints.
-   * - 'shell' (default): interactive chat shell slash commands.
-   * - 'cli': top-level one-shot/run commands where slash commands are unavailable.
-   */
   approvalHintMode?: 'shell' | 'cli'
-  /** How to spell pending-question answer hints. Defaults to chat-shell slash commands. */
   questionHintMode?: 'shell' | 'cli'
 }
 
 export interface AnswerOnlyCliChatStreamPrinterOptions extends BaseCliChatStreamPrinterOptions {
   quiet?: boolean
   suppressContent?: boolean
-  /**
-   * How to spell the resolution hint after an `[approval: ...]` banner.
-   * - `'shell'` (default): the user is sitting at the chat shell, so
-   *   slash commands work — `/approve <id>` / `/deny <id>`.
-   * - `'cli'`: the surrounding context is a piped/non-interactive
-   *   `sepilot ask` run, so point at the top-level cli verbs that
-   *   resolve the same daemon endpoint — `sepilot approve <id>` /
-   *   `sepilot deny <id>`. Without this an automation user reads a
-   *   slash hint and has no shell to type it into.
-   */
   approvalHintMode?: 'shell' | 'cli'
-  /** How to spell pending-question answer hints. Defaults to top-level cli commands. */
   questionHintMode?: 'shell' | 'cli'
 }
 
@@ -67,6 +53,9 @@ export interface CliChatStreamPrinter {
   hadError: () => boolean
   errorMessage: () => string | undefined
 }
+
+const VIEW_LABEL_LIMIT = 120
+const BASE64_PAYLOAD = /^[A-Za-z0-9+/=]*$/
 
 function truncate(text: string, limit: number): string {
   return text.length > limit ? text.slice(0, limit) : text
@@ -78,7 +67,6 @@ const TERMINAL_BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/giu
 const TERMINAL_AWS_KEY_RE = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/gu
 const TERMINAL_JWT_RE = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu
 
-/** Keep live terminal previews useful without printing obvious credentials. */
 export function redactTerminalPreview(text: string): string {
   return text
     .replace(TERMINAL_BEARER_RE, 'Bearer [redacted]')
@@ -130,12 +118,6 @@ const SUPERVISOR_PREVIEW_CHARS = 700
 const SUPERVISOR_PREFIX_RE = /^\[supervisor\]\s*/i
 const COMPLETION_GATE_THINKING_RE = /\bCompletion gate blocked\b/i
 
-/**
- * `SEPILOTD_PROGRESS_HEARTBEAT_MS` throttles the `state_board` progress
- * heartbeat line. Default 30000ms; `0` disables it entirely. Read fresh on
- * every frame (not cached) so tests can flip it between assertions and a
- * long-lived REPL process picks up an env change on the next agent run.
- */
 function progressHeartbeatIntervalMs(): number {
   const raw = process.env.SEPILOTD_PROGRESS_HEARTBEAT_MS
   if (raw === undefined || raw === '') return DEFAULT_PROGRESS_HEARTBEAT_MS
@@ -143,12 +125,6 @@ function progressHeartbeatIntervalMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_PROGRESS_HEARTBEAT_MS
 }
 
-/**
- * `criteria <total>` only — `AgentAcceptanceCriterion` carries no
- * structured met/status field today, so we render a bare count rather than
- * infer completion from text. `plan`/`todos` segments are omitted entirely
- * when the board has none of that kind.
- */
 function formatStateBoardHeartbeat(frame: {
   criteriaTotal: number
   planTotal: number
@@ -161,8 +137,6 @@ function formatStateBoardHeartbeat(frame: {
   if (frame.criteriaTotal > 0) segments.push(`criteria ${frame.criteriaTotal}`)
   if (frame.planTotal > 0) segments.push(`plan ${frame.planDone}/${frame.planTotal}`)
   if (frame.todosTotal > 0) segments.push(`todos ${frame.todosDone}/${frame.todosTotal}`)
-  // Show what the agent is actually working on right now, not just counts —
-  // the structured in_progress todo item from the state board.
   const current = frame.todos?.find((todo) => todo.status === 'in_progress')
   if (current) segments.push(`현재: ${truncate(current.content, 80)}`)
   return segments.length > 0 ? `[진행] ${segments.join(' · ')}` : ''
@@ -180,12 +154,6 @@ function formatCoworkPlanLines(plan: Array<{ role: string; instruction: string }
   return lines
 }
 
-/**
- * Instance-scoped throttle for the `state_board` heartbeat: at most one
- * line per `SEPILOTD_PROGRESS_HEARTBEAT_MS`. Returns the line to print, or
- * `undefined` when this frame should be suppressed (too soon, disabled, or
- * nothing structured to show).
- */
 function createStateBoardHeartbeat() {
   let lastHeartbeatAt: number | undefined
   return (frame: {
@@ -326,15 +294,9 @@ function formatCheckpointFrame(
   return `[edit checkpoint] ${action} ${checkpoint.checkpointId} · ${checkpoint.files.length} file${checkpoint.files.length === 1 ? '' : 's'} · ${truncate(checkpoint.label, 120)}${suffix}`
 }
 
-/** The legacy bare inactivity message — older daemons sent only this. */
 const BARE_INACTIVITY_MESSAGE =
   /^(?:Agent|Resume) produced no output for \d+ms — aborted to release the run slot\.?$/
 
-/**
- * Map a daemon error code to a more useful one-line message for the cli.
- * The daemon's raw `error.message` is correct but sometimes operationally
- * framed; for those codes we substitute a hint the user can act on.
- */
 export function explainErrorCode(
   code: string | undefined,
   fallback: string,
@@ -347,8 +309,6 @@ export function explainErrorCode(
   switch (code) {
     case 'APPROVAL_TIMEOUT':
     case 'QUESTION_TIMEOUT': {
-      // Structured fields win over the daemon's prose: the pending decision
-      // tells the user exactly what to answer, the stopReason how to resume.
       const pending = context.pendingDecision
       const copy = context.stopReason
         ? describeStopReason(context.stopReason, context.locale ?? 'en')
@@ -362,10 +322,6 @@ export function explainErrorCode(
       return parts.length > 0 ? parts.join(' ') : fallback
     }
     case 'AGENT_INACTIVITY':
-      // Current daemons report *why* it stalled — no token/tool from the
-      // provider (check provider health, switch model) vs. a stuck step —
-      // so surface that verbatim. Only the legacy bare message, which says
-      // nothing useful, falls back to the generic hint.
       return fallback && !BARE_INACTIVITY_MESSAGE.test(fallback.trim())
         ? fallback
         : 'The agent stopped making progress and was aborted. Try a smaller, more concrete question or break it into steps.'
@@ -391,10 +347,6 @@ function formatErrorLine(
   return code ? `Error [${code}]: ${friendly}` : `Error: ${friendly}`
 }
 
-/**
- * Stop card lines for a terminal frame that ended a run with a
- * non-completed structured stop reason. Empty when there is nothing to show.
- */
 export function formatStopCardLines(
   stopReason: RunStopReason | undefined,
   hintMode: RunStopHintMode,
@@ -413,7 +365,7 @@ function createCliChatStreamPrinter(
       if (frame.kind === 'error') {
         lastError = frame.message
       }
-      handleFrame(frame)
+      handleFrame(terminalSafeValue(frame))
     },
   })
   return {
@@ -434,14 +386,13 @@ export function createInteractiveCliChatStreamPrinter(
   const questionHintMode = options.questionHintMode ?? 'shell'
   const hintMode: RunStopHintMode = options.approvalHintMode ?? 'shell'
   const showDiagnostics = options.showDiagnostics ?? true
-  // The daemon re-emits run_contract mid-run (steering / re-plan). Repeat
-  // the summary line so the operator knows the contract was refreshed.
-  // Reprint the full criteria list only when the actual criteria changed.
   let lastPrintedCriteriaSignature: string | undefined
   let currentSessionId: string | undefined
   const stateBoardHeartbeat = createStateBoardHeartbeat()
   let pendingThinking = ''
   let pendingThinkingStartedAt: number | undefined
+  let lastStill: { image: string; width: number; height: number } | undefined
+  const env = options.env ?? process.env
 
   const flushThinking = () => {
     if (!showDiagnostics || !pendingThinking.trim()) {
@@ -456,10 +407,6 @@ export function createInteractiveCliChatStreamPrinter(
   }
 
   return createCliChatStreamPrinter((frame) => {
-    // Provider thinking often arrives one token per frame. Preserve the raw
-    // chunk order, but render consecutive chunks as a bounded live paragraph
-    // instead of one terminal line per token. This is transport-level
-    // coalescing only; it does not classify or reinterpret the content.
     if (frame.kind !== 'thinking') flushThinking()
     switch (frame.kind) {
       case 'session':
@@ -645,10 +592,6 @@ export function createInteractiveCliChatStreamPrinter(
           currentSessionId = frame.sessionId
           options.onSessionId?.(frame.sessionId)
         }
-        // Show the tool name + truncated arg preview so the user knows what
-        // they are about to allow without having to switch panes. The hint
-        // line spells out the slash commands because new users won't know
-        // they exist.
         stdout.write(chalk.yellow(`  [approval] ${redactTerminalPreview(frame.preview)}\n`))
         const approvalHint = formatApprovalDecisionHint(
           options.approvalHintMode,
@@ -664,11 +607,6 @@ export function createInteractiveCliChatStreamPrinter(
         break
       }
       case 'auto_approval':
-        // Positive signal that a remembered rule short-circuited the
-        // prompt. Without it operators see no consent ui at all and have
-        // to grep `decisions list` to figure out why — the gray status
-        // line spells out the matched scope/pattern so future rounds are
-        // predictable.
         stdout.write(
           chalk.gray(
             `  [auto-${frame.decision}] ${frame.toolName} via ${frame.scope} rule '${frame.pattern}'\n`,
@@ -685,7 +623,29 @@ export function createInteractiveCliChatStreamPrinter(
         )
         break
       }
+      case 'view_still':
+        {
+          const title = truncate(terminalSafeText(frame.title).replace(/\s+/g, ' '), VIEW_LABEL_LIMIT)
+          const subtitle = frame.subtitle
+            ? truncate(terminalSafeText(frame.subtitle).replace(/\s+/g, ' '), VIEW_LABEL_LIMIT)
+            : ''
+          stdout.write(chalk.gray(`  [view] ${title}${subtitle ? ` — ${subtitle}` : ''}\n`))
+        }
+        lastStill = { image: frame.image, width: frame.width, height: frame.height }
+        break
       case 'done':
+        if (lastStill) {
+          const protocol = detectTerminalImageProtocol(env)
+          const match = /^data:(image\/(?:jpeg|png));base64,/.exec(lastStill.image)
+          const mime = match?.[1] as TerminalImageMime | undefined
+          if ((protocol === 'kitty' || protocol === 'iterm2') && mime && terminalAcceptsImageMime(env, mime)) {
+            const base64 = lastStill.image.slice(match![0].length)
+            if (BASE64_PAYLOAD.test(base64)) {
+              stdout.write(`${encodeTerminalImage(protocol, base64, lastStill)}\n`)
+            }
+          }
+          lastStill = undefined
+        }
         stdout.write(
           chalk.gray(`  [tokens: ${frame.usage.inputTokens}→${frame.usage.outputTokens}]\n`),
         )
@@ -709,11 +669,6 @@ export function createInteractiveCliChatStreamPrinter(
         }
         break
       case 'context_compact':
-        // Always show — without it the user sees totalTokens drop in
-        // /usage and wonders if the agent forgot earlier turns. The
-        // gray "[context compacted: N → M tokens]" line tells them
-        // the daemon summarised earlier rounds and how much head-room
-        // they got back.
         stdout.write(
           chalk.gray(
             `  [context compacted: ${frame.beforeTokens.toLocaleString()} → ${frame.afterTokens.toLocaleString()} tokens]` +
@@ -731,10 +686,6 @@ export function createInteractiveCliChatStreamPrinter(
         break
       }
       case 'post_edit_findings': {
-        // Visual hierarchy: broken callers in red (downstream damage),
-        // edited file diagnostics in yellow, mere likely-callers in
-        // gray. Without this split the operator can't tell whether
-        // the edit *broke* anything or just touched things.
         const editedSummary = frame.editedFiles.slice(0, 3).join(', ')
         if (editedSummary) {
           stdout.write(chalk.gray(`  [post-edit] edited: ${editedSummary}\n`))
@@ -768,12 +719,6 @@ export function createInteractiveCliChatStreamPrinter(
   })
 }
 
-/**
- * Strip the trailing ```planner ... ``` JSON block (used internally by the
- * planner working memory channel) from an answer the user is about to see.
- * The block is *only* meaningful to the cli's planner panel, never to a
- * piped consumer of `sepilot ask`.
- */
 const PLANNER_BLOCK_REGEX = /\n?```(?:planner|json:planner)\s*\n[\s\S]*?\n?```\s*$/i
 function stripPlannerBlock(text: string): string {
   return text.replace(PLANNER_BLOCK_REGEX, '').trimEnd()
@@ -788,9 +733,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
   const answerHintMode: RunStopHintMode = options.approvalHintMode ?? 'cli'
   let needsTrailingNewline = false
   let pendingChunk = ''
-  // The daemon re-emits run_contract mid-run (steering / re-plan). Repeat
-  // the summary line so the operator knows the contract was refreshed.
-  // Reprint the full criteria list only when the actual criteria changed.
   let lastPrintedCriteriaSignature: string | undefined
   let currentSessionId: string | undefined
   const stateBoardHeartbeat = createStateBoardHeartbeat()
@@ -822,14 +764,9 @@ export function createAnswerOnlyCliChatStreamPrinter(
         break
       case 'text': {
         if (pendingChunk.length > 0) {
-          // Already in a fence-suspected buffer; just append.
           pendingChunk += frame.text
           break
         }
-        // Look for the start of a ```planner fence appearing across the
-        // current chunk. If a partial fence opener is at the tail (e.g. the
-        // chunk ends with a stray '```' or '\n```pla'), buffer just enough
-        // to recognise it on the next chunk.
         const merged = frame.text
         const fenceFull = merged.search(/\n?```(?:planner|json:planner)\b/i)
         if (fenceFull !== -1) {
@@ -837,7 +774,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
           pendingChunk = merged.slice(fenceFull)
           break
         }
-        // Detect a partial fence opener at the chunk tail to defer printing.
         const partial = merged.match(/\n?`{1,3}(?:p|pl|pla|plan|plann|planne)?$/i)
         if (partial) {
           const cut = merged.length - partial[0].length
@@ -849,11 +785,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
         break
       }
       case 'message':
-        // The shared presenter emits `message` only for a non-streamed
-        // assistant reply. A previous LLM iteration may have streamed a
-        // progress sentence before a tool call, but that must not suppress
-        // the later final reply. De-duplication of a streamed reply and its
-        // matching message belongs to the presenter, at the segment boundary.
         writeContent(stripPlannerBlock(frame.content))
         break
       case 'llm_request':
@@ -987,10 +918,9 @@ export function createAnswerOnlyCliChatStreamPrinter(
       }
       case 'tool_result':
       case 'state_change':
+      case 'view_still':
         break
       case 'state_board': {
-        // Progress chrome, not consent/content — respect quiet like
-        // tool_call, not always-on like steering/approval.
         if (options.quiet) break
         const line = stateBoardHeartbeat(frame)
         if (line) stderr.write(chalk.gray(`\n${line}\n`))
@@ -1003,9 +933,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
               `\n[run contract] ${formatAcceptanceCriterionCount(frame.contract.acceptanceCriteria.length)} · ${truncate(frame.contract.summary, 120)}\n`,
             ),
           )
-          // Full criteria list so the operator can see exactly what "done"
-          // means for this run without querying the daemon separately —
-          // the summary line alone only gives a count.
           const criteriaSignature = acceptanceCriteriaSignature(frame.contract.acceptanceCriteria)
           if (criteriaSignature !== lastPrintedCriteriaSignature) {
             lastPrintedCriteriaSignature = criteriaSignature
@@ -1017,9 +944,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
         break
       }
       case 'steering_ack':
-        // Consent/visibility class, same as approval_request: the user
-        // just queued a mid-run steering note and needs confirmation it
-        // was received, even in quiet/piped mode.
         stderr.write(
           chalk.yellow(
             `\n[steering 접수] ${frame.noteId}${frame.steeringMessage ? `: ${truncate(frame.steeringMessage, 80)}` : ''}\n`,
@@ -1039,13 +963,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
           currentSessionId = frame.sessionId
           options.onSessionId?.(frame.sessionId)
         }
-        // User-safety critical: always surface approval prompts on
-        // stderr, even in quiet/piped mode. Suppressing them would let
-        // an `ask | tee answer.txt` invocation silently swallow the one
-        // notification the user *must* see before the agent runs a
-        // destructive tool. Other noise (tool_call cyan banner, done
-        // usage line) still respects `quiet` because they're progress
-        // chrome, not consent prompts.
         stderr.write(chalk.yellow(`\n[approval: ${frame.preview}]\n`))
         const hint = `  decide with: ${
           options.approvalHintMode === 'cli'
@@ -1060,11 +977,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
         break
       }
       case 'auto_approval':
-        // Same stderr-always rule as approval_request: this is the
-        // operator-facing signal that *something they previously
-        // remembered* let the daemon skip a consent prompt. Suppressing
-        // it in quiet mode would defeat the visibility purpose — the
-        // whole gap this banner closes is "why did no prompt appear?".
         stderr.write(
           chalk.gray(
             `\n[auto-${frame.decision}] ${frame.toolName} via ${frame.scope} rule '${frame.pattern}'\n`,
@@ -1072,8 +984,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
         )
         break
       case 'done':
-        // Flush any tail still in the buffer (after stripping a planner
-        // block if the buffer contained one).
         if (pendingChunk.length > 0) {
           writeContent(stripPlannerBlock(pendingChunk))
           pendingChunk = ''
@@ -1084,8 +994,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
             chalk.gray(`\n[${frame.usage.inputTokens}→${frame.usage.outputTokens} tokens]\n`),
           )
         }
-        // Operational signal like the approval banner: shown even in quiet
-        // mode, on stderr so a piped stdout consumer never sees it.
         for (const line of formatStopCardLines(frame.stopReason, answerHintMode)) {
           stderr.write(chalk.yellow(`${line}\n`))
         }
@@ -1106,10 +1014,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
         }
         break
       case 'context_compact':
-        // Like the approval banner, this is operational signal the user
-        // needs even in quiet mode — without it a piped `ask` user sees
-        // running token totals shrink with no explanation. Goes to
-        // stderr so it never pollutes a piped stdout consumer.
         stderr.write(
           chalk.gray(
             `\n[context compacted: ${frame.beforeTokens.toLocaleString()} → ${frame.afterTokens.toLocaleString()} tokens]` +
@@ -1119,8 +1023,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
         )
         break
       case 'phase_change': {
-        // Same rationale as context_compact — operational signal, stderr
-        // so piped stdout consumers stay clean.
         if (!options.quiet) {
           const entered = frame.enteredPhase ?? 'finalize'
           const closed = frame.closedPhase
@@ -1131,11 +1033,6 @@ export function createAnswerOnlyCliChatStreamPrinter(
         break
       }
       case 'post_edit_findings': {
-        // Broken-caller signal is a near-failure: surface it even in
-        // quiet mode, the operator probably wants to know an `ask`
-        // run touched downstream files that no longer compile. Other
-        // findings (own diagnostics, mere likely-callers) only render
-        // outside quiet mode since they're informational.
         const editedSummary = frame.editedFiles.slice(0, 3).join(', ')
         if (frame.brokenCallers.length > 0) {
           stderr.write(

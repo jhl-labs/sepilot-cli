@@ -15,12 +15,6 @@ function normalize(value: string): string {
   return value.replace(/\s+/g, ' ').trim().toLocaleLowerCase()
 }
 
-/**
- * Detect provider output that has collapsed into a repeated phrase/reasoning
- * loop. This deliberately ignores language, model, tool names, and task type.
- * Exact sentence/tag units catch common thinking-tag loops; word shingles
- * cover repeated prose that lacks reliable punctuation.
- */
 export function isDegenerateRepeatedResponse(value: string): boolean {
   const normalized = normalize(value)
   if (normalized.length < MIN_DETECTION_CHARS) return false
@@ -41,12 +35,6 @@ export function isDegenerateRepeatedResponse(value: string): boolean {
     }
   }
 
-  // Repeated cell values are normal in structured status tables (for example
-  // several unavailable timestamps rendered as "unknown"). Feeding Markdown
-  // rows into the prose-shingle detector makes those valid answers look like a
-  // reasoning loop. Keep the exact-unit detector above on the full response so
-  // genuinely duplicated rows still converge, but run overlapping word
-  // shingles only over non-table prose.
   const shingleProse = value
     .split(/\r?\n/u)
     .filter((line) => !isMarkdownTableRow(line))

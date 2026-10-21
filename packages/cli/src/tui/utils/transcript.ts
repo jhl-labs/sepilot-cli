@@ -66,9 +66,6 @@ const OPERATIONAL_SYSTEM_MESSAGE_PATTERNS = [
 
 function countWrappedLines(text: string, width: number): number {
   const normalizedWidth = Math.max(MIN_CONTENT_WIDTH, width)
-  // string-width strips ANSI codes internally and correctly measures
-  // full-width CJK / Hangul characters as 2 columns each, so the wrap
-  // estimate matches Ink's actual terminal output.
   const lines = text.split('\n')
   return lines.reduce((total, line) => {
     if (!line) {

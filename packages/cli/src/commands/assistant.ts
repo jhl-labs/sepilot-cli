@@ -218,9 +218,6 @@ async function optional<T>(section: string, promise: Promise<T>): Promise<Option
   try {
     return { section, value: await promise, available: true, failureKind: null }
   } catch (error) {
-    // Do not copy raw remote errors into the snapshot: provider errors may
-    // contain endpoints or credential-bearing diagnostic text. The section
-    // name is enough to make partial availability explicit.
     return {
       section,
       value: null,
@@ -293,9 +290,6 @@ function deliveryRouteReadiness(
   const configured = configuredChannels.find((channel) => channel.type === channelType)
   if (!configured || configured.enabled === false) return 'unavailable'
 
-  // Only channel types with a daemon runtime probe can prove connection
-  // state. Other configured channel types remain usable under the existing
-  // config contract instead of being mislabeled unavailable.
   if (!summaries.has(channelType)) return 'available'
   if (partialFailures.has(`channel.${channelType}`)) return 'unknown'
 
@@ -914,11 +908,6 @@ export async function assistantStatusCommand(options: {
   try {
     await ensureDaemon(client, { url: options.url, quiet: true })
     const health = await client.health()
-    // Runtime status and the remaining readiness reads are independent. Start
-    // them together so a slow journal-backed runtime projection does not add
-    // its latency to another slow optional endpoint. Scheduler remains gated
-    // on the runtime capability result below, preserving disabled-surface
-    // semantics instead of turning an intentional 403 into a partial failure.
     const runtimePromise = optional('assistant-runtime', client.assistantRuntimeStatus())
     const independentResultsPromise = Promise.all([
       optional('config', client.config()),
@@ -968,8 +957,6 @@ export async function assistantStatusCommand(options: {
       ['discord', value(discord)],
       ['slack', value(slack)],
     ])
-    // Keep the historical section ordering stable even though acquisition is
-    // now concurrent; JSON/text automation may compare the partial list.
     const optionalResults = [
       runtime,
       config,

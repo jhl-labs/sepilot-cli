@@ -15,7 +15,6 @@ type ExecFileFn = (
   options?: { maxBuffer?: number; timeout?: number; cwd?: string },
 ) => Promise<ExecFileResult>
 
-/** Run a binary, feed `stdin` to its stdin, and resolve when it exits 0. */
 type RunWithStdinFn = (
   file: string,
   args: string[],
@@ -74,17 +73,6 @@ function defaultDeps(deps?: SpeechToolDeps): Required<SpeechToolDeps> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// media.speech concurrency limiter
-//
-// Every STT/TTS job spawns a CLI that reloads a 150MB–3GB model, so N unbounded
-// concurrent voice requests would fan out into N model loads and OOM the host.
-// This shared semaphore caps concurrent speech jobs. Agent tools already gate on
-// the tool scheduler's `media.speech` resource; the voice HTTP routes bypassed
-// that scheduler and called the binaries directly, so they route through this
-// limiter to get the same protection.
-// ---------------------------------------------------------------------------
-
 class SpeechSemaphore {
   private max: number
   private active = 0
@@ -130,12 +118,10 @@ const speechSemaphore = new SpeechSemaphore(
     : 2,
 )
 
-/** Set the max concurrent STT/TTS jobs (from `voice.maxConcurrent`). */
 export function configureSpeechConcurrency(max: number): void {
   speechSemaphore.setMax(max)
 }
 
-/** Run a speech job under the shared media.speech concurrency limit. */
 export function runSpeechJob<T>(fn: () => Promise<T>): Promise<T> {
   return speechSemaphore.run(fn)
 }
@@ -163,11 +149,8 @@ function isMissingBinary(error: unknown): boolean {
 
 export interface TranscribeOptions {
   audioPath: string
-  /** Local whisper-compatible binary. Defaults to env or "whisper". */
   binaryPath?: string
-  /** ISO 639-1 language hint (e.g. "ko", "en"). Defaults to env or auto-detect. */
   language?: string
-  /** Whisper model name (e.g. "base", "small", "medium"). Defaults to env or "base". */
   model?: string
 }
 
@@ -177,20 +160,6 @@ export interface TranscribeResult {
   language?: string
 }
 
-/**
- * Transcribe a local audio file with a locally-installed `openai-whisper`
- * CLI (`pip install openai-whisper`). This never calls an external paid
- * API — it shells out to the binary on the host (which itself needs
- * `ffmpeg` on PATH to decode formats like Telegram's Opus voice notes).
- *
- * Env knobs:
- *  - SEPILOTD_WHISPER_BIN   (default "whisper")
- *  - SEPILOTD_WHISPER_MODEL (default "base")
- *  - SEPILOTD_WHISPER_LANG  (optional language hint)
- *
- * whisper.cpp users (different CLI) should point SEPILOTD_WHISPER_BIN at
- * a thin wrapper that accepts the same flags.
- */
 export async function transcribeAudio(
   options: TranscribeOptions,
   deps?: SpeechToolDeps,
@@ -211,10 +180,6 @@ export async function transcribeAudio(
       audioPath,
       '--model',
       model,
-      // 'all' writes both the plain-text transcript and the json sidecar; the
-      // json carries whisper's auto-detected `language`, which we surface below
-      // instead of echoing the input hint (auto-detect previously always
-      // returned undefined, defeating language-aware downstream handling).
       '--output_format',
       'all',
       '--output_dir',
@@ -239,14 +204,11 @@ export async function transcribeAudio(
       throw error
     }
 
-    // openai-whisper writes "<basename-without-ext>.{txt,json}" into --output_dir.
     const stem = basename(audioPath, extname(audioPath))
     const txtPath = join(outDir, `${stem}.txt`)
     const raw = await readFile(txtPath, 'utf-8').catch(() => {
       throw new Error(`whisper produced no transcript at ${txtPath}`)
     })
-    // Prefer whisper's detected language (json sidecar); fall back to the input
-    // hint when the json is absent/unparseable.
     let detectedLanguage = language
     try {
       const jsonRaw = await readFile(join(outDir, `${stem}.json`), 'utf-8')
@@ -255,7 +217,6 @@ export async function transcribeAudio(
         detectedLanguage = normalizeSpeechLanguage(parsed.language.trim()) ?? parsed.language.trim()
       }
     } catch {
-      /* no json sidecar — keep the hint */
     }
     return { text: raw.trim(), model, language: detectedLanguage }
   } finally {
@@ -265,20 +226,14 @@ export async function transcribeAudio(
 
 export interface SynthesizeOptions {
   text: string
-  /** Where to write the WAV. A temp file is used (and reported) when omitted. */
   outputPath?: string
-  /** Local piper-compatible binary. Defaults to env or "piper". */
   binaryPath?: string
-  /** Path to a Piper .onnx voice model. Defaults to env resolution. */
   modelPath?: string
-  /** BCP-47/ISO language hint used to select a matching Piper voice model. */
   language?: string
 }
 
 export interface SynthesizeResult {
-  /** Path to the produced WAV file. */
   audioPath: string
-  /** True when no outputPath was supplied, so the caller owns cleanup of the temp dir/file. */
   temporary: boolean
   bytes: number
 }
@@ -336,17 +291,6 @@ function resolvePiperModel(
   return undefined
 }
 
-/**
- * Synthesize speech from text using a locally-installed `piper` CLI
- * (https://github.com/rhasspy/piper) — a single-binary neural TTS that
- * runs fully offline. Never calls an external paid API.
- *
- * Env knobs:
- *  - SEPILOTD_PIPER_BIN   (default "piper")
- *  - SEPILOTD_PIPER_MODEL (required — path to a .onnx voice model)
- *
- * piper reads the text from stdin and writes a WAV to --output_file.
- */
 export async function synthesizeSpeech(
   options: SynthesizeOptions,
   deps?: SpeechToolDeps,
@@ -403,10 +347,8 @@ export async function synthesizeSpeech(
   }
 }
 
-// Locate a top-level RIFF chunk by id (e.g. 'fmt ', 'data'), returning the
-// offset of its payload and its declared size. Chunks are 2-byte aligned.
 function findRiffChunk(buf: Buffer, id: string): { offset: number; size: number } | null {
-  let pos = 12 // skip "RIFF" + size + "WAVE"
+  let pos = 12
   while (pos + 8 <= buf.length) {
     const chunkId = buf.toString('ascii', pos, pos + 4)
     const size = buf.readUInt32LE(pos + 4)
@@ -416,18 +358,12 @@ function findRiffChunk(buf: Buffer, id: string): { offset: number; size: number 
   return null
 }
 
-/**
- * Concatenate multiple same-format PCM WAV files (the clips produced for a long
- * TTS reply) into a single WAV at outputPath. Assumes identical fmt (true for
- * clips from one Piper voice). Returns the output byte length.
- */
 export async function concatenateWavFiles(inputPaths: string[], outputPath: string): Promise<number> {
   if (inputPaths.length === 0) throw new Error('concatenateWavFiles: no input files')
   const buffers = await Promise.all(inputPaths.map((p) => readFile(p)))
   const first = buffers[0]
   const fmt = findRiffChunk(first, 'fmt ')
   if (!fmt) throw new Error('concatenateWavFiles: first WAV has no fmt chunk')
-  // fmt chunk including its 8-byte header.
   const fmtWithHeader = first.subarray(fmt.offset - 8, fmt.offset + fmt.size)
   const dataParts: Buffer[] = []
   for (const buf of buffers) {

@@ -16,9 +16,6 @@ export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
 const LEVEL_ORDER: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 }
 
-// Check size every N writes instead of every write to keep the hot path
-// cheap. With ~10 MiB rotation limit, the worst-case overshoot at this rate
-// is well under a megabyte even for large log lines.
 const ROTATION_CHECK_INTERVAL = 64
 
 let currentLevel: LogLevel = 'info'
@@ -86,7 +83,6 @@ function writeToFile(line: string): void {
       }
       await appendFile(path, fileLine + '\n', 'utf-8')
     } catch {
-      // Logging must never throw into the calling code path.
     }
   })
 }

@@ -1,4 +1,5 @@
 import { SharedBoard } from './shared-board.js'
+import type { AutonomyLevel } from '@sepilotd/core'
 
 export type ActiveRunStatus = 'running'
 
@@ -68,37 +69,75 @@ export type SteeringCancellationResult =
 type ActiveRunCanceller = () => void | Promise<void>
 type ActiveRunChangeListener = (sessionId: string, running: boolean) => void
 
-/** Minimal shape the live registry needs — anything carrying a mutable
- *  `steeringNotes` array, per `agent/graph/state-board.ts` `AgentState`. Kept
- *  structural (not importing `AgentState` here) so this runtime module stays
- *  independent of the graph package. */
 export interface LiveRunState {
   steeringNotes?: LiveRunSteeringNote[]
   [key: string]: unknown
 }
 
+export interface SessionRunContext {
+  mode?: string
+  cwd?: string
+  workspaceRoot?: string
+  provider?: string
+  model?: string
+  autonomy?: AutonomyLevel
+  toolNames?: string[]
+  bot?: string
+  surface?: string
+  recordedAt: number
+}
+
+type SessionRunAuthorityField = 'toolNames' | 'bot' | 'surface'
+
+export type SessionRunContextUpdate =
+  Omit<SessionRunContext, 'recordedAt' | SessionRunAuthorityField>
+  & { [K in SessionRunAuthorityField]?: SessionRunContext[K] | null }
+
+function mergeAuthorityField<T>(next: T | null | undefined, previous: T | undefined): T | undefined {
+  if (next === null) return undefined
+  return next ?? previous
+}
+
 export class ActiveRunRegistry {
   private evidenceReader?: (sessionId: string) => string
+  private readonly runContexts = new Map<string, SessionRunContext>()
+
+  recordRunContext(sessionId: string, update: SessionRunContextUpdate): void {
+    if (!sessionId) return
+    const previous = this.runContexts.get(sessionId)
+    const { toolNames, bot, surface, ...rest } = update
+    const context: SessionRunContext = { ...rest, recordedAt: Date.now() }
+    const mergedToolNames = mergeAuthorityField(toolNames, previous?.toolNames)
+    const mergedBot = mergeAuthorityField(bot, previous?.bot)
+    const mergedSurface = mergeAuthorityField(surface, previous?.surface)
+    if (mergedToolNames !== undefined) context.toolNames = mergedToolNames
+    if (mergedBot !== undefined) context.bot = mergedBot
+    if (mergedSurface !== undefined) context.surface = mergedSurface
+    this.runContexts.delete(sessionId)
+    this.runContexts.set(sessionId, context)
+    while (this.runContexts.size > 500) {
+      const oldest = this.runContexts.keys().next().value
+      if (oldest === undefined) break
+      this.runContexts.delete(oldest)
+    }
+  }
+
+  lastRunContext(sessionId: string): SessionRunContext | undefined {
+    return this.runContexts.get(sessionId)
+  }
+
+  updateRecordedAutonomy(sessionId: string, level: AutonomyLevel): void {
+    const existing = this.runContexts.get(sessionId)
+    if (!existing) return
+    this.runContexts.set(sessionId, { ...existing, autonomy: level })
+  }
   setBackgroundEvidenceReader(reader: (sessionId: string) => string): void { this.evidenceReader = reader }
   backgroundEvidence(sessionId: string): string { return this.evidenceReader?.(sessionId) ?? '' }
   private readonly runs = new Map<string, ActiveRunRecord>()
-  private readonly cancellers = new Map<string, ActiveRunCanceller>()
+  private readonly cancellers = new Map<string, ActiveRunCanceller[]>()
 
-  /**
-   * Live board shared by concurrent sibling subagents under the same parent run
-   * (PLAN_065 T4). Juxtaposed here so it shares the run lifecycle: entries are
-   * dropped in `finish()` when the parent run ends.
-   */
   readonly sharedBoard = new SharedBoard()
 
-  /**
-   * Reference to the LIVE, in-flight `AgentState` object for a running graph
-   * (not a checkpointed/cloned snapshot). The graph engine registers it
-   * alongside its per-node `upsert()` progress update so routes such as
-   * `POST /sessions/:id/steer` can mutate it directly (e.g. via
-   * `appendSteeringNote`) and have the running loop observe the change on its
-   * next turn. Cleared in `finish()`.
-   */
   private readonly liveStates = new Map<string, LiveRunState>()
 
   private readonly pendingSteeringNotes = new Map<string, LiveRunSteeringNote[]>()
@@ -116,20 +155,40 @@ export class ActiveRunRegistry {
     this.liveStates.set(sessionId, state)
   }
 
-  registerCanceller(sessionId: string, cancel: ActiveRunCanceller, options?: { ifAbsent?: boolean }): () => void {
-    if (options?.ifAbsent && this.cancellers.has(sessionId)) return () => {}
-    this.cancellers.set(sessionId, cancel)
+  registerCanceller(sessionId: string, cancel: ActiveRunCanceller): () => void {
+    const owners = this.cancellers.get(sessionId) ?? []
+    owners.push(cancel)
+    this.cancellers.set(sessionId, owners)
     return () => {
-      if (this.cancellers.get(sessionId) === cancel) {
-        this.cancellers.delete(sessionId)
-      }
+      const current = this.cancellers.get(sessionId)
+      if (!current) return
+      const index = current.indexOf(cancel)
+      if (index >= 0) current.splice(index, 1)
+      if (current.length === 0) this.cancellers.delete(sessionId)
     }
   }
 
+  private readonly privilegeSetters = new Map<string, (level: AutonomyLevel) => void>()
+
+  registerPrivilegeSetter(sessionId: string, setter: (level: AutonomyLevel) => void): () => void {
+    this.privilegeSetters.set(sessionId, setter)
+    return () => {
+      if (this.privilegeSetters.get(sessionId) === setter) this.privilegeSetters.delete(sessionId)
+    }
+  }
+
+  setPrivilege(sessionId: string, level: AutonomyLevel): boolean {
+    this.updateRecordedAutonomy(sessionId, level)
+    const setter = this.privilegeSetters.get(sessionId)
+    if (!setter) return false
+    setter(level)
+    return true
+  }
+
   async cancel(sessionId: string): Promise<boolean> {
-    const cancel = this.cancellers.get(sessionId)
-    if (!cancel) return false
-    await cancel()
+    const owners = [...(this.cancellers.get(sessionId) ?? [])]
+    if (owners.length === 0) return false
+    for (const cancel of owners.reverse()) await cancel()
     return true
   }
 
@@ -146,12 +205,6 @@ export class ActiveRunRegistry {
     this.pendingSteeringNotes.set(sessionId, list)
   }
 
-  /**
-   * Cancel steering synchronously against the registry-owned live state.
-   * Consumption and cancellation both run on the daemon event loop, so a
-   * note can transition from pending to exactly one terminal state without a
-   * read/modify/write gap between an HTTP route and the graph loop.
-   */
   cancelPendingSteeringNotes(
     sessionId: string,
     target: SteeringCancellationTarget,

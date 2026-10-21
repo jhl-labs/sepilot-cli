@@ -11,11 +11,6 @@ import {
   type AgentStateBoardSource,
 } from './graph/state-board.js'
 
-/**
- * Load previous conversation messages from a session.
- * Returns Message[] suitable for passing to the LLM.
- * Limits to last `maxMessages` to stay within context window.
- */
 export async function loadSessionContext(
   sessionStore: ISessionStore,
   sessionId: string,
@@ -23,19 +18,28 @@ export async function loadSessionContext(
 ): Promise<Message[]> {
   const events = await sessionStore.getEvents(sessionId)
   const messages: Message[] = []
-  // Durable board seed (P022-T5): the latest contract/todo/planner-working-memory
-  // survive context compaction, so track them across the whole event stream —
-  // not inside `messages`, which `context_compact` clears — and rehydrate the
-  // state board out-of-band on follow-up turns. Previously these events were
-  // dropped, so a new turn lost the prior goal/plan/todo.
   let rehydratedContract: AgentSeedContract | undefined
   let rehydratedTodos: TodoItem[] | undefined
   let rehydratedPlannerMemory: PlannerWorkingMemory | undefined
-  // Map tool_call id -> tool name so a reloaded tool_result can be summarized
-  // with the same per-tool budget the live loop applies (see below).
   const toolNameByCallId = new Map<string, string>()
+  const messageCountAfterEvent = new Map<string, number>()
 
   for (const event of events) {
+    if (event.type === 'context_compact' && event.throughEventId && messageCountAfterEvent.has(event.throughEventId)) {
+      const tail = messages.slice(messageCountAfterEvent.get(event.throughEventId)!)
+      messages.length = 0
+      messages.push({
+        role: 'system',
+        content: getCompactContinuationMessage(event.summary, {
+          recentMessagesPreserved: (event.preservedMessages?.length ?? 0) > 0,
+          suppressFollowUpQuestions: true,
+        }),
+      })
+      if (event.preservedMessages?.length) messages.push(...event.preservedMessages)
+      messages.push(...tail)
+      messageCountAfterEvent.set(event.id, messages.length)
+      continue
+    }
     switch (event.type) {
       case 'user_message':
         messages.push({ role: 'user', content: replayConversationTextControls(event.content) })
@@ -65,14 +69,10 @@ export async function loadSessionContext(
           const toolName = toolNameByCallId.get(event.toolCallId)
           messages.push({
             role: 'tool',
-            // Re-summarize large tool output on reload so the reloaded view
-            // matches the live loop (which stores the summarized form via
-            // summarizeToolOutputForAgentContext). Without this, a resumed
-            // session re-injected the full multi-KB raw output, bloating the
-            // context and diverging from what the model saw live.
             content: summarizeToolOutputForAgentContext(
               toolName ?? '',
               event.output,
+              event.toolCallId,
             ),
             toolCallId: event.toolCallId,
             ...(toolName ? { name: toolName } : {}),
@@ -84,7 +84,6 @@ export async function loadSessionContext(
         }
         break
       case 'context_compact':
-        // Replace all previous messages with the summary
         messages.length = 0
         messages.push({
           role: 'system',
@@ -98,15 +97,12 @@ export async function loadSessionContext(
         }
         break
     }
+    messageCountAfterEvent.set(event.id, messages.length)
   }
 
-  // Trim to last N messages if needed
   const limit = maxMessages ?? DEFAULT_SESSION_CONTEXT_MAX_MESSAGES
   const normalizedMessages = coalesceAdjacentAssistantToolCallMessages(messages)
   const trimmed = stripStalePlannerBlocks(trimMessagesToLimit(normalizedMessages, limit))
-  // Rehydrate the board after trimming so it is never trimmed away, and prepend
-  // it as an out-of-band system block. `buildAgentMessages` replaces it with the
-  // fresh live board when the run rebuilds one this turn (same STATE_BOARD_PREFIX).
   const boardMessage = buildRehydratedBoardMessage(
     rehydratedContract,
     rehydratedTodos,
@@ -115,14 +111,6 @@ export async function loadSessionContext(
   return boardMessage ? [boardMessage, ...trimmed] : trimmed
 }
 
-/**
- * Rebuild the state board from the durable contract/todo/planner seed and
- * render it as a system message, or `null` when there is nothing durable to
- * rehydrate (or the board is disabled via `SEPILOTD_STATE_BOARD=0`). The
- * evidence section is dropped: the evidence ledger is per-run and not part of
- * the durable seed, so a rehydrated board carries only the durable goal/plan/
- * todo/failed/open-question state, never stale contract-evidence gaps.
- */
 export function buildRehydratedBoardMessage(
   contract: AgentSeedContract | undefined,
   todos: TodoItem[] | undefined,
@@ -143,11 +131,6 @@ export function buildRehydratedBoardMessage(
 
 export const DEFAULT_SESSION_CONTEXT_MAX_MESSAGES = 50
 
-/**
- * Default message-count cap for session context loads. Overridable with
- * `SEPILOTD_SESSION_CONTEXT_MAX_MESSAGES` for operators running models with
- * unusually small or large context windows.
- */
 export function resolveSessionContextMaxMessages(): number {
   const raw = Number(process.env.SEPILOTD_SESSION_CONTEXT_MAX_MESSAGES)
   if (Number.isFinite(raw) && raw >= 4) {
@@ -156,12 +139,6 @@ export function resolveSessionContextMaxMessages(): number {
   return DEFAULT_SESSION_CONTEXT_MAX_MESSAGES
 }
 
-/**
- * Trim to the last `maxMessages` entries without starting the window on an
- * orphaned `tool` message. A tool result whose `tool_call` assistant message
- * fell outside the window is rejected by strict providers (OpenAI-style 400),
- * so the window grows backwards until it starts on a non-tool message.
- */
 export function trimMessagesToLimit(
   messages: Message[],
   maxMessages: number | undefined,
@@ -176,27 +153,9 @@ export function trimMessagesToLimit(
   return messages.slice(keepFrom)
 }
 
-/**
- * Drop ````planner` JSON blocks from every assistant message
- * except the most recent one. The model is asked to emit a planner snapshot
- * at the end of each non-trivial turn (see `system-prompt.ts`); without
- * stripping, every prior turn's snapshot rides along on every subsequent
- * LLM call and the planner JSON ends up dominating the prompt budget. The
- * latest plan is the only one with current state, so that's what we keep.
- *
- * The session jsonl event log is unchanged — this only trims the
- * in-memory copy fed to the model.
- */
 const PLANNER_BLOCK_REGEX = /\n?```(?:planner|json:planner)\s*\n[\s\S]*?\n?```\s*$/i
 
 export function stripStalePlannerBlocks(messages: Message[]): Message[] {
-  // Select the most recent *substantive* assistant message to preserve. A turn
-  // that ends in tool calls emits a trailing assistant message with empty
-  // content (and a `toolCalls` array); picking that as the "latest" would strip
-  // the planner block from the real preceding assistant message and lose the
-  // current plan. Skip empty / tool-call-only assistant messages and keep the
-  // last one that actually carries a planner block (falling back to the last
-  // non-empty assistant message).
   let lastAssistantIdx = -1
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i]
@@ -221,9 +180,6 @@ export function stripStalePlannerBlocks(messages: Message[]): Message[] {
   return changed ? next : messages
 }
 
-/**
- * Estimate token count for messages (rough approximation: 1 token ≈ 4 chars)
- */
 export function estimateTokens(messages: Message[]): number {
   let chars = 0
   for (const msg of messages) {

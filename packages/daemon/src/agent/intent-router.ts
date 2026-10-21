@@ -1,3 +1,5 @@
+import { ThinkingLevel } from '@sepilotd/core'
+import { parseTurnMemoryPolicy } from '../memory/turn-policy.js'
 import { TASK_INVOCATION_GUIDANCE } from './task-invocation.js'
 import type {
   AgentExecutionIntent,
@@ -53,18 +55,13 @@ export interface IntentRouterOptions {
   maxPreviousMessages?: number
   perMessageCharLimit?: number
   reasonMaxChars?: number
-  /** Runtime platform used for platform-bound mode eligibility. */
   platform?: NodeJS.Platform
   logger?: { warn: (...args: unknown[]) => void; debug: (...args: unknown[]) => void; info: (...args: unknown[]) => void }
   circuitBreaker?: ProviderCircuitBreaker
   auxiliaryLlmBudget?: AuxiliaryLlmTurnBudget
-  /** Cancels optional routing work when the owning request is cancelled. */
   signal?: AbortSignal
-  /** Active durable goal from the preceding turn, when this is a session continuation. */
   activeRunContract?: AgentRunContract
-  /** Canonical names currently enabled in the runtime tool registry. */
   availableToolNames?: readonly string[]
-  /** Transient stage backoff, never a persisted model compatibility override. */
   stageCircuit?: AuxiliaryStageCircuit
 }
 
@@ -75,6 +72,7 @@ export interface IntentHints {
 }
 
 export interface IntentDecision {
+  memoryPolicy?: { read?: boolean; write?: boolean }
   mode: string
   persona: string
   skillIds: string[]
@@ -82,21 +80,10 @@ export interface IntentDecision {
   reason: string
   confidence: 'high' | 'medium' | 'low'
   fallback: boolean
-  /**
-   * Semantic execution posture judged by the same LLM turn that chooses the
-   * mode. Durable contract planning may refine it, but a later planner timeout
-   * must not erase this successful classification.
-   */
   executionIntent?: AgentExecutionIntent
-  /** LLM-owned relationship between this request and the active durable goal. */
   contractRelation?: 'continue' | 'new' | 'review'
   latencyMs?: number
   routerTokens?: { input: number; output: number }
-  /**
-   * The classifier was never consulted for this turn (explicit caller mode,
-   * explicit task command). Distinct from `fallback`, which means a
-   * classification was wanted but unavailable.
-   */
   skipped?: boolean
 }
 
@@ -113,17 +100,11 @@ export class IntentRouter {
     const timeoutMs = options.timeoutMs ?? DEFAULT_INTENT_ROUTER_TIMEOUT_MS
     this.opts = {
       ...options,
-      // Intent routing is optional pre-flight work. Always honor its bounded
-      // deadline, including for reasoning-capable fallback models, so a cheap
-      // classification can never hold the real agent turn for a minute.
       timeoutMs,
       maxPreviousMessages: options.maxPreviousMessages ?? 4,
       perMessageCharLimit: options.perMessageCharLimit ?? 200,
       reasonMaxChars: options.reasonMaxChars ?? 500,
     }
-    // The response now carries both routing and the semantic execution
-    // posture. Keep the cheap-model envelope bounded but large enough for the
-    // declared JSON schema without truncating the final fields.
     this.maxTokens = reasoningModel ? 8000 : 450
   }
 
@@ -153,6 +134,7 @@ export class IntentRouter {
         request: {
           model: this.opts.model,
           temperature: 0,
+          thinkingLevel: ThinkingLevel.Off,
           maxTokens: this.maxTokens,
           messages: [
             { role: 'system', content: systemPrompt },
@@ -197,11 +179,6 @@ export class IntentRouter {
     circuit.recordSuccess(circuitKey)
 
     const raw = this.extractText(response.message.content).trim()
-    // Models frequently wrap the JSON in a ```json fence or prefix it with
-    // prose ("Here is the decision: {...}"). Extract the first {...} block
-    // greedily before parsing so those turns are not silently discarded into
-    // the default decision. Falls back to the raw string when no object is
-    // found so a bare JSON payload still parses.
     const jsonMatch = raw.match(/\{[\s\S]*\}/)
     const candidate = jsonMatch ? jsonMatch[0] : raw
     let parsed: {
@@ -211,6 +188,7 @@ export class IntentRouter {
       tool_groups?: string[]
       reason?: string
       confidence?: string
+      memory_policy?: unknown
       execution_intent?: unknown
       contract_relation?: unknown
     }
@@ -231,14 +209,12 @@ export class IntentRouter {
     const contractRelation = this.coerceContractRelation(parsed.contract_relation)
     const toolGroups = this.coerceToolGroups(parsed.tool_groups)
     const selectedMode = this.coerceMode(parsed.mode, candidateModes, hints.mode)
-    // Validate the advisory mode against its own requested capability surface.
-    // Explicit user mode selection bypasses this router; Auto must not drop
-    // selected external/workspace tools into the memory-only Instant surface.
     const mode = selectedMode === 'instant' && (toolGroups.some((group) => group !== 'memory-advanced')
       || (executionIntent?.kind === 'operational-action' && !toolGroups.includes('memory-advanced')))
       ? 'react' : selectedMode
     return {
       mode,
+      memoryPolicy: parseTurnMemoryPolicy(parsed.memory_policy),
       persona: this.coercePersona(parsed.persona, candidatePersonas, hints.persona),
       skillIds: this.coerceSkills(parsed.skills, candidateSkills),
       toolGroups,
@@ -256,10 +232,6 @@ export class IntentRouter {
   }
 
   private collectCandidateModes(): Array<{ id: string; description: string }> {
-    // The same catalog the executing model sees in agent.transfer, so the
-    // cheap classifier and the executor reason about identical modes. Graphs
-    // that are roster-bound, platform-bound, direct-capability, or not opted
-    // into semantic routing remain explicit-only (body.mode).
     return listSemanticModes(this.opts.graphRegistry, { platform: this.opts.platform })
       .map((mode) => ({ id: mode.id, description: mode.description }))
   }
@@ -323,10 +295,12 @@ export class IntentRouter {
       '- capabilities and tool_groups are the minimal union needed to finish the whole request including later validation phases. Do not select office, computer, documents, media, image, services, swarm or integrations unless the request actually needs them.',
       '- Explicit user boundaries only, never inferred from examples or likely implementation choices: allowedTools (exact canonical names when the user closes the run to named tools; omit otherwise), toolSequence (only when the user requires distinct named tools in a stated order and a name-only sequence is unambiguous), retryPolicy="forbidden" (only when the user prohibits retries or limits each action to one attempt; keep it even when the workflow cannot be expressed as toolSequence), authorizedWriteTargets (user-named editable files or directories, never read-only inputs or protected paths), protectedWriteTargets (user-named paths that must stay unchanged; disjoint from authorizedWriteTargets).',
       '- With an active durable run contract, classify contract_relation semantically: continue when this turn resumes, finishes, corrects or extends that goal; review when it only asks for its status, review or explanation; new for an independent task. No wording or language-specific shortcuts.',
+      '- persona: the specialist whose description covers the terminal outcome of the whole request; when none clearly fits, the most general persona listed. Choose it independently of the mode; a specialist brings its own engine and tools.',
       '- skills: skill ids to attach, may be empty. reason: describe the choice abstractly without quoting user content. confidence: how clear the full request is; medium or low when action clauses conflict or the terminal outcome is ambiguous, never high from the opening clause alone.',
       '',
+      'memory_policy: classify current-user long-term memory restrictions before retrieval. Set read=false when the user forbids using stored memory; write=false when they forbid remembering, learning or long-term storage of this turn. Otherwise true. Conversation history is separate. Quoted examples or source text are not user restrictions. Never relax an explicit caller denial.',
       'Return JSON:',
-      '{"mode":"<id>","persona":"<id>","skills":["<id>",...],"tool_groups":["<group>",...],"contract_relation":"continue|new|review","execution_intent":{"kind":"operational-action|workspace-change|inspection|artifact-production|conversation","workspaceMutation":"forbidden|allowed|required","capabilities":["process|service|terminal|browser|filesystem-read|filesystem-write|network|application-state"],"allowedTools":["exact.tool.name"],"toolSequence":["first.tool","second.tool"],"retryPolicy":"forbidden","authorizedWriteTargets":["user/named/path"],"protectedWriteTargets":["read-only/input/path"]},"reason":"<short>","confidence":"high|medium|low"}',
+      '{"memory_policy":{"read":true,"write":true},"mode":"<id>","persona":"<id>","skills":["<id>",...],"tool_groups":["<group>",...],"contract_relation":"continue|new|review","execution_intent":{"kind":"operational-action|workspace-change|inspection|artifact-production|conversation","workspaceMutation":"forbidden|allowed|required","capabilities":["process|service|terminal|browser|filesystem-read|filesystem-write|network|application-state"],"allowedTools":["exact.tool.name"],"toolSequence":["first.tool","second.tool"],"retryPolicy":"forbidden","authorizedWriteTargets":["user/named/path"],"protectedWriteTargets":["read-only/input/path"]},"reason":"<short>","confidence":"high|medium|low"}',
     ]
     return lines.join('\n')
   }
@@ -396,8 +370,6 @@ export class IntentRouter {
     const ids = new Set(candidates.map(c => c.id))
     if (raw && ids.has(raw)) return raw
     if (hint && ids.has(hint)) return hint
-    // A fallback decision is advisory only; the mode router applies its own
-    // surface-aware fallback and ignores this value.
     return 'instant'
   }
 

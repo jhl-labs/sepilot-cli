@@ -1,4 +1,4 @@
-import type { Message } from '@sepilotd/core'
+import type { ChatRequest, Message } from '@sepilotd/core'
 
 const DEFAULT_CHARS_PER_TOKEN = 4
 const MIN_RATIO = 1.5
@@ -24,10 +24,15 @@ export function messageChars(messages: Message[]): number {
   return chars
 }
 
-/**
- * Learns a chars-per-token ratio per provider:model from provider usage.
- * In-memory only; ratios reset on daemon restart and re-converge from usage.
- */
+const PER_MESSAGE_OVERHEAD_TOKENS = 4
+const PER_TOOL_OVERHEAD_TOKENS = 4
+
+export function requestChars(request: Pick<ChatRequest, 'messages' | 'systemPrompt' | 'tools'>): number {
+  return messageChars(request.messages)
+    + (request.systemPrompt?.length ?? 0)
+    + (request.tools?.length ? JSON.stringify(request.tools).length : 0)
+}
+
 export class TokenRatioCalibrator {
   private ratios = new Map<string, number>()
 
@@ -38,6 +43,17 @@ export class TokenRatioCalibrator {
     const key = `${providerId}:${model}`
     const prev = this.ratios.get(key)
     this.ratios.set(key, prev == null ? observed : prev + EMA_ALPHA * (observed - prev))
+  }
+
+  observeRequest(
+    providerId: string,
+    model: string,
+    request: Pick<ChatRequest, 'messages' | 'systemPrompt' | 'tools'>,
+    inputTokens: number,
+  ): void {
+    const overhead = request.messages.length * PER_MESSAGE_OVERHEAD_TOKENS
+      + (request.tools?.length ?? 0) * PER_TOOL_OVERHEAD_TOKENS
+    this.observe(providerId, model, requestChars(request), inputTokens - overhead)
   }
 
   charsPerToken(providerId?: string, model?: string): number {

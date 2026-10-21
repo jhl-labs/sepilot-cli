@@ -32,10 +32,6 @@ const DOCTOR_COPY = {
 export async function doctorCommand() {
   const locale = detectCliLocale()
   const copy = DOCTOR_COPY[locale] ?? DOCTOR_COPY.en
-  // The bundled CLI embeds the daemon and re-enters itself through __daemon;
-  // it intentionally has no separate sepilotd binary on PATH. Keep doctor on
-  // the same invocation resolver as start/init so a healthy standalone package
-  // does not diagnose its own packaging layout as missing.
   const daemon = resolveStandaloneDaemonInvocation()
     ?? resolveDaemonInvocation({ moduleSearchRoots: [import.meta.dirname] })
   if (!daemon) {

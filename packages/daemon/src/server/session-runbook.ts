@@ -692,9 +692,6 @@ function buildContractLedgerSignals(
     })
   }
 
-  // Lightweight operational graphs intentionally omit a run contract. Their
-  // conservative ledger defaults are diagnostic context, not missing user
-  // requirements. Authority blockers above remain actionable either way.
   if (!hasDeclaredRunContract(input)) return
 
   const missingSections = ledger.sections.filter((section) =>

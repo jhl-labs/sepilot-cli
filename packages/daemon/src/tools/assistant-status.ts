@@ -213,9 +213,6 @@ export function createAssistantStatusTool(
           } : {}),
         }
         return {
-          // Operational snapshots are machine evidence, not presentation.
-          // Keep them on one bounded line so the agent's line-oriented
-          // observation compactor cannot drop a requested middle section.
           output: JSON.stringify(output),
           status: 'success',
           durationMs: Date.now() - startedAt,

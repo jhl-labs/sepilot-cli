@@ -1,16 +1,7 @@
 import type { AgentCoworkTaskResult } from '../graph/types.js'
 
-/**
- * Default cap for `coworkTaskResults`. Generous — only large orchestrations
- * with many subtasks ever hit it. Overridable via `SEPILOTD_COWORK_RESULTS_CAP`.
- */
 export const MAX_COWORK_RESULTS = 40
 
-/**
- * Resolve the effective cowork-results cap. Defaults to `MAX_COWORK_RESULTS`;
- * `SEPILOTD_COWORK_RESULTS_CAP` overrides it (clamped to a safe range). General
- * knob — no model/dataset/graphId branching.
- */
 export function resolveCoworkResultsCap(): number {
   const raw = process.env.SEPILOTD_COWORK_RESULTS_CAP
   if (!raw) return MAX_COWORK_RESULTS
@@ -19,19 +10,11 @@ export function resolveCoworkResultsCap(): number {
   return Math.max(5, Math.min(500, parsed))
 }
 
-/** Read the folded count we previously stamped into a rollup digest entry. */
 function digestFoldedCount(result: string): number {
   const match = result.match(/(\d+)/)
   return match ? Number(match[1]) : 1
 }
 
-/**
- * Rolling FIFO cap for cowork task results. Structure-only: the decision uses
- * array length and the explicit `digest` flag — never content meaning. Keeps
- * the most recent `max` full entries; older ones fold into a single
- * `{ digest: true }` summary kept at the front. A pre-existing digest
- * contributes its recorded count so the running total survives repeated caps.
- */
 export function capCoworkResults(
   results: AgentCoworkTaskResult[],
   max: number = resolveCoworkResultsCap(),
@@ -49,7 +32,6 @@ export function capCoworkResults(
     planIndex: kept[0]?.planIndex ?? 0,
     role: 'digest',
     instruction: 'folded cowork task results',
-    // 'complete' so the digest is never treated as an unresolved blocker.
     status: 'complete',
     result: `${foldedCount} earlier tasks folded`,
     recordedAt: new Date().toISOString(),

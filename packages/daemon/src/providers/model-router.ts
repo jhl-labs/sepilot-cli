@@ -6,7 +6,7 @@ export type ModelSelectionReason = 'explicit_model' | 'preferred_model' | 'defau
 
 interface ModelRoute {
   taskType: TaskType
-  preferredModels: string[]  // Model IDs in priority order
+  preferredModels: string[]
 }
 
 export interface ModelCandidate {
@@ -35,8 +35,6 @@ function modelIsChatCapable(model: ILLMProvider['models'][number]): boolean {
   return model.capabilities.embedding !== true || model.capabilities.toolUse === true
 }
 
-// Generic capability-downsize suffixes (NOT specific model names). A route that
-// asks for `gpt-4o` must never silently resolve to a smaller `gpt-4o-mini`.
 const DOWNSIZE_SUFFIXES = new Set(['mini', 'nano', 'small', 'lite', 'tiny', 'micro'])
 
 function isDownsizedVariant(id: string, base: string): boolean {
@@ -44,13 +42,6 @@ function isDownsizedVariant(id: string, base: string): boolean {
   return firstSegment ? DOWNSIZE_SUFFIXES.has(firstSegment) : false
 }
 
-// Resolve a requested model id against a provider's model list with prefix +
-// boundary awareness instead of a loose substring `includes`:
-//  - exact id wins;
-//  - otherwise a boundary-prefixed variant (`<id>-…`, e.g. a dated release)
-//    matches, but a downsized sibling (`<id>-mini`) is excluded.
-// This keeps `gpt-4o` from matching `gpt-4o-mini` and `llama3.3` from matching
-// an unrelated `codellama3.3` (substring-anywhere).
 function matchModelId(
   models: ILLMProvider['models'],
   modelId: string,
@@ -71,33 +62,21 @@ export class ModelRouter {
     this.routes = routes ?? DEFAULT_ROUTES
   }
 
-  /** Classify a message into a task type */
   classifyTask(message: string): TaskType {
     const lower = message.toLowerCase()
 
-    // Code indicators
     if (/\b(code|function|class|implement|debug|fix|refactor|test|api|endpoint|component)\b/.test(lower)) return 'code'
     if (/```|\bdef\b|\bconst\b|\bimport\b/.test(message)) return 'code'
 
-    // Analysis indicators
     if (/\b(analyze|compare|evaluate|review|assess|explain.*detail|pros.*cons)\b/.test(lower)) return 'analysis'
 
-    // Creative indicators
     if (/\b(write|create|generate|design|story|poem|email|blog|article)\b/.test(lower)) return 'creative'
 
-    // Complex indicators (length-based + keywords)
     if (message.length > 500 || /\b(step.by.step|plan|architecture|strategy|comprehensive)\b/.test(lower)) return 'complex'
 
     return 'simple'
   }
 
-  /**
-   * Return ordered provider/model candidates for a task.
-   *
-   * The first candidate matches the legacy selectModel behaviour. Callers that
-   * want OpenClaw-style resilience can keep the remaining candidates as an
-   * execution fallback chain without hard-coding provider-specific branches.
-   */
   selectCandidates(
     message: string,
     explicitModel?: string,
@@ -154,16 +133,18 @@ export class ModelRouter {
     }
 
     const defaultProvider = this.registry.getDefault()
-    if (defaultProvider && defaultProvider.models.length > 0) {
-      const defaultModel =
-        defaultProvider.models.find(modelIsChatCapable) ?? defaultProvider.models[0]
-      pushCandidate(defaultProvider, defaultModel.id, 'default_provider')
+    const fallbackProviders = defaultProvider
+      ? [defaultProvider, ...this.registry.list().filter((p) => p !== defaultProvider)]
+      : this.registry.list()
+    for (const provider of fallbackProviders) {
+      if (provider.models.length === 0) continue
+      const defaultModel = provider.models.find(modelIsChatCapable) ?? provider.models[0]
+      pushCandidate(provider, defaultModel.id, 'default_provider')
     }
 
     return candidates
   }
 
-  /** Select best available model for a task */
   selectModel(
     message: string,
     explicitModel?: string,
@@ -173,7 +154,6 @@ export class ModelRouter {
     return candidate ? { provider: candidate.provider, model: candidate.model } : null
   }
 
-  /** Get routing info for debugging */
   getRoutingInfo(message: string): { taskType: TaskType; selectedModel?: string; candidateCount: number } {
     const taskType = this.classifyTask(message)
     const candidates = this.selectCandidates(message)

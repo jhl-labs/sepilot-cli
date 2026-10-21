@@ -3,7 +3,6 @@ import { openDomainDb } from '../storage/domain-db.js'
 import { knowledgeError } from './schema.js'
 
 export const DailyTokenLimit = z.number().int().min(0).max(100_000_000)
-/** UTC ledger: unresolved calls retain their reservation across failures and restarts. */
 export function createKnowledgeBudget(now = Date.now) {
   const db = openDomainDb({ name: 'knowledge' })
   db.exec(`CREATE TABLE IF NOT EXISTS knowledge_budget_settings (id INTEGER PRIMARY KEY CHECK(id=1), limit_tokens INTEGER NOT NULL);
@@ -29,7 +28,6 @@ export function createKnowledgeBudget(now = Date.now) {
   return {
     state,
     backfill() {
-      // Existing automatic calls from before the ledger still count on their original UTC day.
       db.exec(`INSERT OR IGNORE INTO knowledge_budget_calls(id,day,reserved,actual)
         SELECT c.id, strftime('%Y-%m-%d',c.started_at/1000,'unixepoch'),
           COALESCE(json_extract(c.data,'$.requestChars'),0)*4+3500,

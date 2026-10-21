@@ -75,15 +75,6 @@ function formatLevelLine(level: string | undefined): string {
   return `${copy.autonomyPrefix} ${colour(body)}`
 }
 
-/**
- * Read-or-write the daemon's `agent.autonomy` config knob.
- *
- * `sepilot autonomy` (no arg)         → print the current level.
- * `sepilot autonomy <level>`          → set it via PUT /config and re-print.
- *
- * The chat shell already has a `/autonomy` slash command for the same
- * thing; this is the equivalent for one-shot cli usage / scripts.
- */
 export async function autonomyCommand(
   level: string | undefined,
   options: { url?: string },
@@ -119,8 +110,6 @@ export async function autonomyCommand(
     () => {
       const lines = [formatLevelLine(level)]
       if (level === 'autonomous') {
-        // Loud red warning so the user can't accidentally page-up the cli
-        // history later and miss that they turned approvals off.
         lines.push(chalk.red(copy.autonomousWarning))
       }
       return lines.join('\n')

@@ -193,13 +193,13 @@ export function resolveThemeId(
 }
 
 export const symbols = {
-  user: '\u25CF',       // ●
-  assistant: '\u25CF',  // ●
-  success: '\u2713',    // ✓
-  error: '\u2717',      // ✗
-  pending: '\u23F8',    // ⏸
-  thinking: '\u25D0',   // ◐
-  collapsed: '\u25B6',  // ▶
-  expanded: '\u25BC',   // ▼
-  separator: '\u2502',  // │
+  user: '\u25CF',
+  assistant: '\u25CF',
+  success: '\u2713',
+  error: '\u2717',
+  pending: '\u23F8',
+  thinking: '\u25D0',
+  collapsed: '\u25B6',
+  expanded: '\u25BC',
+  separator: '\u2502',
 } as const

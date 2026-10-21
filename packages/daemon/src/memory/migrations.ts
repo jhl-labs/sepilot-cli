@@ -55,7 +55,6 @@ const MIGRATIONS: Migration[] = [
       try {
         db.prepare('ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0.5').run()
       } catch {
-        // Column may already exist.
       }
     },
   },
@@ -75,7 +74,6 @@ const MIGRATIONS: Migration[] = [
         try {
           db.prepare(statement).run()
         } catch {
-          // Column may already exist.
         }
       }
 
@@ -129,7 +127,6 @@ const MIGRATIONS: Migration[] = [
         try {
           db.prepare(statement).run()
         } catch {
-          // Column may already exist.
         }
       }
 
@@ -199,7 +196,6 @@ const MIGRATIONS: Migration[] = [
         try {
           db.prepare(statement).run()
         } catch {
-          // Column may already exist.
         }
       }
       db.prepare(`
@@ -219,7 +215,6 @@ const MIGRATIONS: Migration[] = [
       try {
         db.prepare('ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0').run()
       } catch {
-        // Column may already exist.
       }
       db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_memories_pinned
@@ -300,7 +295,6 @@ const MIGRATIONS: Migration[] = [
       try {
         db.prepare('ALTER TABLE memory_documents ADD COLUMN content_hash TEXT').run()
       } catch {
-        // Column may already exist.
       }
       db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_memory_documents_content_hash
@@ -312,14 +306,10 @@ const MIGRATIONS: Migration[] = [
     version: 11,
     description: 'Add created_at and embedding-backfill indexes for large stores',
     up(db) {
-      // listRecent orders by created_at; without this a large store full-scans.
       db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_memories_created_at
         ON memories(created_at DESC)
       `).run()
-      // The backfill selector scans for rows still needing an embedding; a
-      // partial index over the un-embedded rows keeps each pass ~O(pending)
-      // instead of O(n) (near-O(n^2) across many passes on a big store).
       db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_memories_embedding_backfill
         ON memories(updated_at)
@@ -334,12 +324,10 @@ const MIGRATIONS: Migration[] = [
       try {
         db.prepare('ALTER TABLE memories ADD COLUMN embedding_attempts INTEGER NOT NULL DEFAULT 0').run()
       } catch {
-        // Column may already exist.
       }
       try {
         db.prepare('ALTER TABLE memories ADD COLUMN embedding_next_retry_at TEXT').run()
       } catch {
-        // Column may already exist.
       }
     },
   },
@@ -347,15 +335,9 @@ const MIGRATIONS: Migration[] = [
     version: 13,
     description: 'Add base_importance so importance recompute is deterministic (no ratchet saturation)',
     up(db) {
-      // The old recompute did `importance = importance + age + access` every
-      // run, which ratcheted to 1.0 within days and made the score
-      // non-discriminating. Deterministic recompute needs a stable base to add
-      // recency/access terms to. Seed it from the current importance so existing
-      // stores keep their assigned baseline.
       try {
         db.prepare('ALTER TABLE memories ADD COLUMN base_importance REAL').run()
       } catch {
-        // Column may already exist.
       }
       db.prepare(
         'UPDATE memories SET base_importance = COALESCE(importance, 0.5) WHERE base_importance IS NULL',

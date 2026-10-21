@@ -23,12 +23,6 @@ function ruleSummary(rule: DaemonPolicyRule): string {
   return parts.join(', ') || 'no extra rules'
 }
 
-/**
- * Print the active tool policy in a single readable table. Mirrors the
- * chat-shell `/policy` command but is reachable from a one-shot cli
- * invocation, which means automation, audits, and `--json` consumers can
- * inspect the live rule set without entering the chat shell.
- */
 export async function policyCommand(options: { url?: string }) {
   const client = new DaemonClient(options.url)
   const data = await client.policy()

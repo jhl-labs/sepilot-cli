@@ -43,7 +43,6 @@ export class SkillStoreClient {
 
   async install(id: string): Promise<RemoteSkill> {
     const skill = await this.get(id)
-    // Download count tracked server-side
     return skill
   }
 

@@ -106,7 +106,6 @@ export interface MigrationRepo {
 }
 
 export function createMigrationRepo(): MigrationRepo {
-  // Share the jobs.db file (Phase 1 jobs tables already live here).
   const db = openDomainDb({ name: 'jobs' })
   ensureSchema(db)
   return {

@@ -12,7 +12,7 @@ export class LLMCache {
   private maxSize: number
   private ttlMs: number
 
-  constructor(maxSize = 1000, ttlMs = 300000) { // 5min default TTL
+  constructor(maxSize = 1000, ttlMs = 300000) {
     this.maxSize = maxSize
     this.ttlMs = ttlMs
   }
@@ -30,12 +30,10 @@ export class LLMCache {
   }
 
   set(request: ChatRequest, response: ChatResponse): void {
-    // Don't cache tool_use responses (they should always be fresh)
     if (response.finishReason === 'tool_use') return
 
     const key = this.hashRequest(request)
 
-    // Evict oldest entries if at capacity
     if (this.cache.size >= this.maxSize) {
       const oldest = [...this.cache.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp)[0]
       if (oldest) this.cache.delete(oldest[0])
@@ -59,7 +57,6 @@ export class LLMCache {
   }
 
   private hashRequest(request: ChatRequest): string {
-    // Hash model + messages content (ignore timestamps, request IDs)
     const content = JSON.stringify({
       model: request.model,
       messages: request.messages.map(m => ({ role: m.role, content: m.content })),

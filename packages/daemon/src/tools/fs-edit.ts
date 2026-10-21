@@ -109,11 +109,6 @@ export function createFsEditTool(postureOptions?: FileToolPostureOptions): ToolD
             code: 'EDIT_CONTEXT_AMBIGUOUS_PERMANENT',
           }
         }
-        // split/join for BOTH paths: String.replace would interpret $-
-        // substitution patterns ($&, $$, $') in newText and silently
-        // corrupt the file. After the ambiguity gate above, the
-        // non-replaceAll path is guaranteed exactly one match, so
-        // split/join is an equivalent literal replacement.
         const nextContent = content.split(oldText).join(newText)
         const replacements = replaceAll ? matchCount : 1
         const stale = await context?.workspaceMutation?.detectStale(path)

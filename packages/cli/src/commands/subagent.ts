@@ -43,6 +43,7 @@ function subagentCopy() {
 
 export interface SubagentDispatchOptions {
   isolation?: 'worktree'
+  worktreeBase?: 'head' | 'working-tree'
   url?: string
   system?: string
   systemFile?: string
@@ -55,11 +56,6 @@ export interface SubagentDispatchOptions {
   background?: boolean
 }
 
-/**
- * Minimal client surface used by `subagentDispatchCommand`. Real CLI runs
- * pass `DaemonClient` (which already implements this); unit tests can
- * inject a stub without standing up the full http transport.
- */
 export interface SubagentDaemonClientLike {
   dispatchSubagent(input: SubagentDispatchInput): Promise<SubagentDispatchResult>
   dispatchSubagentBackground?(
@@ -72,10 +68,7 @@ export interface RunSubagentDispatchInput {
   prompt: string
   options: SubagentDispatchOptions
   client: SubagentDaemonClientLike
-  /** Read system prompt from disk. Tests inject a fake reader to avoid I/O. */
   readSystemFile?: (path: string) => Promise<string>
-  /** Output sink — defaults to the global `output()` formatter. Tests can
-   * capture rendered text without mucking with stdout. */
   emit?: (result: SubagentDispatchResult | SubagentBackgroundDispatchResult) => void
 }
 
@@ -101,7 +94,14 @@ function defaultEmit(result: SubagentDispatchResult): void {
   const copy = subagentCopy()
   output(result, (r) => {
     const head = `${chalk.cyan(`[subagent ${r.sessionId}]`)} status=${r.status} iterations=${r.iterations} tokens=${r.usage.inputTokens}+${r.usage.outputTokens}${r.truncated ? copy.truncated : ''}`
-    const isolation = r.worktree ? `\nWorktree ${r.worktree.retained ? 'retained' : 'cleaned'}: ${r.worktree.path}\n${r.worktree.reason}` : ''
+    const isolation = r.worktree
+      ? [
+          `\nWorktree ${r.worktree.retained ? 'retained' : 'cleaned'}: ${r.worktree.path}`,
+          r.worktree.reason,
+          ...(r.worktree.retained ? [`branch: ${r.worktree.branch}`] : []),
+          ...(r.worktree.mergeCommand ? [`merge: ${r.worktree.mergeCommand}`] : []),
+        ].join('\n')
+      : ''
     return r.output ? `${head}${isolation}\n\n${r.output}` : `${head}${isolation}`
   })
 }
@@ -129,11 +129,6 @@ function defaultDispatchEmit(
   defaultEmit(result)
 }
 
-/**
- * Pure async core of the `subagent dispatch` cli command. Splitting it
- * out keeps it unit-testable without spawning a daemon — the integration
- * smoke is covered by the daemon-side route test.
- */
 export async function runSubagentDispatch(
   input: RunSubagentDispatchInput,
 ): Promise<SubagentDispatchResult | SubagentBackgroundDispatchResult> {
@@ -146,8 +141,12 @@ export async function runSubagentDispatch(
     system = await reader(options.systemFile)
   }
 
+  if (options.worktreeBase && options.isolation !== 'worktree') {
+    throw new Error('--worktree-base requires --isolation worktree')
+  }
   const request: SubagentDispatchInput = {
     isolation: options.isolation,
+    ...(options.worktreeBase ? { worktreeBase: options.worktreeBase } : {}),
     cwd: process.cwd(),
     prompt,
     system,
@@ -185,9 +184,6 @@ export async function subagentDispatchCommand(
   try {
     const result = await runSubagentDispatch({ prompt, options, client })
     if (!isBackgroundResult(result) && result.status === 'failed') {
-      // Surface failures with a non-zero exit so automation pipelines
-      // can detect them (the human-friendly banner already went to
-      // stdout via `emit`).
       process.exit(1)
     }
   } catch (err) {

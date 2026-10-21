@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
-import { stat } from 'node:fs/promises'
-import { basename, isAbsolute, resolve } from 'node:path'
+import { open, stat } from 'node:fs/promises'
+import { basename, delimiter, isAbsolute, resolve } from 'node:path'
 import { AutonomyLevel, type ToolExecutionPosture } from '@sepilotd/core'
 import {
   getAbortError,
@@ -8,10 +8,11 @@ import {
   throwIfAborted,
 } from '../abort.js'
 import { enforceOutputLimit, resolveToolOutputMaxBytes } from './output-limit.js'
-import type {
-  ToolDefinitionRuntime,
-  ToolResult,
-  ToolResumeSafety,
+import {
+  rejectUnsupportedToolInputFields,
+  type ToolDefinitionRuntime,
+  type ToolResult,
+  type ToolResumeSafety,
 } from './registry.js'
 
 const SAFE_SHELL_WRAPPERS = new Set([
@@ -130,11 +131,6 @@ function terminalObservationIdentity(
   const timeoutOutcome = typeof normalized.timeoutOutcome === 'string'
     ? normalized.timeoutOutcome
     : null
-  // A normally completed read-only command has the same observation scope
-  // regardless of the deadline it happened to receive. Including an omitted
-  // versus explicit timeout made byte-equivalent inventory commands evade
-  // current-turn reuse. Timed observation modes are different: their window
-  // is part of what was observed, so keep both policy and duration there.
   const timedObservation = timeoutOutcome && timeoutOutcome !== 'error'
     ? {
         timeoutMs: normalized.timeoutMs ?? normalized.timeout_ms ?? normalized['timeout-ms'] ?? null,
@@ -373,19 +369,11 @@ function kubectlOutputFormats(args: string[]): string[] {
       formats.push(normalized.slice('--output='.length).trim())
       continue
     }
-    // kubectl/pflag also accepts the compact `-oname` spelling.
     if (/^-o[^-]/u.test(normalized)) formats.push(normalized.slice(2).trim())
   }
   return formats
 }
 
-/**
- * Secret values remain outside the read-only network capability. The sole
- * exception is an explicit name projection: kubectl owns that renderer and
- * emits only resource identity (`secret/<name>`), including when Secret is
- * one kind in a comma-separated inventory. Do not infer safety from arbitrary
- * jsonpath, template, custom-column, JSON, or YAML expressions.
- */
 function isSecretNameOnlyKubectlGet(args: string[]): boolean {
   if (args.some((arg) => flagName(arg) === '--template')) return false
   const formats = kubectlOutputFormats(args)
@@ -427,12 +415,6 @@ const KUBECTL_FAILURE_FANOUT_TARGET_FLAGS = new Set([
   '-n',
 ])
 
-/**
- * Preserve the full kubectl invocation template while abstracting only the
- * target scope that a model commonly fans out in one response. A different
- * resource, selector, projection, or output format therefore gets a distinct
- * group and remains executable as a genuine recovery attempt.
- */
 export function terminalBatchFailureCouplingKey(
   input: Record<string, unknown>,
 ): string | null {
@@ -469,11 +451,6 @@ const TERMINAL_INPUT_TEMPLATE_FAILURE_PATTERNS = [
   /(?:^|\n)(?:error:\s*)?(?:accepts?|requires?)\s+\d+\s+arg(?:ument)?s?\b/iu,
 ]
 
-/**
- * Identify client-side argv/template failures, not remote target failures.
- * NotFound, Forbidden, connection, timeout, and ordinary non-zero results do
- * not match and therefore cannot suppress a sibling target observation.
- */
 export function isTerminalInputTemplateFailure(result: ToolResult): boolean {
   if (
     result.status !== 'error'
@@ -493,12 +470,6 @@ function isBoundedTeaActionsOptionValue(name: string, value: string): boolean {
   return value.length <= 256
 }
 
-/**
- * `tea actions runs` also contains cancel/delete/log and secret-management
- * surfaces. Only bounded list and exact numeric-id view are observational.
- * Repository/login overrides stay outside this capability so the active
- * workspace remote remains the authority boundary.
- */
 function isReadOnlyTeaActionsCommand(args: string[]): boolean {
   if (args[0] !== 'actions' || args[1] !== 'runs') return false
   const operation = args[2]
@@ -541,7 +512,6 @@ function isTrustedTeaExecutable(executable: string): boolean {
     || (isAbsolute(executable) && TRUSTED_TEA_ABSOLUTE_PATHS.has(resolve(executable)))
 }
 
-// Retain the public import path while sharing the child-environment policy.
 export { scrubChildEnv } from './child-env.js'
 import { scrubChildEnv } from './child-env.js'
 
@@ -603,12 +573,7 @@ async function normalizeTerminalInputCwd(
     return { ...input, cwd: fallbackCwd }
   }
 
-  const resolvedCwd = resolve(fallbackCwd, rawCwd)
-  if (await directoryExists(resolvedCwd)) {
-    return { ...input, cwd: resolvedCwd }
-  }
-
-  return { ...input, cwd: fallbackCwd }
+  return { ...input, cwd: resolve(fallbackCwd, rawCwd) }
 }
 
 function normalizeExecutableName(executable: string): string {
@@ -741,19 +706,87 @@ const TERMINAL_SHELL_EXECUTABLES = new Set([
   'sh',
   'zsh',
 ])
+
+const TERMINAL_ARGUMENT_REQUIRED_EXECUTABLES = new Set([
+  'bash',
+  'cmd',
+  'dash',
+  'fish',
+  'node',
+  'perl',
+  'php',
+  'powershell',
+  'pwsh',
+  'python',
+  'python3',
+  'ruby',
+  'sh',
+  'zsh',
+])
+
+export function detectMissingTerminalArguments(
+  executable: string,
+  args: readonly string[],
+): string | null {
+  const name = normalizeExecutableName(executable)
+  return args.length === 0 && TERMINAL_ARGUMENT_REQUIRED_EXECUTABLES.has(name)
+    ? name
+    : null
+}
+
+function terminalMissingArgumentsResult(executable: string): ToolResult {
+  const shell = SAFE_SHELL_WRAPPERS.has(normalizeExecutableName(executable))
+  return {
+    output: [
+      `terminal.run received ${JSON.stringify(executable)} without arguments; the command was not executed.`,
+      shell
+        ? 'Pass a script path or use args ["-c", "<script>"]; an interactive shell is not available in an agent turn.'
+        : 'Pass the program arguments (for example ["-c", "<script>"] or ["--version"]) so the invocation has a finite, observable result.',
+    ].join(' '),
+    status: 'error',
+    durationMs: 0,
+    code: 'INVALID_INPUT_PERMANENT',
+  }
+}
+
+async function shellScriptInputError(
+  executable: string, args: readonly string[], cwd: string,
+): Promise<ToolResult | null> {
+  if (!SAFE_SHELL_WRAPPERS.has(normalizeExecutableName(executable))) return null
+  const script = args[0]
+  if (!script || script.startsWith('-')) return null
+  const candidates = script.includes('/') || script.includes('\\')
+    ? [resolve(cwd, script)]
+    : [resolve(cwd, script), ...(process.env.PATH ?? '').split(delimiter)
+      .filter(Boolean).map(directory => resolve(directory, script))]
+  for (const path of candidates) {
+    const info = await stat(path).catch(() => null)
+    if (!info?.isFile()) continue
+    const file = await open(path, 'r').catch(() => null)
+    if (!file) return null
+    let binary = false
+    try {
+      const prefix = Buffer.alloc(4)
+      const { bytesRead } = await file.read(prefix, 0, 4, 0)
+      binary = bytesRead >= 4 && prefix.equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))
+        || bytesRead >= 2 && prefix[0] === 0x4d && prefix[1] === 0x5a
+    } finally { await file.close() }
+    if (!binary) return null
+    return {
+      status: 'error', code: 'INVALID_INPUT_PERMANENT', durationMs: 0,
+      output: 'The shell script argument resolves to a binary executable. Invoke that program directly using executable/args; for shell source use args ["-c", "<script>"]. Nothing was executed.',
+    }
+  }
+  if (!['cd', 'pwd', 'export', 'source', 'exec'].includes(script)) return null
+  return {
+    status: 'error', code: 'INVALID_INPUT_PERMANENT', durationMs: 0,
+    output: 'A shell builtin was supplied as a script filename. Use cwd for the working directory or args ["-c", "<script>"] for shell source. Nothing was executed.',
+  }
+}
+
 const STANDALONE_SHELL_CONTROL_ARG_PATTERN =
   /^(?:&&|\|\||[|;]|\d*(?:>>?|<<?)|&>|\d*>&(?:\d+|-))$/u
 
-/**
- * A direct argv invocation is not a shell program.  Off-spec model calls that
- * put `;`, redirects, or pipelines in separate argv elements either fail
- * confusingly or, for wrapper executables such as `npm run`, can be forwarded
- * into a second shell and unexpectedly execute the chain. A shell executable
- * does not make separate argv elements into shell source: the script still
- * has to be one argument after its command-string option (for example,
- * `bash -c "cmd | cmd"`). Fail split control tokens before the runner with a
- * concrete repair.
- */
 export function detectDirectArgvShellControl(
   _executable: string,
   args: readonly string[],
@@ -775,13 +808,6 @@ function terminalShellControlResult(control: string): ToolResult {
 
 const TRAILING_STATUS_ECHO_PATTERN = /(?:^|[;&|]\s*)echo\s+(?:-[A-Za-z]+\s+)?[^\n;&|]*\$\?[^\n;&|]*\s*$/u
 
-/**
- * A trailing `echo "$?"` makes the shell itself exit successfully and masks a
- * failed build/test/install. terminal.run already records the real exit code,
- * so reject this structurally misleading wrapper before execution. This is
- * deliberately limited to a final status echo; ordinary shell scripts and
- * diagnostic echoes remain valid.
- */
 export function detectTrailingShellStatusEcho(
   executable: string,
   args: readonly string[],
@@ -805,12 +831,8 @@ function terminalTrailingStatusEchoResult(): ToolResult {
   }
 }
 
-// execFile's `timeout` option must be a finite non-negative integer. Off-spec
-// model output frequently sends it as a string ("60000"), a kebab/snake-cased
-// key (`timeout-ms` / `timeout_ms`), or a bare `timeout`. Coerce every shape we
-// have seen into a clamped millisecond integer, falling back to the default.
 const DEFAULT_TERMINAL_TIMEOUT_MS = 30_000
-const MAX_TERMINAL_TIMEOUT_MS = 10 * 60_000 // 10 minutes
+const MAX_TERMINAL_TIMEOUT_MS = 10 * 60_000
 const TERMINAL_CAPTURE_EXTRA_BYTES = 8_192
 const TERMINAL_TERMINATE_GRACE_MS = 250
 const TERMINAL_KILL_SETTLE_MS = 250
@@ -953,14 +975,11 @@ export interface TerminalRunSpec {
   executable: string
   args: string[]
   cwd?: string
-  /** Immutable root mounted by strict-workspace runners. */
   workspaceRoot?: string
   timeoutMs: number
   signal?: AbortSignal
   cwdBoundary: ToolExecutionPosture['filesystem']['boundary']
-  /** Internal, policy-derived capability. Never accepted directly from tool input. */
   capability?: ReadOnlyNetworkTerminalCapability | 'managed-loopback' | 'workspace-network-write'
-  /** Daemon-owned Unix socket bridges for the current session only. */
   managedLoopbackConnections?: Array<{ port: number; socketPath: string }>
 }
 
@@ -971,7 +990,6 @@ export interface TerminalRunnerResult {
   durationMs: number
   executionPosture: ToolExecutionPosture
   code?: string
-  /** Actual child exit code when the sandbox command reached normal process exit. */
   exitCode?: number | null
 }
 
@@ -981,15 +999,10 @@ export interface TerminalRunner {
 
 export interface TerminalToolOptions {
   runner?: TerminalRunner
-  /** Fail-closed, read-only runner used whenever a strict workspace is active. */
   strictWorkspaceRunner?: TerminalRunner
-  /** Network-isolated, read-write runner used after workspace mutation authority is granted. */
   strictWorkspaceWriteRunner?: TerminalRunner
-  /** Strict filesystem sandbox with host network for an audited read-only capability. */
   strictReadOnlyNetworkRunner?: TerminalRunner
-  /** Approval-gated workspace-write sandbox with outbound host networking. */
   strictWorkspaceNetworkWriteRunner?: TerminalRunner
-  /** Resolve localhost services owned by the active session or strict workspace. */
   getManagedLoopbackConnections?: (
     sessionId: string | undefined,
     workspaceRoot?: string,
@@ -1119,6 +1132,20 @@ function hasExplicitTerminalArgs(rawArgs: unknown): boolean {
   return true
 }
 
+function terminalSerializedArgsError(input: Record<string, unknown>): ToolResult | null {
+  if (typeof input.args !== 'string' || !input.args.trimStart().startsWith('[')) return null
+  try {
+    if (Array.isArray(JSON.parse(input.args))) return null
+  } catch {
+  }
+  return {
+    status: 'error',
+    code: 'INVALID_INPUT_PERMANENT',
+    durationMs: 0,
+    output: 'terminal.run: invalid serialized argv array. Nothing was executed. Pass args as an actual argv array, not a malformed JSON string or an expression. For a literal argument beginning with [, put that literal inside the argv array. Correct the arguments before retrying.',
+  }
+}
+
 export function normalizeTerminalCommandShape(
   input: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -1127,9 +1154,6 @@ export function normalizeTerminalCommandShape(
     if (!hasExplicitTerminalArgs(input.args) && /\s/.test(executable)) {
       return commandStringInput(input, executable)
     }
-    // Some providers echo both the canonical executable/args fields and the
-    // legacy command alias. Preserve one unambiguous invocation in policy,
-    // approval, evidence, and repeat-detection records.
     const { command: _command, cmd: _cmd, ...canonical } = input
     return { ...canonical, executable }
   }
@@ -1158,10 +1182,6 @@ export function normalizeTerminalCommandShape(
     return commandStringInput(input, command)
   }
 
-  // Off-spec shape some models emit: no `executable` / `command` / `cmd`, only
-  // an `args` array that already carries the whole invocation. Treat a single
-  // string element as a command line (so `bash -lc "…"` kicks in for shell
-  // syntax) and a multi-token array as `[executable, ...rest]`.
   if (typeof input.executable !== 'string' || !input.executable.trim()) {
     if (typeof input.args === 'string' && input.args.trim()) {
       return commandStringInput({ ...input, args: undefined }, input.args.trim())
@@ -1181,12 +1201,6 @@ export function normalizeTerminalCommandShape(
   return input
 }
 
-/**
- * Normalize a tool-call's `args` field into a string[].
- * Tolerates non-array shapes that some models emit (stringified JSON arrays,
- * raw shell strings, single tokens) so an off-spec model output does not
- * crash execFile with `args must be of type object`.
- */
 export function normalizeTerminalArgs(rawArgs: unknown, executable?: string): string[] {
   if (rawArgs == null) return []
   if (Array.isArray(rawArgs)) {
@@ -1204,7 +1218,6 @@ export function normalizeTerminalArgs(rawArgs: unknown, executable?: string): st
         return normalizeTerminalArgArray(parsed.map((arg) => String(arg)), executable)
       }
     } catch {
-      // fall through to whitespace tokenization
     }
   }
   const tokenized = tokenizeSimpleShellCommand(trimmed)
@@ -1237,12 +1250,6 @@ function normalizeTerminalArgArray(args: string[], executable: string | undefine
     return args
   }
 
-  // Smaller prompt-protocol models sometimes select `bash` correctly but put
-  // a complete compound script in argv[0] without `-c`. Executing that shape
-  // asks bash to open a file literally named "cmd; cmd", producing a confusing
-  // ENOENT and another discovery loop. Repair only structurally unambiguous
-  // POSIX shell syntax; a single ordinary path remains a legitimate script
-  // file argument and is left untouched.
   if (
     executable
     && SAFE_SHELL_WRAPPERS.has(normalizeExecutableName(executable))
@@ -1509,7 +1516,6 @@ function classifyCommand(
         return 'replay-risky'
       }
 
-      // Environment-variable prefixes and similar shell-only forms stay risky.
       if (innerTokens[0]!.includes('=')) {
         return 'replay-risky'
       }
@@ -1551,22 +1557,17 @@ function classifyCommand(
 export function getTerminalResumeSafety(
   input: Record<string, unknown>,
 ): ToolResumeSafety {
+  if (terminalSerializedArgsError(input)) return 'replay-risky'
   const executable = typeof input.executable === 'string' ? input.executable : ''
   const args = normalizeTerminalArgs(input.args, executable)
 
   return classifyCommand(executable, args)
 }
 
-/**
- * Conservative network-capability classifier for strict ReadOnly execution.
- * Local commands do not need an executable allowlist because the default
- * strict-workspace runner removes network access and mounts the workspace
- * read-only. This classifier is narrower: a positive result grants host
- * network plus exactly the read-only credentials needed by the capability.
- */
 export function resolveReadOnlyNetworkTerminalCapability(
   input: Record<string, unknown>,
 ): ReadOnlyNetworkTerminalCapability | undefined {
+  if (terminalSerializedArgsError(input)) return undefined
   const normalized = normalizeTerminalCommandShape(input)
   const executable = typeof normalized.executable === 'string' ? normalized.executable : ''
   const command = normalizeExecutableName(executable)
@@ -1597,6 +1598,7 @@ async function normalizeTerminalInput(
 ): Promise<Record<string, unknown>> {
   const withCwd = await normalizeTerminalInputCwd(input, contextCwd)
   const normalizedCommand = normalizeTerminalCommandShape(withCwd)
+  if (terminalSerializedArgsError(withCwd)) return { ...normalizedCommand, args: withCwd.args }
   if (typeof normalizedCommand.executable !== 'string') {
     return normalizedCommand
   }
@@ -1616,37 +1618,17 @@ function mergeTerminalOutput(stdout: string, stderr: string): string {
   return stdout + (stderr ? `\n[stderr]\n${stderr}` : '')
 }
 
-/**
- * Network-reach failure signatures emitted by common resolvers and runtimes
- * (Node getaddrinfo, glibc, curl, git, Go net) when no network namespace is
- * available. Used only together with the structural execution-posture signal
- * (`network.isolated === true`), never on its own, so an ordinary command
- * failure that merely mentions a hostname does not trigger the hint.
- */
 const NETWORK_REACH_FAILURE_PATTERN =
   /(getaddrinfo\s+E|\bENOTFOUND\b|\bEAI_AGAIN\b|\bENETUNREACH\b|Temporary failure in name resolution|Could not resolve host|Name or service not known|nodename nor servname provided|network is unreachable|no route to host|dial tcp: lookup)/i
 
 const NETWORK_ISOLATION_RETRY_HINT =
   '\n[recovery:terminal-network-external-retry]\n[hint] This command ran inside a network-isolated sandbox (network: none), and the failure above is a network-reach error — the tool itself is available. If the command legitimately needs public network access (package install, dependency/registry fetch, crawler), retry the SAME terminal.run call with network: "external". That capability is approval-gated, keeps writes confined to the active workspace, and hides host home/credentials. Do not conclude the task is impossible before trying it.'
 
-/**
- * Read-only filesystem failure signatures (glibc EROFS strings and the raw
- * errno name) emitted when a command mutates a read-only bind mount. Paired
- * with the structural posture signal (`filesystem.readOnly === true`) so an
- * ordinary failure mentioning the phrase does not trigger the hint.
- */
 const READ_ONLY_FILESYSTEM_FAILURE_PATTERN = /(Read-only file system|\bEROFS\b)/i
 
 const READ_ONLY_WORKSPACE_MUTATION_HINT =
   '\n[hint] Terminal commands in this sandbox mount the workspace read-only by design — only the terminal mount is read-only, not the workspace itself. To create or modify files use fs.write / fs.edit / fs.append / apply_patch, to move or rename use fs.move, and to delete a file use an apply_patch "*** Delete File" hunk. Do not conclude the filesystem or the task is blocked because an in-sandbox mutation command failed.'
 
-/**
- * Append escalation hints when a sandboxed command failed against one of the
- * sandbox's intentional restrictions. Each hint requires both a structural
- * execution-posture signal (daemon-owned fact) AND a matching failure
- * signature in the captured output. Purely additive — hints never change
- * status, code, or the original output.
- */
 export function decorateSandboxRestrictionFailure(
   output: string,
   runResult: {
@@ -1732,15 +1714,6 @@ function appendOutputCapture(capture: OutputCapture, chunk: Buffer): void {
   capture.truncated = true
 }
 
-/**
- * Legacy console encodings to try when a child's output is not valid UTF-8.
- *
- * Windows console programs write in the machine's ANSI/OEM code page, not
- * UTF-8, so `cmd`/`powershell` output containing non-ASCII text arrives as
- * mojibake — `영수증 회의록` came back as `������ ȸ�Ƿ�`, and the agent then
- * could not read the result of its own command. Ordered by the locale the
- * daemon is running under, so a Korean machine tries cp949 first.
- */
 const LEGACY_CONSOLE_ENCODINGS_BY_LANGUAGE: Record<string, string> = {
   ko: 'euc-kr',
   ja: 'shift_jis',
@@ -1752,9 +1725,6 @@ export function decodeConsoleOutput(buffer: Buffer): string {
   try {
     return new TextDecoder('utf-8', { fatal: true }).decode(buffer)
   } catch {
-    // Not UTF-8. Fall back to the console encoding this machine's locale
-    // implies, then to windows-1252, which decodes every byte rather than
-    // leaving the caller with replacement characters.
     const language = (() => {
       try {
         return Intl.DateTimeFormat().resolvedOptions().locale.split('-')[0] ?? ''
@@ -1762,10 +1732,6 @@ export function decodeConsoleOutput(buffer: Buffer): string {
         return ''
       }
     })()
-    // Locale is often inherited from a Linux host even when the child is a
-    // Windows console program (for example through a remote shell).  Try the
-    // CJK encodings after the locale-specific choice so Korean output remains
-    // legible instead of being silently decoded as Windows-1252 mojibake.
     const candidates = [
       LEGACY_CONSOLE_ENCODINGS_BY_LANGUAGE[language],
       'euc-kr',
@@ -1778,7 +1744,6 @@ export function decodeConsoleOutput(buffer: Buffer): string {
       try {
         return new TextDecoder(encoding).decode(buffer)
       } catch {
-        /* try the next one */
       }
     }
     return buffer.toString('utf8')
@@ -1815,17 +1780,13 @@ async function runLocalTerminalProcess(spec: {
       return
     }
 
-    // Own one process group per foreground invocation on POSIX. A shell can
-    // exit while a descendant keeps stdout/stderr open; signalling only the
-    // wrapper PID then leaves this Promise waiting past its declared timeout.
-    // Windows child.kill already targets the spawned process through the
-    // platform process API and does not support negative process-group PIDs.
     const isolatedProcessGroup = process.platform !== 'win32'
     const child = spawn(spec.executable, spec.args, {
       cwd: spec.cwd,
       env: scrubChildEnv(process.env),
       detached: isolatedProcessGroup,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     })
     let settled = false
     let timedOut = false
@@ -1847,16 +1808,12 @@ async function runLocalTerminalProcess(spec: {
           process.kill(-child.pid, signal)
           return
         } catch (error) {
-          // The leader may have exited before its descendants released the
-          // pipes. ESRCH means the group is already gone; other failures fall
-          // back to the direct child without turning cleanup into a crash.
           if ((error as NodeJS.ErrnoException).code === 'ESRCH') return
         }
       }
       try {
         child.kill(signal)
       } catch {
-        // A concurrently exiting process needs no further action.
       }
     }
 
@@ -1893,9 +1850,6 @@ async function runLocalTerminalProcess(spec: {
       signalProcessTree('SIGTERM')
       killTimer = setTimeout(() => {
         signalProcessTree('SIGKILL')
-        // Node normally emits close after SIGKILL. Keep a final daemon-owned
-        // bound for platform/runtime edge cases so one missing close event can
-        // never strand the agent run lease or a detached mobile chat job.
         settleTimer = setTimeout(() => {
           child.stdout.destroy()
           child.stderr.destroy()
@@ -1928,7 +1882,8 @@ async function runLocalTerminalProcess(spec: {
 }
 
 export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefinitionRuntime {
-  return {
+  const compatibilityFields = ['command', 'cmd', 'timeout_ms', 'timeout-ms', 'timeout'] as const
+  const tool: ToolDefinitionRuntime = {
     name: 'terminal.run',
     unavailableReason: (context) => context.workspaceRoot?.trim()
       && !options.strictWorkspaceRunner && !options.strictWorkspaceWriteRunner
@@ -1937,6 +1892,7 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
       : undefined,
     description:
       'Execute one program through the configured terminal runner. Always pass `executable` as the program name and `args` as an argv array. Shell builtins such as `command`, pipelines (|), redirects (>), or `&&`/`;` chains require an explicit `bash -c "<script>"` wrapper. Common installed developer toolchains are projected read-only into an isolated sandbox PATH while host credentials remain hidden: invoke the intended tool directly once. If the result is `EXECUTABLE_NOT_FOUND_PERMANENT`, treat that tool as unavailable; do not scan `/`, probe unrelated directories, or repeat the same lookup. A depth-, count-, or line-bounded inventory such as `find -maxdepth`, `head`, or `--max-count` proves only the requested scope; never infer that deeper or omitted files do not exist. For a negative test or health-state command that intentionally exits non-zero, declare the acceptable codes in `expectedExitCodes`; do not hide the real result with `|| true` or a status echo. Use `timeoutMs` to bound observation instead of wrapping the command with shell `timeout` or a trailing status echo. For a watch/follow command where silence is a valid "no changes" result, use `timeoutOutcome: observation_complete`; reaching the deadline then succeeds even with no stdout. Use `success_if_output` only when captured stdout is required for a usable bounded-observation result. Both modes are for commands intentionally expected to remain running until the deadline; commands that must exit normally to prove completion must keep the default `error`. When the user asks for changes during the observation window, prefer the command\'s native changes-only/watch-only option so an initial state replay is not reported as a new change. If a before/after comparison genuinely requires a delay, call `sleep` directly with a finite duration; do not wrap it in a shell. After an observation completes, interpret its output (including explicit no-output completion) instead of adding another delay or repeating the same observation. Under ReadOnly autonomy, a strict workspace lets local commands run in a fail-closed read-only, no-network sandbox; audited remote observation capabilities may receive narrower read-only network access. A direct classified read-only Kubernetes inspection is automatically confined to the read-only network runner even if the call includes `network: external`; shell wrappers, mutations, and Secret value reads never receive that downgrade. To run curl or another API client against a development server previously started with process.start managed loopback ports and available to the same strict workspace, set network to `loopback`; only those capability-bound ports become reachable and external network access stays disabled. For a user-authorized generator, crawler, package installer, or integration command that must both write inside the active workspace and reach public network services, set network to `external`; this uses a workspace-confined bubblewrap sandbox with hidden host home/credentials and requires explicit approval unless a narrower audited read-only capability applies. Prefer dedicated tools when one fits: fs.read/fs.search for files, git.* for repo state, code.* for symbols, and webfetch for a simple GET. Reach for terminal.run only when no other tool covers the job. Legacy `command`/`cmd` inputs are accepted at runtime for compatibility but are intentionally omitted from the model schema.',
+    inputContractHint: 'Long output is bounded automatically and the complete output stays readable with tool.output.read (offset/limit); there is no output-limit field here. Bound what the command prints with the command itself (for example head or a narrower selector).',
     resumeSafety: 'replay-risky',
     resumeSafetyForInput: getTerminalResumeSafety,
     batchFailureCoupling: {
@@ -1947,16 +1903,32 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
       normalizeTerminalInput(input, context.cwd),
     observationCoverage: {
       covers: (observed, requested, context) => {
+        if (rejectUnsupportedToolInputFields(tool, observed, compatibilityFields)
+          || rejectUnsupportedToolInputFields(tool, requested, compatibilityFields)) return false
+        if (terminalSerializedArgsError(observed) || terminalSerializedArgsError(requested)) return false
         const observedIdentity = terminalObservationIdentity(observed, context.cwd)
         return observedIdentity !== null
           && observedIdentity === terminalObservationIdentity(requested, context.cwd)
       },
     },
-    validateInput: (input) => {
+    validateInput: async (input, context) => {
+      const unsupported = rejectUnsupportedToolInputFields(tool, input, compatibilityFields)
+      if (unsupported) return unsupported
+      const argsError = terminalSerializedArgsError(input)
+      if (argsError) return argsError
       const placeholder = detectTerminalInputPlaceholder(input)
       if (placeholder) return terminalPlaceholderResult(placeholder.reason)
       const normalized = normalizeTerminalCommandShape(input)
       const executable = typeof normalized.executable === 'string' ? normalized.executable : ''
+      const missingArgumentsExecutable = executable
+        ? detectMissingTerminalArguments(
+            executable,
+            normalizeTerminalArgs(normalized.args, executable),
+          )
+        : null
+      if (missingArgumentsExecutable) {
+        return terminalMissingArgumentsResult(missingArgumentsExecutable)
+      }
       if (executable && detectTrailingShellStatusEcho(
         executable,
         normalizeTerminalArgs(normalized.args, executable),
@@ -1970,11 +1942,21 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
           )
         : null
       if (shellControl) return terminalShellControlResult(shellControl)
+      const scriptError = await shellScriptInputError(executable,
+        normalizeTerminalArgs(normalized.args, executable),
+        typeof normalized.cwd === 'string' ? resolve(context.cwd ?? process.cwd(), normalized.cwd) : context.cwd ?? process.cwd())
+      if (scriptError) return scriptError
       const expectedExitContract = resolveTerminalExpectedExitCodes(normalized)
-      return terminalExpectedExitCodeInputError(normalized, expectedExitContract)
+      const expectedExitError = terminalExpectedExitCodeInputError(normalized, expectedExitContract)
+      if (expectedExitError) return expectedExitError
+      const cwdResolution = await resolveTerminalCwd(normalized.cwd, context.cwd)
+      return cwdResolution.error
+        ? { ...cwdResolution.error, status: 'error', durationMs: 0 }
+        : null
     },
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         executable: {
           type: 'string',
@@ -1983,7 +1965,7 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
         args: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Argument vector passed verbatim to the executable, one array item per argv element. Redirects, pipelines, and shell operators are not interpreted unless the executable is an explicit shell with `-c`.',
+          description: 'Required argument vector passed verbatim to the executable, one array item per argv element. Use [] for a finite program needing no arguments; shells and interpreters need a script or command, for example bash with ["-c", "pwd"]. Redirects, pipelines, and shell operators are not interpreted unless the executable is an explicit shell with `-c`.',
         },
         cwd: { type: 'string', description: 'Working directory. Omit to use the active session cwd; do not invent placeholder paths.' },
         timeoutMs: { type: 'number', description: 'Timeout in milliseconds' },
@@ -2011,9 +1993,13 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
           description: 'Semantic purpose of this command. Use `observe` for inspection and diagnostic captures even when they write temporary/workspace samples; `mutate` only when the intended result is a durable user-requested product/source/data/config/test artifact; `validate` for tests, builds, formatting checks, and audits even when they emit caches or reports; `unblock` for dependency or environment preparation. This declaration does not weaken filesystem or approval policy.',
         },
       },
-      required: ['executable', 'actionPurpose'],
+      required: ['executable', 'args', 'actionPurpose'],
     },
     async execute(input: Record<string, unknown>, context): Promise<ToolResult> {
+      const unsupported = rejectUnsupportedToolInputFields(tool, input, compatibilityFields)
+      if (unsupported) return unsupported
+      const argsError = terminalSerializedArgsError(input)
+      if (argsError) return argsError
       const normalizedInput = normalizeTerminalCommandShape(input)
       const expectedExitContract = resolveTerminalExpectedExitCodes(normalizedInput)
       const expectedExitInputError = terminalExpectedExitCodeInputError(
@@ -2037,6 +2023,13 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
         }
       }
       const args = normalizeTerminalArgs(normalizedInput.args, executable)
+      const scriptError = await shellScriptInputError(executable, args,
+        typeof normalizedInput.cwd === 'string' ? resolve(context?.cwd ?? process.cwd(), normalizedInput.cwd) : context?.cwd ?? process.cwd())
+      if (scriptError) return scriptError
+      const missingArgumentsExecutable = detectMissingTerminalArguments(executable, args)
+      if (missingArgumentsExecutable) {
+        return terminalMissingArgumentsResult(missingArgumentsExecutable)
+      }
       const shellControl = detectDirectArgvShellControl(executable, args)
       if (shellControl) {
         return terminalShellControlResult(shellControl)
@@ -2088,29 +2081,13 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
             code: 'INVALID_INPUT_PERMANENT',
           }
         }
-        if (externalNetworkRequested && !strictWorkspaceRoot) {
-          return {
-            output: 'External network terminal access requires an active strict workspace.',
-            status: 'error',
-            durationMs: Date.now() - start,
-            code: 'STRICT_WORKSPACE_REQUIRED_PERMANENT',
-          }
-        }
-        const managedLoopbackConnections = managedLoopbackRequested
+        const managedLoopbackConnections = managedLoopbackRequested && strictWorkspaceRoot
           ? options.getManagedLoopbackConnections?.(
               context?.sessionId,
               context?.workspaceRoot,
             ) ?? []
           : []
-        if (managedLoopbackRequested && !strictWorkspaceRoot) {
-          return {
-            output: 'Managed loopback terminal access requires an active strict workspace.',
-            status: 'error',
-            durationMs: Date.now() - start,
-            code: 'STRICT_WORKSPACE_REQUIRED_PERMANENT',
-          }
-        }
-        if (managedLoopbackRequested && managedLoopbackConnections.length === 0) {
+        if (managedLoopbackRequested && strictWorkspaceRoot && managedLoopbackConnections.length === 0) {
           return {
             output: 'No running localhost service with managed loopback ports is available to this session or strict workspace. Start one with process.start network { mode: loopback, ports: [...] } first.',
             status: 'error',
@@ -2182,10 +2159,10 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
             signal: context?.signal,
             cwdBoundary: effectiveCwdBoundary,
             ...(readOnlyNetworkCapability ? { capability: readOnlyNetworkCapability } : {}),
-            ...(externalNetworkRequested && !readOnlyNetworkCommand
+            ...(strictWorkspaceRoot && externalNetworkRequested && !readOnlyNetworkCommand
               ? { capability: 'workspace-network-write' as const }
               : {}),
-            ...(managedLoopbackRequested ? {
+            ...(strictWorkspaceRoot && managedLoopbackRequested ? {
               capability: 'managed-loopback' as const,
               managedLoopbackConnections,
             } : {}),
@@ -2378,13 +2355,6 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
           throw getAbortError(context?.signal, `Command ${executable} aborted`)
         }
         const e = err as { stderr?: string; message?: string; code?: string | number; killed?: boolean }
-        // execFile sets `killed=true` and code='SIGTERM'/null when the
-        // child was killed by the timeout — that's the canonical
-        // transient signal. ENOENT/EACCES from spawn (not from the
-        // child process exit code) are permanent: a different executable
-        // is needed. A non-zero exit code with no other context is
-        // permanent for this invocation but the agent may still try
-        // different args.
         const code = e.killed
           ? 'TIMEOUT_TRANSIENT'
           : e.code === 'ENOENT'
@@ -2407,4 +2377,5 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
       }
     },
   }
+  return tool
 }

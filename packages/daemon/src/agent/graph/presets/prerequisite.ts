@@ -2,7 +2,6 @@ import { stopReasonUserActionRequired } from '../../stop-reason.js'
 import type { AgentGraph } from '../engine.js'
 import type { AgentState, GraphExecutionContext } from '../types.js'
 
-/** Guard each entry point, including checkpoint resumes and subgraph dispatch. */
 export function withGraphPrerequisite(
   graph: AgentGraph,
   check: (state: AgentState, context: GraphExecutionContext | undefined, node: string) => Promise<string | undefined> | string | undefined,

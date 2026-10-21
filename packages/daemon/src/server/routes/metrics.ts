@@ -45,7 +45,6 @@ export async function metricsRoutes(app: FastifyInstance) {
     }
 
     if (runtime) {
-      // Usage stats
       try {
         const usage = runtime.usageTracker.getTotalUsage()
         metrics.total_input_tokens = usage.inputTokens
@@ -58,7 +57,6 @@ export async function metricsRoutes(app: FastifyInstance) {
         })
       }
 
-      // Session count
       try {
         const sessions = await runtime.sessions.list({ perPage: 1 })
         metrics.total_sessions = sessions.totalCount
@@ -68,10 +66,8 @@ export async function metricsRoutes(app: FastifyInstance) {
         })
       }
 
-      // Provider count
       metrics.providers_count = runtime.providerRegistry.list().length
 
-      // Tool count
       metrics.tools_count = runtime.toolRegistry?.list().length ?? 0
 
       const runLimiterStats = runtime.runLimiter?.getStats()
@@ -90,7 +86,6 @@ export async function metricsRoutes(app: FastifyInstance) {
         metrics.provider_circuit_breaker_half_open = breakerSummary.halfOpenCircuits
       }
 
-      // Channel count
       metrics.channels_total = runtime.channels.length
       metrics.channels_connected = runtime.channels.filter(c => c.getStatus() === 'connected').length
       const pipelineStats = runtime.channelPipelineMonitor?.getStats?.()
@@ -165,15 +160,12 @@ export async function metricsRoutes(app: FastifyInstance) {
         metrics.channel_sessions_by_type = sessionStats.byChannelType
       }
 
-      // Scheduled jobs
       metrics.cron_tasks = runtime.jobStore?.list({ status: ['pending'] }).length ?? 0
 
-      // Telemetry
       if (runtime.telemetry) {
         metrics.telemetry = runtime.telemetry.getMetrics()
       }
 
-      // LLM Cache stats
       if (runtime.llmCache) {
         metrics.llm_cache = runtime.llmCache.getStats()
       }

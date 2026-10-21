@@ -14,11 +14,6 @@ export function chatSkillSelectionId(skill: ChatSkillSelectionItem): string {
   return skill.id?.trim() || skill.name.trim()
 }
 
-/**
- * Keep the most recently selected stable ids, matching the user-facing
- * eight-skill cap used by chat surfaces. Empty ids and duplicates are removed
- * before the cap is applied so persisted state cannot expand the request.
- */
 export function normalizeSelectedChatSkillIds(selectedIds: readonly string[]): string[] {
   const normalized: string[] = []
   for (const value of selectedIds) {
@@ -31,7 +26,6 @@ export function normalizeSelectedChatSkillIds(selectedIds: readonly string[]): s
   return normalized.slice(-MAX_SELECTED_CHAT_SKILLS)
 }
 
-/** Remove selections that are no longer present or are explicitly disabled. */
 export function reconcileSelectedChatSkillIds(
   selectedIds: readonly string[],
   skills: readonly ChatSkillSelectionItem[],

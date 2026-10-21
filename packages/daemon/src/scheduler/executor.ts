@@ -21,27 +21,11 @@ import { scriptMonitorConfigFromMetadata, type ScriptMonitorRunResult } from './
 
 const log = createLogger('scheduler:executor')
 
-/**
- * `channelTarget` on a scheduled job is the chat session key (`<channelType>:<id>`,
- * e.g. `telegram:8435235236`) — that's what `schedule_create` records and what
- * `schedule_list` filters by. But `IChannel.sendMessage` wants the raw channel id
- * (`8435235236`); Telegram does `parseInt(target.id)`, so a prefixed key becomes
- * `NaN` → "chat not found" and the scheduled output never reaches the user. Strip
- * the channel-type prefix here, at the boundary where a session key becomes a
- * delivery target. Leaves anything that isn't `<channelType>:`-prefixed untouched.
- */
 function channelIdFromSessionKey(channelType: string, channelTarget: string): string {
   const prefix = `${channelType}:`
   return channelTarget.startsWith(prefix) ? channelTarget.slice(prefix.length) : channelTarget
 }
 
-/**
- * Minimal channel lookup interface used by the scheduler executor.
- *
- * Returns the live IChannel instance so the executor can dispatch the
- * agent's response back to the originating chat (Telegram, Slack, …)
- * once the scheduled instruction has been processed.
- */
 export interface ChannelLookup {
   get(channelType: string): IChannel | undefined
 }
@@ -56,9 +40,7 @@ export interface SchedulerExecutorDeps {
     instruction: string,
     opts: {
       sessionId: string
-      /** Per-run durable evidence journal; distinct from stable approval authority. */
       agentSessionId?: string
-      /** Link the persisted run only after the audit session exists, before agent execution. */
       onAgentSessionReady?: () => void
       parentSessionId: string | null
       channelContext?: { channel: string; chatKey: string; triggerMessageId?: string }
@@ -68,19 +50,13 @@ export interface SchedulerExecutorDeps {
     },
   ) => Promise<string | void | JobExecutionResult | null>
   runInternalJob: (kind: string, job: ScheduledJob, context?: { runId?: string }) => Promise<void>
-  /** Deterministic, non-LLM script monitor execution. */
   runScriptMonitor?: (
     job: ScheduledJob,
-    context?: { runId?: string; signal?: AbortSignal; suppressDelivery?: boolean },
+    context?: { runId?: string; signal?: AbortSignal; suppressDelivery?: boolean; forceReport?: boolean },
   ) => Promise<ScriptMonitorRunResult>
   onJobProgress?: (job: ScheduledJob, message: string) => Promise<void> | void
   deliveryOutbox?: SchedulerDeliveryOutbox
   autonomy: AutonomyLevel
-  /**
-   * Re-establish an unattended job's pre-approval before it runs. The grant
-   * itself is in-memory, so without this a restart silently returns the job to
-   * stalling on approval prompts nobody is there to answer.
-   */
   grantUnattendedApproval?: (schedulerSessionId: string) => void
 }
 
@@ -235,12 +211,10 @@ export function createSchedulerExecutor(deps: SchedulerExecutorDeps): JobExecuto
         ...(context?.runId ? { runId: context.runId } : {}),
         ...(context?.signal ? { signal: context.signal } : {}),
         ...(context?.suppressDelivery ? { suppressDelivery: true } : {}),
+        ...(context?.forceReport ? { forceReport: true } : {}),
       })
       return result.output
     }
-    // Skill selection is a persisted execution contract, not a prompt hint.
-    // Parse it before choosing the channel/headless path so malformed or
-    // unsupported metadata can never degrade to an unskilled run.
     const skillRefs = job.instruction.startsWith('__internal:')
       ? []
       : scheduledAgentSkillRefsFromMetadata(job.metadata)
@@ -278,15 +252,9 @@ export function createSchedulerExecutor(deps: SchedulerExecutorDeps): JobExecuto
     const runHeadlessAgent = async (instruction: string) => {
       return deps.runHeadlessAgent(instruction, headlessOptions)
     }
-    // The `unattended` flag is durable; the approval grant it represents is
-    // not. Re-establish it on every fire so a daemon restart does not quietly
-    // return the job to waiting on a prompt nobody is present to answer.
     if (job.unattended) {
       deps.grantUnattendedApproval?.(schedulerSessionIdForJob(job.id))
     }
-    // Path 0: built-in app-owned jobs. GeekNews insights are deterministic
-    // at the collection layer (RSS + dedupe), then delegate synthesis to the
-    // normal agent so the delivered message still feels like a chat turn.
     if (isGeekNewsInsightsJob(job)) {
       if (!deps.jobStore) throw new Error('GeekNews scheduler job requires a job store')
       const totalUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 }
@@ -356,7 +324,6 @@ export function createSchedulerExecutor(deps: SchedulerExecutorDeps): JobExecuto
       return resultWithUsage(output, totalUsage, incomplete)
     }
 
-    // Path 1: internal job (prefixed with __internal:)
     if (job.instruction.startsWith('__internal:')) {
       const kind = job.instruction.slice('__internal:'.length)
       await deps.runInternalJob(kind, job, context?.runId ? { runId: context.runId } : undefined)
@@ -364,11 +331,8 @@ export function createSchedulerExecutor(deps: SchedulerExecutorDeps): JobExecuto
       return
     }
 
-    // Parse the reserved source contract before either agent path or delivery.
-    // Malformed links must not silently run using stale instruction prose.
     const instruction = scheduledInstructionWithSources(job)
 
-    // Path 2: channel-bound job — route via ChannelAgentExecutor
     if (job.channelType && job.channelTarget) {
       const channel = deps.channelRegistry.get(job.channelType)
       if (!channel) {
@@ -401,9 +365,6 @@ export function createSchedulerExecutor(deps: SchedulerExecutorDeps): JobExecuto
       linkRunAgentSession(sessionId)
 
       const deliveryTracker = new ScheduledDeliveryTracker()
-      // The agent states its own termination cause on the done event. Capturing
-      // it here is what lets run history tell a deliberate, resumable budget
-      // stop apart from a hard failure.
       let observedStopReason: RunStopReason | undefined
       context?.signal?.throwIfAborted()
       const responseText = await deps.channelAgentExecutor.run(
@@ -431,10 +392,6 @@ export function createSchedulerExecutor(deps: SchedulerExecutorDeps): JobExecuto
         return
       }
 
-      // Without this dispatch the agent runs silently and the user never
-      // sees the scheduled output — schedule_create's contract ("the
-      // result is sent back to the same chat automatically") relied on
-      // this final hop, which had been left as a TODO.
       const safeResponse = channelSafeAgentResponse(responseText ?? '')
       context?.signal?.throwIfAborted()
       const trimmed = safeResponse.text.trim()
@@ -481,7 +438,6 @@ export function createSchedulerExecutor(deps: SchedulerExecutorDeps): JobExecuto
           })
     }
 
-    // Path 3: headless — no channel binding
     log.info(`headless execution for job ${job.id} (no channel binding)`)
     if (!context?.suppressDelivery) {
       await notifyJobProgress(

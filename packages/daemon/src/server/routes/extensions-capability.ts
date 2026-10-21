@@ -57,7 +57,6 @@ export async function registerExtensionsCapabilityRoutes(
           continue
         }
       } catch {
-        // Drop dead sockets below.
       }
       sockets.delete(socket)
     }
@@ -244,7 +243,6 @@ export async function registerExtensionsCapabilityRoutes(
           try {
             trackedSocket.close()
           } catch {
-            // Ignore close failures.
           }
           return
         }

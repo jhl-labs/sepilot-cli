@@ -22,15 +22,6 @@ export interface MigrateFacadeInput {
   conflict?: 'skip' | 'overwrite'
   migration: MigrationClient
   pollMs?: number
-  /**
-   * Total elapsed-time cap for the polling loop, in milliseconds. When
-   * the daemon never transitions to a terminal state (network blip,
-   * crash without status update) the CLI would otherwise hang. Default:
-   * 30 minutes — overridable via `SEPILOTD_MIGRATE_TIMEOUT_MS`. Tests
-   * pass an explicit small value via this field instead of relying on
-   * the env var. `0` disables the watchdog (used by tests with stubbed
-   * pollers).
-   */
   timeoutMs?: number
   onStep?: (event: MigrateFacadeStepEvent) => void
 }
@@ -55,13 +46,6 @@ function resolveMigrateTimeoutMs(explicit?: number): number {
   return DEFAULT_MIGRATE_TIMEOUT_MS
 }
 
-/**
- * Thrown by `runMigrateFacade` when the polling loop exceeds its
- * elapsed-time cap. The verb wrapper catches this and prints a
- * resume-with-`migrate:status` hint, then exits 2. Tests assert the
- * `migrationId` so they can confirm the watchdog tripped on the right
- * run.
- */
 export class MigratePollingTimeoutError extends Error {
   readonly migrationId: string
   readonly elapsedMs: number
@@ -75,14 +59,6 @@ export class MigratePollingTimeoutError extends Error {
   }
 }
 
-/**
- * Pure facade over the daemon's `/api/v1/migration/*` routes. The CLI
- * verb is now a thin client: POST /run, poll /:id until the snapshot
- * status is terminal, then GET /report for the summary tally. The CLI
- * no longer owns the migration steps — the daemon's MigrationRunner
- * does — so this surface only translates the daemon's snapshot stream
- * into operator-visible progress rows.
- */
 export async function runMigrateFacade(
   input: MigrateFacadeInput,
 ): Promise<MigrateFacadeResult> {
@@ -97,13 +73,6 @@ export async function runMigrateFacade(
     conflict: input.conflict,
   })
 
-  // Polling loop: emit one onStep callback per visible step in each
-  // snapshot so the renderer can show progress. Break as soon as the
-  // daemon transitions to a terminal status — anything else risks
-  // looping forever if the daemon hangs. The watchdog (timeoutMs > 0)
-  // throws `MigratePollingTimeoutError` once total elapsed exceeds the
-  // cap so the CLI can surface a resume hint instead of hanging
-  // indefinitely. Set timeoutMs=0 to disable (tests).
   const startedAt = Date.now()
   while (true) {
     if (pollMs > 0) {
@@ -148,14 +117,6 @@ export interface MigrateFromDesktopFlags {
   reportPath?: string
 }
 
-/**
- * Operator-facing `sepilot migrate` verb. Resolves the source path
- * (explicit `--source`, otherwise platform-conventional sepilot-desktop
- * userData), then hands off to `runMigrateFacade`. Exit codes:
- *   0 — completed
- *   1 — daemon unreachable / no source detected / report write failure
- *   2 — daemon-side migration finished in a non-completed state
- */
 export async function migrateFromSepilotDesktopCommand(
   flags: MigrateFromDesktopFlags,
 ): Promise<void> {
@@ -213,9 +174,6 @@ export async function migrateFromSepilotDesktopCommand(
   } catch (err) {
     if (err instanceof MigratePollingTimeoutError) {
       const seconds = Math.round(err.elapsedMs / 1000)
-      // operator hint: stay non-zero (2) so scripts catch it; mirror
-      // the resume affordance batch exposes — `migrate:status <id>`
-      // reattaches to the daemon-side run without restarting it.
       console.error(
         chalk.red(
           `migration polling timed out after ${seconds}s (jobId ${err.migrationId}) — daemon may still be running. resume with: sepilotd migrate:status ${err.migrationId}`,
@@ -248,12 +206,6 @@ export async function migrateFromSepilotDesktopCommand(
   }
 }
 
-/**
- * `sepilot migrate:status <id>` — reattach to a daemon-resident
- * migration and print its snapshot. Mirrors batch:status in shape:
- * one terse top line for the daemon-side run status, then one
- * indented row per step with the visible counters operators key on.
- */
 export async function migrateStatusCommand(
   id: string,
   options: { url?: string },
@@ -273,11 +225,6 @@ export async function migrateStatusCommand(
   }
 }
 
-/**
- * `sepilot migrate:cancel <id>` — DELETE /api/v1/migration/:id.
- * Echoes "canceled: <id>" so an operator scanning stdout confirms
- * the request landed without parsing the daemon snapshot.
- */
 export async function migrateCancelCommand(
   id: string,
   options: { url?: string },

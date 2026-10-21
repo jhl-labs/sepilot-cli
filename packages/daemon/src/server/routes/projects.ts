@@ -53,7 +53,6 @@ async function resolveProjectWorkingDirectory(
 }
 
 export async function projectRoutes(app: FastifyInstance) {
-  // GET /projects — list all projects
   app.get('/projects', async (_request, _reply) => {
     const runtime = app.runtime
     if (!runtime)
@@ -76,7 +75,6 @@ export async function projectRoutes(app: FastifyInstance) {
     return { data: projects }
   })
 
-  // POST /projects — create project
   app.post<{ Body: CreateProjectBody }>('/projects', {
     preValidation: zodRequestValidation({
       body: {
@@ -122,7 +120,6 @@ export async function projectRoutes(app: FastifyInstance) {
     return { data: project }
   })
 
-  // GET /projects/:id
   app.get<{ Params: ProjectIdParams }>(
     '/projects/:id',
     {
@@ -158,7 +155,6 @@ export async function projectRoutes(app: FastifyInstance) {
     },
   )
 
-  // PUT /projects/:id — update project
   app.put<{ Params: ProjectIdParams; Body: UpdateProjectBody }>(
     '/projects/:id',
     {
@@ -219,7 +215,6 @@ export async function projectRoutes(app: FastifyInstance) {
     },
   )
 
-  // DELETE /projects/:id
   app.delete<{ Params: ProjectIdParams }>(
     '/projects/:id',
     {
@@ -247,13 +242,11 @@ export async function projectRoutes(app: FastifyInstance) {
       try {
         await unlink(join(dir, `${params.id}.json`))
       } catch {
-        /* not found is ok */
       }
       return reply.status(204).send()
     },
   )
 
-  // POST /projects/:id/sessions — add session to project
   app.post<{ Params: ProjectIdParams; Body: AddProjectSessionBody }>(
     '/projects/:id/sessions',
     {

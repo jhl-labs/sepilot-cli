@@ -19,12 +19,6 @@ function nonNegativeInteger(value: number | undefined, fallback: number): number
   return Math.max(0, Math.floor(value ?? fallback))
 }
 
-/**
- * Retry only filesystem failures that are commonly transient while another
- * Windows process briefly holds a sharing lock. The operation itself must be
- * safe to repeat; callers should retry an open/rename, never a possibly-partial
- * append or direct write.
- */
 export async function retryTransientFsOperation<T>(
   operation: () => Promise<T>,
   options: TransientFsRetryOptions = {},

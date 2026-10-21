@@ -19,12 +19,6 @@ function deliveryLabel(count: number, state: 'pending' | 'retrying'): string {
   return `${count} channel ${count === 1 ? 'delivery' : 'deliveries'} ${state}`
 }
 
-/**
- * Gives every user-facing surface the same content-free interpretation of the
- * durable scheduler delivery queue. Failed rows remain retryable work, not
- * failed scheduler jobs, and therefore take precedence over ordinary pending
- * rows when mixed states are present.
- */
 export function daemonSchedulerDeliveryOutboxEvidence(
   summary: DaemonSchedulerDeliveryOutboxSummary | null | undefined,
 ): DaemonSchedulerDeliveryOutboxPresentation | null {

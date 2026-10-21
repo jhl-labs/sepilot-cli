@@ -46,13 +46,6 @@ interface FileTokenResolverOptions {
   now?: () => number
 }
 
-/**
- * Constant-time secret comparison. Bearer/query tokens are compared with
- * `timingSafeEqual` so a non-loopback bind does not leak the token byte-by-byte
- * via response-timing. A length pre-check is unavoidable (timingSafeEqual
- * requires equal-length buffers) and only leaks the token length, which is not
- * secret. Returns false for any non-string / mismatched-length input.
- */
 export function timingSafeTokenEqual(
   a: string | null | undefined,
   b: string | null | undefined,
@@ -78,12 +71,6 @@ export function assertDaemonAuthPolicy(options: {
   }
 
   if (options.allowUnauthenticatedExternal) {
-    // Double-ack required: SEPILOTD_ALLOW_UNAUTHENTICATED_EXTERNAL alone is
-    // historically a one-liner that can be inherited unintentionally (env
-    // leak from a parent shell, systemd unit re-use, copy-pasted .envrc).
-    // Requiring a second variable with a phrase as its value forces an
-    // explicit acknowledgement, so a typo cannot expose every authenticated
-    // route on the LAN.
     const ack = process.env.SEPILOTD_INSECURE_BIND_ACK
     if (ack !== 'YES_I_UNDERSTAND') {
       throw new Error(
@@ -104,8 +91,17 @@ export function assertDaemonAuthPolicy(options: {
   )
 }
 
+function decodedPathname(url: string): string | null {
+  try {
+    return decodeURIComponent(url.split('?', 1)[0]!)
+  } catch {
+    return null
+  }
+}
+
 function isPublicWebhookReceiverRequest(url: string, method: string): boolean {
-  const pathname = url.split('?', 1)[0]
+  const pathname = decodedPathname(url)
+  if (pathname === null) return false
 
   if (method === 'GET') {
     return pathname === '/api/v1/webhooks/whatsapp'
@@ -185,7 +181,6 @@ const MEMORY_SCOPE_QUERY_NAMES = [
   'scopeGroups',
 ] as const
 
-/** Extension memory ownership is derived from its authenticated token id. */
 function hasCallerControlledMemoryScope(request: FastifyRequest): boolean {
   if (MEMORY_SCOPE_HEADER_NAMES.some((name) => request.headers[name] !== undefined)) {
     return true
@@ -214,23 +209,11 @@ function acceptsBrowserQueryToken(request: FastifyRequest): boolean {
   return (
     (request.headers.accept ?? '').includes('text/event-stream') ||
     pathname === '/image-gen/events' ||
-    // Browser WebSocket constructors cannot attach an Authorization header.
-    // Keep query-token fallback constrained to this exact authenticated
-    // extension event endpoint rather than all WebSocket upgrades.
     pathname === '/extensions/events' ||
     pathname.startsWith('/image-gen/files/')
   )
 }
 
-/**
- * Load the daemon's master bearer token from disk. Returns null when
- * the token file does not exist (legitimate "auth not configured"
- * state). Re-throws every other read error so the caller — currently
- * the daemon's startup path — refuses to come up with auth silently
- * degraded to "no token, accept everything" because the token file
- * happened to be unreadable due to a permission flap or transient IO
- * error.
- */
 export function daemonAuthTokenPath(dataDir?: string): string {
   const dir = dataDir ?? join(homedir(), '.sepilotd')
   const override = process.env.SEPILOTD_DAEMON_TOKEN_FILE?.trim()
@@ -241,20 +224,6 @@ export function daemonAuthTokenPath(dataDir?: string): string {
   return override
 }
 
-/**
- * Guarantee that a presentable master bearer token exists for this data dir.
- *
- * Without this, a daemon booting into a fresh data dir came up with no token
- * file at all: every authenticated request was rejected and there existed no
- * token the operator could present. Auth must never reach a state where no
- * valid credential is obtainable.
- *
- * An existing token file is returned untouched — never rotated, never
- * overwritten — so already-configured clients keep working. When the token
- * path is pinned by SEPILOTD_DAEMON_TOKEN_FILE the file is operator/platform
- * owned (e.g. a projected Kubernetes Secret) and is never generated here.
- * The generated value is written atomically with 0600 and never logged.
- */
 export async function ensureDaemonAuthToken(dataDir?: string): Promise<string | null> {
   const existing = await loadToken(dataDir)
   if (existing) return existing
@@ -275,8 +244,6 @@ export async function ensureDaemonAuthToken(dataDir?: string): Promise<string | 
       { cause: err },
     )
   }
-  // A concurrent boot may have won the rename race; re-read so both processes
-  // agree on one token.
   return (await loadToken(dataDir)) ?? token
 }
 
@@ -300,13 +267,6 @@ export async function loadToken(dataDir?: string): Promise<string | null> {
   }
 }
 
-/**
- * Resolve a projected Secret-backed token without restarting the daemon.
- * Successful values and failures are cached briefly so request throughput is
- * not coupled to filesystem I/O. Once refresh observes a missing, unreadable,
- * or empty file it throws until a later refresh succeeds; callers must fail
- * closed rather than falling back to unauthenticated access or a stale token.
- */
 export function createFileDaemonAuthTokenResolver(
   tokenPath: string,
   options: FileTokenResolverOptions,
@@ -399,18 +359,8 @@ export function createAuthPlugin(token: string | null, options: AuthPluginOption
           },
         })
       }
-      // Readiness stays unauthenticated, but a deployment whose required
-      // projected token cannot be refreshed must not advertise itself as
-      // ready for protected traffic. Liveness remains independent so a
-      // transient Secret projection failure does not restart long-running work.
       if (readinessRequest) return
       const extensionTokenStore = runtimeApp.runtime?.extensionTokenStore
-      // Reject a caller only when a valid credential is actually obtainable.
-      // With no master token configured, an extension token store alone used
-      // to make every unauthenticated request 401 even though no master token
-      // existed for anyone to present — an unusable state. Callers that do
-      // present a bearer token are still validated against the extension store
-      // below, so scoped extension tokens keep their meaning.
       const hasPresentableMasterToken = Boolean(currentToken)
       const bearerPresented = (request.headers.authorization ?? '').startsWith('Bearer ')
       if (
@@ -425,12 +375,6 @@ export function createAuthPlugin(token: string | null, options: AuthPluginOption
       if (isWebSocketRequest(request.url) && !authHeader?.startsWith('Bearer ')) {
         return
       }
-      // Browser transport fallback: EventSource and WebSocket constructors
-      // cannot set custom request headers, so explicitly allowlisted browser
-      // endpoints accept the token as a `?token=` query param. Do not expand
-      // this to general API calls. NOTE: a query-string bearer can leak into access
-      // logs / proxy logs / Referer headers. Replacing this with a short-lived
-      // single-use SSE ticket is tracked as follow-up (out of scope here).
       let bearerToken: string | null = null
       if (authHeader?.startsWith('Bearer ')) {
         bearerToken = authHeader.slice(7)
@@ -457,13 +401,6 @@ export function createAuthPlugin(token: string | null, options: AuthPluginOption
         return
       }
 
-      // A bearer token was presented but is not the master token. WS upgrades no
-      // longer fall through to anonymous identity resolution here: a
-      // present-but-invalid (or unscoped) credential is rejected. Previously WS
-      // requests were passed through, which — combined with an absent master
-      // token — could yield anonymous WebSocket chat (arbitrary agent runs).
-      // The no-credential path (handled above: WS + no Bearer header) still
-      // defers to ws.ts for paired-device / anonymous resolution.
       if (!extensionTokenStore) {
         return reply.status(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid token' } })
       }

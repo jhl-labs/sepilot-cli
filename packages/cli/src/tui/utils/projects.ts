@@ -61,7 +61,6 @@ async function inferWorkspaceProjectName(rootDir: string): Promise<string> {
       return parsed.name.trim()
     }
   } catch {
-    // Fall back to directory name.
   }
 
   return basename(rootDir) || rootDir

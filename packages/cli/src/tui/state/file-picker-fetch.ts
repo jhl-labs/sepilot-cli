@@ -1,8 +1,3 @@
-// Pulled out of App.tsx so the file-picker directory listing — readdir
-// + sort (folders first, then alphabetical) + map into the picker
-// shape — can live as a single async helper with a tagged result and
-// be unit-tested without rendering the picker overlay.
-
 import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { FilePickerItem } from '../components/FilePicker.js'
@@ -12,16 +7,6 @@ export type FilePickerFetchResult =
   | { ok: true; cancelled: true }
   | { ok: false; error: string }
 
-/**
- * List the supplied directory and shape its entries for the file
- * picker UI. Sorts directories first (so navigation stays consistent
- * with how the picker renders), then alphabetical-by-name. Every
- * entry's absolute path is precomputed so the renderer doesn't have
- * to hit fs again.
- *
- * Cancellation is checked once after readdir returns; the sort/map
- * is fast enough that we don't need an additional check inside it.
- */
 export async function loadFilePickerItems(opts: {
   dir: string
   cancelled: () => boolean

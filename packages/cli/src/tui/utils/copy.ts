@@ -70,12 +70,6 @@ export async function copyTextToClipboard(
     }
   }
 
-  // OSC 52 fallback. Works over SSH and in headless / no-X11 environments
-  // when the terminal supports it (most modern ones do: iTerm2, Wezterm,
-  // Kitty, Alacritty, recent xterm, mosh, tmux with `set -g set-clipboard on`).
-  // We can't observe whether the terminal accepted it, so this is best-effort —
-  // if a paste later turns up empty, the terminal silently ignored the
-  // sequence (Termius/older builds, GNOME Terminal without the patch, etc.).
   const stdout = options.stdout ?? process.stdout
   if (writeOsc52(text, stdout)) {
     return
@@ -88,9 +82,6 @@ export async function copyTextToClipboard(
   )
 }
 
-// 1 MiB is well past the safe ceiling for OSC 52 on most terminals
-// (xterm caps at 100k by default, Wezterm/Kitty at ~few MiB). Above this
-// we don't bother — the user will need a native clipboard tool.
 const OSC52_MAX_BYTES = 1_000_000
 
 function writeOsc52(
@@ -105,9 +96,6 @@ function writeOsc52(
     return false
   }
   try {
-    // ESC ] 52 ; c ; <base64> BEL — `c` selects the system clipboard
-    // (vs `p` primary selection). BEL terminator is the broadly-supported
-    // form; ST (ESC \) would work on stricter parsers but breaks on some.
     stdout.write(`\x1b]52;c;${encoded}\x07`)
     return true
   } catch {

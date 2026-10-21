@@ -14,41 +14,21 @@ import {
 } from './delegation-signing.js'
 
 export interface DelegatorSecurityOptions {
-  /** Signs claim/status assertions written by this device. */
   signer?: DelegationSigner
-  /** Resolves paired-device public keys for verifying inbound assertions. */
   keyResolver?: DelegationKeyResolver
-  /**
-   * When true, inbound claim/status/cancel/answer assertions must carry a valid
-   * paired-device signature or they are ignored (fail-closed). Default false so
-   * an un-upgraded peer that does not yet sign is not silently cut off; operators
-   * opt in via SEPILOTD_DELEGATION_REQUIRE_SIGNATURE once every device signs.
-   */
   requireSignature?: boolean
 }
 
 export interface DelegationRequest {
-  targetDevice?: string  // device name or ID, empty = any available
+  targetDevice?: string
   instruction: string
   priority?: 'high' | 'medium' | 'low'
   timeoutMs?: number
   executionId?: string
-  /** Parent run contract forwarded to the remote worker as hard task boundaries. */
   runContract?: AgentRunContract
-  /**
-   * Scoped board slice (goal + acceptance criteria + known failed-attempts +
-   * open-questions) built by {@link buildScopedBoardSlice}, transmitted down to
-   * the delegate so a cross-device run starts from the parent's structured state
-   * instead of `previousMessages: []`. PLAN_065 T5.
-   */
   boardSlice?: string
 }
 
-/**
- * Append a scoped board slice to a delegation instruction so it rides down in
- * the dispatched payload (parsed back into the worker's `task.instruction`).
- * Returns the instruction unchanged when there is no slice. PLAN_065 T5.
- */
 export function appendBoardSliceToDelegationInstruction(
   instruction: string,
   boardSlice?: string,
@@ -73,13 +53,6 @@ export function appendRunContractToDelegationInstruction(
 
 const DELEGATION_FINDINGS_FENCE = 'findings'
 
-/**
- * Parse a structured findings block a delegate emitted in its completion
- * comment. This is a self-describing fenced-JSON protocol block (like the
- * ANSWER: stem), NOT free-text extraction — findings are only accepted when the
- * delegate deliberately emitted the block. Missing/invalid block -> undefined so
- * the caller falls back to the legacy text-only path. PLAN_065 T5.
- */
 export function parseDelegationFindings(commentBody: string): SubagentFindings | undefined {
   const match = commentBody.match(
     new RegExp('```' + DELEGATION_FINDINGS_FENCE + '\\s*\\n([\\s\\S]*?)```'),
@@ -137,7 +110,6 @@ export interface DelegationStatusUpdate {
   message?: string
   claimId?: string
   generation?: number
-  /** Authenticated writer device id, when the comment is signed. */
   deviceId?: string
   signature?: string
 }
@@ -162,7 +134,6 @@ export interface DelegationClaim {
   targetDevice: string
   message?: string
   createdAt?: string
-  /** Authenticated writer device id, when the comment is signed. */
   deviceId?: string
   signature?: string
 }
@@ -407,8 +378,6 @@ function buildActiveClaimsByDelegation(
   for (const comment of comments) {
     const claim = parseDelegationClaim(comment.body)
     if (claim) {
-      // Fail-closed: an unsigned or badly-signed claim from an unpaired/forged
-      // device is ignored so it can neither win nor block a delegation.
       if (verifier && !verifier.verifyClaim(claim)) {
         continue
       }
@@ -429,8 +398,6 @@ function buildActiveClaimsByDelegation(
     if (!release) {
       continue
     }
-    // Only an authenticated release may drop a claim; a forged release must not
-    // be able to evict the legitimate holder.
     if (verifier && !verifier.verifyRelease(release)) {
       continue
     }
@@ -477,16 +444,10 @@ export class TaskDelegator {
     this.requireSignature = security.requireSignature ?? false
   }
 
-  /**
-   * Whether inbound assertions must be verified. Only active when a key resolver
-   * is available AND the operator opted in — otherwise verification is skipped so
-   * an un-upgraded peer is not cut off.
-   */
   private get verificationEnabled(): boolean {
     return this.requireSignature && !!this.keyResolver
   }
 
-  /** Marker suffix authenticating an outbound assertion, or '' when unsigned. */
   private signMarkerSuffix(fields: Omit<DelegationAssertionFields, 'deviceId'>): string {
     if (!this.signer) return ''
     const payload = buildDelegationAssertionPayload({ ...fields, deviceId: this.signer.deviceId })
@@ -538,10 +499,6 @@ export class TaskDelegator {
     )
   }
 
-  /**
-   * Delegate a task to another device via Gateway (GitHub Issue comment).
-   * Creates a ticket for the target device to pick up.
-   */
   async delegate(request: DelegationRequest): Promise<DelegationResult> {
     const delegationId = randomUUID()
     const targetDevice = request.targetDevice ?? 'pending'
@@ -550,9 +507,6 @@ export class TaskDelegator {
       : `[delegation:${delegationId}][target:${targetDevice}]`
 
     try {
-      // Use Gateway to create a ticket (Issue) for delegation. Ride the scoped
-      // board slice down inside the instruction payload so the delegate starts
-      // from the parent's structured state (PLAN_065 T5).
       const instructionWithContract = appendRunContractToDelegationInstruction(
         request.instruction,
         request.runContract,
@@ -561,11 +515,8 @@ export class TaskDelegator {
         instructionWithContract,
         request.boardSlice,
       )
-      // Do NOT swallow the gateway write failure: an un-written delegation that
-      // reports 'dispatched' is a silent black-hole (the target never sees the
-      // task). Let it propagate so the status is reported as failed.
       await this.gatewayClient.addComment(
-        'delegation',  // Special ticket for inter-device communication
+        'delegation',
         `${marker} ${instructionWithBoard}`,
         'general',
       )
@@ -638,8 +589,6 @@ export class TaskDelegator {
         continue
       }
 
-      // Fail-closed: a forged/unsigned status comment cannot flip a delegation
-      // to completed/failed/cancelled when signature enforcement is active.
       if (!this.isStatusUpdateAuthentic(update)) {
         continue
       }
@@ -677,8 +626,6 @@ export class TaskDelegator {
     const now = options?.now ?? Date.now()
     const delegations = await this.listDelegations()
     const activeClaims = buildActiveClaimsByDelegation(comments, claimTtlMs, now, this.commentVerifier())
-    // When verification is on, authorize a foreign claim by its authenticated
-    // device id, not the free-text [target] name a forger controls.
     const claimMatchesDevice = (claim: DelegationClaim): boolean =>
       this.verificationEnabled
         ? !!claim.deviceId && candidates.has(claim.deviceId)
@@ -1040,12 +987,10 @@ export class TaskDelegator {
     )
   }
 
-  /** Check if a task should be delegated based on device capabilities */
   shouldDelegate(_instruction: string, requiredCapabilities: string[]): boolean {
     const myRole = this.config.device.role
     const myCapabilities = new Set(['terminal', 'filesystem'])
 
-    // Add capabilities based on role
     if (myRole === 'server') {
       myCapabilities.add('docker')
       myCapabilities.add('gpu')
@@ -1056,9 +1001,8 @@ export class TaskDelegator {
       myCapabilities.add('gui')
     }
 
-    // Check if we have all required capabilities
     for (const cap of requiredCapabilities) {
-      if (!myCapabilities.has(cap)) return true  // Should delegate
+      if (!myCapabilities.has(cap)) return true
     }
     return false
   }

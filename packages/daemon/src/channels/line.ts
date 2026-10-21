@@ -6,22 +6,12 @@ import { UNSUPPORTED_MEDIA_MESSAGE } from './media-ack.js'
 const log = createLogger('line')
 
 export interface LINEChannelConfig {
-  /** LINE Channel Access Token (long-lived) */
   channelAccessToken: string
-  /** LINE Channel Secret (for signature verification) */
   channelSecret: string
-  /** Allowed user IDs (empty = allow all) */
   allowedUsers?: string[]
   rateLimitPerMinute?: number
 }
 
-/**
- * LINE Messaging API channel.
- *
- * Uses the LINE Messaging API directly via fetch (no SDK dependency).
- * Receives messages via webhook (POST /webhooks/line).
- * Sends replies via the LINE Reply/Push API.
- */
 export class LINEChannel implements IChannel {
   readonly id = 'line'
   readonly type: ChannelType = 'line'
@@ -85,7 +75,6 @@ export class LINEChannel implements IChannel {
       && this.config.channelSecret.trim().length > 0
   }
 
-  /** Verify LINE webhook signature */
   verifySignature(body: string, signature: string): boolean {
     if (!this.canVerifySignature()) {
       return false
@@ -93,15 +82,12 @@ export class LINEChannel implements IChannel {
     const hash = createHmac('SHA256', this.config.channelSecret)
       .update(body)
       .digest('base64')
-    // timingSafeEqual on equal-length Buffers — string `===` leaks the
-    // common-prefix length under a remote-timing attack.
     const expected = Buffer.from(hash)
     const provided = Buffer.from(signature)
     if (expected.length !== provided.length) return false
     return timingSafeEqual(expected, provided)
   }
 
-  /** Handle incoming LINE webhook event */
   async handleWebhook(body: LINEWebhookBody, rawBody: string, signature: string): Promise<boolean> {
     if (!this.verifySignature(rawBody, signature)) {
       log.warn('LINE webhook signature verification failed')
@@ -113,35 +99,28 @@ export class LINEChannel implements IChannel {
 
       const userId = event.source?.userId ?? ''
 
-      // Non-text inbound (image / audio / video / file / location / sticker)
-      // can't be processed yet. Ack via the reply token instead of silently
-      // dropping it.
       if (event.message?.type !== 'text') {
         if (this.allowedUsers.size > 0 && !this.allowedUsers.has(userId)) continue
         if (!this.checkRateLimit(userId)) continue
         if (event.replyToken) {
           try {
             await this.reply(event.replyToken, UNSUPPORTED_MEDIA_MESSAGE)
-          } catch { /* best-effort ack */ }
+          } catch {}
         }
         continue
       }
 
-      // Check allowlist
       if (this.allowedUsers.size > 0 && !this.allowedUsers.has(userId)) {
         log.warn('LINE message from non-allowed user', { userId })
         continue
       }
 
-      // Rate limit
       if (!this.checkRateLimit(userId)) continue
 
-      // Get user profile for display name
       let displayName = userId
       try {
         displayName = await this.getUserName(userId)
       } catch {
-        // Use userId as fallback
       }
 
       const incoming: IncomingMessage = {
@@ -173,7 +152,6 @@ export class LINEChannel implements IChannel {
     return true
   }
 
-  /** Reply using the reply token (more cost-efficient than push) */
   async reply(replyToken: string, text: string): Promise<void> {
     const url = 'https://api.line.me/v2/bot/message/reply'
     await fetch(url, {

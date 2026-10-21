@@ -14,10 +14,8 @@ function substitutePlaceholders(
   value: string,
   variables: Record<string, string>,
 ): string {
-  // Replace {workdir} with cwd
   let result = value.replace(/\{workdir\}/g, process.cwd())
 
-  // Replace {env.VAR} with process.env.VAR (leave as-is if undefined)
   result = result.replace(/\{env\.([^}]+)\}/g, (_match, varName: string) => {
     const envValue = process.env[varName]
     return envValue !== undefined ? envValue : `{env.${varName}}`
@@ -89,7 +87,6 @@ export async function installMcpServer(
     entry.args = template.args ? substituteArray(template.args, variables) : []
     entry.env = template.env ? substituteRecord(template.env, variables) : {}
   } else {
-    // sse or http
     entry.url = template.url ? substitutePlaceholders(template.url, variables) : ''
     entry.headers = template.headers
       ? substituteRecord(template.headers, variables)

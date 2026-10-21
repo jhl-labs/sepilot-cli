@@ -29,6 +29,7 @@ import {
   isSameRuntimeNetworkConfigSnapshot,
 } from '../runtime/config-snapshot.js'
 import { openJsonWatch } from './watch-sse.js'
+import { applyBrowserSitePolicy, prepareToolPolicyUpdate } from '../runtime/security.js'
 
 type SettingsJsonWatchPayload =
   | { type: 'snapshot'; document: Record<string, unknown> }
@@ -213,9 +214,6 @@ export async function registerSettingsJsonRoutes(app: FastifyInstance): Promise<
         }
 
         try {
-          // Validate paths and environment-derived network inputs before any
-          // in-memory mutation or config.yaml write. This keeps settings JSON
-          // imports consistent with the dedicated Network endpoint.
           planProviderDispatcher(parsed.data.network)
         } catch (error) {
           if (error instanceof ProviderNetworkConfigurationError) {
@@ -253,6 +251,7 @@ export async function registerSettingsJsonRoutes(app: FastifyInstance): Promise<
             cloneRuntimeConfigSnapshot(parsed.data),
           )
           nextConfig.configRevision = currentRevision + 1
+          const nextPolicy = prepareToolPolicyUpdate(previousConfig, nextConfig, runtime.dataDir)
 
           const updatedKeys = buildUpdatedKeys(previousConfig, nextConfig)
           const channelTypes = collectChannelTypesForRebind(
@@ -290,6 +289,8 @@ export async function registerSettingsJsonRoutes(app: FastifyInstance): Promise<
             rawChannels,
           )
           await writeConfigYamlAtomic(persistedConfig as Record<string, unknown>)
+          if (nextPolicy) runtime.policyEngine.updateConfig(nextPolicy)
+          else applyBrowserSitePolicy(runtime.policyEngine, nextConfig)
           savedDocument = persistedConfig
         })
 

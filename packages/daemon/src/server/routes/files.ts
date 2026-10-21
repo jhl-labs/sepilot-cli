@@ -36,7 +36,7 @@ import {
 export { fileOpenApiComponents, fileOpenApiOverrides } from './files-schema.js'
 
 const UPLOAD_DIR_NAME = 'uploads'
-const MAX_FILE_SIZE = 20 * 1024 * 1024 // 20MB
+const MAX_FILE_SIZE = 20 * 1024 * 1024
 export const ORPHAN_UPLOAD_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
 const SUPPORTED_EXT = new Set(getSupportedExtensions())
 const TEXT_EXT = new Set(getSupportedTextExtensions())
@@ -143,9 +143,6 @@ export async function fileRoutes(app: FastifyInstance) {
           })
         inFlight = pending
       }
-      // Do not hold daemon readiness behind a potentially large history scan.
-      // Registry last-access checks make the background sweep race-safe with
-      // requests that begin once route registration completes.
       if (restored > 0) triggerSweep()
       const timer = setInterval(triggerSweep, ORPHAN_UPLOAD_SWEEP_INTERVAL_MS)
       timer.unref()
@@ -160,7 +157,6 @@ export async function fileRoutes(app: FastifyInstance) {
     limits: { fileSize: MAX_FILE_SIZE, files: 10 },
   })
 
-  // POST /files/upload — multipart file upload
   app.post('/files/upload', async (request, reply) => {
     const runtime = app.runtime
     if (!runtime) {
@@ -245,7 +241,6 @@ export async function fileRoutes(app: FastifyInstance) {
     }
   })
 
-  // GET /files/:id — get file info
   app.get<{ Params: FileIdParams }>(
     '/files/:id',
     {
@@ -269,7 +264,6 @@ export async function fileRoutes(app: FastifyInstance) {
     },
   )
 
-  // GET /files/:id/download — stream uploaded/generated file bytes
   app.get<{ Params: FileIdParams }>(
     '/files/:id/download',
     {
@@ -290,7 +284,6 @@ export async function fileRoutes(app: FastifyInstance) {
     },
   )
 
-  // DELETE /files/:id — delete uploaded file
   app.delete<{ Params: FileIdParams }>(
     '/files/:id',
     {
@@ -315,7 +308,6 @@ export async function fileRoutes(app: FastifyInstance) {
     },
   )
 
-  // POST /files/:id/content-part — convert uploaded file to LLM ContentPart
   app.get<{ Params: FileIdParams }>(
     '/files/:id/content-part',
     {
@@ -408,11 +400,6 @@ export async function fileRoutes(app: FastifyInstance) {
     },
   )
 
-  // GET /files/search?q=&cwd=&limit= — workspace-scoped fuzzy file search
-  // for chat composer @mention completion. Walks `cwd` (capped at
-  // MAX_SEARCH_FILES entries) skipping common heavy directories, returns
-  // up to `limit` (default 8, max 32) entries scored by basename
-  // prefix → basename substring → path substring.
   app.get<{ Querystring: FilesSearchQuery }>(
     '/files/search',
     {
@@ -424,11 +411,6 @@ export async function fileRoutes(app: FastifyInstance) {
       }),
     },
     async (request, reply) => {
-      // After zod validation: cwd is required string, q is optional,
-      // limit is optional coerced number. Route-boundaries lint forbids
-      // direct field access on the request query object, so destructure
-      // into a typed local first and pull the validated values from
-      // there.
       const runtime = app.runtime
       const query = request.query
       const q = (query.q ?? '').trim()
@@ -441,9 +423,6 @@ export async function fileRoutes(app: FastifyInstance) {
           },
         })
       }
-      // Contain the search to configured workspace roots (default: the daemon
-      // user's home directory) so an arbitrary cwd cannot enumerate the whole
-      // filesystem layout.
       let canonicalCwd: string
       let searchRoots: string[]
       try {
@@ -482,7 +461,6 @@ export async function fileRoutes(app: FastifyInstance) {
       try {
         entries = await scanWorkspace(canonicalCwd)
       } catch (error) {
-        // Do not leak the raw fs error (path/errno). Log details server-side.
         request.log.warn({ err: error }, 'files.search cwd unreadable')
         return reply.status(404).send({
           error: {
@@ -545,8 +523,6 @@ async function scanWorkspace(
 ): Promise<Array<{ path: string; basename: string; isDirectory: boolean }>> {
   const out: Array<{ path: string; basename: string; isDirectory: boolean }> = []
   const root = cwd
-  // Confirm cwd exists and is a dir before walking — surfaces 404 in the
-  // route instead of an opaque ENOENT.
   await stat(cwd)
   const queue: string[] = [cwd]
   while (queue.length > 0 && out.length < MAX_SEARCH_FILES) {
@@ -568,10 +544,6 @@ async function scanWorkspace(
       } catch {
         continue
       }
-      // Workspace search is a discovery surface, so following a directory
-      // symlink/junction can disclose names from outside the selected root.
-      // File access tools perform their own canonical boundary checks; the
-      // mention picker simply omits links entirely and never traverses them.
       if (info.isSymbolicLink()) continue
       const rel = relative(root, abs).split(sep).join('/')
       out.push({
@@ -590,8 +562,6 @@ function scoreMatches(
   query: string,
 ): Array<{ path: string; basename: string; isDirectory: boolean }> {
   if (!query) {
-    // No query: surface a stable, alphabetised slice (most common
-    // first-letter shortcuts work).
     return entries.slice().sort((a, b) => a.path.localeCompare(b.path))
   }
   const q = query.toLowerCase()

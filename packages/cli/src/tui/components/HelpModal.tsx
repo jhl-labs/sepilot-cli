@@ -241,7 +241,7 @@ export function HelpModal({ height, onClose, context }: HelpModalProps) {
       ),
     [flatLines],
   )
-  const reservedRows = 4 // border + title + footer hint + divider
+  const reservedRows = 4
   const visibleRows = Math.max(1, (height ?? flatLines.length + reservedRows) - reservedRows)
   const [scrollOffset, setScrollOffset] = useState(0)
   const maxOffset = Math.max(0, flatLines.length - visibleRows)

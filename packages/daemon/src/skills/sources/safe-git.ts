@@ -21,17 +21,6 @@ export interface SafeGitTransport {
   createGit(baseDir?: string): SimpleGit
 }
 
-/**
- * Build an isolated git execution context for a skill source.
- *
- * Remote git is deliberately narrower than a generic `git clone`: only HTTPS
- * is accepted, redirects and proxies are disabled, and libcurl is pinned to
- * the public address approved by the SSRF guard. GitHub is trusted because it
- * backs the built-in marketplace; other hosts require an explicit operator
- * allowlist. Local filesystem repositories remain available for tests and
- * operator-managed sources, but UNC and scp/remote-helper spellings are
- * rejected so they cannot silently become network access.
- */
 export async function prepareSafeGitTransport(
   rawSource: string,
   runtime: SafeGitRuntime = {},
@@ -141,9 +130,6 @@ function createTransport(source: string, remote: boolean, config: string[]): Saf
           stdErr: true,
           stdOut: true,
         },
-        // Every protocol override above is a fixed internal value. Opting in
-        // here only bypasses simple-git's generic argv guard; callers cannot
-        // supply additional git config.
         unsafe: {
           allowUnsafeConfigPaths: true,
           allowUnsafeProtocolOverride: true,
@@ -176,9 +162,6 @@ async function assertPinnedDnsSupported(
 }
 
 export function supportsCurloptResolve(major: number, minor: number): boolean {
-  // Ubuntu 22.04 ships Git 2.34, whose libcurl transport supports this
-  // option.  Requiring 2.37 made the supported CI/runtime platform reject
-  // every remote marketplace before it could use the pinned-DNS defence.
   return major > 2 || (major === 2 && minor >= 34)
 }
 
@@ -237,8 +220,6 @@ function isolatedGitEnvironment(): NodeJS.ProcessEnv {
       delete env[key]
     }
   }
-  // simple-git rejects inherited pager commands unless its unsafe pager mode
-  // is enabled. An isolated non-interactive transport must never invoke one.
   delete env.PAGER
   env.GCM_INTERACTIVE = 'Never'
   env.GIT_CONFIG_GLOBAL = configNullDevice

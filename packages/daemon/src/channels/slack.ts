@@ -67,16 +67,11 @@ export class SlackChannel implements IChannel {
     }
   }
 
-  /** Process incoming Slack event (called by webhook route) */
   async handleEvent(body: Record<string, unknown>): Promise<void> {
-    if (body.type === 'url_verification') return // Challenge handled by route
+    if (body.type === 'url_verification') return
 
     const event = body.event as Record<string, unknown> | undefined
     if (event?.type === 'message' && !event.bot_id) {
-      // Ignore edited/deleted/system message subtypes: `message_changed` and
-      // `message_deleted` nest the real content under `event.message` and would
-      // otherwise dispatch with empty text and an undefined sender. `file_share`
-      // is the one subtype we still process (handled by the media-ack check).
       const subtype = event.subtype as string | undefined
       if (subtype && subtype !== 'file_share') return
 
@@ -85,20 +80,16 @@ export class SlackChannel implements IChannel {
       const ts = event.ts as string
       const text = (event.text as string) ?? ''
       const conversationType = event.channel_type as string | undefined
-      // Preserve thread context so a reply stays in the originating thread
-      // instead of collapsing to the channel root.
       const threadTs = typeof event.thread_ts === 'string' ? event.thread_ts : undefined
 
       if (this.config.allowedChannels?.length && !this.config.allowedChannels.includes(channel)) return
       if (this.config.allowedUsers?.length && !this.config.allowedUsers.includes(user)) return
 
-      // Inbound media (file uploads) can't be processed yet. Ack instead of
-      // silently dropping so the sender knows the upload wasn't handled.
       const files = event.files as unknown[] | undefined
       if ((Array.isArray(files) && files.length > 0) && text.trim().length === 0) {
         try {
           await this.sendMessage({ id: channel, type: 'channel' }, { text: UNSUPPORTED_MEDIA_MESSAGE })
-        } catch { /* best-effort ack */ }
+        } catch {}
         return
       }
 
@@ -116,7 +107,7 @@ export class SlackChannel implements IChannel {
         },
       }
       for (const h of this.handlers) {
-        try { await h(msg) } catch { /* handler errors are silently ignored */ }
+        try { await h(msg) } catch {}
       }
     }
   }

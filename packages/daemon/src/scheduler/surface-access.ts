@@ -5,13 +5,6 @@ export type SchedulerSurface = 'cli' | 'desktop' | 'mobile'
 
 export const SCHEDULER_SURFACE_DISABLED_CODE = 'SCHEDULER_SURFACE_DISABLED'
 
-/**
- * `scheduler` is optional in the config schema, so a config file that never
- * mentions it — every fresh install — leaves the key undefined. Fall back to
- * the schema's declared per-surface defaults instead of reading "absent" as
- * "every surface disabled", which silently contradicts them and rejects the
- * surfaces the schema enables by default.
- */
 export function isSchedulerSurfaceEnabled(
   config: Pick<SepilotdConfig, 'scheduler'> | undefined,
   surface: SchedulerSurface,

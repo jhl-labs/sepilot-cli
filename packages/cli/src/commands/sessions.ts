@@ -33,9 +33,6 @@ function relativeTimeLabel(deltaMs: number): string {
   return remMin === 0 ? `${hours}h` : `${hours}h${remMin}m`
 }
 
-// Compact "updated X ago" label — covers anything from seconds to
-// weeks. Unlike relativeTimeLabel above it doesn't bail on long
-// gaps; sessions list commonly shows runs from days/weeks ago.
 function elapsedSinceLabel(iso: string, now: number): string {
   const updated = new Date(iso).getTime()
   if (Number.isNaN(updated)) return ''
@@ -81,8 +78,6 @@ export function resolveEventTail(raw: string | undefined): number {
 }
 
 function snippet(text: string, max = 80): string {
-  // Collapse code-fence newlines so a leaked ```a2ui block doesn't
-  // bleed across the rest of the events list.
   const flat = text.replace(/\s+/g, ' ').trim()
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat
 }
@@ -97,10 +92,6 @@ function formatSessionEvent(event: SessionEvent): string {
     case 'tool_call':
       return event.tool
     case 'approval_request': {
-      // Surface status + reason note on the audit trail. Without these
-      // an operator browsing `sessions show` after the fact can't tell
-      // approved from denied, and can't recall *why* they denied — both
-      // critical for "what did I just consent to?" reviews.
       const status = (event as { status?: string }).status
       const note = (event as { note?: string }).note
       const statusLabel = status && status !== 'pending' ? ` [${status}]` : ''
@@ -164,10 +155,6 @@ function formatSessionEvent(event: SessionEvent): string {
     case 'state_board':
       return 'board snapshot'
     case 'auto_approval':
-      // Mirrors the live `[auto-approved]` cli banner so audit
-      // browsers see the same scope/pattern as a live operator did —
-      // bridges the gap between the live ux signal and post-hoc
-      // `sessions show` review.
       return `${event.tool} auto-${event.decision} via ${event.scope} rule '${event.rule.pattern}'`
     default:
       return ''
@@ -334,10 +321,6 @@ function truncateTitle(title: string | undefined, width: number): string {
   return `${value.slice(0, width - 1)}…`
 }
 
-// Branch/import sessions are tagged on the daemon side. Surface a
-// small lineage glyph in cli output so the operator can tell a
-// derived run from a fresh one without --json. Matches the web
-// sidebar badge vocabulary.
 function lineageGlyph(tags: string[] = []): string {
   if (tags.some((tag) => tag.startsWith('branch:'))) return chalk.cyan('⌥')
   if (tags.includes('imported:share')) return chalk.cyan('⇣')
@@ -368,10 +351,6 @@ export async function sessionsCommand(options: {
 }) {
   const client = new DaemonClient(options.url)
   const status = parseSessionStatus(options.status)
-  // Always request approval counters from the cli — the column is
-  // the headline operator signal for "which sessions actually
-  // exercised the consent flow vs. ran on auto?". Web/desktop list
-  // views still default to metrics=false to keep their list cheap.
   const limitArg = options.limit ? Number.parseInt(options.limit, 10) : 20
   const limit = Number.isFinite(limitArg) && limitArg >= 0 ? limitArg : 20
   const first = await client.sessions(options.query, {
@@ -403,16 +382,11 @@ export async function sessionsCommand(options: {
   }
   output(data, (d) => {
     if (!d.items?.length) {
-      // Friendlier empty-list copy under --status — "no sessions"
-      // alone leaves operators wondering whether the daemon's empty
-      // or the filter excluded them.
       return status ? `No ${status} sessions.` : 'No sessions.'
     }
     const items = limit === 0 ? d.items : d.items.slice(0, limit)
     const filterLabel = status ? `, status=${status}` : ''
     const lines = [`Sessions (${d.totalCount} total${filterLabel}, showing ${items.length}):\n`]
-    // Column header — same widths as the data rows below, in chalk.dim
-    // so it sits behind the data but still anchors the eye.
     const showCost = items.some((s) => s.totalCost > 0)
     const costHeader = showCost ? `  ${'COST'.padStart(8)}` : ''
     const now = Date.now()
@@ -422,10 +396,6 @@ export async function sessionsCommand(options: {
       ),
     )
     for (const s of items) {
-      // Only render the approvals column when at least one signal
-      // exists — a quiet session shouldn't drag a "appr: 0/0/0" tag
-      // along that adds noise to the row. Auto-only sessions still
-      // light up because autoApprovalsApproved bumps the threshold.
       const counters = s.approvalCounters
       const hasApprovalActivity =
         counters && (counters.approvalsRequested > 0 || counters.autoApprovalsApproved > 0)
@@ -433,10 +403,6 @@ export async function sessionsCommand(options: {
         ? `  appr: ${counters.approvalsRequested}/${counters.approvalsApproved}/${counters.approvalsDenied}` +
           (counters.autoApprovalsApproved > 0 ? ` · auto: ${counters.autoApprovalsApproved}` : '')
         : ''
-      // Tint the status column so a 200-row list lets the operator
-      // skim active vs. archived without parsing the word every line.
-      // Mirrors the web sidebar treatment: green=active, dim=completed,
-      // red=abandoned.
       const paddedStatus = s.status.padEnd(10)
       const statusLabel =
         s.status === 'active'
@@ -444,9 +410,6 @@ export async function sessionsCommand(options: {
           : s.status === 'abandoned'
             ? chalk.red(paddedStatus)
             : chalk.dim(paddedStatus)
-      // Render cost only when at least one row in the page actually
-      // accrued spend; an all-$0 page would otherwise carry a column
-      // of zeros that adds visual noise.
       const costLabel = showCost
         ? '  ' +
           (s.totalCost > 0
@@ -497,18 +460,10 @@ export async function sessionDetailCommand(id: string, options: { url?: string; 
     process.exit(1)
   }
   output(data, (d) => {
-    // After a long-running session, an operator's first question is
-    // "what has this cost me so far?" — surface accumulated tokens and
-    // cost up front so the headline doesn't drop them under the events
-    // log where nobody scrolls. The mock daemon records 22 tokens / turn,
-    // so this becomes the most useful number on screen after 20+ rounds.
     const tokens = d.totalTokens
       ? `${(d.totalTokens.input ?? 0).toLocaleString()} in / ${(d.totalTokens.output ?? 0).toLocaleString()} out`
       : null
     const cost = typeof d.totalCost === 'number' ? `$${d.totalCost.toFixed(4)}` : null
-    // Same status colour vocabulary as `sessions list` so the
-    // operator can land on the same row twice and read the same
-    // signal without re-learning it.
     const statusLabel =
       d.status === 'active'
         ? chalk.green(d.status)
@@ -540,14 +495,6 @@ export async function sessionDetailCommand(id: string, options: { url?: string; 
       const costLine = cost ? ` (cost ${cost})` : ''
       lines.push(`Tokens: ${tokenLine}${costLine}`)
     }
-    // Approvals at-a-glance: surface traceMetrics counts up front so an
-    // operator auditing "what consent decisions did this session
-    // accumulate?" doesn't have to re-render with --json | jq. Auto-
-    // approval counts are split onto their own sub-line so the
-    // explicit-vs-rule-driven distinction is obvious — without it,
-    // a 1-prompt session that ran 20 tools via a remembered rule
-    // looks identical to a single-tool session, masking the actual
-    // automation level.
     const trace = d.traceMetrics
     if (trace) {
       const providerAttemptEvents = trace.providerAttemptEvents ?? 0
@@ -574,9 +521,6 @@ export async function sessionDetailCommand(id: string, options: { url?: string; 
         if (feedback > 0) parts.push(`${feedback} feedback`)
         lines.push(`\nApprovals: ${parts.join(' · ')}`)
         if (autoApproved > 0 || autoDenied > 0) {
-          // The auto: line only fires when something actually
-          // short-circuited; keeping it conditional means a session
-          // with no remembered rules doesn't get a noisy "auto: 0/0".
           const autoParts = [`${autoApproved} approved`]
           if (autoDenied > 0) autoParts.push(`${autoDenied} denied`)
           lines.push(chalk.gray(`  auto (remembered rule): ${autoParts.join(' · ')}`))
@@ -723,13 +667,6 @@ export async function sessionDetailCommand(id: string, options: { url?: string; 
         lines.push(chalk.yellow(`  ! ${risk.message}`))
       }
     }
-    // Working memory: condensed view of what the session has actually
-    // *decided* and what's still open. Lifts keyDecisions (incl.
-    // auto_approval entries from the durable journal) out of --json so
-    // an operator scanning `sessions show` after the fact sees a
-    // human-readable answer to "what did this run end up agreeing to?"
-    // — without it, the only audit path was to scroll the events tail
-    // and infer from approval_request/auto_approval rows directly.
     const wm = d.workingMemory
     if (wm) {
       const wmLines: string[] = []
@@ -744,9 +681,6 @@ export async function sessionDetailCommand(id: string, options: { url?: string; 
           const age = decision.timestamp
             ? relativeTimeLabel(now - new Date(decision.timestamp).getTime())
             : null
-          // relativeTimeLabel returns 'expired' for past timestamps;
-          // re-frame as "<X> ago" so an audit reader doesn't see
-          // "expired" applied to a recorded decision.
           const ageLabel = age && age !== 'expired' ? ` (${age} ago)` : ''
           wmLines.push(`    · ${decision.summary}${chalk.gray(ageLabel)}`)
         }
@@ -768,11 +702,6 @@ export async function sessionDetailCommand(id: string, options: { url?: string; 
     }
     if (d.pendingApprovals?.length) {
       const now = Date.now()
-      // Headline count first so an operator scrolling past `sepilot
-      // session show <id>` notices the run is paused on a decision; the
-      // per-row detail (args preview, age, expiry, decide hint) follows
-      // underneath, mirroring what the chat shell's `/approvals` command
-      // shows so an operator switching surfaces sees the same content.
       lines.push(
         `\nPending approvals: ${chalk.yellow(String(d.pendingApprovals.length))} ` +
           `(use \`/approve <id>\` or \`/deny <id>\` from the chat shell)`,
@@ -781,10 +710,6 @@ export async function sessionDetailCommand(id: string, options: { url?: string; 
         const askedAgo = approval.requestedAt
           ? relativeTimeLabel(now - new Date(approval.requestedAt).getTime())
           : null
-        // `relativeTimeLabel(<=0)` returns 'expired'; combining that
-        // with ' until timeout' produced the awkward 'expired until
-        // timeout'. Render the past-the-deadline case as a bare
-        // 'expired' label so an operator can scan for it visually.
         const expiresIn = approval.expiresAt
           ? relativeTimeLabel(new Date(approval.expiresAt).getTime() - now)
           : null
@@ -806,11 +731,6 @@ export async function sessionDetailCommand(id: string, options: { url?: string; 
       }
     }
     if (d.events) {
-      // Show only the tail so a 100-turn session doesn't flood the
-      // terminal, but tell the operator how many earlier events are
-      // hidden — silent truncation made `sessions show` look like the
-      // full log when it wasn't, which is the regression this branch
-      // fixes. `--json` carries the full events array for tooling.
       lines.push(`\nEvents (${d.events.length}):`)
       if (d.events.length > tailLimit) {
         lines.push(
@@ -1075,8 +995,6 @@ export async function sessionExportCommand(
   let content: string
   if (format === 'json') {
     const raw = (await res.json()) as unknown
-    // Unwrap the standard daemon envelope { data: ... } so the exported
-    // JSON file is the session payload itself, not an envelope wrapper.
     const payload =
       raw && typeof raw === 'object' && 'data' in (raw as Record<string, unknown>)
         ? (raw as { data: unknown }).data
@@ -1104,8 +1022,6 @@ export async function sessionExportCommand(
       process.exit(1)
     }
     if (options.output === '/dev/stdout' || options.output === '/dev/fd/1') {
-      // Keep redirected JSON/Markdown parseable: a success footer on stdout
-      // becomes an invalid trailing token for consumers such as jq.
       console.error(chalk.green('Output written to stdout'))
     } else {
       console.log(chalk.green(`Output written to ${options.output}`))

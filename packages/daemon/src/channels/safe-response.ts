@@ -24,14 +24,8 @@ function compactInternalFallbackLine(value: string): string {
 }
 
 function stripThinkingArtifactsForChannel(text: string): string {
-  // Remove all well-formed <think>...</think> (or <thinking>...</thinking>) blocks.
   let remaining = text.replace(/<(think|thinking)>[\s\S]*?<\/\1>/gi, '')
 
-  // Some models emit a closing </think> without an opening tag (the reasoning was
-  // streamed before the wrapper was injected). Only strip such a leading close tag
-  // when it is at the very start of the remaining text — never search-and-slice
-  // mid-response, since a legitimate answer may quote `</think>` in code blocks,
-  // documentation, or in a reply that echoes user-provided text.
   const trimmedLeading = remaining.trimStart()
   if (/^<\/(think|thinking)>/i.test(trimmedLeading)) {
     remaining = trimmedLeading.replace(/^<\/(?:think|thinking)>/i, '')

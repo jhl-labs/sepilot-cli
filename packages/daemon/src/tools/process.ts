@@ -13,7 +13,7 @@ import { StringDecoder } from 'node:string_decoder'
 import { promisify } from 'node:util'
 import xtermHeadless from '@xterm/headless'
 import type { Terminal as HeadlessTerminal } from '@xterm/headless'
-import type { IHookRegistry, ToolExecutionPosture } from '@sepilotd/core'
+import type { IHookRegistry, ToolExecutionPosture, ToolResultMetadata } from '@sepilotd/core'
 import { getAbortError, throwIfAborted } from '../abort.js'
 import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
 
@@ -315,6 +315,7 @@ const MANAGED_PROCESS_START_FIELDS = new Set([
   'lifetime',
   'pty',
   'network',
+  'notifyOnExit',
 ])
 
 function invalidManagedProcessStartShape(output: string): ToolResult {
@@ -328,6 +329,7 @@ function invalidManagedProcessStartShape(output: string): ToolResult {
 
 function validateManagedProcessStartShape(input: Record<string, unknown>): ToolResult | null {
   if (input.interactive !== undefined && typeof input.interactive !== 'boolean') return invalidManagedProcessStartShape('interactive must be a boolean')
+  if (input.notifyOnExit !== undefined && typeof input.notifyOnExit !== 'boolean') return invalidManagedProcessStartShape('notifyOnExit must be a boolean')
   const unsupported = Object.keys(input).filter((key) => !MANAGED_PROCESS_START_FIELDS.has(key))
   if (unsupported.length > 0) {
     return invalidManagedProcessStartShape(
@@ -473,9 +475,6 @@ async function waitForManagedLoopbackSockets(
     )
     if (ready.every(Boolean)) {
       socketsReadySince ??= Date.now()
-      // The wrapper creates its Unix sockets immediately before spawning the
-      // requested executable. Require a short stable window so an exec failure
-      // cannot race the socket check and be misreported as a running server.
       if (Date.now() - socketsReadySince >= 100) return
     } else {
       socketsReadySince = undefined
@@ -525,15 +524,6 @@ export class ManagedProcessLimitError extends Error {
   }
 }
 
-/**
- * Bounded, multibyte-safe accumulator for a managed process stream. A
- * StringDecoder keeps UTF-8 codepoints intact across chunk boundaries (raw
- * `chunk.toString()` corrupts multibyte sequences split at a byte boundary),
- * and the retained window is capped so a chatty child cannot grow the buffer
- * without limit. Absolute offsets are preserved across eviction so incremental
- * readers stay consistent; a reader that falls behind the evicted window gets a
- * truncation marker instead of silently shifted data.
- */
 export class BoundedProcessOutput {
   private readonly decoder = new StringDecoder('utf8')
   private text = ''
@@ -572,11 +562,6 @@ export interface ManagedProcessPtyOptions {
   rows: number
 }
 
-/**
- * Headless VT screen used for bounded observation of full-screen terminal
- * programs. Raw output remains available for audit/debugging while callers get
- * the current visible screen without having to interpret cursor-control bytes.
- */
 export class ManagedProcessPtyScreen {
   private readonly terminal: HeadlessTerminal
   private pendingWrites = 0
@@ -651,8 +636,8 @@ interface ManagedProcessRecord {
   pty?: ManagedProcessPtyScreen
   ownerSessionId?: string
   ownerExecutionId?: string
-  /** Strict workspace capability that may rediscover this process across turns. */
   ownerWorkspaceRoot?: string
+  notifyOnExit?: boolean
   loopbackBridge?: ManagedLoopbackBridge
   hookChain: Promise<void>
   exitPromise: Promise<void>
@@ -751,6 +736,21 @@ function parseSignal(rawSignal: unknown): NodeJS.Signals {
     : 'SIGTERM'
 }
 
+function managedProcessMetadata(
+  record: NonNullable<ToolResultMetadata['managedProcess']>,
+): ToolResultMetadata {
+  return {
+    managedProcess: {
+      id: record.id,
+      startedAt: record.startedAt,
+      status: record.status,
+      exitCode: record.exitCode,
+      signal: record.signal,
+      ...(record.terminationReason ? { terminationReason: record.terminationReason } : {}),
+    },
+  }
+}
+
 function snapshotManagedProcess(record: ManagedProcessRecord) {
   return {
     interactive: record.child.stdin !== null,
@@ -784,16 +784,6 @@ function snapshotManagedProcess(record: ManagedProcessRecord) {
   }
 }
 
-/**
- * A POSIX process group can remain addressable while it contains only zombie
- * descendants waiting for the host/container init process to reap them.
- * kill(-pgid, 0) reports that group as present even though no member can run
- * or handle another signal. Linux /proc lets us distinguish that settled
- * state without treating a genuinely live descendant as exited.
- *
- * null means the inspection was not authoritative, so callers must retain the
- * conservative kill(0) result.
- */
 function linuxProcessGroupHasLiveMembers(processGroupId: number): boolean | null {
   if (process.platform !== 'linux') return null
 
@@ -900,12 +890,61 @@ function presentManagedProcessOutput<T extends {
   }
 }
 
+export interface ManagedProcessExitEvent {
+  process: ReturnType<typeof snapshotManagedProcess>
+  ownerSessionId?: string
+  notifyOnExit: boolean
+  terminationReason?: ManagedProcessRecord['terminationReason']
+  stdoutTail: string
+  stderrTail: string
+}
+
 export class ManagedProcessRegistry {
   private readonly records = new Map<string, ManagedProcessRecord>()
   private readonly maxProcesses = resolveMaxManagedProcesses()
   private readonly maxOutputChars = resolveManagedProcessMaxOutputChars()
   private readonly defaultTtlMs = resolveDefaultManagedProcessTtlMs()
   private hookRegistry?: IHookRegistry
+  private readonly exitListeners = new Set<(event: ManagedProcessExitEvent) => void>()
+
+  onExit(listener: (event: ManagedProcessExitEvent) => void): () => void {
+    this.exitListeners.add(listener)
+    return () => { this.exitListeners.delete(listener) }
+  }
+
+  outputSince(id: string, offsets: { stdout: number; stderr: number }): { stdout: string; stderr: string; next: { stdout: number; stderr: number }; exited: boolean } | null {
+    const record = this.records.get(id)
+    if (!record) return null
+    const stdout = record.stdout.read(offsets.stdout)
+    const stderr = record.stderr.read(offsets.stderr)
+    return {
+      stdout: stdout.chunk,
+      stderr: stderr.chunk,
+      next: { stdout: record.stdout.totalLength, stderr: record.stderr.totalLength },
+      exited: record.status === 'exited',
+    }
+  }
+
+  ownerOf(id: string): string | undefined {
+    return this.records.get(id)?.ownerSessionId
+  }
+
+  private notifyExit(record: ManagedProcessRecord): void {
+    if (this.exitListeners.size === 0) return
+    const tail = (output: BoundedProcessOutput, chars: number) =>
+      output.read(Math.max(0, output.totalLength - chars)).chunk
+    const event: ManagedProcessExitEvent = {
+      process: snapshotManagedProcess(record),
+      ...(record.ownerSessionId ? { ownerSessionId: record.ownerSessionId } : {}),
+      notifyOnExit: record.notifyOnExit === true,
+      ...(record.terminationReason ? { terminationReason: record.terminationReason } : {}),
+      stdoutTail: record.pty ? record.pty.snapshot().slice(-1_500) : tail(record.stdout, 1_500),
+      stderrTail: tail(record.stderr, 800),
+    }
+    for (const listener of this.exitListeners) {
+      try { listener(event) } catch {}
+    }
+  }
 
   setHookRegistry(hookRegistry: IHookRegistry | undefined): void {
     this.hookRegistry = hookRegistry
@@ -945,8 +984,6 @@ export class ManagedProcessRegistry {
         },
       })
     } catch {
-      // Background lifecycle hooks are observational and must never break or
-      // retain a managed child when a handler fails.
     }
   }
 
@@ -954,9 +991,6 @@ export class ManagedProcessRegistry {
     event: 'post:process:start' | 'post:process:exit',
     record: ManagedProcessRecord,
   ): void {
-    // Serialize lifecycle events per child. A fast process can exit while a
-    // slow webhook is still delivering its start event; consumers must never
-    // observe exit before start.
     record.hookChain = record.hookChain
       .then(() => this.emitProcessHook(event, record))
       .catch(() => undefined)
@@ -977,13 +1011,13 @@ export class ManagedProcessRegistry {
     cwd?: string
     env?: Record<string, string>
     ttlMs?: number
-    /** Operator-facing command when the actual child is a sandbox launcher. */
     displayCommand?: string
     executionPosture?: ToolExecutionPosture
     pty?: ManagedProcessPtyOptions
     ownerSessionId?: string
     ownerExecutionId?: string
     ownerWorkspaceRoot?: string
+    notifyOnExit?: boolean
     loopbackBridge?: ManagedLoopbackBridge
   }): ManagedProcessRecord {
     if (this.countRunning() >= this.maxProcesses) {
@@ -1001,6 +1035,7 @@ export class ManagedProcessRegistry {
         : process.env,
       detached: isolatedProcessGroup,
       stdio: [input.interactive ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     }) as ChildProcessByStdio<Writable | null, Readable, Readable>
     const id = randomUUID()
 
@@ -1029,6 +1064,7 @@ export class ManagedProcessRegistry {
       ...(input.ownerSessionId ? { ownerSessionId: input.ownerSessionId } : {}),
       ...(input.ownerExecutionId ? { ownerExecutionId: input.ownerExecutionId } : {}),
       ...(input.ownerWorkspaceRoot ? { ownerWorkspaceRoot: resolve(input.ownerWorkspaceRoot) } : {}),
+      ...(input.notifyOnExit ? { notifyOnExit: true } : {}),
       ...(input.loopbackBridge ? { loopbackBridge: input.loopbackBridge } : {}),
       hookChain: Promise.resolve(),
       exitPromise,
@@ -1041,21 +1077,19 @@ export class ManagedProcessRegistry {
       resolveExit?.()
       void record.loopbackBridge?.close()
       this.queueProcessHook('post:process:exit', record)
+      record.hookChain = record.hookChain.then(() => this.notifyExit(record)).catch(() => undefined)
     }
 
     child.stdout.on('data', (chunk: Buffer | string) => {
       record.stdout.append(chunk)
       record.pty?.append(chunk)
     })
-    child.stdin?.on('error', () => { /* write callback reports closed input; never crash the daemon */ })
+    child.stdin?.on('error', () => {})
     child.stderr.on('data', (chunk: Buffer | string) => {
       record.stderr.append(chunk)
     })
     child.on('error', (error) => {
       record.stderr.append(`${error.message}\n`)
-      // spawn() reports setup failures asynchronously and does not emit exit
-      // when no child was created. Close the registry session immediately so
-      // callers do not wait until the TTL for a process that never existed.
       if (!record.pid) record.finalizeExit()
     })
     child.on('close', (code, signal) => {
@@ -1065,9 +1099,6 @@ export class ManagedProcessRegistry {
         record.finalizeExit()
         return
       }
-      // A shell wrapper can exit while a child remains in the isolated process
-      // group. Keep the session live (and its TTL armed) until the whole group
-      // is gone instead of losing ownership of an orphaned daemon.
       void waitForManagedTargetExit(record, ttlMs > 0 ? ttlMs : MAX_MANAGED_PROCESS_TTL_MS)
         .then((exited) => { if (exited) record.finalizeExit() })
     })
@@ -1083,12 +1114,6 @@ export class ManagedProcessRegistry {
     return record
   }
 
-  /**
-   * Terminate every still-running managed child and drop all records. Invoked
-   * from lifecycle teardown so a daemon restart does not leave orphaned
-   * background processes behind. Running children get SIGTERM, then any that
-   * have not exited within a short grace window are escalated to SIGKILL.
-   */
   async stopAll(): Promise<void> {
     const running = [...this.records.values()].filter(
       (record) => record.status === 'running',
@@ -1132,15 +1157,6 @@ export class ManagedProcessRegistry {
     return this.loopbackConnectionsForScope(sessionId)
   }
 
-  /**
-   * Return loopback bridges available to the current execution capability.
-   *
-   * Exact session ownership remains sufficient. A live process may also be
-   * reused by a later turn (including a cowork child) when both executions
-   * carry the same strict workspace root. This is the capability boundary
-   * promised by lifetime='session' + process.sessions; it does not expose a
-   * bridge to another workspace or to an unscoped caller.
-   */
   loopbackConnectionsForScope(
     sessionId: string | undefined,
     workspaceRoot?: string,
@@ -1380,16 +1396,9 @@ export class ManagedProcessRegistry {
       exited = await waitForManagedTargetExit(record, STOP_KILL_SETTLE_MS)
     }
     if (exited && record.status === 'running') {
-      // Group liveness can settle just before Node emits the leader's close
-      // event. Give that event one polling interval to retain its exit code or
-      // signal before force-finalizing a wrapper whose close event occurred
-      // earlier while descendants were still alive.
       await Promise.race([record.exitPromise, delay(FOLLOW_POLL_MS)])
     }
     if (exited && record.status === 'running') {
-      // Process-group liveness is authoritative.  Waiting only for the
-      // leader's exit event left a short race where callers saw "running"
-      // after every descendant was gone on busy hosts.
       record.finalizeExit()
     }
     return snapshotManagedProcess(record)
@@ -1543,6 +1552,10 @@ export function createManagedProcessStartTool(
           enum: ['bounded', 'session'],
           description: "Lifecycle scope. 'bounded' is temporary and uses ttlMs/default TTL. 'session' disables TTL and survives agent turns, but is still stopped when the daemon shuts down. Defaults to 'bounded'.",
         },
+        notifyOnExit: {
+          type: 'boolean',
+          description: 'When the process exits on its own (not stopped by process.stop or daemon shutdown), deliver its exit code and output tail to this conversation and wake it if idle. Defaults to true; set false for long-lived servers whose exit needs no follow-up.',
+        },
         pty: {
           description: 'Allocate a headless terminal for full-screen/TUI output. Use true for defaults or provide bounded columns/rows. Enable interactive separately to accept input.',
           anyOf: [
@@ -1692,6 +1705,7 @@ export function createManagedProcessStartTool(
               ownerSessionId: context.sessionId,
               ownerExecutionId: context.executionId,
               ownerWorkspaceRoot: context.workspaceRoot,
+              notifyOnExit: input.notifyOnExit !== false,
               loopbackBridge,
             })
           } catch (error) {
@@ -1709,6 +1723,7 @@ export function createManagedProcessStartTool(
           }
           return {
             output: JSON.stringify(snapshotManagedProcess(record), null, 2),
+            metadata: managedProcessMetadata(record),
             status: 'success',
             durationMs: Date.now() - start,
             executionPosture: prepared.executionPosture,
@@ -1742,9 +1757,11 @@ export function createManagedProcessStartTool(
           pty,
           ownerSessionId: context?.sessionId,
           ownerExecutionId: context?.executionId,
+          notifyOnExit: input.notifyOnExit !== false,
         })
         return {
           output: JSON.stringify(snapshotManagedProcess(record), null, 2),
+          metadata: managedProcessMetadata(record),
           status: 'success',
           durationMs: Date.now() - start,
         }
@@ -1817,6 +1834,7 @@ export function createManagedProcessFollowTool(
           null,
           2,
         ),
+        metadata: managedProcessMetadata(payload.process),
         status: 'success',
         durationMs: Date.now() - start,
       }
@@ -1896,6 +1914,7 @@ export function createManagedProcessReadTool(
           null,
           2,
         ),
+        metadata: managedProcessMetadata(payload.process),
         status: 'success',
         durationMs: Date.now() - start,
       }
@@ -1959,6 +1978,7 @@ export function createManagedProcessWaitTool(
           null,
           2,
         ),
+        metadata: managedProcessMetadata(payload.process),
         status: 'success',
         durationMs: Date.now() - start,
       }
@@ -2042,13 +2062,6 @@ export function createProcessSignalTool(
         }
       }
 
-      // PID ownership check: only allow signalling processes the agent
-      // itself started via the ManagedProcessRegistry AND that are still
-      // running. Without the liveness half, an exited record keeps a dead
-      // PID alive as an owned target; once the OS recycles that PID onto an
-      // unrelated process, the agent could signal (and kill) it. Requiring a
-      // running record closes the PID-reuse bypass while still letting the
-      // agent stop its own live children.
       if (registry) {
         const owned = registry
           .list()

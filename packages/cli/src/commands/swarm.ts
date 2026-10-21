@@ -49,11 +49,6 @@ function parseWarmPool(raw: string | undefined): SwarmAgentName[] {
   return parts as SwarmAgentName[]
 }
 
-/**
- * Pure async core of `sepilot swarm run`. Tests inject a stub `client`
- * and `printer` so we can assert wire shape without standing up the
- * daemon transport.
- */
 export async function runSwarmStart(
   deps: RunSwarmStartDeps,
 ): Promise<{ runId: string }> {
@@ -75,7 +70,7 @@ export async function runSwarmStart(
 
 function buildClient(url?: string): SwarmClient {
   const baseUrl = resolveDaemonBaseUrl(url) ?? 'http://127.0.0.1:17600'
-  const token = loadDaemonToken()
+  const token = loadDaemonToken(baseUrl)
   return createSwarmClient({ baseUrl, token })
 }
 
@@ -191,21 +186,6 @@ export interface SwarmAttachOptions {
   agent?: string
 }
 
-/**
- * `sepilot swarm attach <runId>` — raw tmux mirror + key passthrough.
- *
- * Renders the active (or `--agent`-selected) pane by capturing the tmux
- * session and writing diffs to stdout. In an interactive TTY, stdin is put
- * in raw mode and every byte is forwarded to the daemon via sendKeys.
- *
- * Escape prefix is Ctrl-B (0x02), inspired by tmux. Recognised chords:
- *   - Ctrl-B d → detach (exit 0)
- *   - Ctrl-B k → cancel the run, then exit 0
- *   - Ctrl-B l → print agent list to stderr
- *
- * The SSE stream is still consumed so run-ended and pane.snapshot events
- * terminate or refresh the mirror promptly between poll ticks.
- */
 export async function swarmAttachCommand(
   runId: string,
   options: SwarmAttachOptions,
@@ -323,7 +303,6 @@ export async function swarmAttachCommand(
         if (ev.type === 'run.ended') stopRendering()
       }
     } catch {
-      /* abort */
     }
   })().catch(() => undefined)
 
@@ -524,7 +503,6 @@ function watchSwarmDrive(
         console.log(fmt(ev))
       }
     } catch {
-      /* stream abort or transient watch failure; drive result remains authoritative */
     }
   })()
   return {

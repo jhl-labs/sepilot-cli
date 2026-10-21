@@ -25,7 +25,6 @@ export class AgentCoordinator {
     this.engineOptions = options
   }
 
-  /** Run a single sub-task with its own AgentEngine */
   async runSubTask(task: SubTask): Promise<SubTaskResult> {
     const engine = new AgentEngine(this.engineOptions)
     const context: AgentContext = task.context ?? {
@@ -60,7 +59,6 @@ export class AgentCoordinator {
     }
   }
 
-  /** Run multiple sub-tasks sequentially */
   async runSequential(tasks: SubTask[]): Promise<SubTaskResult[]> {
     const results: SubTaskResult[] = []
     for (const task of tasks) {
@@ -69,14 +67,11 @@ export class AgentCoordinator {
     return results
   }
 
-  /** Run multiple sub-tasks in parallel */
   async runParallel(tasks: SubTask[]): Promise<SubTaskResult[]> {
     return Promise.all(tasks.map(task => this.runSubTask(task)))
   }
 
-  /** Plan and execute: use LLM to decompose a complex task, then execute sub-tasks */
   async *planAndExecute(input: string, context: AgentContext): AsyncIterable<AgentEvent> {
-    // Phase 1: Planning — use the LLM to decompose
     const planEngine = new AgentEngine({ ...this.engineOptions, maxIterations: 3 })
     const planPrompt = `Break down this task into 2-5 independent sub-tasks. Return a JSON array of objects with "id" and "instruction" fields only. Task: ${input}`
 
@@ -85,20 +80,17 @@ export class AgentCoordinator {
       if (event.type === 'message') planJson = event.content
     }
 
-    // Try to parse plan
     let subTasks: SubTask[]
     try {
       const match = planJson.match(/\[[\s\S]*\]/)
       subTasks = match ? JSON.parse(match[0]) : [{ id: '1', instruction: input }]
     } catch {
-      // Fallback: run as single task
       subTasks = [{ id: '1', instruction: input }]
     }
 
     yield { type: 'state_change', state: 'thinking' }
     yield { type: 'thinking', content: `Decomposed into ${subTasks.length} sub-tasks` }
 
-    // Phase 2: Execute sub-tasks
     const totalUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 }
 
     for (const task of subTasks) {
@@ -112,7 +104,6 @@ export class AgentCoordinator {
       }
     }
 
-    // Phase 3: Synthesize results
     const results = await this.runSequential(subTasks)
     const summary = results.map(r => `[${r.id}] ${r.content}`).join('\n\n')
 

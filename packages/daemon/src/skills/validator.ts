@@ -19,12 +19,10 @@ export function validateSkill(
   const errors: string[] = []
   const warnings: string[] = []
 
-  // 1. Check required fields
   if (!skill.name) errors.push('Skill name is required')
   if (!skill.version) errors.push('Skill version is required')
   if (!skill.description) errors.push('Skill description is required')
 
-  // 2. Check all required tools exist
   if (skill.tools) {
     for (const toolName of skill.tools) {
       if (!toolRegistry.get(toolName)) {
@@ -126,7 +124,6 @@ export function validateSkill(
     }
   }
 
-  // 3. Check autonomy level
   if (skill.autonomy_required) {
     const requiredLevel = skill.autonomy_required
     if (!autonomyAllows(requiredLevel, currentAutonomy)) {
@@ -134,7 +131,6 @@ export function validateSkill(
     }
   }
 
-  // 4. Check for dangerous patterns in skill content
   const dangerousPatterns = [
     /rm\s+-rf\s+\//,
     /eval\s*\(/,
@@ -149,7 +145,6 @@ export function validateSkill(
     }
   }
 
-  // 5. Check tool policy for each declared tool
   if (skill.tools) {
     for (const toolName of skill.tools) {
       const result = policyEngine.check({ tool: toolName, input: {} }, currentAutonomy)

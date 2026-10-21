@@ -50,6 +50,10 @@ export {
   type ComposerShortcutHintOptions,
 } from './chat/composer-shortcuts.js'
 export {
+  FrameViewer,
+  type FrameViewerProps,
+} from './views/react.js'
+export {
   formatStateBoardText,
   stateBoardIsEmpty,
 } from './state-board/format.js'

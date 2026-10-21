@@ -1,10 +1,5 @@
 import type { DaemonConfigProvider } from '@sepilotd/api-client'
 
-/**
- * Per-model capability flags that operators may toggle from the TUI.
- * Mirrors the daemon's providerModelCapabilitiesOverrideSchema subset that is
- * meant as an operator judgement (weak-model support), not a hardware fact.
- */
 export const TOGGLEABLE_MODEL_CAPABILITIES = [
   'adaptivePromptReact',
   'promptReactPreferred',
@@ -51,7 +46,6 @@ function readModelOverrides(provider: DaemonConfigProvider): ProviderModelOverri
 
 export interface ModelCapabilityView {
   capability: ToggleableModelCapability
-  /** Effective value: model override, else provider capabilities, else off. */
   enabled: boolean
   source: 'model-override' | 'provider' | 'default'
 }
@@ -83,10 +77,6 @@ export interface ApplyCapabilityResult {
   changed: boolean
 }
 
-/**
- * Returns a new providers array with the capability set on the model's
- * modelOverrides entry (created if missing). Does not mutate the input.
- */
 export function applyModelCapabilityOverride(
   providers: DaemonConfigProvider[],
   providerId: string,

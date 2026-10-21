@@ -37,14 +37,6 @@ import {
   waitForBackgroundChat,
 } from './ask.js'
 
-/**
- * Minimal subset of {@link DaemonClient} used by {@link runCommandImpl}.
- *
- * Only the methods the run command actually invokes are exposed so that
- * tests can supply lightweight fakes without reconstructing the full HTTP
- * client. The real {@link DaemonClient} satisfies this shape via
- * structural typing.
- */
 interface RunCommandClient {
   health(): Promise<unknown>
   cancelActiveRun(sessionId: string): Promise<unknown>
@@ -84,6 +76,7 @@ export interface RunCommandImplDeps {
   model?: string
   maxTokens?: number
   maxIterations?: number
+  timeoutMs?: number
   background?: boolean
   wait?: boolean
   pollMs?: number
@@ -222,20 +215,6 @@ function formatQueuedBackgroundSkillRun(started: DaemonChatBackgroundStartResult
   ]
 }
 
-/**
- * Pure, dependency-injected implementation of `sepilotd run <skill>`.
- *
- * The daemon resolves skill content server-side from `skillRefs`; the CLI
- * just sends `skillRefs: [{ name }]` alongside the user request and the
- * daemon injects the skill into the system prompt before the agent loop
- * runs.
- *
- * Streaming behaviour mirrors `sepilot ask`: SSE is the default so the
- * user sees tool calls and partial messages as they happen — important
- * for skills whose agent loop runs for minutes (e.g. \`software-architect\`
- * reverse-engineering a codebase). Non-streaming \`POST /chat\` is used
- * only under \`--json\` for callers that explicitly need one final envelope.
- */
 export async function runCommandImpl(deps: RunCommandImplDeps): Promise<void> {
   const cwd = process.cwd()
   const skillContext = { cwd, workspaceRoot: cwd }
@@ -253,7 +232,6 @@ export async function runCommandImpl(deps: RunCommandImplDeps): Promise<void> {
         }
       }
     } catch {
-      // Suggestion lookup is best-effort.
     }
     process.exit(1)
   }
@@ -266,6 +244,12 @@ export async function runCommandImpl(deps: RunCommandImplDeps): Promise<void> {
   }
   if (typeof deps.maxIterations === 'number' && deps.maxIterations >= 1) {
     chatOptions.maxIterations = deps.maxIterations
+  }
+
+  if (deps.timeoutMs !== undefined) {
+    const deadlineAt = Date.now() + deps.timeoutMs
+    if (!Number.isSafeInteger(deps.timeoutMs) || deps.timeoutMs <= 0 || !Number.isSafeInteger(deadlineAt)) throw new RangeError('timeoutMs must be a positive safe duration')
+    chatOptions.deadlineAt = deadlineAt
   }
 
   const outputFormat = getOutputFormat()
@@ -339,8 +323,6 @@ export async function runCommandImpl(deps: RunCommandImplDeps): Promise<void> {
     return
   }
 
-  // JSON output: keep the legacy non-streaming envelope so `--json` callers
-  // get a single parseable object.
   if (outputFormat === 'json') {
     try {
       const data = await deps.client.chat(userInput, undefined, chatOptions, {
@@ -360,14 +342,7 @@ export async function runCommandImpl(deps: RunCommandImplDeps): Promise<void> {
     return
   }
 
-  // Default: stream tool events + partial output to the terminal.
   try {
-    // Use the interactive printer (tool calls, results, thinking previews,
-    // phase changes, context-compaction notes) so the user sees what the
-    // agent is actually doing during a multi-minute skill run. The
-    // answer-only printer is too quiet for an end-to-end skill like
-    // `software-architect`, where the agent's final answer arrives only
-    // after dozens of tool calls.
     let activeSessionId: string | undefined
     const printer = createInteractiveCliChatStreamPrinter({
       approvalHintMode: 'cli',
@@ -448,6 +423,7 @@ export async function runCommand(
     model?: string
     maxTokens?: string
     maxIters?: string
+    timeoutMs?: string
     background?: boolean
     wait?: boolean
     pollMs?: string
@@ -494,6 +470,7 @@ export async function runCommand(
     model: options.model,
     maxTokens,
     maxIterations,
+    timeoutMs: parsePositiveIntegerCliOption(options.timeoutMs, '--timeout-ms'),
     background: options.background,
     wait: options.wait,
     pollMs,

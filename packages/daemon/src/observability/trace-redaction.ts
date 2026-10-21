@@ -45,13 +45,6 @@ const EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/giu
 const NAMED_SECRET_RE =
   /\b(api[_-]?key|authorization|password|passwd|secret|token)(["']?\s*[:= ]\s*["']?)([^\s,;&"'}]{6,})/giu
 const LONG_TOKEN_RE = /\b[A-Za-z0-9_./+=-]{32,}\b/gu
-// A UUID is a correlation identifier — it joins an event to the tool call,
-// run, or turn it belongs to — never a credential. LONG_TOKEN_RE matches a
-// 36-character UUID, so without this carve-out every join key in a trace is
-// rewritten to '[redacted-token]' and downstream consumers can no longer
-// reconstruct causality. Credential shapes (opaque hex/base64 blobs, `sk-`
-// style keys) are not UUID-shaped and stay redacted. Values under a
-// secret-named key are handled earlier by NAMED_SECRET_RE and are unaffected.
 const CORRELATION_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu
 const DEFAULT_MAX_STRING_LENGTH = 2_000
@@ -215,9 +208,6 @@ export function redactSecretKeys(
       .filter(([entryKey]) => !BLOCKED_OBJECT_KEYS.has(entryKey))
       .sort(([left], [right]) => left.localeCompare(right))
     for (const [entryKey, entryValue] of entries.slice(0, maxObjectKeys)) {
-      // Counters such as inputTokens/outputTokens are numeric telemetry, not
-      // credentials. Preserve primitive non-string values even when the key
-      // contains "token" so trace stats remain type-safe and summable.
       output[entryKey] = SECRET_KEY_RE.test(entryKey)
         && typeof entryValue !== 'number'
         && typeof entryValue !== 'boolean'

@@ -39,8 +39,8 @@ export function createToolCallProgressTracker(): ToolCallProgressTracker {
       return {
         type: 'thinking',
         content: toolName
-          ? `Preparing ${toolName} input (${sizeKiB} KiB streamed)...`
-          : `Preparing tool input (${sizeKiB} KiB streamed)...`,
+          ? `[progress] Preparing ${toolName} input (${sizeKiB} KiB streamed)...`
+          : `[progress] Preparing tool input (${sizeKiB} KiB streamed)...`,
       }
     },
   }

@@ -173,8 +173,7 @@ export const ChatView = React.forwardRef<ChatViewHandle, ChatViewProps>(function
         <Box flexDirection="column" justifyContent="center" alignItems="center" flexGrow={1}>
           <BrandMark width={width} />
           <Box height={1} />
-          {/* Grouped, scannable quick-reference instead of one wall-of-text
-              paragraph (CLI_BACKLOG.md A1). */}
+          {}
           <Text color={colors.text}>Start a conversation by typing a message below.</Text>
           <Box height={1} />
           <Text color={colors.dimText}>

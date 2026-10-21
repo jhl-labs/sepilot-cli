@@ -54,7 +54,6 @@ const SYSTEMD_UNIT_NAME = 'sepilotd.service'
 const SYSTEMD_UNIT_PATH = join(SYSTEMD_USER_DIR, SYSTEMD_UNIT_NAME)
 
 export interface DaemonServiceOptions {
-  /** Skip running `systemctl` after writing the unit file. */
   noEnable?: boolean
 }
 
@@ -84,8 +83,6 @@ function quoteShellArg(value: string): string {
 }
 
 function resolveExecLine(): string {
-  // Standalone single-file build: there is no separate `sepilotd` entry, so the
-  // unit re-enters this binary with `__daemon` (e.g. `ExecStart=/path/to/sepilot __daemon`).
   const standalone = resolveStandaloneDaemonInvocation()
   if (standalone) {
     return [standalone.command, ...standalone.args].map(quoteShellArg).join(' ')
@@ -105,8 +102,6 @@ function runSystemctl(args: string[]): void {
   try {
     execSync(['systemctl', '--user', ...args].join(' '), { stdio: 'inherit' })
   } catch {
-    // Surface a clearer error than execSync's verbose dump — we re-throw so
-    // the caller can decide whether the missing piece is fatal.
     throw new Error(daemonServiceCopy().systemctlFailed(args.join(' ')))
   }
 }
@@ -153,7 +148,6 @@ export async function uninstallServiceCommand(): Promise<void> {
   try {
     runSystemctl(['disable', '--now', SYSTEMD_UNIT_NAME])
   } catch {
-    /* unit may not be enabled; continue */
   }
 
   try {
@@ -167,7 +161,6 @@ export async function uninstallServiceCommand(): Promise<void> {
   try {
     runSystemctl(['daemon-reload'])
   } catch {
-    /* best-effort */
   }
 }
 
@@ -192,6 +185,5 @@ export async function showServiceStatus(): Promise<void> {
   try {
     runSystemctl(['status', SYSTEMD_UNIT_NAME, '--no-pager'])
   } catch {
-    /* status returns non-zero when not running; that's fine */
   }
 }

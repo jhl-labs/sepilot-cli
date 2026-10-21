@@ -18,6 +18,9 @@ interface ModePickerProps {
   onSelectIndex: (index: number) => void
   onConfirm: (agent: DaemonAgentDescriptor) => void
   onClose: () => void
+  title?: string
+  loadingLabel?: string
+  emptyLabel?: string
 }
 
 export interface ModePickerItem {
@@ -134,6 +137,9 @@ export function ModePicker({
   onSelectIndex,
   onConfirm,
   onClose,
+  title,
+  loadingLabel,
+  emptyLabel,
 }: ModePickerProps) {
   const { ordered } = useMemo(() => buildModePickerList(agents, currentMode, query), [agents, currentMode, query])
   const clampedIndex = ordered.length === 0 ? 0 : Math.max(0, Math.min(selectedIndex, ordered.length - 1))
@@ -182,14 +188,14 @@ export function ModePicker({
 
   return (
     <PickerFrame
-      title="Mode Picker"
+      title={title ?? 'Mode Picker'}
       query={query}
       placeholder="id, name, description..."
       loading={loading}
-      loadingLabel="Loading agent modes..."
+      loadingLabel={loadingLabel ?? 'Loading agent modes...'}
       error={error}
       isEmpty={ordered.length === 0}
-      emptyLabel="No agent modes matched."
+      emptyLabel={emptyLabel ?? 'No agent modes matched.'}
       onQueryChange={onQueryChange}
       footer={<Text color={colors.dimText}>↑/↓ move Enter select Tab select Esc close</Text>}
     >

@@ -3,7 +3,7 @@ import type { AgentEvent, TokenUsage } from '@sepilotd/core'
 import type { ScheduledAgentSkillRef } from '@sepilotd/api-client'
 import { AgentModeRouter } from '../agent/mode-router.js'
 import { resolveInstantModeToolNames } from '../agent/instant-mode-tool-intent.js'
-import { withAuthorizedToolExposure, withContextualToolExposure } from '../tools/role-filter.js'
+import { withContextualToolExposure, withTurnToolAuthority } from '../tools/role-filter.js'
 import {
   createJournalStateBoard,
   createJournalSteeringConsumed,
@@ -12,7 +12,7 @@ import { resolvePersona } from '../agent/custom/persona-resolver.js'
 import { createAgentOutputTracker } from '../agent/event-output.js'
 import { resolveRunIterationBudget } from '../agent/iteration-budget.js'
 import { buildRetrievalQuery } from '../agent/query-context.js'
-import { buildSystemPrompt } from '../agent/system-prompt.js'
+import { buildDeferredSystemPrompt } from '../agent/system-prompt.js'
 import {
   isAutoRetrieveDisabledByEnv,
   retrieveRelevantMemory,
@@ -44,13 +44,6 @@ import type {
   DefaultProvider,
 } from './session-resolver.js'
 
-/**
- * Render the chat's pending scheduled tasks as a context block for the agent.
- * This is the "assistant glances at their own notes before writing a new one"
- * mechanism — the agent reconciles against this list rather than blindly
- * re-creating a job the user already asked for. Pure function; the store query
- * lives in ChannelAgentExecutor.collectPendingScheduledTasks.
- */
 export function formatPendingScheduledTasksBlock(
   jobs: ScheduledJob[],
   now: number,
@@ -89,20 +82,10 @@ interface ChannelRelevantMemory {
   relevantMemories: string[]
 }
 
-/**
- * Diagnostic context attached to a {@link ChannelAgentInactivityError} so the
- * channel reply can tell the user *what* stalled rather than guessing. The
- * common case is `sawModelOutput === false`: the run produced no tokens and no
- * tool activity at all, which almost always means the provider/model call
- * itself never came back (overloaded endpoint, rate limit, dead model) — quite
- * different from a tool that hung mid-run.
- */
 export interface ChannelAgentInactivityContext {
   readonly provider?: string
   readonly model?: string
-  /** True once the run emitted any model-produced output (text/tool/message/error). */
   readonly sawModelOutput?: boolean
-  /** Type of the last agent event seen before the run went silent. */
   readonly lastEventType?: string
 }
 
@@ -183,7 +166,6 @@ class ChannelAgentInactivityWatchdog {
       try {
         void this.onTrip()
       } catch {
-        // The rejection below is the authoritative failure signal.
       }
       this.reject(new ChannelAgentInactivityError(this.timeoutMs))
     }, tickMs)
@@ -326,10 +308,6 @@ export class ChannelAgentExecutor {
     executionOptions?: { skillRefs?: ScheduledAgentSkillRef[] },
   ): Promise<string> {
     const modeRouterRef: { current?: AgentModeRouter } = {}
-    // A channel session's selected cwd is also its filesystem boundary. Direct
-    // API clients already send both values; keeping them identical here makes
-    // Mattermost/Telegram development turns honor the same strict workspace
-    // policy instead of treating cwd as a display-only working directory.
     const workspaceRoot = cwd
 
     const requestQuestion = async (input: {
@@ -353,7 +331,6 @@ export class ChannelAgentExecutor {
       try {
         await onQuestionRequest?.(question)
       } catch {
-        // The pending question can still be answered from the web UI.
       }
       try {
         return await answerPromise
@@ -399,17 +376,18 @@ export class ChannelAgentExecutor {
       : ''
     const defaultMode = this.runtime.config.agent.mode
     const initialMode = !defaultMode || defaultMode === 'auto' ? 'instant' : defaultMode
-    const authorizedTools = withAuthorizedToolExposure(this.runtime.toolRegistry, {
+    const turnToolAuthority = withTurnToolAuthority(this.runtime.toolRegistry, {
       declaredSkillToolNames,
       personaAllowedTools: persona?.allowedTools,
       personaDeniedTools: persona?.deniedTools,
     })
+    const authorizedTools = turnToolAuthority.own
     const visibleTools = withContextualToolExposure(authorizedTools, {
       semanticRouting: true,
       routedMode: initialMode,
       explicitToolNames: resolveInstantModeToolNames(message.text, initialMode, undefined),
     })
-    const baseSystemPrompt = await buildSystemPrompt({
+    const { prompt: baseSystemPrompt, systemToolGuidance } = await buildDeferredSystemPrompt({
       config: this.runtime.config,
       tools: visibleTools,
       profile: initialMode === 'instant' ? 'instant' : 'agent',
@@ -430,9 +408,11 @@ export class ChannelAgentExecutor {
     })
     const channelBudget = resolveRunIterationBudget({ surface: 'channel' })
     const modeRouter = new AgentModeRouter({
+      systemToolGuidance,
       provider,
       tools: visibleTools,
       authorizedTools,
+      delegationTools: turnToolAuthority.delegation,
       policy: this.runtime.policyEngine,
       autonomy,
       semanticIndex: this.runtime.semanticIndex,
@@ -509,9 +489,6 @@ export class ChannelAgentExecutor {
     let errorText = ''
     const providerId = provider.id
     const modelId = this.runtime.config.agent?.defaultModel ?? provider.models[0]?.id ?? 'default'
-    // Track whether the run ever produced *model* output (tokens, a tool call,
-    // an explicit message, or an error). If it did not, an inactivity trip means
-    // the provider/model call itself never came back — surface that distinctly.
     let sawModelOutput = false
     let lastEventType: string | undefined
     const iterator = modeRouter.run(message.text, {
@@ -526,6 +503,7 @@ export class ChannelAgentExecutor {
       scopeTags,
       channelContext,
       toolAllowlist: authorizedTools.list().map((tool) => tool.name),
+      delegationToolAllowlist: turnToolAuthority.delegation.list().map((tool) => tool.name),
       ...resolveSkillExecutionContext(loadedExecutionSkillIds, declaredSkillToolNames),
     })[Symbol.asyncIterator]()
     try {
@@ -565,8 +543,6 @@ export class ChannelAgentExecutor {
             })
           }
         }
-        // Channel bindings are long-lived conversations, so keep the session
-        // active while still journaling tool, approval, memory, and cowork events.
         if (event.type !== 'done') {
           await persistAgentSessionEvent(this.runtime.sessions, sessionId, event)
         }

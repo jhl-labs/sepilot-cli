@@ -24,12 +24,6 @@ const STATUS_COLOR: Record<string, string> = {
   cancelled: 'yellow',
 }
 
-/**
- * Live todo checklist for the current run, fed by the `state_board` stream
- * frame (structured items from the agent's own todowrite list — no text
- * parsing). Gives the user a per-step "what is it doing now / how much is
- * left" view during long runs.
- */
 export function TodoProgressPanel({ todos, maxRows = 8 }: TodoProgressPanelProps) {
   if (todos.length === 0) {
     return null

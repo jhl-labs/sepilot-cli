@@ -49,8 +49,6 @@ const TEST_CONNECTION_COPY = {
   },
 } as const
 
-// Add a `v` prefix only when the version starts with a digit so a
-// daemon reporting `surface-e2e-mock` doesn't render as `vsurface-...`.
 function formatVersion(version: string | undefined): string {
   if (!version) return '?'
   return /^\d/.test(version) ? `v${version}` : version
@@ -76,7 +74,6 @@ export async function testConnectionCommand(options: { url?: string }) {
 
   if (!jsonMode) console.log(chalk.gray(copy.testingConnections))
 
-  // Test daemon
   try {
     const health = await client.health()
     probes.push({
@@ -104,7 +101,6 @@ export async function testConnectionCommand(options: { url?: string }) {
     return
   }
 
-  // Test providers
   if (!jsonMode) console.log()
   try {
     const providers = await client.providers()
@@ -123,7 +119,6 @@ export async function testConnectionCommand(options: { url?: string }) {
     if (!jsonMode) console.log(`${chalk.red('✗')} ${copy.couldNotFetchProviders}`)
   }
 
-  // Test gateway
   if (!jsonMode) console.log()
   try {
     const gateway = new GatewayClient(resolveGatewayBaseUrl())
@@ -149,7 +144,6 @@ export async function testConnectionCommand(options: { url?: string }) {
     if (!jsonMode) console.log(`${chalk.gray('-')} ${copy.gatewayLabel}: ${copy.notRunningOptional}`)
   }
 
-  // Test Ollama directly
   if (!jsonMode) console.log()
   try {
     const res = await fetch('http://localhost:11434/api/tags')

@@ -72,12 +72,6 @@ const SINGLE_TOOL_EXACT_CALL_PATTERN =
 const REPEATED_SEMANTIC_ACTION_EXACT_ONCE_PATTERN =
   /(?:\b(?:each|every)\s+(?:(?:required|listed|named)\s+)?(?:actions?|steps?|commands?|checks?|queries|requests?)[^.!?\n]{0,32}\b(?:exactly\s+)?once\b|(?:작업|단계|명령|검증|쿼리|요청)(?:들)?(?:을|를|은|는|도)?[^.!?。！？\n]{0,32}(?:각각|각\s*(?:작업|단계|명령|검증|쿼리|요청)?(?:을|를|은|는|도)?)[^.!?。！？\n]{0,20}(?:정확히\s*)?(?:한\s*번|한번|1\s*회))/iu
 
-/**
- * Bound model-generated fan-out before any tool is executed. The default is
- * context-aware so small-window models cannot create a result batch that is
- * larger than the next prompt, while large-window models still get useful
- * parallelism. An explicit positive limit remains an operator override.
- */
 export function resolveToolCallBatchLimit(
   contextWindowTokens: number,
   configuredLimit?: number,
@@ -139,12 +133,6 @@ export function hasToolCallBatchCap(messages: readonly Message[]): boolean {
   )
 }
 
-/**
- * Reconstruct only trusted, current-turn execution attempts for cardinality
- * budgets. A tool result without the daemon-owned execution marker represents
- * a pre-execution rejection (policy, approval, unknown tool, and similar) and
- * must not consume a user's exactly-once allowance.
- */
 export function toolCallBudgetHistoryFromCurrentTurnMessages(
   messages: readonly Message[],
 ): ToolCallBudgetHistoryEntry[] {
@@ -191,13 +179,6 @@ export function toolCallBudgetHistoryFromCurrentTurnMessages(
   return history
 }
 
-/**
- * A retry prohibition is a semantic failure boundary even when a name-only
- * sequence cannot represent several actions through one tool. Only a failed,
- * actually executed action with an explicit non-observation purpose closes
- * this boundary. Preparatory reads and pre-execution rejections remain
- * repairable because neither proves that a required action was attempted.
- */
 export function currentTurnHasNoRetrySemanticActionFailure(
   messages: readonly Message[],
 ): boolean {
@@ -227,11 +208,6 @@ export function currentTurnHasNoRetrySemanticActionFailure(
   return false
 }
 
-/**
- * Resolve only registered, structural aliases for user-authored cardinality
- * limits. Alias callbacks are advisory runtime metadata, so a broken callback
- * must fail closed to the canonical tool name rather than break the run.
- */
 export function resolveToolCardinalityIdentities(
   tools: readonly CardinalityAwareTool[],
 ): ToolCardinalityIdentity[] {
@@ -334,11 +310,6 @@ function canonicalReadUrlMatchesTemplate(target: string, template: string): bool
   }
 }
 
-/**
- * Resolve credential-free, integration-owned GET route templates. Broken or
- * malformed callbacks fail closed to no routing claim so registry metadata can
- * never make the agent loop unavailable.
- */
 export function resolveToolCanonicalReadIdentities(
   tools: readonly CanonicalReadTargetAwareTool[],
 ): ToolCanonicalReadIdentity[] {
@@ -367,12 +338,6 @@ function toolIsExplicitlyExcludedFromPositiveScope(input: string, tool: string):
     && identityOccurrences(inputPositiveCapabilityScope(input), tool).length === 0
 }
 
-/**
- * Reject a generic URL transport when exactly one registered integration tool
- * owns the requested GET route. The rejection is pre-execution: it does not
- * expose runtime credentials or silently convert the user's action. Explicit
- * user transport choices and explicit exclusions of the canonical tool win.
- */
 export function partitionToolCallsByCanonicalReadTarget(
   input: string,
   calls: ToolCall[],
@@ -554,14 +519,6 @@ function hasAffirmativeGlobalNamedToolsExactOnceBoundary(input: string): boolean
   return false
 }
 
-/**
- * Resolve a closed one-tool workflow whose cardinality phrase is separated
- * from the registered tool name by concrete arguments or sentence structure.
- * This is deliberately narrower than the ordinary per-name matcher: exactly
- * one registered capability must be named, every other tool must be excluded,
- * and the remaining affirmative text must describe one tool invocation rather
- * than several semantic actions that happen to share a transport tool.
- */
 function singleClosedToolWithExactCallBoundary(
   input: string,
   identities: readonly ToolCardinalityIdentity[],
@@ -601,12 +558,6 @@ function singleClosedToolWithExactCallBoundary(
   return structural.size === 1 ? [...structural][0] ?? null : null
 }
 
-/**
- * Preserve the ordered occurrences of registered tool identities in a global
- * named-call boundary. Unlike a name-only execution sequence, this list may
- * contain duplicates: two different semantic calls can legitimately use the
- * same tool with different arguments.
- */
 export function namedToolCallSequence(
   input: string,
   identities: readonly ToolCardinalityIdentity[] = [],
@@ -634,13 +585,6 @@ export function namedToolCallSequence(
     .map(({ tool }) => tool)
 }
 
-/**
- * Extract explicit per-turn tool cardinality constraints from affirmative
- * request scope. Tool names are structural identifiers, and the exact-once
- * marker must immediately follow that identifier (apart from connective
- * grammar). Negative clauses are removed first, so “do not call process.read”
- * can never become a positive execution budget.
- */
 export function exactOnceToolNames(
   input: string,
   identities: readonly ToolCardinalityIdentity[] = [],
@@ -660,11 +604,6 @@ export function exactOnceToolNames(
     }
   }
   for (const identity of identities) {
-    // Canonical dotted tool names already passed through the stricter
-    // structural grammar above. Running them through the looser endpoint
-    // alias window can turn "terminal.run with command A once, then command B
-    // once" into a one-call budget for terminal.run itself. Aliases describe
-    // the capability identity; the canonical tool name is not its own alias.
     if (
       canonicalIdentityCarriesExactOnceMarker(
         positive,
@@ -678,12 +617,6 @@ export function exactOnceToolNames(
       limits.add(identity.tool.toLowerCase())
     }
   }
-  // A user may put one cardinality boundary in front of a bounded tool list
-  // instead of repeating it after every identifier: "use only the following
-  // tools, exactly once each" / "다음 등록 도구를 각각 정확히 한 번". This is
-  // still structural authority, but only when the wording is explicitly about
-  // named tools. Do not treat "run each action/step once" as a name-level
-  // budget because several semantic actions can legitimately share one tool.
   if (hasAffirmativeGlobalNamedToolsExactOnceBoundary(input)) {
     const callSequence = namedToolCallSequence(input, identities)
     const mentionCounts = new Map<string, number>()
@@ -702,10 +635,6 @@ export function exactOnceToolNames(
   return limits
 }
 
-/**
- * A closed named-call list can still constrain the enabled tool surface when
- * repeated occurrences make a name-only exact-once workflow unrepresentable.
- */
 export function inputClosesNamedToolCallSet(
   input: string,
   identities: readonly ToolCardinalityIdentity[] = [],
@@ -717,12 +646,6 @@ export function inputClosesNamedToolCallSet(
     )
 }
 
-/**
- * A closed exact-once set is stronger than a per-tool cardinality limit: the
- * user also explicitly excluded every unnamed tool. Keep this structural and
- * conservative so ordinary “call X once” requests can still use unrelated
- * evidence or recovery tools when the user did not close the tool surface.
- */
 export function inputClosesExactOnceToolSet(
   input: string,
   identities: readonly ToolCardinalityIdentity[] = [],
@@ -736,13 +659,6 @@ export function inputClosesExactOnceToolSet(
     )
 }
 
-/**
- * Resolve the registered tool names owned by a structural closed-call
- * boundary. This is the shared projection used both before prompt assembly
- * and when the durable run contract is recovered later in mode routing. A
- * null result means the request did not establish a closed boundary; an
- * unregistered or purely negative name can never enter the returned set.
- */
 export function resolveClosedExactToolNames(
   input: string,
   tools: readonly CardinalityAwareTool[],
@@ -784,14 +700,6 @@ function cardinalityTargetStrings(value: unknown): string[] {
   return targets
 }
 
-/**
- * Map an action to the registered capability identity whose exact cardinality
- * it consumes. Besides the canonical tool name, URL/endpoint-shaped arguments
- * can target a registered runtime alias through another transport tool. This
- * prevents an exhausted provider budget from being bypassed with webfetch or
- * browser navigation while leaving prose/query arguments and unrelated hosts
- * alone.
- */
 function cardinalityToolForAction(
   tool: string,
   input: Record<string, unknown> | undefined,
@@ -916,12 +824,6 @@ export function partitionToolCallsByExactOnceBudget(
       continue
     }
     if (exactOnce.has(name) && name !== call.name.toLowerCase()) {
-      // The user bounded a registered capability, not an arbitrary transport
-      // that happens to target the same endpoint. Reject the substitute before
-      // execution so it cannot spend the one permitted attempt on a homepage,
-      // browser navigation, or incompatible HTTP method. An explicitly named
-      // transport remains canonical for itself because cardinalityToolForAction
-      // returns that tool name before considering endpoint aliases.
       nonCanonical.push({ call, canonicalTool: name })
       continue
     }
@@ -970,12 +872,6 @@ export function partitionToolCallsBySequence(
     return { executable: calls, outOfOrder: [], workflowFailed: false }
   }
   if (new Set(sequence).size !== sequence.length) {
-    // A string sequence has no action identity beyond the tool name. Repeated
-    // names therefore cannot distinguish a required semantic action from a
-    // preparatory or follow-up call through the same tool. Ignore this
-    // unrepresentable ordering contract rather than consuming false steps or
-    // closing a no-retry workflow prematurely. Distinct-name sequences retain
-    // the strict behavior below.
     return { executable: calls, outOfOrder: [], workflowFailed: false }
   }
   let sequenceIndex = 0

@@ -50,10 +50,6 @@ function ensureColumn(db: SqliteDatabase, table: string, column: string, ddl: st
   try {
     db.prepare(`ALTER TABLE ${table} ADD COLUMN ${ddl}`).run()
   } catch (error) {
-    // Multiple daemon/test processes can open the same legacy database at
-    // once. If another process completed this migration after our PRAGMA,
-    // accept only the confirmed duplicate-column race and surface all other
-    // schema errors.
     if (
       error instanceof Error
       && /duplicate column name/i.test(error.message)
@@ -101,10 +97,6 @@ function ensureSchema(db: SqliteDatabase): void {
     INSERT INTO snippets_fts(rowid, title, body, tags) VALUES (new.rowid, new.title, new.body, new.tags);
   END;`,
   ).run()
-  // Existing databases can predate the FTS table and its synchronization
-  // triggers. Rebuild from the content table so those rows are searchable as
-  // soon as the upgraded daemon opens the repository. The command is
-  // idempotent and snippets is a user-curated, bounded collection.
   db.prepare(
     `INSERT INTO snippets_fts(snippets_fts) VALUES ('rebuild')`,
   ).run()
@@ -187,9 +179,6 @@ export function createSnippetsRepo(): SnippetsRepo {
           )
           .all(ftsQuery) as Row[]
       } catch {
-        // FTS5 syntax/tokenizer behavior differs across SQLite builds. A
-        // literal LIKE search keeps natural punctuation-heavy queries usable
-        // instead of surfacing a 500 from the snippets route.
         rows = searchWithLike(db, q)
       }
       return rows.map(rowToSnippet)

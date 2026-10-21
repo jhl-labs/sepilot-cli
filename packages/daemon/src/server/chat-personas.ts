@@ -13,13 +13,6 @@ export interface ChatPersonaSelection {
   source: 'request' | 'session' | 'default'
 }
 
-/**
- * Resolve the persona selection for one chat turn.
- *
- * A caller-owned selection always wins. The stored session roster is only a
- * fallback when neither `persona` nor `personaIds` was supplied, so an
- * explicit `personaIds: []` continues to mean "use the default assistant".
- */
 export function resolveChatPersonaSelection(
   request: ChatPersonaSelectionInput,
   session: SessionPersonaSelection | null | undefined,
@@ -41,7 +34,6 @@ export function resolveChatPersonaSelection(
   }
 }
 
-/** Return every selected id that the current daemon catalog cannot resolve. */
 export function findUnknownChatPersonaIds(
   selection: ChatPersonaSelection,
   resolves: (id: string) => boolean,

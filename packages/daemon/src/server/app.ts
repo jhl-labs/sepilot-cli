@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
+import { SessionTitleUpdates } from '../agent/session-title.js'
 import { PassThrough } from 'node:stream'
 import { join } from 'node:path'
 import fastifyWebsocket from '@fastify/websocket'
@@ -72,6 +73,7 @@ import {
   personaOpenApiComponents,
   personaOpenApiOverrides,
   personaRoutes,
+  roleBotRoutes,
 } from './routes/personas.js'
 import { chatStreamOpenApiOverrides, chatStreamRoutes } from './routes/chat-stream.js'
 import { doctorOpenApiComponents, doctorOpenApiOverrides, doctorRoutes } from './routes/doctor.js'
@@ -96,6 +98,7 @@ import {
   sessionAgentOpenApiComponents,
   sessionAgentOpenApiOverrides,
   sessionAgentRoutes,
+  sessionPrivilegeRoutes,
 } from './routes/sessions-agent.js'
 import { agentOpenApiComponents, agentOpenApiOverrides, agentRoutes } from './routes/agents.js'
 import {
@@ -144,6 +147,9 @@ import {
   registerAcpFeatureRoutes,
   registerA2aFeatureRoutes,
   registerSwarmFeatureRoutes,
+  registerEventRoutingFeatureRoutes,
+  installEventRoutingLlmRunner,
+  stopEventRoutingFeature,
   getPluginsOpenApiComponents,
   getPluginsOpenApiOverrides,
 } from '../generated/feature-registration.js'
@@ -154,7 +160,9 @@ import { createJobRunner } from '../jobs/runner.js'
 import { createBackgroundHooks } from '../jobs/hooks.js'
 import { executeSubagentJob, createBackgroundSubagents } from '../jobs/subagent.js'
 import { publishStoredNotification } from '../notifications/publish.js'
-import { SessionInbox } from './runtime/session-inbox.js'
+import { SessionInbox, setSessionInboxWakeListener } from './runtime/session-inbox.js'
+import { SessionWakeService, resolveMaxWakesPerHour, sessionWakeEnabledFromEnv } from './runtime/session-wake.js'
+import type { SessionRunContext } from './runtime/active-runs.js'
 import { registerWorkRoutes } from './routes/work.js'
 import { JsonWorkPlanStore } from '../plans/store.js'
 import { registerMigrationRoutes } from './routes/migration.js'
@@ -180,7 +188,6 @@ export interface AppOptions {
 
 function shouldCaptureRawBody(url: string, method: string): boolean {
   if (method !== 'POST') return false
-  // Signature verification needs the exact raw bytes only for incoming webhooks.
   return url.startsWith('/api/v1/webhooks/')
 }
 
@@ -209,44 +216,10 @@ function resolveWsMaxPayloadBytes(): number {
   return readPositiveIntegerEnv('SEPILOTD_WS_MAX_PAYLOAD_BYTES', 1024 * 1024)
 }
 
-/**
- * Bound how long a client may take to deliver a complete request. Fastify
- * defaults this to 0, which *disables* Node's own 5-minute `requestTimeout`
- * and lets a slowloris-style client hold a connection open indefinitely by
- * dribbling out the body. That is harmless on a loopback-only daemon but real
- * once the daemon is bound to a LAN/remote address, which the auth policy
- * explicitly supports.
- *
- * This measures receipt of the *request*, not the lifetime of the response, so
- * SSE and WebSocket streams are unaffected. `connectionTimeout` is deliberately
- * left at Fastify's default (0) — it is a socket-inactivity timer and would
- * tear down idle SSE/WS connections.
- */
 function resolveRequestTimeoutMs(): number {
   return readPositiveIntegerEnv('SEPILOTD_REQUEST_TIMEOUT_MS', 300_000)
 }
 
-/**
- * Whether to derive `request.ip` from `X-Forwarded-For`.
- *
- * Off by default, and that default is the safe one: an untrusted client can
- * put anything in `X-Forwarded-For`, so trusting it on a directly-reachable
- * daemon would let a single caller spoof a fresh IP per request and walk
- * straight past the rate limiter. Left off, every request behind a reverse
- * proxy instead collapses onto the proxy's own address and shares one token
- * bucket — so one busy client can 429 everyone else.
- *
- * Operators who actually terminate at a proxy opt in with
- * `SEPILOTD_TRUST_PROXY`, and should scope it as tightly as they can:
- *
- *   10.0.0.1,10.0.0.0/8  trust only these proxy addresses
- *   true                 trust any upstream — only when the proxy is the
- *                        daemon's sole ingress
- *
- * Numeric hop counts are intentionally rejected. They cannot authenticate
- * the immediate peer, so a directly connected client could otherwise forge
- * enough forwarding entries to appear trusted.
- */
 export function resolveTrustProxy(
   raw = process.env.SEPILOTD_TRUST_PROXY,
 ): boolean | string {
@@ -260,9 +233,6 @@ export function resolveTrustProxy(
   const hops = Number.parseInt(value, 10)
   if (String(hops) === value && hops > 0) return false
 
-  // Anything else is an address/CIDR list, which Fastify parses itself. A
-  // malformed list throws at construction — louder, and safer, than silently
-  // downgrading to "trust everything".
   return value
 }
 
@@ -357,6 +327,9 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
   })
   const chatKnowledgeProviders = new ChatKnowledgeProviderRegistry()
   app.decorate('runtime', options.runtime)
+  const sessionTitleUpdates = new SessionTitleUpdates()
+  app.decorate('sessionTitleUpdates', sessionTitleUpdates)
+  app.addHook('preClose', async () => { sessionTitleUpdates.close() })
   app.decorate('authToken', options.authToken ?? null)
   app.decorate(
     'authTokenRequired',
@@ -364,9 +337,6 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
   )
   app.decorate('connectionRegistry', connectionRegistry)
   app.decorate('chatKnowledgeProviders', chatKnowledgeProviders)
-  // Every successful inbound request (anything that isn't a 5xx) counts as
-  // activity so the idle reaper does not kill a daemon that's actively
-  // servicing one-shot `sepilot ask` calls or background batch jobs.
   app.addHook('onResponse', async (_request, reply) => {
     if (reply.statusCode < 500) connectionRegistry.bumpActivity()
   })
@@ -420,29 +390,22 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
         },
       ])
     } catch {
-      // Observability is best-effort and must never affect user traffic.
     }
   })
 
-  // Request ID must be registered first
   await app.register(requestIdPlugin)
 
-  // Request logging after request ID
   await app.register(requestLoggerPlugin)
 
-  // CORS must be registered before auth
   await app.register(corsPlugin)
 
-  // Auth must be registered before routes
   await app.register(createAuthPlugin(options.authToken ?? null, {
     resolveMasterToken: options.authTokenResolver,
     masterTokenRequired: app.authTokenRequired,
   }))
 
-  // Rate limiting after auth
   await app.register(daemonRateLimitPlugin)
 
-  // Global error handler - registered after plugins, before routes
   await app.register(errorHandlerPlugin)
   await app.register(fastifyWebsocket, {
     options: {
@@ -451,9 +414,6 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
   })
 
   app.get('/api/v1/openapi.json', async (request) => {
-    // Advertise the origin the client actually reached so swagger-ui /
-    // generated SDKs target the right host when the daemon is bound to
-    // 0.0.0.0 and accessed via LAN. Falls back to loopback.
     const host = request.headers.host
     const serverUrl = host ? `${request.protocol}://${host}` : undefined
     return generateOpenApiSpec(openApiRoutes, openApiOverrides, openApiComponents, { serverUrl })
@@ -487,10 +447,12 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
   await app.register(usageRoutes, { prefix: '/api/v1' })
   await app.register(observabilityRoutes, { prefix: '/api/v1' })
   await app.register(webhookRoutes, { prefix: '/api/v1' })
+  await registerEventRoutingFeatureRoutes(app, { prefix: '/api/v1' })
   await app.register(cronRoutes, { prefix: '/api/v1' })
   await app.register(scheduledTasksRoutes, { prefix: '/api/v1' })
   await app.register(estimateRoutes, { prefix: '/api/v1' })
   await app.register(personaRoutes, { prefix: '/api/v1' })
+  await app.register(roleBotRoutes, { prefix: '/api/v1' })
   await app.register(chatStreamRoutes, { prefix: '/api/v1' })
   await app.register(doctorRoutes, { prefix: '/api/v1' })
   await app.register(policyRoutes, { prefix: '/api/v1' })
@@ -500,6 +462,7 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
   await app.register(sharePublicRoutes)
   await app.register(sessionQuestionsRoutes, { prefix: '/api/v1' })
   await app.register(sessionAgentRoutes, { prefix: '/api/v1' })
+  await app.register(sessionPrivilegeRoutes, { prefix: '/api/v1' })
   await app.register(agentRoutes, { prefix: '/api/v1' })
   await app.register(commandRoutes, { prefix: '/api/v1' })
   await app.register(artifactRoutes, { prefix: '/api/v1' })
@@ -519,12 +482,61 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
   await registerA2aFeatureRoutes(app, { prefix: '/api/v1' })
   await registerSwarmFeatureRoutes(app, { prefix: '/api/v1' })
 
-  // Jobs infrastructure (batch + future migration runner).
   const jobsRepo = createJobsRepo()
   const sessionInbox = new SessionInbox()
   app.runtime?.activeRuns?.setBackgroundEvidenceReader(id => sessionInbox.evidence(id))
-  // Startup recovery: any job left in pending/running from a previous process
-  // can never resume — mark them failed so the API surfaces a terminal status.
+  const sessionBusy = app.runtime?.sessionBusy
+  const sessionWake = new SessionWakeService({
+    pendingWake: id => sessionInbox.pendingWake(id),
+    isBusy: id => sessionBusy?.isBusy(id) ?? false,
+    lastRunContext: id => app.runtime?.activeRuns?.lastRunContext(id),
+    enabled: () => sessionWakeEnabledFromEnv(),
+    maxWakesPerHour: resolveMaxWakesPerHour(),
+    startTurn: input => startSessionWakeTurn(app, input),
+  })
+  installEventRoutingLlmRunner(app)
+  setSessionInboxWakeListener(id => sessionWake.request(id))
+  const stopIdleObserver = sessionBusy?.onIdle(id => {
+    sessionInbox.completeTurn(id)
+    sessionWake.turnEnded(id)
+  })
+  app.addHook('onReady', async () => {
+    for (const id of sessionInbox.sessionsWithPendingWake()) sessionWake.request(id)
+  })
+  app.addHook('preClose', async () => {
+    if (app.runtime) app.runtime.eventRoutingLlmRunner = undefined
+    try { if (app.runtime) await stopEventRoutingFeature(app.runtime) } catch (error) {
+      app.log.warn({ err: error }, 'event routing stop failed during close')
+    }
+    stopIdleObserver?.()
+    setSessionInboxWakeListener(undefined)
+    sessionWake.dispose()
+  })
+  try {
+    for (const job of jobsRepo.listInProgress().filter(entry => entry.kind === 'subagent')) {
+      const parentSessionId = jobsRepo.listItems(job.id, 0)[0]?.sessionId
+      if (!parentSessionId) continue
+      const childSessionId = jobsRepo.listActivity(job.id)
+        .map(activity => activity.sessionId)
+        .find(id => id && id !== parentSessionId)
+      sessionInbox.tryPublish({
+        sessionId: parentSessionId,
+        source: 'subagent',
+        sourceId: job.id,
+        eventKey: `${job.id}:interrupted`,
+        title: 'Background subagent interrupted by daemon restart',
+        body: [
+          `Background subagent job ${job.id} was running when the daemon restarted and did not finish. Nothing was retried automatically.`,
+          childSessionId
+            ? `Its completed steps are in child session ${childSessionId}; continue it from its last checkpoint with sepilot sessions resume ${childSessionId}, or dispatch the remaining work again.`
+            : 'Dispatch the remaining work again if it is still needed.',
+        ].join(' '),
+        wake: true,
+      })
+    }
+  } catch (error) {
+    app.log.warn({ err: error }, 'could not report interrupted background subagents')
+  }
   const recoveredJobs = jobsRepo.markInProgressFailed()
   if (recoveredJobs > 0) {
     app.log.warn({ recovered: recoveredJobs }, 'marked in-progress jobs as failed on startup')
@@ -534,13 +546,14 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
     globalMax: parseInt(process.env.JOBS_GLOBAL_MAX ?? '16', 10),
   })
   app.addHook('preClose', async () => { jobRunner.shutdown() })
-  app.runtime?.hookRegistry?.setBackgroundExecutor(createBackgroundHooks({ repo: jobsRepo, runner: jobRunner,
+  app.runtime?.hookRegistry?.setBackgroundExecutor?.(createBackgroundHooks({ repo: jobsRepo, runner: jobRunner,
     onFinished: (jobId, sessionId, status) => { sessionInbox.tryPublish({ sessionId, source: 'hook', sourceId: jobId,
       eventKey: jobId, title: `Background hook ${status}`, body: `Collect retained evidence with sepilot jobs resume ${jobId}; this does not rerun the hook.` }) },
   }))
   const onSubagentFinished: NonNullable<Parameters<typeof createBackgroundSubagents>[0]['onFinished']> = (job, parentSessionId) => {
         sessionInbox.tryPublish({ sessionId: parentSessionId, source: 'subagent', sourceId: job.id,
           eventKey: job.id, title: `Background subagent ${job.status}`,
+          wake: !parentSessionId.startsWith('api-subagent:'),
           body: `Job ${job.id}. Collect retained results with subagent.job or sepilot jobs resume ${job.id} (no re-execution). For interrupted work inspect the child session in job activity and use sepilot sessions resume <child-session-id> only when a safe checkpoint is available.` })
         publishStoredNotification({
           id: `subagent-job:${job.id}`, title: `Background subagent ${job.status}`,
@@ -588,7 +601,6 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
         if (final && input.parentSessionId) onSubagentFinished(final, input.parentSessionId)
       })
       .catch(() => {
-        /* runner persists error itself */
       })
     return {
       jobId: job.id,
@@ -599,8 +611,6 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
   }
   const batchExecutor: JobsBatchExecutor = {
     async executeItem({ request }, signal) {
-      // Re-enter the daemon's own /chat route in-process so the batch executor
-      // benefits from the existing handler (sessions, providers, agent loop).
       const res = await app.inject({
         method: 'POST',
         url: '/api/v1/chat',
@@ -613,7 +623,6 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
           const body = res.json() as { error?: { message?: string } }
           if (body?.error?.message) message = body.error.message
         } catch {
-          /* non-JSON error body */
         }
         throw new Error(message)
       }
@@ -644,8 +653,6 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
     { prefix: '/api/v1' },
   )
 
-  // Migration runner (Phase 2): /api/v1/migration/* — daemon-side runner that
-  // ports the legacy `cli migrate` step pipeline behind HTTP. Shares jobs.db.
   const migrationRepo = createMigrationRepo()
   const recoveredMigrations = migrationRepo.markInProgressFailed()
   if (recoveredMigrations > 0) {
@@ -669,11 +676,59 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
     { prefix: '/api/v1' },
   )
 
-  // Phase D0-D6 capability routes (desktop UI/UX parity; no /api/v1 prefix).
   await app.register(capabilityRoutes)
   if (options.runtime) {
     await app.register(wsRoutes)
   }
 
   return app
+}
+
+const WAKE_TURN_MODES = new Set(['instant', 'react'])
+
+export function buildWakeTurnRequest(input: {
+  sessionId: string
+  message: string
+  cwd?: string
+  context?: SessionRunContext
+  authToken?: string | null
+}): { payload: Record<string, unknown>; headers: Record<string, string> } {
+  const context = input.context
+  const payload: Record<string, unknown> = { message: input.message, sessionId: input.sessionId }
+  payload.mode = context?.mode && WAKE_TURN_MODES.has(context.mode) ? context.mode : 'react'
+  const cwd = context?.cwd ?? input.cwd
+  if (cwd) payload.cwd = cwd
+  if (context?.workspaceRoot) payload.workspaceRoot = context.workspaceRoot
+  if (context?.provider && context.model) {
+    payload.provider = context.provider
+    payload.model = context.model
+  }
+  if (context?.autonomy) payload.autonomy = context.autonomy
+  if (context?.toolNames) payload.toolNames = context.toolNames
+  if (context?.bot) payload.bot = context.bot
+  const headers: Record<string, string> = {}
+  if (input.authToken) headers.authorization = `Bearer ${input.authToken}`
+  if (context?.surface) headers['x-sepilotd-surface'] = context.surface
+  return { payload, headers }
+}
+
+async function startSessionWakeTurn(
+  app: FastifyInstance,
+  input: { sessionId: string; message: string; context?: SessionRunContext },
+): Promise<void> {
+  const session = app.runtime?.sessions?.get
+    ? await app.runtime.sessions.get(input.sessionId).catch(() => null)
+    : null
+  if (!session) throw new Error(`Session ${input.sessionId} is not available for a background wake`)
+  const { payload, headers } = buildWakeTurnRequest({
+    sessionId: input.sessionId,
+    message: input.message,
+    cwd: session.cwd,
+    context: input.context,
+    authToken: (app as unknown as { authToken?: string | null }).authToken,
+  })
+  const response = await app.inject({ method: 'POST', url: '/api/v1/chat/background', headers, payload })
+  if (response.statusCode !== 202) {
+    throw new Error(`Background wake turn was rejected (${response.statusCode}): ${response.body.slice(0, 200)}`)
+  }
 }

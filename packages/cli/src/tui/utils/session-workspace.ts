@@ -5,7 +5,6 @@ function normalizedWorkspace(path: string): string {
   return resolve(path)
 }
 
-/** A resume list contains only sessions carrying this exact workspace capability. */
 export function sessionBelongsToWorkspace(
   session: Pick<DaemonSessionMeta, 'cwd'>,
   workspaceRoot: string,
@@ -15,10 +14,6 @@ export function sessionBelongsToWorkspace(
   return normalizedWorkspace(sessionWorkspace) === normalizedWorkspace(workspaceRoot)
 }
 
-/**
- * Explicit session IDs may still target legacy, unbound sessions. A bound
- * session, however, must never be loaded into a different workspace surface.
- */
 export function sessionWorkspaceLoadError(
   session: Pick<DaemonSessionMeta, 'cwd'>,
   workspaceRoot: string,

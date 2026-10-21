@@ -71,3 +71,18 @@ export async function personaRoutes(app: FastifyInstance) {
     return { data: persona }
   })
 }
+
+export async function roleBotRoutes(app: FastifyInstance) {
+  app.get('/bots', async () => {
+    return { data: app.runtime?.roleBots?.summaries() ?? [] }
+  })
+
+  app.get<{ Params: PersonaIdParams }>('/bots/:id', {
+    schema: fastifySchemaFromZod({ params: personaIdParamsSchema }),
+  }, async (request, reply) => {
+    const params = request.params
+    const bot = app.runtime?.roleBots?.get(params.id)
+    if (!bot) return reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Bot not found' } })
+    return { data: bot }
+  })
+}

@@ -60,7 +60,6 @@ export async function loadManagedExtensionEnv(): Promise<void> {
       }
     }
   } catch {
-    // Managed env file is optional.
   }
 }
 

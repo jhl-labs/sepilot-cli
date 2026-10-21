@@ -49,11 +49,6 @@ export class ChannelPostProcessor {
         })
         log.info(`Auto-closed issue #${message.messageId}`)
       } catch (err) {
-        // Auto-close is best-effort (the message was processed
-        // successfully), but a silent failure means the operator
-        // sees a still-open issue with no idea why the OpenClaw
-        // integration didn't close it. Surface the failure so
-        // gateway/auth/permission problems are diagnosable.
         log.warn(`auto-close failed for issue #${message.messageId}`, {
           channelType: message.channelType,
           messageId: message.messageId,

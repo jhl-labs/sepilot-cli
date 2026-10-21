@@ -1,7 +1,4 @@
-/** Explicit user command syntax, never a natural-language scheduling classifier. */
 export function isTaskInvocation(input: string): boolean {
-  // Prefix-only: quoted examples, code, environment variables and $taskboard
-  // are data. Selecting task management does not select a mutation or a time.
   return /^\s*\$task(?:\s|$)/u.test(input)
 }
 

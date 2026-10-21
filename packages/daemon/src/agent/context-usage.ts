@@ -13,11 +13,6 @@ function finiteNonNegative(value: number | undefined): number {
   return Number.isFinite(value) ? Math.max(0, Math.floor(value ?? 0)) : 0
 }
 
-/**
- * Provider input usage can split uncached, cache-read, and cache-created
- * prompt tokens (Anthropic). All three occupy the request context even though
- * only the uncached portion is exposed as `inputTokens` there.
- */
 export function providerContextInputTokens(usage: TokenUsage): number {
   return finiteNonNegative(usage.inputTokens)
     + finiteNonNegative(usage.cacheReadTokens)
@@ -47,13 +42,18 @@ export function buildProviderContextUsageEvent(input: {
 }): Extract<AgentEvent, { type: 'context_usage' }> | null {
   const inputTokens = providerContextInputTokens(input.usage)
   if (inputTokens <= 0) return null
-  return buildContextUsageEvent({
+  const event = buildContextUsageEvent({
     inputTokens,
     contextWindowTokens: input.contextWindowTokens,
     reservedOutputTokens: input.reservedOutputTokens,
     iteration: input.iteration,
     source: 'provider',
   })
+  const outputTokens = finiteNonNegative(input.usage.outputTokens)
+  const generationMs = finiteNonNegative(input.usage.generationMs)
+  if (outputTokens > 0) event.context.outputTokens = outputTokens
+  if (generationMs > 0) event.context.generationMs = generationMs
+  return event
 }
 
 
@@ -117,11 +117,6 @@ export function estimateContextToolTokens(
   return estimateContextTextTokens(JSON.stringify(tools), charsPerToken) + tools.length * 4
 }
 
-/**
- * Builds the input-window estimate shown by context inspection surfaces.
- * Prompt variants are produced by the canonical system-prompt builder, so the
- * category deltas stay aligned when memory or skill formatting changes.
- */
 export function estimateContextUsage(input: ContextUsageEstimateInput): ContextUsageEstimate {
   const ratio = Number.isFinite(input.charsPerToken) && input.charsPerToken > 0
     ? input.charsPerToken

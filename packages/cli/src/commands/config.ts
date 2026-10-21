@@ -27,11 +27,6 @@ export async function providersCommand(options: { url?: string }) {
       lines.push(`  ${p.name} (${p.id})`)
       const embedIds = new Set(p.embeddingModelIds)
       for (const m of p.models) {
-        // A model is embed-only when daemon flags it as such *and* the
-        // capabilities don't include tool use. Some providers (Ollama)
-        // tag every chat model as embedding-capable, which previously
-        // made the whole list render as [embed]. Trust capabilities
-        // first, fall back to the embeddingModelIds set.
         const cap = (m as { capabilities?: { toolUse?: boolean; embedding?: boolean } }).capabilities
         const embedOnly = cap?.embedding === true && cap?.toolUse !== true
         const role = embedOnly ? 'embed' : embedIds.has(m.id) && !cap?.toolUse ? 'embed' : 'chat '

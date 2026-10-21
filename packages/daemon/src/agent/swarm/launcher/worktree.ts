@@ -35,7 +35,6 @@ export class WorktreeManager {
       try {
         rmSync(wtRoot, { recursive: true, force: true })
       } catch {
-        /* ignore */
       }
       throw e
     }
@@ -52,16 +51,12 @@ export class WorktreeManager {
       try {
         rmSync(wt.path, { recursive: true, force: true })
       } catch {
-        /* ignore */
       }
     }
-    // Best-effort branch cleanup. Only meaningful when worktree removal succeeded
-    // (otherwise the branch is still checked out by the worktree).
     if (removed && wt.branch) {
       try {
         execFileSync('git', ['branch', '-D', wt.branch], { cwd: wt.originRepo, stdio: 'ignore' })
       } catch {
-        /* ignore — branch may not exist */
       }
     }
   }

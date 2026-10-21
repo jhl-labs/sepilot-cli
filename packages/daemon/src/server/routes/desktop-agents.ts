@@ -24,7 +24,6 @@ const createSchema = z
   .strict()
 const inputSchema = z.object({ data: z.string().min(1).max(65536), requestId: z.string().uuid().optional() }).strict()
 
-/** Protected by the daemon's normal authenticated API; never by a token in a URL. */
 export function registerDesktopAgentRoutes(
   app: FastifyInstance,
   sessions = new DesktopAgentSessions(),
@@ -118,7 +117,6 @@ export function registerDesktopAgentRoutes(
       unsubscribe = await sessions.subscribe(params.data.id, (event) => {
         if (closed) return
         reply.raw.write(`data: ${JSON.stringify(event)}\n\n`)
-        // A slow reader reconnects to a fresh screen snapshot; never drop arbitrary ANSI bytes.
         if (reply.raw.writableLength > 4 * 1024 * 1024) reply.raw.destroy()
         if (event.type === 'exit') reply.raw.end()
       })

@@ -4,7 +4,6 @@ export const DEFAULT_LEADER_KEY = 'ctrl+x'
 
 export interface KeybindingConfig {
   leaderKey: string
-  /** Follow-up key to command id. */
   bindings: Map<string, string>
   warnings: string[]
 }
@@ -78,8 +77,6 @@ export function resolveKeybindings(raw: unknown): KeybindingConfig {
       requestedKeys.push(match[1])
     }
 
-    // An empty array intentionally unbinds. A non-empty but wholly malformed
-    // array keeps the old binding so a typo cannot make a command unreachable.
     if (value.length > 0 && requestedKeys.length === 0) continue
 
     const previousKeys = [...next]
@@ -95,7 +92,6 @@ export function resolveKeybindings(raw: unknown): KeybindingConfig {
       if (!acceptedKeys.includes(key)) acceptedKeys.push(key)
     }
 
-    // Preserve the previous binding when all valid candidates collide.
     if (requestedKeys.length > 0 && acceptedKeys.length === 0) continue
     for (const key of previousKeys) next.delete(key)
     for (const key of acceptedKeys) next.set(key, commandId)
@@ -115,9 +111,6 @@ export function loadKeybindings(
   try {
     contents = readFile(path)
   } catch (error) {
-    // The user-level override is optional. Node's readFileSync throws when it
-    // does not exist, while injected readers may represent the same case as
-    // null, so normalize both forms to the default configuration.
     if (isMissingFileError(error)) return resolveKeybindings(undefined)
     return withLoadWarning('read', path, error)
   }

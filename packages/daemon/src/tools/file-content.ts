@@ -1,4 +1,3 @@
-/** Lossless text transport for providers that alter literal whitespace. */
 export const contentEncodingSchema = {
   type: 'string',
   enum: ['utf8', 'base64'],
@@ -10,7 +9,6 @@ export function decodeFileContent(input: Record<string, unknown>): string | unde
   if (input.contentEncoding === undefined || input.contentEncoding === 'utf8') return input.content
   if (input.contentEncoding !== 'base64') return undefined
   const bytes = Buffer.from(input.content, 'base64')
-  // Buffer decoding is permissive; reject ignored characters and invalid UTF-8.
   if (bytes.toString('base64') !== input.content) return undefined
   const text = bytes.toString('utf8')
   return Buffer.from(text, 'utf8').equals(bytes) ? text : undefined

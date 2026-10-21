@@ -22,16 +22,7 @@ import {
 
 export interface WebSearchToolOptions {
   getTrustedDomains?: () => readonly string[]
-  /**
-   * Which backend to search with. Read per execution so a settings change
-   * takes effect without restarting the daemon, like the trusted domains.
-   */
   getProviderSettings?: () => WebSearchProviderSettings
-  /**
-   * Bound the complete search attempt, including provider fallback work.
-   * Search is a discovery aid: it must return control well before the global
-   * tool backstop so the agent can try a known URL with webfetch/browser.
-   */
   timeoutMs?: number
 }
 
@@ -50,8 +41,6 @@ function configuredSearchCardinalityAliases(
       if (parsed.hostname) aliases.add(parsed.hostname)
       if (parsed.host) aliases.add(parsed.host)
     } catch {
-      // An invalid endpoint will fail through the normal provider contract.
-      // It is not a safe structural identity for cardinality enforcement.
     }
   }
   return [...aliases]
@@ -139,9 +128,6 @@ export function createWebSearchTool(options: WebSearchToolOptions = {}): ToolDef
         const domainPolicy = createTrustedDomainPolicy(options.getTrustedDomains?.() ?? [])
         const effectiveQuery = buildSearchQuery(query, domainPolicy)
 
-        // No settings supplied means no provider configuration to honour at
-        // all — including the environment, which the daemon reads only through
-        // the settings it passes in. Keeps a bare tool instance deterministic.
         const settings = options.getProviderSettings?.()
         let provider = settings
           ? resolveSearchProvider(settings)
@@ -203,7 +189,6 @@ export function createWebSearchTool(options: WebSearchToolOptions = {}): ToolDef
           }
         }
 
-        // Use DuckDuckGo instant answer API (no API key needed)
         const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(effectiveQuery)}&format=json&no_html=1&skip_disambig=1`
         const res = await raceWithAbort(
           fetch(url, { signal: controller.signal }),
@@ -215,8 +200,6 @@ export function createWebSearchTool(options: WebSearchToolOptions = {}): ToolDef
           discardSearchResponse(res)
           return { output: `Search failed: ${res.status}`, status: 'error', durationMs: Date.now() - start }
         }
-        // 202 here is the same anti-bot response the HTML endpoint returns; the
-        // body is not the JSON payload this path expects.
         if (res.status !== 200) {
           discardSearchResponse(res)
           throw new SearchBackendUnavailableError(res.status)
@@ -230,7 +213,6 @@ export function createWebSearchTool(options: WebSearchToolOptions = {}): ToolDef
         }>('duckduckgo', res, controller.signal)
         const results: string[] = []
 
-        // Abstract (main answer)
         const abstract = data.AbstractText || data.Abstract
         const abstractSource = normalizeSearchHref(data.AbstractURL ?? '', domainPolicy)
         if (abstract && (!domainPolicy.restricted || abstractSource)) {
@@ -239,7 +221,6 @@ export function createWebSearchTool(options: WebSearchToolOptions = {}): ToolDef
           )
         }
 
-        // Related topics
         if (data.RelatedTopics) {
           let topicCount = 0
           for (const topic of flattenRelatedTopics(data.RelatedTopics)) {
@@ -320,10 +301,6 @@ export function createWebSearchTool(options: WebSearchToolOptions = {}): ToolDef
             code: 'SEARCH_RESPONSE_TOO_LARGE_PERMANENT',
           }
         }
-        // A configured provider's failure is reported as itself. Quietly
-        // retrying the query on DuckDuckGo would turn a rejected API key into
-        // "the web has nothing", which is exactly the class of silent
-        // degradation this tool already guards against.
         if (err instanceof SearchProviderError) {
           return {
             output: `Search error: ${message}`,
@@ -339,8 +316,6 @@ export function createWebSearchTool(options: WebSearchToolOptions = {}): ToolDef
             output: `Search error: ${message}`,
             status: 'error',
             durationMs: Date.now() - start,
-            // Transient so the agent's own error-code guidance lets it retry
-            // once rather than treating search as permanently gone.
             code: 'SEARCH_BACKEND_UNAVAILABLE_TRANSIENT',
           }
         }
@@ -365,13 +340,6 @@ function webSearchMetadata(
   }
 }
 
-/**
- * Tool metadata is authoritative for journals and policy, but the next model
- * turn only sees the tool output. Project the same bounded provider/source
- * boundary into that output so synthesis cannot silently relabel an internal
- * index as public web (or the reverse). Every field here comes from validated
- * daemon-owned enums and counts; arbitrary provider prose is never copied.
- */
 function formatSearchRetrievalEvidence(
   evidence: SearchRetrievalEvidence,
   returnedResultCount: number,
@@ -392,11 +360,6 @@ function restrictionSuffix(domainPolicy: TrustedDomainPolicy): string {
   return ` within trusted search domains: ${domainPolicy.domains.join(', ') || '(invalid configuration)'}`
 }
 
-/**
- * Keyed providers return structured hits, but the trusted-domain boundary has
- * to hold for them too: `site:` filters in the query are the provider's best
- * effort, not a guarantee, so every URL is checked again here.
- */
 function formatSearchHits(
   hits: SearchHit[],
   maxResults: number,
@@ -436,13 +399,6 @@ function flattenRelatedTopics(topics: DuckDuckGoTopic[]): DuckDuckGoTopic[] {
   return flattened
 }
 
-/**
- * DuckDuckGo answers a rate-limited or bot-suspected scrape with HTTP 202 and
- * an ordinary-looking landing page rather than an error status. `res.ok` is
- * true for 202, so without this check the challenge page is parsed as a result
- * set, yields nothing, and the caller is told "no results found" — which reads
- * as "the web has no answer" instead of "search is unavailable right now".
- */
 function isSearchBackendChallenge(status: number, body: string): boolean {
   if (status !== 200) return true
   return /\banomaly\b|\bcaptcha\b|challenge-form/i.test(body)
@@ -534,9 +490,6 @@ function createTrustedDomainPolicy(rawDomains: readonly string[]): TrustedDomain
     ),
   ]
   return {
-    // Config validation prevents malformed domains. Keeping the restriction
-    // active for any non-empty direct caller input makes the tool fail closed
-    // if that boundary is bypassed.
     restricted: rawDomains.length > 0,
     domains,
   }
@@ -575,11 +528,6 @@ function htmlToText(html: string): string {
     .trim()
 }
 
-/**
- * Search-provider labels and snippets are model-facing Markdown. Preserve
- * their visible text while preventing a literal pipe from becoming a table
- * delimiter when the assistant copies a result into a Markdown table.
- */
 function escapeMarkdownInlineText(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/\|/g, '\\|')
 }

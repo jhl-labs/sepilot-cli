@@ -106,11 +106,6 @@ export function isRuntimeManagedChannel(
   )
 }
 
-/**
- * Apply an operator-controlled Mattermost channel without persisting its
- * credentials. The opt-in is explicit so ordinary desktop/CLI processes that
- * happen to inherit a MATTERMOST_* variable do not silently grow a channel.
- */
 export function applyRuntimeChannelEnvironment(
   config: SepilotdConfig,
   env: Record<string, string | undefined> = process.env,
@@ -167,11 +162,6 @@ export function applyRuntimeChannelEnvironment(
   return next
 }
 
-/**
- * Merge a runtime channel update into the raw on-disk list. Environment-owned
- * types are always kept from the raw YAML (or omitted if absent), never copied
- * from the effective runtime config where credentials have been resolved.
- */
 export function channelsForPersistence(
   config: SepilotdConfig,
   rawChannels: unknown,
@@ -197,8 +187,6 @@ export function channelsForPersistence(
   ]
 }
 
-/** Keep operator-owned runtime channels effective across a full-document
- * settings update while accepting all non-managed channels from that update. */
 export function preserveRuntimeManagedChannels(
   source: SepilotdConfig,
   target: SepilotdConfig,

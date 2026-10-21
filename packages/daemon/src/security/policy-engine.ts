@@ -4,25 +4,11 @@ import type {
   ToolExecRequest,
   PolicyCheckResult,
   PolicyConfig,
+  ResourceAccessPolicy,
   PolicyRule,
   ToolPolicyMode,
 } from '@sepilotd/core'
 
-/**
- * Tool-rule mode as understood by the daemon policy engine.
- *
- * - `autonomous`: run without prompting.
- * - `supervised`: prompt when the run autonomy prompts (supervised,
- *   accept-edits, workspace-write); under `autonomous` autonomy the tool
- *   runs without prompting once every deny gate has passed.
- * - `ask`: always prompt, regardless of run autonomy. Use it for the few
- *   tools that must have a human in the loop even in headless runs.
- * - `blocked`: never run.
- *
- * `ask` is a daemon-side extension of the core `ToolPolicyMode` union so a
- * policy file can opt individual tools into "always ask" without changing
- * what `supervised` means for interactive runs.
- */
 export type ToolRuleMode = ToolPolicyMode | 'ask'
 
 export type PolicyEngineRule = Omit<PolicyRule, 'mode'> & { mode: ToolRuleMode }
@@ -32,26 +18,18 @@ export interface PolicyEngineDefaults {
   unmatched_policy: PolicyConfig['defaults']['unmatched_policy']
   max_timeout_ms: number
   max_output_bytes: number
-  /**
-   * Escape hatch for operators: when `true`, `autonomous` autonomy treats a
-   * `supervised` tool rule as approval-required (which the autonomous
-   * executor turns into a hard block), restoring the pre-`ask` behaviour.
-   * Default `false`: autonomous means "do not prompt", not "block more".
-   */
   autonomous_honors_supervised_rules?: boolean
 }
 
-/** `PolicyConfig` widened with the daemon-only `ask` mode and defaults knob.
- * Every core `PolicyConfig` is assignable to it, so existing callers and
- * loaders need no changes. */
 export interface PolicyEngineConfig {
+  access?: ResourceAccessPolicy
   version: number
   defaults: PolicyEngineDefaults
   tools: Record<string, PolicyEngineRule>
   elevated?: Record<string, Partial<PolicyEngineRule>>
+  browserSites?: BrowserSitePolicy
 }
 
-/** Static per-tool rule posture returned by `PolicyEngine.ruleModeFor`. */
 export interface ToolRulePosture {
   mode: ToolRuleMode
   hasRule: boolean
@@ -66,20 +44,19 @@ export const AUTONOMOUS_SUPERVISED_RULE_REASON =
 import { lstatSync, readlinkSync } from 'node:fs'
 import { basename, dirname, extname, isAbsolute, parse, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { checkResourceAccess } from './resource-access.js'
+import { decideBrowserSite, type BrowserSitePolicy } from './browser-site-policy.js'
 import { parseApplyPatch } from '../tools/apply-patch-parser.js'
 import { resolvePagesScaffoldPolicyTargets } from '../tools/pages-scaffold-plan.js'
 import { resolveToolCwd, resolveToolPath } from '../tools/path-utils.js'
 import { resolveToolSecurityDescriptor } from '../tools/security.js'
+import { terminalAutoApprovalEscalation } from './terminal-auto-approval.js'
 import {
   isReadOnlyNetworkTerminalCommand,
   normalizeTerminalArgs,
   normalizeTerminalCommandShape,
 } from '../tools/terminal.js'
 
-/**
- * Simple glob matching supporting * (single segment) and ** (any depth).
- * Converts a glob pattern to a RegExp.
- */
 function globToRegex(pattern: string): RegExp {
   const escaped = pattern
     .replace(/[.+^${}()|[\]\\]/g, '\\$&')
@@ -102,12 +79,6 @@ function matchesPathAny(value: string, patterns: string[]): boolean {
   return patterns.some((pattern) => globToRegex(normalizePolicyPath(pattern)).test(normalizedValue))
 }
 
-/**
- * Like {@link matchesAny} but matches the pattern *anywhere inside* the value.
- * Used for wrapper-script content where the dangerous fragment may sit between
- * other shell tokens (e.g. `cd /tmp && rm -rf /` shouldn't slip past a
- * `rm -rf /` deny_pattern just because the script also has a `cd` prefix).
- */
 function containsAny(value: string, patterns: string[]): boolean {
   return patterns.some((pattern) => {
     const inner = globToRegex(pattern).source.replace(/^\^/, '').replace(/\$$/, '')
@@ -119,10 +90,6 @@ function containsAny(value: string, patterns: string[]): boolean {
   })
 }
 
-// Download-pipe-to-shell detection. The glob deny_patterns `curl * | sh`
-// / `wget * | sh` use a path-segment glob (`*` → `[^/]*`), so a URL with
-// slashes (the common case) slips past them. This regex catches a
-// fetch-then-pipe-to-interpreter chain regardless of slashes in the URL.
 const DOWNLOAD_PIPE_TO_SHELL =
   /\b(?:curl|wget|fetch)\b[\s\S]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|ksh|fish|python3?|perl|ruby|node)\b/i
 
@@ -134,11 +101,6 @@ function isShellCommandFlag(arg: string): boolean {
   return arg === '-c' || /^-[A-Za-z]*c[A-Za-z]*$/.test(arg)
 }
 
-/**
- * If the request is a shell wrapper (`bash -c "<script>"`, `sh -c "<script>"`,
- * etc.), return the script body so the policy can scan it independently of
- * the wrapper invocation. Returns `null` when no `-c` script body is present.
- */
 function extractWrappedScript(input: Record<string, unknown>): string | null {
   const normalized = normalizeTerminalCommandShape(input)
   const executable = typeof normalized.executable === 'string' ? normalized.executable : undefined
@@ -194,7 +156,7 @@ function canonicalBoundaryPath(rawPath: string, symlinkDepth = 0): BoundaryPathR
         typeof error === 'object' && error && 'code' in error
           ? String((error as { code?: unknown }).code)
           : ''
-      if (code && code !== 'ENOENT' && code !== 'ENOTDIR') {
+      if (code && code !== 'ENOENT' && code !== 'ENOTDIR' && code !== 'ENAMETOOLONG') {
         return {
           error: `Could not inspect path ${candidate}: ${
             error instanceof Error ? error.message : String(error)
@@ -231,10 +193,6 @@ function canonicalBoundaryPath(rawPath: string, symlinkDepth = 0): BoundaryPathR
   return { path: current }
 }
 
-/**
- * Canonical, symlink-aware containment check shared by tools whose effective
- * file target is runtime state rather than a model-visible path argument.
- */
 export function strictWorkspacePathViolation(
   rawPath: string,
   rawWorkspaceRoot: string,
@@ -723,8 +681,6 @@ function workspaceTargetsForRequest(
       : { paths: [] }
   }
 
-  // A move mutates both ends: the source disappears and the destination
-  // appears, so both are workspace-write targets.
   if (tool === 'fs.move') {
     const paths: string[] = []
     for (const key of ['from', 'to'] as const) {
@@ -772,10 +728,6 @@ const STRICT_WORKSPACE_PATH_TOOLS = new Set([
   'browser.evaluate',
 ])
 
-// These Office operations execute against the host PowerPoint process, but
-// their public contract is narrower than the legacy office.* bridge: they take
-// one .pptx path, canonicalize it before and after realpath, reject symlink
-// escapes, and re-check the active presentation on every call.
 const STRICT_WORKSPACE_SELF_CONFINED_OFFICE_TOOLS = new Set([
   'office.open_presentation',
   'office.navigate_slide',
@@ -790,28 +742,14 @@ const STRICT_WORKSPACE_CWD_TOOLS = new Set([
   'code.symbols',
 ])
 
-// These tools execute Git only through a runner that must attest active
-// workspace-only filesystem isolation. Their repoPath is still checked here
-// and is rechecked immediately before execution by the tool itself.
 const STRICT_WORKSPACE_SANDBOXED_GIT_TOOLS = new Set([
   'git.status',
   'git.diff',
   'git.log',
 ])
 
-// terminal.run is permitted to reach the ordinary policy/approval gate only
-// because the tool runtime replaces host execution with a fail-closed
-// read-only, no-network workspace sandbox whenever workspaceRoot is present.
-// The runner re-attests that posture after execution and never falls back to
-// the host. Managed background children use the separate lifecycle set below.
 const STRICT_WORKSPACE_SANDBOXED_TERMINAL_TOOLS = new Set(['terminal.run'])
 
-// Managed process.start uses the same fail-closed bubblewrap launcher as
-// terminal.run when a strict workspace is present. The remaining lifecycle
-// tools operate only on daemon-owned session ids and captured buffers; they do
-// not open arbitrary host paths. This is a capability boundary, not a command
-// allowlist: the child executable remains subject to ordinary policy and
-// approval, while the runtime attests the namespace posture.
 const STRICT_WORKSPACE_MANAGED_PROCESS_TOOLS = new Set([
   'process.start',
   'process.sessions',
@@ -827,6 +765,7 @@ const STRICT_WORKSPACE_UNCONFINED_TOOLS = new Set([
   'image_gen.create',
   'skillhub.install',
   'external_acp.run',
+  'external_cli.run',
   'device.delegate',
   'a2a.send',
   'pages.status',
@@ -842,8 +781,6 @@ const STRICT_WORKSPACE_UNCONFINED_PREFIXES = [
 ] as const
 
 const STRICT_WORKSPACE_AUDITED_TOOLS = new Set([
-  // Knowledge tools accept record IDs and content, never caller-selected paths.
-  // They access only the daemon-owned profile store; write approval still applies.
   'knowledge.search',
   'knowledge.read',
   'knowledge.save',
@@ -852,9 +789,6 @@ const STRICT_WORKSPACE_AUDITED_TOOLS = new Set([
   'apply_patch',
   'browser.extract',
   'browser.navigate',
-  // Companion exposes only HTTP(S) tab observation and fixed input actions.
-  // No filesystem paths, uploads, arbitrary CDP, or script execution are accepted.
-  // External-write approval and URL policy still apply below.
   'browser.remote_snapshot',
   'browser.remote_action',
   'image_gen.cancel',
@@ -871,8 +805,13 @@ const STRICT_WORKSPACE_AUDITED_TOOLS = new Set([
   'pages.scaffold',
   'question',
   'notification.publish',
+  'event.deliver',
+  'event.destinations',
   'monitor.evaluate',
   'monitor.report',
+  'monitor.watch',
+  'monitor.watches',
+  'session.schedule_wakeup',
   'schedule_create',
   'schedule_cancel',
   'schedule_cancel_all',
@@ -885,9 +824,6 @@ const STRICT_WORKSPACE_AUDITED_TOOLS = new Set([
   'schedule_update',
   'assistant.status',
   'self.info',
-  // Trusted, structured host metrics only. system.info never accepts a file
-  // read target and returns coarse resource values, so enabling the explicit
-  // hostSystemInfo capability does not widen the workspace filesystem root.
   'system.info',
   'skill',
   'skillhub.search',
@@ -1012,10 +948,6 @@ function strictWorkspaceTargetsForRequest(
   return { paths: [] }
 }
 
-/**
- * A strict workspace is a filesystem capability, not an autonomy setting.
- * Human approval can authorize a side effect but cannot widen this root.
- */
 function checkStrictWorkspaceBoundary(request: ToolExecRequest): PolicyCheckResult | null {
   if (!request.workspaceRoot) return null
 
@@ -1033,9 +965,6 @@ function checkStrictWorkspaceBoundary(request: ToolExecRequest): PolicyCheckResu
     }
   }
 
-  // Plugin and MCP tools do not carry an auditable local-filesystem posture.
-  // A user approval can authorize a side effect, but cannot attest that an
-  // opaque implementation stays under the immutable workspace root.
   if (request.registrationSource === 'plugin' || request.tool.startsWith('mcp.')) {
     return {
       allowed: false,
@@ -1043,8 +972,6 @@ function checkStrictWorkspaceBoundary(request: ToolExecRequest): PolicyCheckResu
     }
   }
 
-  // LSP servers retain their own process-wide project roots and may return or
-  // inspect dependency files outside a narrower desktop workspace.
   if (
     request.tool === 'lsp'
     || request.tool === 'code.diagnostics'
@@ -1060,9 +987,6 @@ function checkStrictWorkspaceBoundary(request: ToolExecRequest): PolicyCheckResu
     }
   }
 
-  // Text extraction is in-process for text files and PDFs with OCR disabled.
-  // OCR-capable paths spawn pdftoppm/tesseract and use host temp directories,
-  // which cannot be confined without an OS filesystem sandbox.
   if (request.tool === 'media.extract_text') {
     const rawPath = typeof request.input.path === 'string' ? request.input.path : ''
     const extension = extname(rawPath).toLowerCase()
@@ -1077,9 +1001,6 @@ function checkStrictWorkspaceBoundary(request: ToolExecRequest): PolicyCheckResu
     }
   }
 
-  // Host command execution cannot be proven workspace-confined by parsing
-  // command strings. Keep this fail-closed until a runner can attest that it
-  // provides an active workspace-only filesystem sandbox.
   if (
     STRICT_WORKSPACE_UNCONFINED_TOOLS.has(request.tool)
     || (
@@ -1091,6 +1012,7 @@ function checkStrictWorkspaceBoundary(request: ToolExecRequest): PolicyCheckResu
     return {
       allowed: false,
       reason: `Strict workspace blocks ${request.tool}: local host command execution cannot guarantee workspace-only filesystem access`,
+      code: 'workspace_confinement_required',
     }
   }
 
@@ -1230,14 +1152,6 @@ function checkDeniedPathCandidates(
   return null
 }
 
-/**
- * ReadOnly autonomy may launch a temporary observer only when the runtime can
- * enforce the strict-workspace capability: read-only workspace, no host
- * network, bounded resources, daemon ownership, and an automatic positive
- * lifetime. This is intentionally based on execution posture rather than an
- * executable/argument allowlist, so it applies uniformly to samplers, TUIs,
- * test watchers, and future tools without prompt-specific heuristics.
- */
 function isStrictReadOnlyManagedProcessStart(request: ToolExecRequest): boolean {
   if (request.tool !== 'process.start' || !request.workspaceRoot) return false
   const env = request.input.env
@@ -1252,20 +1166,6 @@ function isStrictReadOnlyManagedProcessStart(request: ToolExecRequest): boolean 
       && ttlMs <= 24 * 60 * 60_000)
 }
 
-/**
- * A terminal invocation is read-only when the request carries an immutable
- * workspace capability. The terminal runtime treats that capability as a
- * contract: it must execute in the fail-closed strict-workspace runner with a
- * read-only workspace, private temporary storage, bounded resources, hidden
- * host credentials/state, and no network unless the runtime grants a narrower
- * audited read-only network capability.
- *
- * This is deliberately independent of the executable name. Maintaining a
- * growing allowlist of `pwd`, `ls`, language analyzers, and future inspection
- * tools both blocks legitimate observations and mistakes names for security
- * boundaries. Without a strict workspace capability the host execution path
- * remains side-effecting and therefore fails closed in ReadOnly/Plan modes.
- */
 function isStrictReadOnlyTerminalRun(request: ToolExecRequest): boolean {
   if (
     request.tool !== 'terminal.run'
@@ -1300,25 +1200,22 @@ function invocationSecurityEffect(
   return 'process-lifecycle'
 }
 
+function writesArtifact(tool: string, security?: ToolExecRequest['security']): boolean {
+  return resolveToolSecurityDescriptor(tool, security).writesArtifact === true
+}
+
 export function isPolicyReadOnlyRequest(request: ToolExecRequest): boolean {
   const effect = invocationSecurityEffect(request)
+  if (writesArtifact(request.tool, request.security)) return false
   return effect === 'observe' || effect === 'internal-state'
 }
 
-/**
- * Canonical policy classification used by per-turn approval guards. Unknown
- * and plugin-provided tools stay side-effecting unless their registered
- * descriptor explicitly classifies them as safe.
- */
 export function isPolicyReadOnlyTool(tool: string, security?: ToolExecRequest['security']): boolean {
-  const effect = resolveToolSecurityDescriptor(tool, security).effect
-  return effect === 'observe' || effect === 'internal-state'
+  const descriptor = resolveToolSecurityDescriptor(tool, security)
+  if (descriptor.writesArtifact === true) return false
+  return descriptor.effect === 'observe' || descriptor.effect === 'internal-state'
 }
 
-/** Destructive memory tools that mutate or delete durable state.
- * These are blocked in read-only and plan modes regardless of the
- * tool-rule policy mode, so an agent can't sneak a memory.forget
- * past a "diagnose only" autonomy. */
 const MEMORY_DESTRUCTIVE_TOOLS = new Set([
   'memory.forget',
   'memory.update',
@@ -1340,22 +1237,22 @@ const WORKSPACE_WRITE_FAST_PATH_TOOLS = new Set(['fs.write', 'fs.append', 'fs.ed
 const SHELL_WRAPPER_EXECUTABLES = new Set(['bash', 'dash', 'sh', 'zsh', 'fish', 'csh', 'tcsh'])
 
 export class PolicyEngine implements IToolPolicy {
-  constructor(private config: PolicyEngineConfig) {}
+  constructor(private config: PolicyEngineConfig, private readonly runtimeDataDir?: string) {}
 
-  /** Read-only snapshot of the active policy. Surfaces use this to render
-   * the current rule table to the operator (e.g. cli `/policy`). The
-   * returned object is intentionally a structuredClone so callers can't
-   * mutate engine state by holding the reference. */
+  private withRuntimeStatePaths(denyPaths: readonly string[]): string[] {
+    const dataDir = this.runtimeDataDir?.replace(/\/+$/, '')
+    if (!dataDir) return [...denyPaths]
+    const mirrored = denyPaths.flatMap((glob) => {
+      const match = /^\*\*\/\.sepilotd\/(.+)$/.exec(glob)
+      return match ? [`${dataDir}/${match[1]}`] : []
+    })
+    return [...denyPaths, ...mirrored]
+  }
+
   describe(): PolicyEngineConfig {
     return JSON.parse(JSON.stringify(this.config)) as PolicyEngineConfig
   }
 
-  /**
-   * Static rule posture for one tool name, without evaluating any input.
-   * Used to describe up front which tools will prompt or are unavailable.
-   * Mirrors the rule/default resolution inside `check` (mcp.* fallback,
-   * user-memory write default) but performs no deny_* or path matching.
-   */
   ruleModeFor(tool: string): ToolRulePosture {
     const isMcpTool = tool.startsWith('mcp.')
     const toolRule = this.config.tools[tool] ?? (isMcpTool ? this.config.tools['mcp.*'] : undefined)
@@ -1378,18 +1275,12 @@ export class PolicyEngine implements IToolPolicy {
     autoApprove?: boolean,
   ): PolicyCheckResult {
     const { tool, input } = request
+    const accessResult = checkResourceAccess(this.config.access, request, this.runtimeDataDir)
+    if (accessResult) return accessResult
     const isMcpTool = tool.startsWith('mcp.')
     const readOnlySafeInvocation = isPolicyReadOnlyRequest(request)
-    // MCP tools arrive with server-defined names the operator has no
-    // per-tool rules for; without a fallback rule they would skip every
-    // deny_paths / deny_patterns check below. `mcp.*` acts as the shared
-    // rule for all of them, overridable per exact tool name.
     const toolRule = this.config.tools[tool] ?? (isMcpTool ? this.config.tools['mcp.*'] : undefined)
 
-    // Normalize before the exact-match so a stored/forwarded agent id like
-    // 'Plan', 'plan ', or 'PLAN' can't silently bypass plan-mode write
-    // blocking (the surfaces only send 'plan', but a typo/case variant must
-    // fail safe — block — not fail open).
     if (primaryAgentId?.trim().toLowerCase() === 'plan' && !readOnlySafeInvocation) {
       return {
         allowed: false,
@@ -1402,13 +1293,10 @@ export class PolicyEngine implements IToolPolicy {
       return strictWorkspaceResult
     }
 
-    // 1. ReadOnly mode: block non-read tools
     if (
       autonomy === 'readonly'
       && !readOnlySafeInvocation
     ) {
-      // Specialized message for destructive memory tools so the agent's
-      // explanation back to the user is precise instead of generic.
       if (MEMORY_DESTRUCTIVE_TOOLS.has(tool)) {
         return {
           allowed: false,
@@ -1418,26 +1306,18 @@ export class PolicyEngine implements IToolPolicy {
       return { allowed: false, reason: `ReadOnly mode blocks tool '${tool}'` }
     }
 
-    // Build the full command string for pattern matching
     const commandStr = this.buildCommandString(tool, input)
 
-    // 1b. Edit fast-paths are auto-allowed after deny and workspace
-    // boundary checks run. deny_patterns / deny_paths still apply below
-    // before we return.
     const isAcceptEditsFastPath =
       autonomy === 'accept-edits' && WORKSPACE_WRITE_FAST_PATH_TOOLS.has(tool)
     const isWorkspaceWriteFastPath =
       autonomy === 'workspace-write' && WORKSPACE_WRITE_FAST_PATH_TOOLS.has(tool)
 
-    // 2. deny_patterns check (from tool-specific rule, then defaults-level)
     const denyPatterns = toolRule?.deny_patterns ?? []
     if (denyPatterns.length > 0 && matchesAny(commandStr, denyPatterns)) {
       return { allowed: false, reason: `Command matches deny_pattern` }
     }
 
-    // 2-dl. Download-pipe-to-shell guard for command tools. The glob
-    // deny_patterns miss URLs (slashes break the path-segment glob), so a
-    // `curl https://x/y | sh` chain is caught here regardless of slashes.
     if (
       denyPatterns.length > 0 &&
       (tool === 'terminal.run' || tool === 'process.start' || tool === 'service.start' || tool === 'service.install' || isMcpTool) &&
@@ -1449,12 +1329,6 @@ export class PolicyEngine implements IToolPolicy {
       }
     }
 
-    // 2a. MCP arg hardening: MCP servers name their command/script arguments
-    // freely and a shell-running MCP tool would otherwise only get the
-    // deny_paths scan, not deny_patterns. Scan every string argument value
-    // (substring match, like the shell-wrapper guard) so `rm -rf /` or
-    // `curl … | sh` hidden in any arg key is blocked the same way it is for
-    // terminal.run. Purely additive — only adds denials.
     if (isMcpTool && denyPatterns.length > 0) {
       for (const value of collectStringValues(input)) {
         if (containsAny(value, denyPatterns)) {
@@ -1463,12 +1337,6 @@ export class PolicyEngine implements IToolPolicy {
       }
     }
 
-    // 2b. Shell wrapper hardening: a `bash -c "<script>"` invocation skips the
-    // anchored deny_patterns check above (the wrapper prefix breaks the
-    // regex), and supervised mode would otherwise just ask the user to
-    // approve. Scan the wrapped script body for the same deny_patterns,
-    // matched as substrings, so a hostile wrapper can't smuggle `rm -rf /`
-    // past an explicit deny_pattern by hiding it inside `bash -c`.
     if (
       (tool === 'terminal.run' || tool === 'process.start' || tool === 'service.start' || tool === 'service.install') &&
       denyPatterns.length > 0
@@ -1485,13 +1353,7 @@ export class PolicyEngine implements IToolPolicy {
       }
     }
 
-    // 3. deny_paths check
-    // For most tools, `input.path` is the affected file. For `apply_patch`,
-    // a single call can write many files, so we expand the patch and check
-    // every file path against deny_paths — otherwise a hostile patch can
-    // bypass the deny list by hiding the protected file as the second
-    // entry. Unparseable patches are caught by the workspace-write path.
-    const denyPaths = toolRule?.deny_paths ?? []
+    const denyPaths = this.withRuntimeStatePaths(toolRule?.deny_paths ?? [])
     if (denyPaths.length > 0) {
       const candidatePaths: string[] = []
       const inputPath = typeof input.path === 'string' ? input.path : ''
@@ -1503,12 +1365,6 @@ export class PolicyEngine implements IToolPolicy {
       }
       if (inputPath) candidatePaths.push(inputPath)
       if (isMcpTool) {
-        // MCP servers name their path arguments freely (path, file, target,
-        // uri, ...), so every string value is a deny_paths candidate.
-        // Non-path strings resolve under cwd and simply never match the
-        // protected-path globs. A NUL-bearing value cannot be an OS path;
-        // skip it here so binary content is not rejected by path
-        // canonicalization. The explicit input.path above remains fail-closed.
         candidatePaths.push(
           ...collectStringValues(input).filter((value) => !value.includes('\0')),
         )
@@ -1518,7 +1374,6 @@ export class PolicyEngine implements IToolPolicy {
           const parsed = parseApplyPatch(String(input.patch ?? ''))
           for (const file of parsed.files) candidatePaths.push(file.path)
         } catch {
-          // ignore — parse-failure is reported by other paths
         }
       }
       const deniedPathResult = checkDeniedPathCandidates(candidatePaths, denyPaths, request.cwd)
@@ -1536,10 +1391,6 @@ export class PolicyEngine implements IToolPolicy {
       }
     }
 
-    // 3b. URL allow/deny checks for headless browser tools and the dedicated
-    // user-visible browser handoff. Keeping this keyed to URL-bearing tools
-    // prevents a custom/file protocol from bypassing policy just because the
-    // action does not use the browser.* namespace.
     const isUrlBearingTool = tool.startsWith('browser.') || tool === 'computer.open_url'
     if (toolRule && isUrlBearingTool) {
       const targetUrl = tool === 'browser.remote_action' && input.action !== 'navigate'
@@ -1575,7 +1426,18 @@ export class PolicyEngine implements IToolPolicy {
       }
     }
 
-    // 4. deny_executables check
+    let browserSiteAllowed = false
+    if (tool === 'browser.remote_action' && this.config.browserSites) {
+      const targetUrl = input.action !== 'navigate' ? input.expectedUrl : input.url
+      if (typeof targetUrl === 'string' && targetUrl) {
+        const decision = decideBrowserSite(targetUrl, this.config.browserSites)
+        if (decision.kind === 'deny') {
+          return { allowed: false, reason: 'Site is in the browser deny list' }
+        }
+        browserSiteAllowed = decision.kind === 'allow'
+      }
+    }
+
     const denyExecutables = toolRule?.deny_executables ?? []
     const executable = normalizeExecutable(input.executable)
     const normalizedDeniedExecutables = denyExecutables.map(normalizeExecutable)
@@ -1590,11 +1452,6 @@ export class PolicyEngine implements IToolPolicy {
       return { allowed: false, reason: `Executable '${executable}' is blocked` }
     }
 
-    // 5. Mode check from tool rule. Explicit blocks remain authoritative,
-    // but a successfully audited observation/internal-state invocation must
-    // not be turned back into an approval request by a legacy `supervised`
-    // tool rule. All deny, workspace-boundary, executable, and URL checks have
-    // already run above, so this is the single effect-based approval boundary.
     const mode =
       toolRule?.mode ??
       (USER_MEMORY_WRITE_TOOLS.has(tool) ? 'autonomous' : this.config.defaults.mode)
@@ -1609,23 +1466,10 @@ export class PolicyEngine implements IToolPolicy {
       return { allowed: false, reason: 'Denied by default unmatched_policy' }
     }
 
-    // 4b. Edit fast-paths skip the supervised approval gate once deny_*,
-    // workspace, and explicit blocked-mode checks above have passed.
     if (isAcceptEditsFastPath || isWorkspaceWriteFastPath) {
       return { allowed: true }
     }
 
-    // 5b. Approval semantics. Autonomy answers "does the runtime prompt?";
-    // the tool rule answers "is this tool allowed at all?". Every hard deny
-    // (deny_*, workspace boundary, blocked mode, unmatched_policy: deny,
-    // wrapped-script deny, plan/readonly) has already returned above, so the
-    // only question left is whether to prompt.
-    //
-    // - `ask` rules prompt under every autonomy, including autonomous.
-    // - `supervised` rules prompt under prompting autonomies; under
-    //   autonomous they run, because autonomous means "do not ask", not
-    //   "block more". `defaults.autonomous_honors_supervised_rules: true`
-    //   restores the legacy prompt (which the autonomous executor blocks).
     const promptingAutonomy =
       autonomy === 'supervised' ||
       autonomy === 'accept-edits' ||
@@ -1640,7 +1484,11 @@ export class PolicyEngine implements IToolPolicy {
 
     if (ruleRequestsPrompt || promptingAutonomy) {
       const allowPatterns = toolRule?.allow_patterns ?? []
-      if (allowPatterns.length > 0 && matchesAny(commandStr, allowPatterns)) {
+      if (
+        allowPatterns.length > 0
+        && matchesAny(commandStr, allowPatterns)
+        && !this.escalatesTerminalAutoApproval(tool, input, request.cwd)
+      ) {
         return { allowed: true }
       }
 
@@ -1652,7 +1500,10 @@ export class PolicyEngine implements IToolPolicy {
         }
       }
 
-      // If not in allow list, require approval
+      if (browserSiteAllowed) {
+        return { allowed: true, reason: 'Site is in the browser allow list' }
+      }
+
       const supervising =
         ruleRequestsPrompt ||
         (promptingAutonomy && !readOnlySafeInvocation && !USER_MEMORY_WRITE_TOOLS.has(tool))
@@ -1671,19 +1522,12 @@ export class PolicyEngine implements IToolPolicy {
       }
     }
 
-    // 5c. A `supervised` rule under autonomous autonomy runs without a
-    // prompt. Its allow_patterns are "auto-approve without asking" hints for
-    // prompting autonomies, not an allowlist, so they must not turn into a
-    // deny here: autonomous may run at least what supervised could run
-    // after approval, minus the deny gates that already returned above.
     if (autonomousRunsSupervisedRule) {
       return { allowed: true, reason: AUTONOMOUS_SUPERVISED_RULE_REASON }
     }
 
-    // 6. allow_patterns check for autonomous rules
     const allowPatterns = toolRule?.allow_patterns ?? []
     if (allowPatterns.length > 0 && !matchesAny(commandStr, allowPatterns)) {
-      // Has allow patterns but doesn't match → fall through to unmatched
       if (this.config.defaults.unmatched_policy === 'deny') {
         return { allowed: false, reason: 'Command does not match allow_patterns' }
       }
@@ -1693,7 +1537,6 @@ export class PolicyEngine implements IToolPolicy {
       return { allowed: true }
     }
 
-    // 7. Fallback to defaults.unmatched_policy
     if (this.config.defaults.unmatched_policy === 'deny') {
       return { allowed: false, reason: 'Denied by default unmatched_policy' }
     }
@@ -1702,30 +1545,40 @@ export class PolicyEngine implements IToolPolicy {
   }
 
   async reload(): Promise<void> {
-    // Hot-reload from disk is not yet implemented. Throwing keeps callers
-    // honest: anyone wiring up policy reload must either (a) plumb a real
-    // loader through updateConfig() or (b) construct a fresh PolicyEngine.
-    // Returning silently here would let policy edits appear to apply while
-    // the in-memory config keeps serving stale rules.
     throw new Error(
       'PolicyEngine.reload() is not implemented; rebuild the engine via updateConfig() or construct a new instance instead.',
     )
+  }
+
+  updateBrowserSites(browserSites: BrowserSitePolicy | undefined): void {
+    this.config = { ...this.config, browserSites }
   }
 
   updateConfig(config: PolicyEngineConfig): void {
     this.config = config
   }
 
+  private escalatesTerminalAutoApproval(
+    tool: string,
+    input: Record<string, unknown>,
+    requestCwd: string | undefined,
+  ): boolean {
+    if (tool !== 'terminal.run' && tool !== 'process.start') return false
+    const executable = typeof input.executable === 'string' ? input.executable : ''
+    if (!executable) return false
+    const readDenyPaths = this.withRuntimeStatePaths(this.config.tools['fs.read']?.deny_paths ?? [])
+    return terminalAutoApprovalEscalation({
+      executable,
+      args: normalizeTerminalArgs(input.args, executable),
+      cwd: typeof input.cwd === 'string' ? input.cwd : undefined,
+      requestCwd,
+      isProtectedPath: (path, cwd) => readDenyPaths.length > 0
+        && checkDeniedPathCandidates([path], readDenyPaths, cwd ?? requestCwd) !== null,
+    }) !== null
+  }
+
   private buildCommandString(tool: string, input: Record<string, unknown>): string {
-    // process.start and process-backed service.start run an executable just
-    // like terminal.run, so build the
-    // same "exe args" command string — otherwise deny_patterns (rm -rf /, fork
-    // bombs, ...) would never match its JSON-stringified input (CLI_BACKLOG.md B12).
-    // service.install registers a boot-persistent OS service from an
-    // executable + args, i.e. it runs a command just like terminal.run. Build
-    // the same "exe args" string so deny_patterns / download-pipe / shell-wrapper
-    // guards apply — otherwise its JSON-stringified input would never match and
-    // a `curl … | sh` persistence payload would sail through (PLAN_021 D2).
+    if (tool === 'git.transfer') return ['git', input.operation, input.url, input.branch].filter(v => typeof v === 'string' && v).join(' ')
     if (tool === 'terminal.run' || tool === 'process.start' || tool === 'service.start' || tool === 'service.install') {
       const exe = (input.executable as string) ?? ''
       const args = normalizeTerminalArgs(input.args, exe)
@@ -1767,16 +1620,8 @@ export const __testables = {
   checkDeniedPathCandidates,
 }
 
-/**
- * Creates a default PolicyConfig with safe hardcoded rules.
- */
-// Bound the recursive walk so a pathological deeply-nested argument
-// object can't hang the policy check, but keep it far above any real
-// tool-call shape: a low cap would let an attacker bury a protected
-// path behind enough decoy strings to skip the deny_paths scan.
 const MAX_COLLECTED_STRING_VALUES = 10_000
 
-/** Recursively collect string values from a tool-call argument object. */
 function collectStringValues(value: unknown, out: string[] = []): string[] {
   if (out.length >= MAX_COLLECTED_STRING_VALUES) return out
   if (typeof value === 'string') {
@@ -1791,6 +1636,8 @@ function collectStringValues(value: unknown, out: string[] = []): string[] {
 
 export function createDefaultPolicy(): PolicyConfig {
   const writeDenyPaths = [
+    '**/.git/config',
+    '**/.git/hooks/**',
     '**/.ssh/**',
     '**/.env',
     '**/.env.*',
@@ -1808,9 +1655,6 @@ export function createDefaultPolicy(): PolicyConfig {
     '/usr/**',
     '/bin/**',
     '/sbin/**',
-    // The daemon's own state: writes here would let an agent
-    // plant a plugin / rewrite a session / overwrite its own
-    // bearer token via fs.write, fs.edit, apply_patch, or browser.screenshot.
     '**/.sepilotd/security/**',
     '**/.sepilotd/sessions/**',
     '**/.sepilotd/memory/**',
@@ -1840,11 +1684,7 @@ export function createDefaultPolicy(): PolicyConfig {
       max_output_bytes: 10 * 1024 * 1024,
     },
     tools: {
-      // Shared default for every MCP-provided tool (overridable per exact
-      // tool name). Without it, a filesystem/shell MCP server would bypass
-      // the deny lists that protect ~/.ssh, .env, and the daemon's own state.
-      // deny_patterns mirror terminal.run so a shell-running MCP tool can't
-      // smuggle a destructive command through a string argument.
+      'git.transfer': { mode: 'ask' },
       'mcp.*': {
         mode: 'supervised',
         deny_paths: [...writeDenyPaths],
@@ -1912,18 +1752,10 @@ export function createDefaultPolicy(): PolicyConfig {
           '**/.gnupg/**',
           '**/*.pem',
           '**/*.key',
-          // Linux/BSD account secrets — readable by an over-zealous agent
-          // running as root and historically the first stop in any LFI.
-          // `**` (rather than `*`) covers /etc/sudoers.d/<file> and similar
-          // sub-trees; the simple `*` only spans a single path segment.
           '/etc/shadow**',
           '/etc/gshadow**',
           '/etc/sudoers**',
           '/etc/master.passwd**',
-          // The daemon's own state. Keeping these out of fs.read prevents
-          // an autonomous agent from exfiltrating its own bearer tokens,
-          // session transcripts, memory db, encryption key, audit log, or
-          // user-installed skill code.
           '**/.sepilotd/security/**',
           '**/.sepilotd/sessions/**',
           '**/.sepilotd/memory/**',
@@ -1996,30 +1828,15 @@ export function createDefaultPolicy(): PolicyConfig {
         mode: 'supervised',
         deny_paths: [...writeDenyPaths],
       },
-      // apply_patch inherits fs.write deny semantics so a single
-      // multi-file patch cannot bypass the deny list path-by-path.
-      // The policy engine evaluates deny_paths against every file
-      // affected by the patch.
       apply_patch: {
         mode: 'supervised',
         deny_paths: [...writeDenyPaths],
       },
-      // Long-running process tools mirror terminal.run: they execute commands,
-      // so they are supervised (and carry the same destructive-command deny
-      // list) rather than falling through to unmatched_policy: deny, which
-      // silently blocked an agent that picked process.start to run a script
-      // (CLI_BACKLOG.md B12). process.list/sessions/read/follow/wait are read-only and
-      // handled by the canonical observe/internal-state effect descriptors.
       'process.start': {
         mode: 'supervised',
         deny_patterns: [...dangerousCommandPatterns],
         deny_executables: [],
       },
-      // Durable service supervision is the intentional escape hatch for a
-      // process that should survive the current agent turn. Starting one is
-      // command execution and remains approval-gated with the same destructive
-      // command protections as process.start. Inspection and log following are
-      // classified as read-only above; lifecycle mutations stay supervised.
       'service.start': {
         mode: 'supervised',
         deny_patterns: [...dangerousCommandPatterns],
@@ -2037,12 +1854,6 @@ export function createDefaultPolicy(): PolicyConfig {
       'service.healthcheck': {
         mode: 'supervised',
       },
-      // Native OS service tools register/mutate boot-persistent services — the
-      // highest-value persistence + RCE surface. service.install carries the
-      // command-execution deny lists (its executable+args are built into a
-      // command string in buildCommandString); every mutating service tool is
-      // supervised so it requires approval even under autonomous autonomy
-      // instead of falling through to unmatched_policy (PLAN_021 D2).
       'service.install': {
         mode: 'supervised',
         deny_patterns: [...dangerousCommandPatterns],
@@ -2099,6 +1910,12 @@ export function createDefaultPolicy(): PolicyConfig {
       'device.delegate': {
         mode: 'supervised',
       },
+      'external_acp.run': {
+        mode: 'supervised',
+      },
+      'external_cli.run': {
+        mode: 'supervised',
+      },
       'computer.list_windows': {
         mode: 'autonomous',
       },
@@ -2111,9 +1928,6 @@ export function createDefaultPolicy(): PolicyConfig {
       'computer.launch_app': {
         mode: 'supervised',
       },
-      // Opening a real browser changes the user's visible desktop and may
-      // disclose the destination to the browser/network. Always ask, even
-      // under Autonomous, so Desktop can provide an explicit HITL checkpoint.
       'computer.open_url': {
         mode: 'ask',
         deny_urls: ['file://**', 'chrome://**', 'about://**'],
@@ -2257,13 +2071,6 @@ export function createDefaultPolicy(): PolicyConfig {
       'memory.remind_at': {
         mode: 'autonomous',
       },
-      // Scheduler tools were absent from this map entirely, so every one of
-      // them fell through to `unmatched_policy: deny` and the whole scheduling
-      // feature was unreachable — even `schedule_list`. Autonomous matches the
-      // neighbouring assistant-state tools (`memory.remind_at` schedules a
-      // future delivery, `memory.forget` deletes user data) and does not grant
-      // anything: a scheduled run executes with the configured autonomy, so
-      // whatever it later does is policed exactly like an interactive turn.
       schedule_create: {
         mode: 'autonomous',
       },
@@ -2297,10 +2104,25 @@ export function createDefaultPolicy(): PolicyConfig {
       'notification.publish': {
         mode: 'supervised',
       },
+      'event.deliver': {
+        mode: 'ask',
+      },
+      'event.destinations': {
+        mode: 'autonomous',
+      },
       'monitor.evaluate': {
         mode: 'autonomous',
       },
       'monitor.report': {
+        mode: 'autonomous',
+      },
+      'monitor.watch': {
+        mode: 'autonomous',
+      },
+      'monitor.watches': {
+        mode: 'autonomous',
+      },
+      'session.schedule_wakeup': {
         mode: 'autonomous',
       },
       'memory.reminders.list': {

@@ -20,7 +20,6 @@ export function recoveredReactSteering(messages: readonly Message[]): AgentSteer
     .map((note) => ({ ...note }))
 }
 
-/** Checkpoint-only metadata; re-inject active instructions after compaction on every request. */
 export function withSteeringCheckpoint(messages: readonly Message[], notes: readonly AgentSteeringNote[] = []): Message[] {
   const result = withoutSteeringCheckpoint(messages)
   if (notes.length > 0) result.push({

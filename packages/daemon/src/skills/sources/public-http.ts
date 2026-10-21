@@ -42,13 +42,6 @@ export interface PublicSkillTextResponse {
   url: string
 }
 
-/**
- * Fetch an HTTPS skill document without allowing a validated hostname to be
- * resolved again at connect time. Redirects are followed manually so every
- * hop is checked by both the configured source policy and the public-address
- * guard. The response body is consumed (or cancelled) before its dispatcher
- * is closed.
- */
 export async function fetchPublicSkillText(
   rawUrl: string,
   options: PublicSkillFetchOptions = {},
@@ -169,6 +162,5 @@ async function discardResponseBody(response: Response | undefined): Promise<void
   try {
     await response?.body?.cancel()
   } catch {
-    // Best effort. The per-hop dispatcher is closed immediately afterwards.
   }
 }

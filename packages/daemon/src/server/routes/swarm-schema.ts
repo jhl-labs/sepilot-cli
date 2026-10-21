@@ -11,13 +11,6 @@ export const createRunSchema = z.object({
     .optional(),
   autoApproveAgents: z.boolean().optional().default(true),
   warmPool: z.array(z.enum(SWARM_AGENTS)).optional().default(['claude']),
-  /**
-   * When true, the daemon spawns the warm pool but does NOT start the
-   * supervisor agent loop. The run lives until DELETE; the user drives the
-   * agents directly via the keys endpoint or attach mode. Useful for tests,
-   * scripts, and "human-in-the-loop" sessions where you don't want an LLM
-   * supervisor making decisions for you.
-   */
   noSupervisor: z.boolean().optional().default(false),
 })
 

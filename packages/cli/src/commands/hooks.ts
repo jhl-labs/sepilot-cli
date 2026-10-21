@@ -197,8 +197,6 @@ function formatWebhookSummary(
   }
   extras.push(copy.retry(webhook.retry.maxAttempts, webhook.retry.backoffMs))
 
-  // Two-line layout so url + events stay readable without horizontal
-  // overflow even when the id is long.
   const head = `  ${chalk.bold(webhook.id)}  ${status}  ${chalk.gray(webhook.events.join(', '))}`
   const tail = `      ${webhook.url}  ${chalk.gray(`[${extras.join(' ')}]`)}`
   return `${head}\n${tail}`

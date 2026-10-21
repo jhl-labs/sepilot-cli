@@ -506,7 +506,6 @@ export function buildComputerUseGraph(deps: Deps) {
     )
     .addEdge('reporter', '__end__')
   return withGraphPrerequisite(graph, (state, context, node) => {
-    // Text-only finalization/critique may use an auxiliary non-vision model.
     if (['reflection', 'reporter', 'iteration_guard'].includes(node)) return undefined
     const modelId = context?.agentContext.model ?? deps.provider.models[0]?.id ?? ''
     const model = deps.provider.models.find((candidate) => candidate.id === modelId)

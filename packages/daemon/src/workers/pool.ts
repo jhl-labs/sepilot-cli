@@ -3,7 +3,7 @@ import { cpus } from 'node:os'
 
 interface Task<T> {
   id: string
-  fn: string  // Serialized function code
+  fn: string
   args: unknown[]
   resolve: (value: T) => void
   reject: (error: Error) => void
@@ -18,7 +18,6 @@ export class WorkerPool {
     this.maxWorkers = maxWorkers ?? Math.max(1, cpus().length - 1)
   }
 
-  /** Execute a function in a worker thread */
   async execute<Args extends unknown[], T>(
     fn: (...args: Args) => T,
     ...args: Args
@@ -40,7 +39,6 @@ export class WorkerPool {
     })
   }
 
-  /** Get pool stats */
   getStats(): { active: number; queued: number; maxWorkers: number } {
     return { active: this.activeWorkers, queued: this.queue.length, maxWorkers: this.maxWorkers }
   }
@@ -48,7 +46,6 @@ export class WorkerPool {
   private runTask<T>(task: Task<T>): void {
     this.activeWorkers++
 
-    // Worker evaluates the serialized function — intentional for sandboxed CPU task execution
     const workerCode = [
       "const { parentPort, workerData } = require('node:worker_threads');",
       "const fn = (0, eval)('(' + workerData.fn + ')');",

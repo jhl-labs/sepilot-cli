@@ -34,11 +34,6 @@ const TRANSACTIONS_DIRNAME = 'transactions'
 const JOURNAL_FILENAME = 'journal.json'
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
-// These paths historically resolved through SEPILOTD_HOME even when the
-// daemon itself was started with a different SEPILOTD_DATA_DIR. They are the
-// only roots eligible for automatic import. Canonical profile state such as
-// config, sessions, memory, skills, security tokens, logs, and cache is never
-// overwritten by this compatibility migration.
 const LEGACY_OWNED_ENTRIES = [
   'backup',
   'channel-ingress',
@@ -113,8 +108,8 @@ interface StorageMigrationJournal {
 
 export interface PrepareDaemonStorageInput {
   dataDir: string
-  /** Whether config.yaml existed before bootstrap created any profile files. */
   profileExisted: boolean
+  importLegacyState?: boolean
   legacyHome?: string
   explicitHome?: string
 }
@@ -347,9 +342,6 @@ async function discoverLegacyEntries(sourceRoot: string): Promise<string[]> {
     if (await exists(join(sourceRoot, entry))) entries.add(entry)
   }
 
-  // Preserve forward compatibility for domain repositories added after this
-  // migration shipped. A top-level directory with an immediate SQLite DB is a
-  // stable structural signal; canonical/mixed roots are explicitly excluded.
   let roots: Dirent[] = []
   try {
     roots = await readdir(sourceRoot, { withFileTypes: true })
@@ -578,10 +570,6 @@ async function activeTransaction(dataDir: string): Promise<StorageMigrationJourn
     const journalFile = journalPath(dataDir, id)
     if (!(await exists(journalFile))) continue
     const journal = await readJournal(dataDir, id)
-    // A process can stop after the last entry and completed journal were
-    // committed but before active.json was renamed into place. With no marker
-    // present, that completed transaction is still the only authoritative
-    // recovery candidate.
     active.push(journal)
   }
   if (active.length > 1) {
@@ -692,12 +680,6 @@ async function assertLegacyDaemonInactive(legacyHome: string): Promise<void> {
   }
 }
 
-/**
- * Resolve and, when required, migrate the legacy SEPILOTD_HOME-owned state
- * before any domain repository is opened. Source state is never removed.
- * Existing target entries are atomically archived inside the transaction's
- * rollback tree before the consistent source snapshot becomes active.
- */
 export async function prepareDaemonStorage(
   input: PrepareDaemonStorageInput,
 ): Promise<PreparedDaemonStorage> {
@@ -772,7 +754,7 @@ export async function prepareDaemonStorage(
     return completeMigration(dataDir, transaction)
   }
 
-  if (!input.profileExisted) {
+  if (input.importLegacyState !== true) {
     const freshMarker: StorageLayoutMarker = {
       version: STORAGE_LAYOUT_VERSION,
       mode: 'fresh-profile',

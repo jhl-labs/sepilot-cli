@@ -5,9 +5,7 @@ export type ConnectionKind = 'ws' | 'sse'
 export interface ConnectionInfo {
   id: string
   kind: ConnectionKind
-  /** Free-form route label, e.g. 'chat-stream', '/api/v1/ws'. */
   label: string
-  /** Best-effort surface tag — extension token label or 'master'. */
   client: string | null
   openedAt: number
 }
@@ -15,12 +13,6 @@ export interface ConnectionInfo {
 export interface ConnectionSnapshot {
   count: number
   byKind: Record<ConnectionKind, number>
-  /**
-   * Milliseconds since the daemon last saw any inbound activity (HTTP request
-   * completion, WS open/close, etc). The idle reaper uses this so a chain of
-   * one-shot `sepilot ask` calls keeps the daemon alive even though no
-   * long-lived client is attached.
-   */
   idleMs: number
   clients: ConnectionInfo[]
 }
@@ -39,13 +31,6 @@ export interface ConnectionRegistryOptions {
   maxConnectionsByKind?: Partial<Record<ConnectionKind, number>>
 }
 
-/**
- * Central registry that the WS/SSE handlers and the idle-reaper share.
- *
- * Implemented as a plain in-memory store — daemons are single-process by PID
- * lock, so there's no cross-process state to reconcile. Calling `bumpActivity`
- * is cheap and safe to invoke from request hooks.
- */
 export class ConnectionRegistry {
   private connections = new Map<string, ConnectionInfo>()
   private lastActivityAt = Date.now()

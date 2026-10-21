@@ -681,7 +681,6 @@ export class ServiceSupervisor {
     return [...this.records.values()].map(toSnapshot)
   }
 
-  /** Read-only inventory: listing a task must not trigger probes or restarts. */
   async inventory(): Promise<ServiceSnapshot[]> {
     await this.ensureLoaded()
     return [...this.records.values()].map(toSnapshot)
@@ -783,9 +782,6 @@ export class ServiceSupervisor {
     if ((record.backend === 'process' && !record.pid) || (record.backend === 'container' && !record.containerId)) {
       return toSnapshot(record)
     }
-    // Durable status can lag a detached process or container generation. An
-    // explicit stop is authoritative when the recorded target is still live,
-    // but recordIsRunning retains the PID-identity guard against PID reuse.
     if (!await this.recordIsRunning(record)) return toSnapshot(record)
 
     const signal = input.signal ?? 'SIGTERM'
@@ -1329,10 +1325,6 @@ export class ServiceSupervisor {
   }): boolean {
     if (record.restart.mode === 'never') return false
     if (record.status === 'stopped' || record.status === 'stopping') return false
-    // Exit observers and reconciliation can race. Once either path has
-    // already replaced the failed process, a late observation must not apply
-    // the old exit policy to the new running generation. Health-triggered
-    // restarts are the only valid policy transition from a running state.
     if (record.status === 'running' && input.stopRunningProcess !== true) return false
     if (record.restart.mode === 'always') return true
     if (input.forceFailure) return true

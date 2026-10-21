@@ -4,9 +4,6 @@ const HEADLESS_BROWSER_TOOLS = new Set([
   'browser.navigate', 'browser.extract', 'browser.screenshot', 'browser.click', 'browser.evaluate',
 ])
 
-/** Retain the selected tab as the default across transfers without removing explicit headless work.
- * Selection is an execution target, not an authorization grant. Search and fetch stay independent.
- */
 export function withSelectedBrowserTarget(source: ToolRegistry, attached: boolean): ToolRegistry {
   if (!attached) return source
   const selected = new ToolRegistry()

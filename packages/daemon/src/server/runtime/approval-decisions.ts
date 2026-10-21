@@ -124,7 +124,6 @@ export class ApprovalDecisionStore implements IApprovalDecisionStore {
       raw = await readFile(this.persistentPath, 'utf8')
     } catch (err) {
       if (isNodeFsError(err, 'ENOENT')) {
-        // First run — no remembered "Always allow" decisions yet.
         this.persistentLoaded = true
         return
       }
@@ -143,11 +142,6 @@ export class ApprovalDecisionStore implements IApprovalDecisionStore {
         )
       }
     } catch (err) {
-      // Corrupted decision file — rotate aside so the operator can
-      // see the rule set was wiped out and reissue if they want
-      // those "Always allow" rules back. Silently restarting empty
-      // would mean every previously-remembered tool re-prompts and
-      // the operator has no idea why.
       const aside = `${this.persistentPath}.broken-${Date.now()}`
       log.error('approval decisions file unparseable; rotating aside', {
         path: this.persistentPath,
@@ -173,12 +167,6 @@ export class ApprovalDecisionStore implements IApprovalDecisionStore {
     const sessionMatches = this.sessionDecisions.get(sessionId) ?? []
     for (const entry of sessionMatches) {
       if (matchesRule(entry, tool, input)) {
-        // Bump usage counters so `decisions list` can show *which*
-        // rules are actually short-circuiting prompts — a hitCount=0
-        // rule registered weeks ago is a cleanup candidate, while a
-        // hot rule signals heavy unsupervised tool execution that
-        // operators should re-examine. Session-scope rules live
-        // in-memory only, so no persistence call here.
         entry.hitCount = (entry.hitCount ?? 0) + 1
         entry.lastHitAt = now()
         return {
@@ -189,10 +177,6 @@ export class ApprovalDecisionStore implements IApprovalDecisionStore {
     }
     for (const entry of this.persistentDecisions) {
       if (matchesRule(entry, tool, input)) {
-        // Always-scope rules outlive the daemon process, so the
-        // hit counter must persist alongside the rule itself —
-        // otherwise restarts would reset the operator's view of
-        // which rules are in active use.
         entry.hitCount = (entry.hitCount ?? 0) + 1
         entry.lastHitAt = now()
         this.schedulePersist()
@@ -294,12 +278,6 @@ export class ApprovalDecisionStore implements IApprovalDecisionStore {
       || params.pattern
       || params.approved !== undefined,
     )
-    // `keep` returns true when the entry should *survive* the clear.
-    // Filters compose: an entry is removed only if it matches every
-    // active filter (stale AND tool). Without the all-filters-must-
-    // match contract, clear --tool fs.write --stale would also wipe
-    // hot fs.write rules, which contradicts "prune the cleanup
-    // candidates I just listed".
     const keep = (entry: RememberedDecision): boolean => {
       if (params.stale && !isStaleRememberedDecision(entry, now)) return true
       if (params.tool && entry.tool !== params.tool) return true
@@ -376,11 +354,6 @@ export class ApprovalDecisionStore implements IApprovalDecisionStore {
         { mode: 0o600 },
       )
     } catch (err) {
-      // Persistence failures are non-fatal: the in-memory layer
-      // still serves this session's prompts. But "Always allow" is
-      // an explicit user contract — log so the operator can see
-      // their rule won't survive a daemon restart, and they can
-      // address the underlying disk/permission problem.
       log.error('failed to persist remembered approval decisions', {
         path: this.persistentPath,
         decisionCount: this.persistentDecisions.length,

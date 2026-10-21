@@ -8,17 +8,6 @@ export interface RipgrepCaptureResult {
   code: number | null
 }
 
-/**
- * Run ripgrep and capture stdout up to a byte cap, streaming instead of
- * buffering the whole output. When the cap is reached rg is killed and the
- * partial capture is returned with `truncated: true`, so a huge result set is
- * degraded to a byte-bounded prefix + a truncation hint instead of the
- * execFile `maxBuffer` hard-fail that used to discard every match.
- *
- * Exit code 1 (rg's "no matches") resolves normally with empty stdout; a real
- * rg error (code >= 2) rejects, and a spawn failure (ENOENT) rejects so callers
- * can fall back to their pure-Node search path.
- */
 export function runRipgrepCapture(options: {
   args: string[]
   cwd: string
@@ -64,8 +53,6 @@ export function runRipgrepCapture(options: {
       if (settled) return
       settled = true
       const stdout = Buffer.concat(chunks, captured).toString('utf8')
-      // When we killed rg on the byte limit, close reports a null code / signal
-      // — treat that as a successful (truncated) capture rather than an error.
       if (!truncated && code !== 0 && code !== 1 && code !== null) {
         reject(new Error(
           stderr.trim()

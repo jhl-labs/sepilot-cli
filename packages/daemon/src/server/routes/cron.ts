@@ -1,8 +1,3 @@
-// DEPRECATED SURFACE — `/api/v1/cron` predates the unified scheduler model and
-// is kept only for backwards compatibility with older clients. New code should
-// use `/api/v1/scheduled-tasks` (REST, natural-language `when`, timezone,
-// retries, run history) or the `scheduler` capability (`/scheduler/jobs*`).
-// All routes here are backed by the same job-store used by those surfaces.
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import '../fastify-types.js'
@@ -98,7 +93,6 @@ export const cronOpenApiOverrides: OpenApiOverrideMap = {
   },
 }
 
-/** Shape legacy CronTask response from a ScheduledJob */
 const toLegacy = (j: ScheduledJob) => ({
   id: j.id,
   name: j.name,
@@ -110,7 +104,6 @@ const toLegacy = (j: ScheduledJob) => ({
 })
 
 export async function cronRoutes(app: FastifyInstance) {
-  // Every /cron response carries a Deprecation header
   app.addHook('onSend', async (_req, reply) => {
     reply.header('Deprecation', 'true')
   })
@@ -193,7 +186,6 @@ export async function cronRoutes(app: FastifyInstance) {
       })
     }
 
-    // If job not found, still return 204 (idempotent delete)
     const { id } = request.params
     const existing = store.get(id)
     if (existing) {

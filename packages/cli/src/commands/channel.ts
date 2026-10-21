@@ -179,8 +179,6 @@ function formatTelegramChannelSummary(
     `rate=${summary.rateLimitPerMinute}/min`,
   ]
 
-  // Two stat columns labelled — `admin=enabled` (operator toggle) vs
-  // `link=connected` (transport health) — were ambiguous side-by-side.
   return `  ${chalk.bold('telegram'.padEnd(10))}  admin=${enabled}  link=${status}  ${chalk.gray(`[${extras.join(' ')}]`)}`
 }
 

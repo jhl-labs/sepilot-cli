@@ -1,4 +1,3 @@
-/** A real interactive CLI running on the connected daemon host. */
 export type DesktopAgentId = 'claude' | 'codex' | 'gemini' | 'opencode'
 export type DesktopAgentState = 'running' | 'exited'
 export interface DesktopAgentEvent {
@@ -10,7 +9,6 @@ export interface DesktopAgentEvent {
   exitCode?: number
 }
 export interface DesktopAgentSshTarget {
-  /** Hostname, IP address or alias in the daemon user's ~/.ssh/config. */
   host: string
   user?: string
   port?: number

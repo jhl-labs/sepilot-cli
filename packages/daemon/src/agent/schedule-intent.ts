@@ -163,11 +163,6 @@ function directiveText(input: string): string {
     .trim()
 }
 
-/**
- * Conservative intent gate for a request that must create future work now.
- * It requires both a future-time anchor and an imperative reminder/scheduling
- * action so ordinary time questions stay conversational.
- */
 export function isExplicitScheduleCreateRequest(input: string): boolean {
   const directive = directiveText(input)
   if (!directive) return false
@@ -177,11 +172,6 @@ export function isExplicitScheduleCreateRequest(input: string): boolean {
     && EXPLICIT_SCHEDULE_ACTION_PATTERNS.some((pattern) => pattern.test(directive))
 }
 
-/**
- * Conservative read-only intent gate for inspecting the user's registered
- * schedules. Requiring both scheduling vocabulary and a list/existence query
- * keeps ordinary mentions of reminders conversational.
- */
 export function isExplicitScheduleListRequest(input: string): boolean {
   const directive = directiveText(input)
   if (!directive) return false
@@ -193,7 +183,6 @@ export function isExplicitScheduleListRequest(input: string): boolean {
     )
 }
 
-/** Select the scheduler's narrow current view unless the user explicitly asks for history. */
 export function scheduleListStatusForRequest(input: string): 'pending' | 'all' {
   const directive = directiveText(input)
   return SCHEDULE_HISTORY_LIST_PATTERNS.some((pattern) => pattern.test(directive))
@@ -201,7 +190,6 @@ export function scheduleListStatusForRequest(input: string): 'pending' | 'all' {
     : 'pending'
 }
 
-/** Detect explicit management of an existing schedule without widening ordinary chat turns. */
 export function resolveExplicitScheduleManagementIntent(
   input: string,
 ): ScheduleManagementIntent | null {
@@ -218,11 +206,6 @@ export function resolveExplicitScheduleManagementIntent(
   return null
 }
 
-/**
- * Detect an explicit read of one durable schedule definition or its persisted
- * execution history. These capabilities stay separate from schedule_list:
- * a job summary cannot prove that a particular run happened or why it failed.
- */
 export function resolveExplicitScheduleInspectionIntent(
   input: string,
 ): ScheduleInspectionIntent | null {

@@ -14,41 +14,14 @@ function isValidBucketKey(key: string): boolean {
 }
 
 export interface ScopedFileMemoryRegistry {
-  /** Returns the FileMemory bucket the caller's scope writes to. */
   get(scopeTags: string[] | undefined): FileMemory
-  /** Returns the global (no-scope) FileMemory bucket. */
   global(): FileMemory
-  /** All cached buckets — used by maintenance/export operations. */
   list(): Array<{ key: string; fileMemory: FileMemory; scopeTags?: string[] }>
-  /** Discover existing owner buckets after a daemon restart. */
   discover?(): Promise<void>
-  /** Remove an entire scoped bucket (the directory + the cache entry).
-   *  Refuses to delete the global bucket. Returns true when the
-   *  directory was removed. */
   deleteScope(scopeKey: string): Promise<boolean>
-  /** Rename a scoped bucket directory. Refuses to touch the global
-   *  bucket on either side. Returns true when the rename succeeded. */
   renameScope(fromKey: string, toKey: string): Promise<boolean>
 }
 
-/**
- * Decide which scope owns the file-memory bucket for a given tag list.
- *
- * Priority is most-specific first:
- *   user > channel > group > session > global
- *
- * - `user` and `channel` are the common cases (a person, a chat room).
- * - `group` is the "shared team notes" case: a caller scoped purely to
- *   `scope:group:<id>` (no user/channel of their own) reads and writes
- *   one shared MEMORY.md / daily-note bucket. When the caller also has
- *   a user or channel identity, that wins — alice's personal notes
- *   don't bleed into the team bucket just because she's on the team.
- *   If the caller is in several groups, the first (canonically sorted)
- *   group id is chosen so the bucket is deterministic.
- * - `session` is intentionally not its own bucket — sessions are
- *   short-lived and forking would balloon the memory directory.
- *   Session-scoped writes fall back to user / channel / group / global.
- */
 export function canonicalFileMemoryScopeKey(
   scopeTags: string[] | undefined,
 ): string {
@@ -69,7 +42,6 @@ function canonicalKey(scope: MemoryScope): string {
 }
 
 function sanitizeIdSegment(value: string): string {
-  // Lowercase + replace anything outside POSIX-safe filename chars with '_'.
   return value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '')
     || 'unknown'
 }
@@ -115,7 +87,6 @@ export class ScopedFileMemoryRegistryImpl implements ScopedFileMemoryRegistry {
         throw error
       })
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-      // Never follow symlinks or interpret arbitrary directory names as owners.
       if (!entry.isDirectory() || !isValidBucketKey(entry.name)) continue
       const file = this.getByKey(entry.name)
       try {
@@ -144,16 +115,13 @@ export class ScopedFileMemoryRegistryImpl implements ScopedFileMemoryRegistry {
     try {
       await stat(fromDir)
     } catch {
-      // Source doesn't exist — nothing to move; evict cache entry just in case.
       this.cache.delete(from)
       return false
     }
-    // Refuse to clobber an existing target bucket.
     try {
       await stat(toDir)
       return false
     } catch {
-      // target missing, good
     }
     try {
       await mkdir(join(this.rootDir, 'scopes'), { recursive: true })
@@ -175,7 +143,6 @@ export class ScopedFileMemoryRegistryImpl implements ScopedFileMemoryRegistry {
     try {
       await stat(dir)
     } catch {
-      // Directory doesn't exist — treat as a no-op delete.
       this.cache.delete(key)
       return false
     }

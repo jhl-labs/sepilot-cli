@@ -20,7 +20,6 @@ export const INSTANT_PERSONAL_TOOL_NAMES = [
   'knowledge.review',
 ] as const
 
-/** Mode projection can only narrow an explicit caller tool boundary. */
 export function resolveInstantModeToolNames(
   _input: string,
   effectiveMode: string | undefined,
@@ -31,9 +30,6 @@ export function resolveInstantModeToolNames(
 ): readonly string[] | undefined {
   if (effectiveMode !== 'instant') return requestedToolNames
   const permitted = requestedToolNames === undefined ? undefined : new Set(requestedToolNames)
-  // Keep session-scoped observation reachable after disconnect too, so the
-  // tool can return its structured connection/control prerequisite. This does
-  // not attach a tab or authorize mutation; explicit tool ceilings still win.
   const names: readonly string[] = [...INSTANT_PERSONAL_TOOL_NAMES, 'browser.remote_snapshot']
   return names.filter((name) => !permitted || permitted.has(name))
 }

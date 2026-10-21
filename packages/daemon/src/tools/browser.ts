@@ -1,5 +1,6 @@
 import type { ContentPart } from '@sepilotd/core'
 import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
+import type { BrowserObservationRegistry, PageObservation } from './browser-observation.js'
 import type { Dispatcher } from 'undici/index.js'
 import { access, readFile, stat } from 'node:fs/promises'
 import { getAbortError, throwIfAborted } from '../abort.js'
@@ -29,11 +30,6 @@ const BROWSER_RESOURCE_TIMEOUT_MS = 30_000
 const MAX_BROWSER_NAVIGATION_REDIRECTS = 10
 const GUARDED_CHROMIUM_ARGS = [
   '--disable-quic',
-  // Chromium 151 enables Local Network Access checks for WebSockets. The
-  // guarded page already enforces a stricter capability boundary: only the
-  // exact localhost port backed by a managed process bridge may connect, and
-  // every remote or unowned socket is closed. Disable Chromium's interactive
-  // permission gate so that one authorized socket works in headless mode.
   '--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebSockets',
   '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
 ]
@@ -59,6 +55,7 @@ export function formatBrowserNavigationResult(input: {
 }
 
 export interface BrowserToolOptions {
+  observations?: BrowserObservationRegistry
   egressAllowlist?: readonly string[] | null
   env?: Record<string, string | undefined>
   egressLogger?: EgressPolicyLogger
@@ -109,7 +106,6 @@ async function firstExistingExecutable(paths: readonly string[]): Promise<string
       await access(path)
       return path
     } catch {
-      // Keep trying common system browser paths.
     }
   }
   return null
@@ -233,10 +229,6 @@ async function newGuardedPage(
     totalRequests: 0,
   }
   await page.routeWebSocket?.('**/*', async (route) => {
-    // A session-owned managed-loopback endpoint is already capability-bound
-    // by process.start. Permit its same-port localhost aliases so dev-server
-    // HMR and application WebSockets work during browser QA, while every
-    // remote or unowned WebSocket remains fail-closed.
     if (
       managedLoopbackSocketPath
       && isSameAllowedLocalhostEndpoint(route.url(), allowedLocalhostOrigin)
@@ -305,12 +297,19 @@ interface GuardedPageState {
 }
 
 const guardedPageStates = new WeakMap<import('playwright').Page, GuardedPageState>()
+const pageObservations = new WeakMap<import('playwright').Page, PageObservation>()
+
+async function observePage(page: import('playwright').Page, options: BrowserToolOptions, sessionId: string | undefined, tool: string): Promise<void> {
+  try {
+    const observation = await options.observations?.observe(sessionId, page, tool)
+    if (observation) pageObservations.set(page, observation)
+  } catch {}
+}
 
 async function closeGuardedPage(page: import('playwright').Page): Promise<void> {
+  await pageObservations.get(page)?.stop().catch(() => {})
+  pageObservations.delete(page)
   if (page.isClosed()) return
-  // DOMContentLoaded can be followed by an implicit favicon or module fetch.
-  // Give those already-scheduled requests one bounded network-idle window so
-  // closing the page does not tear down a single-threaded dev server mid-call.
   if (typeof page.waitForLoadState === 'function') {
     await page.waitForLoadState('networkidle', { timeout: 750 }).catch(() => {})
   }
@@ -329,8 +328,6 @@ async function closeGuardedPage(page: import('playwright').Page): Promise<void> 
   }
   await waitForIdle()
   if (!page.isClosed()) await page.close().catch(() => {})
-  // page.close aborts resources that Chromium scheduled after network-idle.
-  // Wait for their guarded transports to release the server-side proxy too.
   await waitForIdle()
 }
 
@@ -378,8 +375,6 @@ function proxyResponseHeaders(
   )
   const setCookies = (headers as Headers & { getSetCookie?: () => string[] }).getSetCookie?.()
   if (setCookies?.length) {
-    // Playwright's Chromium adapter splits newline-delimited Set-Cookie values
-    // before fulfilling the route, preserving multiple cookie headers.
     proxied['set-cookie'] = setCookies.join('\n')
   }
 
@@ -399,8 +394,6 @@ function proxyResponseHeaders(
     new URL(requestUrl).origin !== requestOrigin &&
     !('access-control-allow-origin' in proxied)
   ) {
-    // Route.fulfill otherwise adds the request Origin automatically, which
-    // would turn a server-side CORS denial into an allowed browser response.
     proxied['access-control-allow-origin'] = 'https://sepilotd-cors-denied.invalid'
   }
   return proxied
@@ -476,11 +469,6 @@ async function fulfillGuardedBrowserRequest(
   const requestHeaders = await request.allHeaders()
   const requestOrigin = new Headers(requestHeaders).get('origin')?.trim()
   if (requestOrigin && new URL(rawUrl).origin !== requestOrigin) {
-    // Playwright auto-fulfills intercepted CORS preflights. Forwarding the
-    // actual cross-origin request would therefore bypass a server's preflight
-    // denial and could trigger state changes even if its response stays
-    // unreadable. Keep these requests fail-closed until a transport-level
-    // pinned proxy can preserve Chromium's native CORS behavior.
     throw new Error('Cross-origin browser requests are blocked by the guarded transport')
   }
 
@@ -522,12 +510,6 @@ async function fulfillGuardedBrowserRequest(
         ? { managedLoopbackSocketPath }
         : {}),
     } as FetchInitWithDispatcher)
-    // Chromium does not surface a fulfilled redirect's next hop through a new
-    // user Route. Passing a 3xx through would therefore bypass DNS pinning and
-    // the egress policy. Keep redirects fail-closed until a fully pinned proxy
-    // owns the entire browser transport. For the main document, hand the
-    // validated target back to gotoPublicUrl so it can start a fresh guarded
-    // navigation instead of letting Chromium follow invisibly.
     if (isBrowserRedirectResponse(response)) {
       const location = response.headers.get('location')
       const currentUrl = new URL(rawUrl)
@@ -699,16 +681,6 @@ function normalizeWaitMs(value: unknown, fallback = 0): number {
 
 const DEFAULT_POST_INTERACTION_AUDIT_SETTLE_MS = 300
 
-/**
- * A click/evaluate call that also captures a screenshot is normally asking
- * for the settled UI state, not an intermediate CSS-transition frame. An
- * immediate audit can combine the new foreground color with the old
- * background (or vice versa) and manufacture low-contrast findings that send
- * the agent into a repair loop. Give screenshot-backed interaction audits a
- * short default settle window while preserving exact caller control: an
- * explicit waitAfterMs=0 still captures the immediate/transient state, and
- * evaluate calls without a screenshot remain immediate.
- */
 function normalizePostInteractionAuditWaitMs(input: Record<string, unknown>): number {
   const fallback = typeof input.path === 'string' && input.path.trim()
     ? DEFAULT_POST_INTERACTION_AUDIT_SETTLE_MS
@@ -1537,6 +1509,7 @@ export function createBrowserNavigateTool(options: BrowserToolOptions = {}): Too
           'browser.navigate',
           allowedLocalhostOrigin,
         )
+        await observePage(page, options, context?.sessionId, 'browser.navigate')
         if (input.waitFor) await page.waitForSelector(input.waitFor as string, { timeout: 10000 })
         const [title, text] = await Promise.all([
           page.title(),
@@ -1692,6 +1665,7 @@ export function createBrowserScreenshotTool(
           'browser.screenshot',
           allowedLocalhostOrigin,
         )
+        await observePage(page, options, context?.sessionId, 'browser.screenshot')
         if (input.waitFor) await page.waitForSelector(input.waitFor as string, { timeout: 10000 })
         const waitAfterMs = normalizeWaitMs(input.waitAfterMs)
         if (waitAfterMs > 0) await page.waitForTimeout(waitAfterMs)
@@ -1826,6 +1800,7 @@ export function createBrowserClickTool(options: BrowserToolOptions = {}): ToolDe
           'browser.click',
           allowedLocalhostOrigin,
         )
+        await observePage(page, options, context?.sessionId, 'browser.click')
         if (input.waitFor) await page.waitForSelector(input.waitFor as string, { timeout: 10000 })
         await page.click(selector, { timeout: 10000 })
         if (input.waitForAfter)
@@ -1975,6 +1950,7 @@ export function createBrowserEvaluateTool(options: BrowserToolOptions = {}): Too
           'browser.evaluate',
           allowedLocalhostOrigin,
         )
+        await observePage(page, options, context?.sessionId, 'browser.evaluate')
         if (input.waitFor) await page.waitForSelector(input.waitFor as string, { timeout: 10000 })
         const value = await page.evaluate(async (source) => {
           const fn = new Function(`return (async () => {\n${source}\n})()`)
@@ -2073,6 +2049,7 @@ export function createBrowserExtractTool(options: BrowserToolOptions = {}): Tool
           'browser.extract',
           allowedLocalhostOrigin,
         )
+        await observePage(page, options, context?.sessionId, 'browser.extract')
         const selector = String(input.selector ?? '')
         const element = await page.$(selector)
         if (!element) {
@@ -2114,7 +2091,6 @@ function browserExtractEmptyResult(start: number, selector: string): ToolResult 
   }
 }
 
-/** Cleanup browser on shutdown */
 export async function closeBrowser(): Promise<void> {
   if (browser) {
     await browser.close()

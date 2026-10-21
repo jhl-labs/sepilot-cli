@@ -1,40 +1,10 @@
 #!/usr/bin/env bun
-/**
- * `bun build --compile` helper, run by `scripts/build.ts` via `bun run`.
- *
- * Why a separate Bun script instead of the `bun build --compile` CLI: the CLI
- * has no module-alias option, and the bundler eagerly resolves *static*
- * `import`s found inside dynamically-imported modules. `ink` reaches
- * `ink/build/devtools.js`, which does a top-level `import devtools from
- * 'react-devtools-core'` (only *executed* when `DEV === 'true'`, but the import
- * is still resolved at bundle time). `react-devtools-core` is an optional peer
- * dep that isn't installed, so the CLI build fails — and marking it `--external`
- * makes the compiled binary fail at startup (a compiled binary has no
- * `node_modules` to resolve externals from). The `Bun.build()` JS API lets us
- * register `onResolve`/`onLoad` plugins that replace optional modules with
- * inert stubs so those paths are harmless no-ops.
- *
- * The Node-only SQLite addon (`better-sqlite3`, never loaded under Bun) and
- * optional Chromium BiDi mapper stay external. Playwright and
- * `playwright-core` must be bundled: the standalone artifact has no adjacent
- * `node_modules`, while browser automation can use an already-installed
- * system Chromium through the daemon's executable-path fallback. `ssh2`
- * embeds private-key parser/test strings that must not ship in the standalone
- * binary; docker-over-SSH is therefore stubbed out for the single-file build,
- * while local Docker socket usage through dockerode keeps working. `protobufjs`
- * uses a hidden optional `require("long")`; when parent tooling injects
- * NODE_PATH, Bun can pick up a host ESM-shaped `long` module and crash during
- * startup, so the standalone build disables that optional acceleration path.
- *
- * Usage: `bun run scripts/bun-compile.ts <bun-target> <entry> <outfile>`
- *   e.g. `bun run scripts/bun-compile.ts bun-linux-x64 src/main.ts out/sepilot-linux-x64`
- */
 import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const EXTERNAL = [
-  'node-pty', // Node/Electron fallback; Unix standalone uses Bun.Terminal.
+  'node-pty',
   'better-sqlite3',
   'cpu-features',
   'chromium-bidi',
@@ -43,12 +13,6 @@ const EXTERNAL = [
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
 const DAEMON_SOURCE_DIR = resolve(SCRIPT_DIR, '..', '..', 'daemon', 'src')
 
-// Bun provides a built-in `undici` compatibility module whose fetch and
-// dispatcher registry do not enforce npm Undici's global dispatcher. Bun
-// resolves a bare `undici` specifier before plugins can override it. Runtime
-// imports therefore use the explicit `undici/index.js` package subpath, and
-// this plugin pins that subpath to the daemon's installed npm implementation so
-// Agent/fetch/setGlobalDispatcher share one concrete module instance.
 const NPM_UNDICI_ENTRY = resolve(
   SCRIPT_DIR,
   '..',
@@ -103,11 +67,6 @@ function importDeclarations(source: string): string[] {
   return declarations
 }
 
-/**
- * Source gate for Bun's non-overridable bare `undici` builtin. Type-only
- * imports are harmless because they disappear; every runtime import must use
- * `undici/index.js` so the compiled binary cannot bypass the daemon dispatcher.
- */
 export function assertNoBareUndiciRuntimeImports(
   sourceRoot: string = DAEMON_SOURCE_DIR,
 ): void {
@@ -137,8 +96,6 @@ const stubReactDevtools = {
       namespace: 'sepilot-react-devtools-stub',
     }))
     build.onLoad({ filter: /.*/, namespace: 'sepilot-react-devtools-stub' }, () => ({
-      // ink's devtools.js does `import devtools from 'react-devtools-core'` then
-      // `devtools.connectToDevTools()` — give it a default object with a no-op.
       contents: 'export default { connectToDevTools() {} }\n',
       loader: 'js',
     }))
@@ -170,10 +127,6 @@ const stubSsh2 = {
   },
 }
 
-// Playwright bundles its Electron loader even though this standalone product
-// only exposes browser automation. Resolve the optional import without shipping
-// Electron; invoking the unsupported branch must fail explicitly, not succeed
-// silently. Keep this in the source repository so public projection retains it.
 const stubElectron = {
   name: 'stub-electron',
   setup(build: import('bun').PluginBuilder) {
@@ -220,13 +173,6 @@ const stubProtobufInquire = {
   },
 }
 
-/**
- * Playwright uses its package.json location only as a stack-frame prefix.
- * `bun build --compile` otherwise freezes the build host's absolute pnpm path
- * into require.resolve(), but a single-file runtime has no package directory.
- * Point that diagnostic prefix at the bundled module instead; browser assets
- * are not resolved through this value and system Chromium remains explicit.
- */
 const makePlaywrightCoreDirStandaloneSafe = {
   name: 'playwright-core-dir-standalone-safe',
   setup(build: import('bun').PluginBuilder) {
@@ -283,7 +229,6 @@ export async function compileWithBun(
       makePlaywrightCoreDirStandaloneSafe,
     ],
     // @ts-expect-error `compile` is supported by `bun build --compile` (Bun 1.2+);
-    // the published `Bun.build` types in some versions don't list it yet.
     compile: { target, outfile },
   })
 

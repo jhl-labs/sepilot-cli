@@ -68,15 +68,6 @@ function buildProvider(
   }
 }
 
-/**
- * Shared provider setup flow: preset/custom input -> discover-models -> validate.
- *
- * Discovery runs first because compatible endpoints can advertise transport-level
- * capabilities that must be applied to the validation request itself. On validation
- * failure, nothing is saved and the caller gets `{ ok: false, reason }`. If discovery
- * fails but validation succeeds, the provider is returned with an empty model list and
- * a `discoveryWarning` so the caller can prompt for a manual model name.
- */
 export async function runProviderSetupFlow(
   io: ProviderSetupIO,
   client: ProviderSetupClient,

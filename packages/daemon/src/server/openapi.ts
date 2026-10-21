@@ -285,12 +285,6 @@ export function recordDiscoveredOpenApiRoute(
 }
 
 export interface GenerateOpenApiSpecOptions {
-  /**
-   * Server URL to advertise in the `servers` field. Defaults to the
-   * loopback bind so the spec renders correctly for local installs.
-   * Pass the request's host/protocol when serving remote clients so
-   * generated SDKs / swagger-ui pick up the reachable origin.
-   */
   serverUrl?: string
   serverDescription?: string
 }

@@ -6,12 +6,6 @@ export interface ComposerInputPresentation {
   editorCursorOffset: number
 }
 
-/**
- * Keep the leading bang as the transport-level shell shortcut while presenting
- * the remainder as a real shell editor. This lets submission/history continue
- * to use the existing `!command` contract without making users edit a hidden
- * implementation prefix after entering shell mode.
- */
 export function deriveComposerInputPresentation(
   value: string,
   cursorOffset = value.length,

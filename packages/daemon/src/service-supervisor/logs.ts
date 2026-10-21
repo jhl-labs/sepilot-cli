@@ -118,9 +118,6 @@ export async function rotateServiceLogFile(
     await rename(`${path}.${index}`, `${path}.${index + 1}`).catch(() => {})
   }
 
-  // Copy+truncate preserves the active file inode, so already-running
-  // process, systemd, or launchd writers that hold the file open keep writing
-  // to the same path after rotation.
   await copyFile(path, `${path}.1`)
   await chmod(`${path}.1`, SERVICE_LOG_FILE_MODE).catch(() => {})
   await truncate(path, 0)

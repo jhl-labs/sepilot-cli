@@ -46,11 +46,6 @@ function windowsOnly(start: number): ToolResult {
   }
 }
 
-// Handing a URL to the desktop's default browser is a plain OS primitive
-// everywhere, unlike the rest of computer.* which drives the Windows-only
-// automation backend (mouse, keyboard, window handles). Keep the platform
-// question per-tool so routing can advertise this capability where it really
-// works instead of tying it to the GUI-automation backend.
 const OPEN_URL_COMMANDS = new Map<NodeJS.Platform, string>([
   ['darwin', 'open'],
   ['linux', 'xdg-open'],
@@ -151,11 +146,6 @@ function parseLaunchApp(value: unknown): ComputerLaunchApp | null {
   return typeof value === 'string' && value in LAUNCH_APPS ? (value as ComputerLaunchApp) : null
 }
 
-/**
- * Validate the narrow URL surface that may be handed to the user's default
- * browser. Keeping this separate from headless browser navigation makes the
- * user-visible side effect explicit and prevents file/custom-protocol launch.
- */
 export function parseComputerOpenUrl(value: unknown): ComputerOpenUrlParseResult {
   if (typeof value !== 'string' || !value.trim()) {
     return { ok: false, message: 'url must be a non-empty HTTP(S) URL.' }
@@ -759,10 +749,6 @@ export function createComputerOpenUrlTool(): ToolDefinitionRuntime {
 
         const command = OPEN_URL_COMMANDS.get(process.platform)
         if (!command) return openUrlUnsupported(start)
-        // The URL travels as its own argv entry and never through a shell.
-        // parseComputerOpenUrl has already pinned it to a credential-free
-        // http(s) URL, so it can be read neither as shell syntax nor as an
-        // option flag by the opener.
         await execFileAsync(command, [parsed.url], {
           signal: context?.signal,
           timeout: DEFAULT_TIMEOUT_MS,
@@ -1466,11 +1452,6 @@ export function createComputerWaitTool(): ToolDefinitionRuntime {
   }
 }
 
-/**
- * Walk a Windows window's UI Automation tree and return element names by
- * control type. Use this instead of OCR/vision when the target surface
- * uses standard Win32 controls.
- */
 export function createComputerListElementsTool(): ToolDefinitionRuntime {
   return {
     name: 'computer.list_elements',

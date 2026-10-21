@@ -126,43 +126,19 @@ export interface TelegramChannelConfig {
   botToken: string
   allowedUsers: string[]
   pairingRequired?: boolean
-  pairingCodeTtl?: number  // seconds, default 300
-  rateLimitPerMinute?: number  // default 30
+  pairingCodeTtl?: number
+  rateLimitPerMinute?: number
   onPairedUser?: (userId: string) => Promise<void> | void
   loadPendingPairing?: () => Promise<TelegramPendingPairing | null> | TelegramPendingPairing | null
   clearPendingPairing?: () => Promise<void> | void
-  /**
-   * Optional voice-note transcriber. When wired (by the runtime, to a
-   * local whisper binary — never an external API), an incoming voice /
-   * audio message is downloaded, transcribed, and the transcript is
-   * dispatched into the pipeline as if the user had typed it. Returns
-   * the transcript text; throws if transcription is unavailable so the
-   * channel can fall back to a "please type" reply. Leave unset to
-   * politely decline voice messages.
-   */
   transcribeAudioFile?: (audioPath: string) => Promise<string>
-  /**
-   * Optional reply synthesizer. When wired (by the runtime, to a local
-   * piper binary — never an external API), and the most recent inbound
-   * in a chat was a voice note, the agent's reply is *also* sent as a
-   * voice note (modality mirroring). Returns the path to a WAV plus a
-   * `temporary` flag the channel uses to clean up after sending.
-   */
   synthesizeReply?: (text: string) => Promise<{ audioPath: string; temporary: boolean }>
-  /**
-   * Maximum inbound voice/audio size (bytes) the channel will download for
-   * transcription. A paired user could otherwise force unbounded downloads of
-   * large audio files, pressuring disk. Default 20 MiB.
-   */
   maxVoiceDownloadBytes?: number
 }
 
-/** Default cap on inbound voice/audio downloads (bytes). */
 const DEFAULT_MAX_VOICE_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
-/** A chat's "last inbound was a voice note" flag is treated as stale after this. */
 const VOICE_REPLY_WINDOW_MS = 5 * 60_000
-/** Don't voice replies longer than this — a multi-minute spoken code dump is useless. */
 const VOICE_REPLY_MAX_CHARS = 4_000
 
 export interface TelegramPairingCode {
@@ -180,7 +156,6 @@ export class TelegramChannel implements IChannel {
   private allowedUsers: Set<string>
   private pendingPairing: TelegramPendingPairing | null = null
   private messageCount = new Map<string, { count: number; resetAt: number }>()
-  /** chatId → ms timestamp of the most recent transcribed voice-note inbound. */
   private voiceReplyChats = new Map<string, number>()
 
   constructor(config: TelegramChannelConfig) {
@@ -292,10 +267,6 @@ export class TelegramChannel implements IChannel {
 
     await this.sendAttachments(chatId, msg, replyToMessageId)
 
-    // Modality mirroring: if the most recent inbound in this chat was a
-    // voice note and a TTS synthesizer is wired, also deliver the reply
-    // as a voice note. Best-effort — the text was already sent, so a
-    // synthesis failure is logged and swallowed.
     await this.maybeSendVoiceReply(target.id, chatId, msg.text)
   }
 
@@ -354,7 +325,6 @@ export class TelegramChannel implements IChannel {
       log.warn('Voice reply synthesis/send failed', { error: error instanceof Error ? error.message : String(error) })
     } finally {
       if (result?.temporary) {
-        // synthesizeSpeech writes the WAV inside a temp dir; remove the dir.
         const { dirname } = await import('node:path')
         await rm(dirname(result.audioPath), { recursive: true, force: true }).catch(() => {})
       }
@@ -363,7 +333,6 @@ export class TelegramChannel implements IChannel {
 
   private noteInboundModality(chatId: string, fromVoice: boolean): void {
     if (fromVoice) {
-      // Opportunistic prune of stale entries while we're here.
       const cutoff = Date.now() - VOICE_REPLY_WINDOW_MS
       for (const [key, ts] of this.voiceReplyChats) {
         if (ts < cutoff) this.voiceReplyChats.delete(key)
@@ -448,7 +417,6 @@ export class TelegramChannel implements IChannel {
     await this.bot.sendChatAction(parseInt(target.id), 'typing')
   }
 
-  /** Generate a pairing code for CLI to display */
   generatePairingCode(): TelegramPairingCode {
     const code = String(randomInt(100000, 999999))
     const expiresAt = Date.now() + (this.config.pairingCodeTtl ?? 300) * 1000
@@ -480,27 +448,13 @@ export class TelegramChannel implements IChannel {
     const userId = String(msg.from.id)
     const chatId = String(msg.chat.id)
 
-    // Rate-limit at the entrance before any outbound reply. This
-    // covers /start, unpaired prompts, and pairing replies. The
-    // previous flow only checked after the unpaired branch, so an
-    // attacker hitting /start (or messaging from an unpaired
-    // account) could force this bot into uncapped outbound traffic
-    // — Telegram's send budget would burn out and the bot would be
-    // rate-limited or temporarily banned.
     if (!this.checkRateLimit(userId)) {
-      // Drop silently. Replying with "Rate limit exceeded" here
-      // would itself amplify, defeating the purpose. The legitimate
-      // path replies to messages that pass the limit; abusive
-      // senders get nothing.
       return
     }
 
     const hasText = typeof msg.text === 'string' && msg.text.trim().length > 0
     const hasAudio = Boolean(msg.voice || msg.audio)
     if (!hasText && !hasAudio) {
-      // Distinguish real media (photo/document/video/sticker/…) — which the
-      // user actively sent and deserves an ack — from content-less updates
-      // (empty edits, service messages) which stay silent.
       const hasMedia = Boolean(
         msg.photo || msg.document || msg.video || msg.sticker
         || msg.animation || msg.video_note || msg.location || msg.contact,
@@ -511,7 +465,6 @@ export class TelegramChannel implements IChannel {
       return
     }
 
-    // Text-only slash commands.
     if (typeof msg.text === 'string') {
       if (msg.text.startsWith('/pair ')) {
         await this.handlePairing(msg)
@@ -523,22 +476,14 @@ export class TelegramChannel implements IChannel {
       }
     }
 
-    // Access gate — covers text and voice; an unpaired sender always
-    // gets the pairing hint regardless of message type.
     if (this.config.pairingRequired !== false && !this.allowedUsers.has(userId)) {
       await this.bot?.sendMessage(chatId, 'You are not paired. Use /pair <code> to connect.')
       return
     }
 
-    // Resolve the message body: typed text, or a transcribed voice /
-    // audio note. Returns null when transcription already replied with
-    // an explanation (unavailable / failed).
     const text = await this.resolveMessageText(msg, chatId)
     if (text == null || text.length === 0) return
 
-    // Track the inbound modality so a reply to a voice note can be
-    // voiced back (and a later typed message switches the chat back to
-    // text-only replies).
     this.noteInboundModality(chatId, !hasText)
 
     const incoming: IncomingMessage = {
@@ -579,7 +524,6 @@ export class TelegramChannel implements IChannel {
 
     const voice = msg.voice ?? msg.audio
     if (!voice) {
-      // Photos, stickers, documents, etc. are not handled here.
       return null
     }
     if (!this.config.transcribeAudioFile) {
@@ -591,8 +535,6 @@ export class TelegramChannel implements IChannel {
     }
     if (!this.bot) return null
 
-    // Cap inbound audio size before downloading — a paired user could
-    // otherwise force unbounded large-file downloads and pressure disk.
     const maxBytes = this.config.maxVoiceDownloadBytes ?? DEFAULT_MAX_VOICE_DOWNLOAD_BYTES
     const fileSize = (voice as { file_size?: number }).file_size
     if (typeof fileSize === 'number' && fileSize > maxBytes) {
@@ -606,7 +548,6 @@ export class TelegramChannel implements IChannel {
     let dir: string | undefined
     try {
       dir = await mkdtemp(join(tmpdir(), 'sepilotd-tg-voice-'))
-      // node-telegram-bot-api downloads the file and returns its path.
       const localPath = await this.bot.downloadFile(voice.file_id, dir)
       const transcript = (await this.config.transcribeAudioFile(localPath)).trim()
       if (!transcript) {

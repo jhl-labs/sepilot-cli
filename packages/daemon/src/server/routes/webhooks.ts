@@ -12,6 +12,8 @@ import {
   webhookIdempotencyKey,
 } from '../../channels/webhook-dispatch.js'
 import { normalizeHeaders, parseRequestInput } from './utils.js'
+import { buildWebhookEvent } from '../../event-routing/inbound.js'
+import { EVENT_ROUTING_ORIGIN_HEADER, hasEventRoutingOrigin } from '../../event-routing/origin.js'
 import {
   resolveWebhookSecurityPolicy,
 } from '../runtime/webhook-security-policy.js'
@@ -97,7 +99,6 @@ export async function webhookRoutes(app: FastifyInstance) {
     }
   })
 
-  // Slack Events API
   app.post('/webhooks/slack', async (request, reply) => {
     const slackChannel = runtime.channels.find(c => c.type === 'slack') as SlackChannel | undefined
     const securityPolicy = resolveWebhookSecurityPolicy(runtime.config, 'slack')
@@ -117,7 +118,6 @@ export async function webhookRoutes(app: FastifyInstance) {
     const headers = normalizeHeaders(request.headers)
     const rawBody = getRawBody(request.body, request.rawBody)
 
-    // Handle URL verification challenge
     if (body?.type === 'url_verification') {
       if (!slackChannel.verifySignature(
         rawBody,
@@ -147,7 +147,6 @@ export async function webhookRoutes(app: FastifyInstance) {
     return { ok: true }
   })
 
-  // Discord Interactions
   app.post('/webhooks/discord', async (request, reply) => {
     const discordChannel = runtime.channels.find(c => c.type === 'discord') as DiscordChannel | undefined
     const securityPolicy = resolveWebhookSecurityPolicy(runtime.config, 'discord')
@@ -188,7 +187,6 @@ export async function webhookRoutes(app: FastifyInstance) {
     return { type: 5 }
   })
 
-  // Mattermost slash command / outgoing webhook callback
   app.post('/webhooks/mattermost', async (request, reply) => {
     const mattermostChannel = runtime.channels.find(c => c.type === 'mattermost') as MattermostChannel | undefined
     if (!mattermostChannel) {
@@ -220,7 +218,6 @@ export async function webhookRoutes(app: FastifyInstance) {
     }
   })
 
-  // WhatsApp Cloud API
   app.get<{ Querystring: WhatsAppVerifyQuery }>('/webhooks/whatsapp', async (request, reply) => {
     const whatsappChannel = runtime.channels.find(c => c.type === 'whatsapp') as WhatsAppChannel | undefined
     if (!whatsappChannel) {
@@ -294,7 +291,6 @@ export async function webhookRoutes(app: FastifyInstance) {
     return { ok: true }
   })
 
-  // Microsoft Teams Bot Framework
   app.post('/webhooks/teams', async (request, reply) => {
     const teamsChannel = runtime.channels.find(c => c.type === 'teams') as TeamsChannel | undefined
     if (!teamsChannel) {
@@ -317,8 +313,6 @@ export async function webhookRoutes(app: FastifyInstance) {
       'Invalid Teams activity body',
     )
     if (!body) return reply
-    // Bind the JWT serviceurl claim to the inbound activity's serviceUrl so a
-    // valid token cannot be replayed against an attacker-chosen serviceUrl.
     if (!await teamsChannel.validateRequest(headers, body.serviceUrl)) {
       return reply.status(401).send({ error: 'Invalid Teams authorization' })
     }
@@ -354,7 +348,6 @@ export async function webhookRoutes(app: FastifyInstance) {
     return { ok: true }
   })
 
-  // LINE Messaging API
   app.post('/webhooks/line', async (request, reply) => {
     const lineChannel = runtime.channels.find(c => c.type === 'line') as LINEChannel | undefined
     if (!lineChannel) {
@@ -394,7 +387,6 @@ export async function webhookRoutes(app: FastifyInstance) {
     return { ok: true }
   })
 
-  // Generic Webhooks
   app.post<{ Params: Record<'*', string> }>('/webhooks/*', async (request, reply) => {
     const params = parseRequestInput(
       reply,
@@ -417,16 +409,29 @@ export async function webhookRoutes(app: FastifyInstance) {
           'Webhook endpoint secret configuration is required for verification',
         )
       }
-      const handled = await webhookChannel.handleWebhook(
-        `/hook/${params.path}`,
-        body as GenericWebhookBody,
-        normalizeHeaders(request.headers),
-        request.ip,
-        getRawBody(request.body, request.rawBody),
-      )
-      if (handled) {
-        return { ok: true }
+      const headers = normalizeHeaders(request.headers)
+      const rawBody = getRawBody(request.body, request.rawBody)
+      const verified = webhookChannel.verifyRequest(`/hook/${params.path}`, body as GenericWebhookBody, headers, request.ip, rawBody)
+      if (!verified) continue
+      if (hasEventRoutingOrigin(request.headers[EVENT_ROUTING_ORIGIN_HEADER])) {
+        return reply.status(202).send({ accepted: false, reason: 'loop' })
       }
+      if (verified.endpoint.mode === 'route') {
+        const routing = runtime.eventRouting
+        if (!routing || runtime.config?.eventRouting?.enabled === false) {
+          return reply.status(404).send({ error: 'Webhook endpoint not found' })
+        }
+        const result = routing.ingest(buildWebhookEvent({
+          endpoint: verified.endpoint,
+          normalizedPath: verified.normalizedPath,
+          headers,
+          body: body as Record<string, unknown>,
+          rawBody,
+        }))
+        return reply.status(202).send({ accepted: true, eventId: result.eventId, duplicate: result.duplicate })
+      }
+      await webhookChannel.dispatchVerified(verified, body as GenericWebhookBody, headers)
+      return { ok: true }
     }
     return reply.status(404).send({ error: 'Webhook endpoint not found' })
   })

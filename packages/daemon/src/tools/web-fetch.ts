@@ -33,10 +33,10 @@ interface WebFetchQueryOptions {
 }
 
 export interface WebFetchToolOptions {
+  checkUrl?: (url: string) => string | undefined
   egressAllowlist?: readonly string[] | null
   env?: Record<string, string | undefined>
   egressLogger?: EgressPolicyLogger
-  /** Permit loopback URLs for local development-service validation. */
   allowLocalhost?: boolean
   isLocalhostAllowed?: (
     sessionId: string | undefined,
@@ -49,7 +49,6 @@ export interface WebFetchToolOptions {
     workspaceRoot?: string,
   ) => string | null
   fetcher?: typeof fetch
-  /** Request deadline for DNS, redirects, and response-body reads. Cleanup is separately bounded. */
   timeoutMs?: number
 }
 
@@ -73,12 +72,9 @@ export function normalizeWebFetchInput(
   let url = rawUrl
   try {
     const parsed = new URL(rawUrl)
-    // URL fragments are never sent in the HTTP request and therefore cannot
-    // identify a different observation.
     parsed.hash = ''
     url = parsed.toString()
   } catch {
-    // Preserve invalid input for the ordinary validator/error contract.
   }
   const query = typeof input.query === 'string'
     ? input.query.trim().slice(0, MAX_QUERY_CHARS)
@@ -207,8 +203,6 @@ export function createWebFetchTool(options: WebFetchToolOptions = {}): ToolDefin
       t.unref?.()
       try {
         throwIfAborted(ctrl.signal, `Web fetch for ${url} aborted`)
-        // Manual redirect chain so each hop is re-validated by assertPublicUrl.
-        // Without this, a public URL could 302 to http://169.254.169.254/.
         let currentUrl = url
         const localhostAllowed = options.allowLocalhost
           || options.isLocalhostAllowed?.(
@@ -220,6 +214,8 @@ export function createWebFetchTool(options: WebFetchToolOptions = {}): ToolDefin
           ? new URL(url).origin
           : null
         for (let hop = 0; ; hop += 1) {
+          const accessDenied = options.checkUrl?.(currentUrl)
+          if (accessDenied) return { output: accessDenied, status: 'error', code: 'ACCESS_DENIED_PERMANENT', durationMs: Date.now() - start }
           const current = new URL(currentUrl)
           const isAllowedLocalhost = Boolean(
             allowedLocalhostOrigin
@@ -342,9 +338,6 @@ export function createWebFetchTool(options: WebFetchToolOptions = {}): ToolDefin
         if (context?.signal?.aborted) {
           throw getAbortError(context.signal, `Web fetch for ${url} aborted`)
         }
-        // AbortError from the timeout vs. genuine network DNS/TLS errors:
-        // both are surfaced as transient — the agent may retry once with a
-        // longer timeout / different host but should not loop endlessly.
         return {
           output: (e as Error).message,
           status: 'error',
@@ -359,13 +352,6 @@ export function createWebFetchTool(options: WebFetchToolOptions = {}): ToolDefin
   }
 }
 
-/**
- * Undici's graceful close waits for pooled connections to drain. A broken or
- * uncooperative peer can keep that promise pending even after the request
- * signal has been aborted, which used to leave the whole agent tool call
- * suspended until the much larger global tool timeout. Bound graceful cleanup
- * and fall back to destroy so webfetch's own deadline remains meaningful.
- */
 export async function closeDispatcherBounded(
   dispatcher: Pick<Dispatcher, 'close' | 'destroy'> | undefined,
   timeoutMs = DISPATCHER_CLOSE_TIMEOUT_MS,
@@ -397,7 +383,6 @@ export async function closeDispatcherBounded(
       dispatcher.destroy(new Error('webfetch dispatcher close timed out')),
     ).catch(() => undefined)
   } catch {
-    // Cleanup must never replace the bounded request result.
   }
 }
 
@@ -412,11 +397,6 @@ export function parseContentType(raw: string): { mime: string; charset: string }
   return { mime, charset }
 }
 
-// Accept anything text-shaped: text/*, and structured application subtypes that
-// are really text (json/xml/javascript/csv/yaml/...). A missing content-type is
-// treated as text (best-effort, preserves prior behavior). Everything else —
-// images, audio, video, fonts, archives, octet-stream — is binary and returning
-// it verbatim only produces mojibake, so it is refused with a clear label.
 export function isTextualContentType(mime: string): boolean {
   if (!mime) return true
   if (mime.startsWith('text/')) return true
@@ -430,7 +410,6 @@ function decodeBody(bytes: Uint8Array, charset: string): string {
   try {
     return new TextDecoder(label, { fatal: false }).decode(bytes)
   } catch {
-    // Unknown/unsupported charset label — fall back to UTF-8.
     return new TextDecoder('utf-8', { fatal: false }).decode(bytes)
   }
 }
@@ -476,7 +455,6 @@ function discardResponseReader(reader: ReadableStreamDefaultReader<Uint8Array>):
   try {
     void reader.cancel().catch(() => undefined)
   } catch {
-    // Best effort only. The request signal and dispatcher cleanup own teardown.
   }
 }
 
@@ -488,8 +466,6 @@ export async function handleResponse(
   sourceUrl?: string,
 ): Promise<ToolResult> {
   if (!res.ok) {
-    // 5xx, 429, 408 are typically transient — a retry can succeed.
-    // 4xx (404, 401, 403, 410, 451) is permanent for the same URL.
     const transient = res.status >= 500 || res.status === 429 || res.status === 408
     await discardResponseBody(res, signal)
     return {
@@ -511,7 +487,6 @@ export async function handleResponse(
     }
   }
 
-  // Content-Length pre-check: reject oversized bodies before buffering anything.
   const declaredLength = Number(res.headers.get('content-length'))
   if (Number.isFinite(declaredLength) && declaredLength > MAX_BYTES) {
     await discardResponseBody(res, signal)
@@ -525,9 +500,6 @@ export async function handleResponse(
 
   let body: string
   if (res.body) {
-    // Stream with a running byte cap so a missing/lying Content-Length cannot
-    // force us to materialize an unbounded body; decode with the declared
-    // charset (Response.text() would force UTF-8 and mangle other encodings).
     const { bytes, tooLarge } = await readBodyBounded(res, MAX_BYTES, signal)
     if (tooLarge) {
       return {
@@ -539,8 +511,6 @@ export async function handleResponse(
     }
     body = decodeBody(bytes, charset)
   } else {
-    // No readable stream (e.g. a hand-rolled Response in tests) — fall back to
-    // text() and still enforce the size cap post-materialization.
     const pendingText = res.text()
     body = signal ? await raceWithAbort(pendingText, signal) : await pendingText
     if (Buffer.byteLength(body, 'utf8') > MAX_BYTES) {
@@ -556,9 +526,10 @@ export async function handleResponse(
   const isHtml = mime.includes('html')
   const out = isHtml ? htmlToText(body) : body
   if (queryOptions?.linkQuery) {
-    if (!isHtml) {
+    const isLinkText = !isHtml && (mime.includes('markdown') || mime.startsWith('text/') || /\.(md|markdown|txt)(?:$|[?#])/i.test(sourceUrl ?? ''))
+    if (!isHtml && !isLinkText) {
       return {
-        output: 'linkQuery requires an HTML response containing anchors. Use query for plain text, JSON, or other textual formats.',
+        output: 'linkQuery reads links from HTML, Markdown or plain-text responses. Use query for JSON or other structured formats.',
         status: 'error',
         durationMs: Date.now() - start,
         code: 'LINK_QUERY_REQUIRES_HTML_PERMANENT',
@@ -568,6 +539,7 @@ export async function handleResponse(
       body,
       queryOptions.linkQuery,
       sourceUrl,
+      isHtml,
     )
     if (!extracted) {
       return {
@@ -588,11 +560,6 @@ export async function handleResponse(
       durationMs: Date.now() - start,
     }
   }
-  // A 2xx response without usable text is not an observation. Reporting it as
-  // success makes the agent treat an empty page as evidence, while also
-  // bypassing both exact-failure suppression and same-turn evidence reuse. The
-  // same URL cannot become useful through an ordinary retry; the caller must
-  // switch to a rendered-browser path or another textual source.
   if (out.trim().length === 0) {
     return {
       output: [
@@ -629,9 +596,6 @@ export async function handleResponse(
       durationMs: Date.now() - start,
     }
   }
-  // First clip at 200KB chars (legacy hard cap), then enforce the
-  // shared per-tool byte cap. enforceOutputLimit appends a hint so
-  // the agent can re-run with a more specific URL when truncated.
   const limited = enforceOutputLimit(out.slice(0, 200_000), {
     toolName: 'webfetch',
     resumeHint: 'request a smaller URL or extract a specific section',
@@ -643,10 +607,39 @@ export async function handleResponse(
   }
 }
 
+function linkCandidates(body: string, isHtml: boolean): Array<{ rawHref: string; label: string }> {
+  if (isHtml) {
+    const contentHtml = body
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+    const candidates: Array<{ rawHref: string; label: string }> = []
+    const anchorPattern = /<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi
+    let anchor: RegExpExecArray | null
+    while ((anchor = anchorPattern.exec(contentHtml)) !== null) {
+      const attributes = anchor[1] ?? ''
+      const rawHref = readHtmlAttribute(attributes, 'href')
+      if (!rawHref) continue
+      const fallbackLabel = readHtmlAttribute(attributes, 'aria-label') ?? readHtmlAttribute(attributes, 'title') ?? ''
+      candidates.push({ rawHref: decodeHtmlEntities(rawHref.trim()), label: htmlToText(anchor[2] ?? '') || decodeHtmlEntities(fallbackLabel) })
+    }
+    return candidates
+  }
+  const candidates: Array<{ rawHref: string; label: string }> = []
+  const markdown = /\[([^\]\n]{0,300})\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g
+  let link: RegExpExecArray | null
+  while ((link = markdown.exec(body)) !== null) candidates.push({ rawHref: link[2]!, label: link[1]!.trim() })
+  const withoutMarkdownLinks = body.replace(markdown, ' ')
+  for (const match of withoutMarkdownLinks.matchAll(/https?:\/\/[^\s<>"'`)\]]+/g)) {
+    candidates.push({ rawHref: match[0].replace(/[.,;:!?]+$/, ''), label: '' })
+  }
+  return candidates
+}
+
 export function extractWebFetchLinkMatches(
-  html: string,
+  body: string,
   rawQuery: string,
   sourceUrl?: string,
+  isHtml = true,
 ): string | null {
   const query = rawQuery.trim().slice(0, MAX_QUERY_CHARS)
   if (!query || !sourceUrl) return null
@@ -657,36 +650,22 @@ export function extractWebFetchLinkMatches(
     return null
   }
 
-  const contentHtml = html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
   const lowerQuery = query.toLocaleLowerCase()
   const matches: Array<{ label: string; url: string }> = []
   const seenUrls = new Set<string>()
   let matchCount = 0
-  const anchorPattern = /<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi
-  let anchor: RegExpExecArray | null
 
-  while ((anchor = anchorPattern.exec(contentHtml)) !== null) {
-    const attributes = anchor[1] ?? ''
-    const rawHref = readHtmlAttribute(attributes, 'href')
-    if (!rawHref || rawHref.trim().startsWith('#')) continue
+  for (const candidate of linkCandidates(body, isHtml)) {
+    const rawHref = candidate.rawHref.trim()
+    if (!rawHref || rawHref.startsWith('#')) continue
     let resolved: URL
     try {
-      resolved = new URL(decodeHtmlEntities(rawHref.trim()), baseUrl)
+      resolved = new URL(rawHref, baseUrl)
     } catch {
       continue
     }
     if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') continue
-
-    const fallbackLabel = readHtmlAttribute(attributes, 'aria-label')
-      ?? readHtmlAttribute(attributes, 'title')
-      ?? ''
-    const label = (
-      htmlToText(anchor[2] ?? '')
-      || decodeHtmlEntities(fallbackLabel)
-      || resolved.toString()
-    ).replace(/\s+/g, ' ').trim().slice(0, 300)
+    const label = (candidate.label || resolved.toString()).replace(/\s+/g, ' ').trim().slice(0, 300)
     const absoluteUrl = resolved.toString()
     if (!`${label}\n${rawHref}\n${absoluteUrl}`.toLocaleLowerCase().includes(lowerQuery)) {
       continue
@@ -787,15 +766,6 @@ export function extractWebFetchQueryMatches(
   ].join('\n\n')
 }
 
-/**
- * A query that matched nothing is still a completed observation: the fetch
- * succeeded and the page demonstrably does not contain the term. Report it the
- * way fs.search/fs.glob report an empty result set — success with an explicit
- * empty marker — rather than an error, which counts a normal negative answer as
- * a tool failure and drives the failure-recovery machinery. The bounded head
- * excerpt exists so the caller can choose its next term from what the page
- * actually contains instead of guessing another literal.
- */
 export function formatWebFetchQueryMiss(opts: {
   content: string
   queryLabel: string
@@ -821,17 +791,10 @@ async function discardResponseBody(res: Response, signal?: AbortSignal): Promise
     const cancellation = res.body?.cancel(signal?.reason)
     if (cancellation) void cancellation.catch(() => undefined)
   } catch {
-    // Best effort only. The dispatcher is closed immediately afterwards.
   }
 }
 
 function htmlToText(html: string): string {
-  // Order matters: insert structural separators BEFORE the generic tag strip,
-  // otherwise tables and lists collapse into a single-line word soup and the
-  // model can no longer tell which number belongs to which cell. The previous
-  // implementation lost all row/cell boundaries, which is how benchmark pages
-  // turned into unstructured noise and pushed the agent into hallucinating
-  // numbers from training instead of quoting the fetched data.
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<style[\s\S]*?<\/style>/gi, '')

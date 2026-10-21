@@ -9,26 +9,9 @@ export function errorMessage(err: unknown): string {
   return String(err)
 }
 
-/**
- * Render an api-client error as something a human reads. Handles three
- * shapes, in order of preference:
- *
- *  1. `ApiHttpError` (new) — daemon/gateway returned a structured
- *     `{ error: { code, message, requestId } }` envelope; we render
- *     `<status> <code>: <message>` so the user sees the diagnostic code
- *     once and the message once, no JSON.
- *  2. Legacy `<status>: <json>` Error message — older transports throw a
- *     plain `Error` whose `message` carries the body verbatim. We unwrap
- *     it the same way for backward compatibility.
- *  3. Anything else — fall through to the raw `Error.message`.
- */
 export function friendlyErrorMessage(err: unknown): string {
   if (err instanceof ApiHttpError) {
     if (err.code) return `${err.status} ${err.code}: ${err.message}`
-    // The fallback ApiHttpError (no envelope) already encodes the
-    // status as a prefix on `.message` — surfacing it again would
-    // produce "404: 404: ..." double prefixes. Detect that shape and
-    // either run it through the legacy unwrap below or return as-is.
     const legacyMatch = /^(\d{3}):\s*(\{.*\})\s*$/s.exec(err.message)
     if (legacyMatch) {
       try {
@@ -43,7 +26,7 @@ export function friendlyErrorMessage(err: unknown): string {
                 ? body.message
                 : null
         if (message) return `${legacyMatch[1]}: ${message}`
-      } catch { /* ignore */ }
+      } catch {}
     }
     return err.message
   }
@@ -64,16 +47,10 @@ export function friendlyErrorMessage(err: unknown): string {
             : null
     if (message) return `${match[1]}: ${message}`
   } catch {
-    // ignore JSON parse failures and surface the raw daemon string
   }
   return raw
 }
 
-/**
- * Extract status, user-facing text, and optional contract recovery details
- * from typed HTTP errors and foreground SSE rejection strings. Returns null
- * when the error is not recognisable as HTTP so the caller can fall through.
- */
 interface ParsedJsonError {
   inner: string
   code?: string
@@ -112,7 +89,7 @@ function parseJsonError(text: string): ParsedJsonError {
       }
     }
     if (typeof parsed.message === 'string') return { inner: parsed.message }
-  } catch { /* keep raw */ }
+  } catch {}
   return { inner: text }
 }
 
@@ -123,10 +100,6 @@ function extractStatus(err: unknown): {
   details?: Readonly<Record<string, unknown>>
 } | null {
   if (err instanceof ApiHttpError) {
-    // The legacy fallback packs `<status>: <body>` into `.message`. Strip
-    // the prefix so the caller doesn't print "503: 503: ..." double, and
-    // unwrap any `{"error":"..."}` body the same way friendlyErrorMessage
-    // does so the printed copy doesn't show raw braces.
     const stripped = err.message.replace(/^\d{3}:\s*/, '')
     const parsed = parseJsonError(stripped)
     return {
@@ -150,20 +123,10 @@ function extractStatus(err: unknown): {
 }
 
 export interface PrintApiErrorOptions {
-  /**
-   * Optional context-specific suggestion appended in gray. Use for retry
-   * guidance unique to the calling command (e.g., 'Re-run with --session
-   * <id>' for ask). Skip for idempotent commands where retry is obvious.
-   */
   hint?: string
 }
 
 export interface PrintStreamErrorOptions {
-  /**
-   * Current --session id, if the caller is mid-stream on a known
-   * session. When present we tell the user how to resume from the same
-   * session id; when absent we suggest passing one next time.
-   */
   sessionId?: string
 }
 
@@ -197,13 +160,6 @@ export function isRecoverableStreamDrop(err: unknown): boolean {
   )
 }
 
-/**
- * Build the multi-line friendly text for an SSE-stream failure. Returns
- * null when the error doesn't match a known stream-failure shape so the
- * caller can fall through. Plain text (no chalk) so React surfaces (TUI)
- * can dispatch it through their own rendering pipeline; the
- * `printStreamError` wrapper colourises for the cli stderr path.
- */
 export function formatStreamError(
   err: unknown,
   opts: PrintStreamErrorOptions = {},
@@ -260,13 +216,6 @@ export function formatStreamError(
   return null
 }
 
-/**
- * Build the multi-line friendly text for an api-client http error.
- * Returns null when the error isn't an http error so the caller can
- * fall through. Mirrors `formatStreamError` — the cli wrapper
- * `printApiError` colourises, surfaces with their own renderer reuse
- * the plain text form via `normalizeError`.
- */
 export function formatApiError(
   err: unknown,
   opts: PrintApiErrorOptions = {},
@@ -310,22 +259,12 @@ export function formatApiError(
   return lines.join('\n')
 }
 
-/**
- * Print a multi-line friendly text to stderr, colourising the first line
- * (red header) and the rest (gray detail/hint). Internal helper shared
- * by `printStreamError` and `printApiError`.
- */
 function emitFriendlyMultiline(text: string): void {
   const [first, ...rest] = text.split('\n')
   console.error(chalk.red(first))
   for (const line of rest) console.error(chalk.gray(line))
 }
 
-/**
- * Render an SSE-stream failure to stderr. Returns true when the error
- * matched a known stream-failure shape (caller should `process.exit(1)`
- * / abort the loop). Returns false on unrelated errors.
- */
 export function printStreamError(
   err: unknown,
   opts: PrintStreamErrorOptions = {},
@@ -336,11 +275,6 @@ export function printStreamError(
   return true
 }
 
-/**
- * Render an api-client error to stderr. Returns true when the error
- * matched a known http status (caller should exit). Returns false on
- * unrelated errors.
- */
 export function printApiError(err: unknown, opts: PrintApiErrorOptions = {}): boolean {
   const text = formatApiError(err, opts)
   if (text == null) return false

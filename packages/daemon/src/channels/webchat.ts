@@ -38,14 +38,12 @@ export class WebchatChannel implements IChannel {
     }
   }
 
-  /** Inject a message from the web UI */
   async injectMessage(msg: IncomingMessage): Promise<void> {
     for (const h of this.handlers) {
-      try { await h(msg) } catch { /* handler errors are silently ignored */ }
+      try { await h(msg) } catch {}
     }
   }
 
-  /** Wait for a response to a specific message */
   waitForResponse(messageId: string, timeoutMs?: number): Promise<ChannelMessage> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {

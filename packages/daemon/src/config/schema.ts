@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { rejectPrivateLiteralUrl } from '../utils/ssrf-guard.js'
+import { eventRoutingConfigSchema } from '../event-routing/config-schema.js'
 
 export const DEFAULT_RESUME_ARTIFACT_RETENTION_DAYS = 30
 
@@ -36,7 +37,7 @@ const providerModelCapabilitiesOverrideSchema = z.object({
   streaming: z.boolean().optional(),
   embedding: z.boolean().optional(),
   thinking: z.boolean().optional(),
-  thinkingControl: z.enum(['reasoning-effort', 'chat-template-kwargs']).optional(),
+  thinkingControl: z.enum(['reasoning-effort', 'chat-template-kwargs', 'think-levels']).optional(),
   adaptivePromptReact: z.boolean().optional(),
   promptReactPreferred: z.boolean().optional(),
   deepCoderAnalysis: z.boolean().optional(),
@@ -44,8 +45,24 @@ const providerModelCapabilitiesOverrideSchema = z.object({
 
 const providerModelCompatibilitySchema = z.object({
   toolTransport: z.enum(['auto', 'native', 'prompt-react', 'adaptive']).optional(),
+  reasoningEffortOffValue: z.enum(['none', 'minimal']).optional(),
+  reasoningEffortAliases: z.record(z.enum(['low', 'medium', 'high']), z.string().trim().min(1)).optional(),
+  auxiliaryThinkingOffFallback: z.enum(['low', 'medium', 'high', 'max']).optional(),
+  repairThinkingOffFallback: z.enum(['low', 'medium', 'high', 'max']).optional(),
   answerProtocol: z.enum(['auto', 'repair-left-truncated-answer-stem']).optional(),
   notes: z.array(z.string().trim().min(1).max(500)).max(16).optional(),
+}).refine(value => !value.reasoningEffortOffValue || Boolean(value.notes?.length), {
+  message: 'An Off wire mapping requires endpoint/model evidence in compatibility.notes.',
+  path: ['notes'],
+}).refine(value => !value.auxiliaryThinkingOffFallback || Boolean(value.notes?.length), {
+  message: 'An auxiliary thinking fallback requires endpoint/model evidence in compatibility.notes.',
+  path: ['notes'],
+}).refine(value => !value.repairThinkingOffFallback || Boolean(value.notes?.length), {
+  message: 'A repair thinking fallback requires endpoint/model evidence in compatibility.notes.',
+  path: ['notes'],
+}).refine(value => !value.reasoningEffortAliases || Boolean(value.notes?.length), {
+  message: 'Reasoning-effort aliases require endpoint/model evidence in compatibility.notes.',
+  path: ['notes'],
 })
 
 const providerModelOverrideSchema = z.object({
@@ -95,8 +112,6 @@ export const sandboxBubblewrapConfigSchema = z
     processIsolation: z
       .enum(['namespace', 'container-boundary'])
       .default('namespace'),
-    // Host-DoS resource caps applied via prlimit + a size-bounded /tmp tmpfs.
-    // Omit to use safe defaults; set a field to 0 to disable that cap.
     resourceLimits: z
       .object({
         pidsMax: z.number().int().nonnegative().optional(),
@@ -137,9 +152,6 @@ const networkProxyUrlSchema = z
   .trim()
   .url()
   .superRefine((value, context) => {
-    // `z.string().url()` records malformed strings as validation errors, but
-    // Zod still runs refinements afterwards.  Do not turn an invalid request
-    // into an uncaught `new URL()` exception (and therefore a 500 response).
     let url: URL
     try {
       url = new URL(value)
@@ -169,11 +181,6 @@ type NetworkConfigRuntimeMetadata = {
   [legacyUnsafeProxyRuntimeMarker]?: true
 }
 
-/**
- * A pre-proxyMode config with an unsupported or credential-bearing proxy URL
- * is kept parseable for upgrades, but must remain fail-closed until the user
- * explicitly saves a current network policy.
- */
 export function hasLegacyUnsafeProxyMigration(value: unknown): boolean {
   return Boolean(
     value
@@ -195,11 +202,6 @@ export function copyNetworkConfigRuntimeMetadata(
   })
 }
 
-/**
- * Process-wide outbound HTTP policy used by the daemon's global undici
- * dispatcher. `maxConcurrency` is the per-origin connection-pool limit, not a
- * daemon-wide agent-run semaphore.
- */
 export const networkConfigSchema = z
   .preprocess(
     (input) => {
@@ -208,13 +210,6 @@ export const networkConfigSchema = z
         [LEGACY_UNSAFE_PROXY_INPUT_MARKER]: _ignoredRuntimeMarker,
         ...legacy
       } = input as Record<string, unknown>
-      // Before proxyMode existed, a non-null proxyUrl meant manual proxy.
-      // Old releases accepted schemes and embedded credentials that the
-      // canonical contract intentionally rejects. Do not let one unsafe old
-      // value brick an upgrade: retain a canonical direct-shaped value with
-      // non-serialized runtime metadata that forces fail-closed egress. A
-      // current client that explicitly sends proxyMode=manual still goes
-      // through strict validation below and receives a 400 from the API.
       if (legacy.proxyMode === undefined && legacy.proxyUrl != null) {
         if (
           typeof legacy.proxyUrl === 'string'
@@ -272,12 +267,11 @@ export const providerSchema = z.object({
   apiKey: z.string().optional(),
   baseUrl: z.string().url().optional(),
   headers: z.record(z.string()).default({}),
-  // /v1/models discovery가 실패하거나 endpoint가 catalog를 안 주는 provider도
-  // 일단 등록해두고 나중에 모델을 채울 수 있도록 0개 허용. 모델 없는 provider는
-  // chat 흐름에서 단순히 후보로 잡히지 않을 뿐, config 자체는 유효.
   models: z.array(z.string()).default([]),
   defaultContextWindow: z.number().int().positive().optional(),
   defaultMaxOutputTokens: z.number().int().positive().optional(),
+  disableDefaultPlugins: z.boolean().optional(),
+  structuredToolCalling: z.boolean().optional(),
   capabilities: providerModelCapabilitiesOverrideSchema.optional(),
   modelOverrides: z.array(providerModelOverrideSchema).default([]),
   default: z.boolean().optional().default(false),
@@ -323,9 +317,15 @@ const mcpToolManifestSchema = z.object({
   ),
 })
 
+const mcpToolSecuritySchema = z
+  .record(z.enum(['observe', 'external-write']))
+  .optional()
+
 const mcpServerSecurityFieldsSchema = {
   provenance: mcpServerProvenanceSchema.optional(),
   toolManifest: mcpToolManifestSchema.optional(),
+  toolSecurity: mcpToolSecuritySchema,
+  toolCapabilities: z.record(z.array(z.enum(['process', 'service', 'terminal', 'browser', 'filesystem-read', 'filesystem-write', 'network', 'application-state']))).optional(),
 }
 
 const mcpServerToolTimeoutMsSchema = z
@@ -588,13 +588,6 @@ export const memoryMaintenanceSchema = z
     dryRun: false,
   })
 
-// Opt-in agent-driven "deepening user model" loop. When enabled, the
-// scheduler creates a recurring headless run that re-invokes the agent
-// to reflect on recent daily notes / conversations and refresh a "User
-// Profile" section of MEMORY.md (durable role / preferences / working
-// style / recurring projects). Default off — it writes to the default
-// memory scope, so multi-user deployments should leave it disabled or
-// configure it deliberately.
 export const memoryUserProfileSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -615,14 +608,6 @@ export const memoryUserProfileSchema = z
     section: 'User Profile',
   })
 
-// Opt-in "agent reaches out first" digest. When enabled with a target
-// chat, the scheduler creates a recurring channel-bound run that
-// re-invokes the agent to surface anything pending or noteworthy
-// (open-loop daily notes, due reminders, pending scheduled tasks) and
-// delivers a short briefing to that chat. Default off; needs an
-// explicit channelType + channelTarget so it does not message a chat
-// the operator did not pick. The schedule accepts a full cron string
-// (so "0 9 * * *" = 9am daily) as well as the interval shorthand.
 export const proactivityDigestSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -659,11 +644,6 @@ export const schedulerConfigSchema = z
     timezone: z.string().trim().min(1).optional(),
     dailyTokenBudget: z.number().int().positive().optional(),
     maxConsecutiveFailures: z.number().int().min(1).max(100).default(5),
-    // A scheduled run collects before it reports — quotes, searches, fetches,
-    // an artifact write and its read-back — so the interactive-chat default of
-    // 10 iterations cannot finish one. A nightly market briefing over 13
-    // tickers exhausted it and reported INCOMPLETE with the report already
-    // written.
     maxIterations: z.number().int().min(1).max(200).default(40),
     surfaces: schedulerSurfaceAccessSchema,
   })
@@ -683,7 +663,6 @@ export const channelPipelineConfigSchema = z
     sharedGroupContext: z.boolean().default(false),
     maxGlobalRuns: z.number().int().min(1).max(100).default(8),
     maxGlobalQueuedRuns: z.number().int().min(0).max(100).default(0),
-    /** Optional collection root applied to new channel sessions without an explicit /cwd. */
     defaultWorkspaceRoot: z.string().trim().min(1).optional(),
   })
   .default({
@@ -725,10 +704,6 @@ export const outboundWebhookRetrySchema = z
 
 export const outboundWebhookSchema = z.object({
   enabled: z.boolean().default(true),
-  // Fail-fast egress guard at config load: reject a literal private/loopback/
-  // metadata target so a misconfigured exfil URL is caught before any delivery.
-  // Hostnames are validated at delivery time by the DNS-resolving guard in
-  // hooks/outbound-webhook.ts. Bypass with SEPILOTD_OUTBOUND_WEBHOOK_ALLOW_PRIVATE=1.
   url: z
     .string()
     .url()
@@ -771,9 +746,7 @@ export const commandHookEventSchema = z.enum([
 export const commandHookSchema = z.object({
   enabled: z.boolean().default(true),
   event: commandHookEventSchema,
-  /** Regex matched against the tool name for tool-scoped events. */
   toolMatcher: z.string().optional(),
-  /** Shell command. Receives the hook payload as JSON on stdin; exit 2 aborts. */
   command: z.string().min(1),
   timeoutMs: z.number().int().min(100).max(60_000).optional(),
   async: z.boolean().optional(),
@@ -881,13 +854,6 @@ export const webhookSecurityPolicyConfigSchema = webhookSecurityPolicyThresholdS
   byChannelType: z.record(webhookSecurityPolicyOverrideSchema).default({}),
 })
 
-// Application log rotation. Applies to `~/.sepilotd/logs/daemon.log` and
-// `~/.sepilotd/logs/agent-trace.jsonl`. Without rotation these grow without
-// bound on long-running daemons, especially the trace file which records full
-// LLM payloads. Defaults match service-supervisor: 10 MiB × 3 files.
-//
-// Disabling rotation (`enabled: false`) reverts to the legacy unbounded
-// behaviour. Use it only when an external log shipper handles rolling.
 export const DEFAULT_APP_LOG_ROTATION = {
   enabled: true,
   maxBytes: 10 * 1024 * 1024,
@@ -944,12 +910,8 @@ export const voiceConfigSchema = z
         language: z.string().trim().min(1).optional(),
       })
       .default({}),
-    // Retention for server-synthesized voice WAVs: evicted + unlinked past the
-    // TTL or when the count exceeds the max (was an unbounded disk/memory leak).
     fileRetentionMs: z.number().int().positive().default(60 * 60 * 1000),
     maxFiles: z.number().int().positive().default(200),
-    // Max concurrent STT/TTS jobs; bounds per-call model reloads so N parallel
-    // voice requests do not fan out into N model loads and OOM the host.
     maxConcurrent: z.number().int().positive().default(2),
   })
   .default({
@@ -1011,12 +973,6 @@ export const webSearchProviderIdSchema = z.enum([
   'ai-search',
 ])
 
-/**
- * Granular update payload for the search backend. `apiKey` accepts the
- * `***redacted***` placeholder a settings UI gets back from GET /config, which
- * means "keep the stored key" — without it, saving any other field on the form
- * would wipe the credential.
- */
 export const webSearchProviderUpdateSchema = z.object({
   provider: webSearchProviderIdSchema,
   apiKey: z.string().trim().optional(),
@@ -1026,32 +982,59 @@ export const webSearchProviderUpdateSchema = z.object({
 export const webSearchConfigSchema = z
   .object({
     trustedDomains: webSearchTrustedDomainsSchema.default([]),
-    /**
-     * Search backend. `auto` picks a keyed provider when its credential is in
-     * the environment and otherwise falls back to keyless DuckDuckGo, which
-     * frequently answers automated queries with an anti-bot challenge.
-     */
     provider: webSearchProviderIdSchema.default('auto'),
-    /** Credential for the selected provider; may also come from the environment. */
     apiKey: z.string().trim().min(1).optional(),
-    /** Base URL of a self-hosted SearXNG or compatible AI Search instance. */
     endpoint: z.string().url().optional(),
   })
   .default({
     trustedDomains: [],
   })
 
-/** Host-neutral placeholder: never derived from OS user/host identity. */
 export const DEFAULT_DEVICE_NAME = 'sepilot-device'
+
+const browserSiteHostPattern = z
+  .string()
+  .trim()
+  .min(1)
+  .max(253)
+  .regex(/^(\*\.)?[a-z0-9.-]+$/i, 'host pattern must be a host or *.host')
+const browserSecurityConfigSchema = z
+  .object({
+    sites: z
+      .object({
+        allow: z.array(browserSiteHostPattern).default([]),
+        deny: z.array(browserSiteHostPattern).default([]),
+      })
+      .default({ allow: [], deny: [] }),
+  })
+  .default({ sites: { allow: [], deny: [] } })
+const browserConfigSchema = z
+  .object({
+    cdp: z
+      .object({
+        enabled: z.boolean().default(true),
+        channel: z.enum(['stable', 'beta', 'dev', 'canary']).default('stable'),
+        userDataDir: z.string().trim().min(1).optional(),
+      })
+      .default({ enabled: true, channel: 'stable' }),
+  })
+  .default({ cdp: { enabled: true, channel: 'stable' } })
+
+const viewsConfigSchema = z
+  .object({
+    stills: z
+      .object({
+        enabled: z.boolean().default(true),
+        maxWidth: z.number().int().min(160).max(1280).default(480),
+        format: z.enum(['jpeg', 'png']).default('jpeg'),
+      })
+      .default({ enabled: true, maxWidth: 480, format: 'jpeg' }),
+  })
+  .default({ stills: { enabled: true, maxWidth: 480, format: 'jpeg' } })
 
 export const configSchema = z.object({
   version: z.literal(1),
   configRevision: z.number().int().nonnegative().optional(),
-  // First boot into an empty data dir must not require the operator to
-  // hand-write a device block. The identity is auto-provisioned as a random
-  // UUID (never derived from the OS username, hostname or home directory —
-  // those would leak host identity into config artifacts) and persisted back
-  // to config.yaml by the bootstrap path so it stays stable across restarts.
   device: z
     .object({
       id: z.string().default(() => randomUUID()),
@@ -1086,11 +1069,6 @@ export const configSchema = z.object({
     .default({ url: 'http://127.0.0.1:17610' }),
   network: networkConfigSchema,
   webSearch: webSearchConfigSchema,
-  // Data retention. Each *Days field is optional; unset means unlimited (the
-  // historical behavior — no automatic aging). When set, a periodic sweeper
-  // deletes items older than the window. Session deletion reuses the complete
-  // deletion path (usage/memory/embeddings/uploads) so sweeping leaves no
-  // orphans. Disable the whole sweeper with enabled:false or the env kill-switch.
   retention: z
     .object({
       enabled: z.boolean().default(true),
@@ -1112,26 +1090,12 @@ export const configSchema = z.object({
       auxModel: z.string().trim().min(1).optional(),
       mode: z.string().trim().min(1).default('instant'),
       persona: z.string().trim().min(1).optional(),
-      // Output language for assistant replies. 'auto' (default) mirrors the
-      // user's language per turn; a specific value (e.g. 'en', 'ko', 'English',
-      // '日本語') instructs the model to always answer in that language. Personas
-      // no longer hardcode Korean — language is governed here so non-Korean
-      // users are not forced into Korean output.
       outputLanguage: z.string().trim().min(1).default('auto'),
       intentRouter: z
         .object({
-          // Enabled by default so natural-language chat turns can select
-          // mode/persona/skills through the LLM router. Per-turn callers can
-          // still bypass it with `intentRouting: { enabled: false }`.
           enabled: z.boolean().default(true),
           provider: z.string().optional(),
           model: z.string().optional(),
-          // 4s only fits a co-located classifier. When the router shares the
-          // main model — the default when `model` is unset — a hosted or cloud
-          // endpoint routinely needs longer, and every timeout silently
-          // downgrades the turn to a low-confidence fallback decision that
-          // picks the wrong mode. 12s still bounds the added latency while
-          // letting a normal remote classification finish.
           timeoutMs: z.number().int().min(500).max(60_000).default(12_000),
           maxPreviousMessages: z.number().int().min(0).max(20).default(4),
           perMessageCharLimit: z.number().int().min(50).max(2000).default(200),
@@ -1139,10 +1103,6 @@ export const configSchema = z.object({
         })
         .default({
           enabled: true,
-          // Keep the nested-object default identical to timeoutMs.default().
-          // Zod applies this object wholesale when `agent` exists but
-          // `intentRouter` is omitted, so a stale value here silently bypasses
-          // the field-level default.
           timeoutMs: 12_000,
           maxPreviousMessages: 4,
           perMessageCharLimit: 200,
@@ -1169,10 +1129,6 @@ export const configSchema = z.object({
     }),
   limits: z
     .object({
-      // Daily / per-session USD spend caps checked before every LLM dispatch.
-      // undefined (default) means unlimited. Only priced (costKnown) spend
-      // counts, so local models never trip the cap. env
-      // SEPILOTD_DAILY_USD_BUDGET / SEPILOTD_SESSION_USD_BUDGET override.
       dailyUsdBudget: z.number().positive().optional(),
       sessionUsdBudget: z.number().positive().optional(),
     })
@@ -1186,6 +1142,7 @@ export const configSchema = z.object({
       commandHooks: z.array(commandHookSchema).default([]),
     })
     .default({ outboundWebhooks: [], commandHooks: [] }),
+  eventRouting: eventRoutingConfigSchema,
   mcp: z
     .object({
       servers: z.array(mcpServerSchema).default([]),
@@ -1211,11 +1168,6 @@ export const configSchema = z.object({
           'custom-api',
         ])
         .default('auto'),
-      // Which `memory.*` tools direct-API surfaces (CLI/web/desktop) expose to
-      // the agent. The full set (~40 tools) is the channel/auto-memory concept;
-      // direct API defaults to `lean` (remember/list/search/forget) so one-shot
-      // CLI work isn't paying ~8k tokens of memory-tool schemas. Channels are
-      // unaffected — they always get the full registry.
       directApiToolset: z.enum(['lean', 'full', 'none']).default('lean'),
       qdrant: memoryQdrantSchema.optional(),
       opensearch: memorySearchEngineSchema.optional(),
@@ -1244,27 +1196,21 @@ export const configSchema = z.object({
     .object({
       chatCompletion: z
         .object({
-          enabled: z.boolean().default(false),
+          enabled: z.boolean().default(true),
           includeFailures: z.boolean().default(true),
         })
-        .default({ enabled: false, includeFailures: true }),
+        .default({ enabled: true, includeFailures: true }),
     })
     .optional(),
   voice: voiceConfigSchema,
   scheduler: schedulerConfigSchema.optional(),
   skills: z
     .object({
-      // When true, auto-discovered project/home skills (e.g. `.claude/skills`)
-      // are treated as trusted (no untrusted-provenance banner). Default false:
-      // they still load but are flagged untrusted supply-chain content.
       trustProjectSkills: z.boolean().default(false),
     })
     .default({ trustProjectSkills: false }),
   files: z
     .object({
-      // Absolute directory roots that `/files/search` may enumerate. When empty
-      // (default) the search is contained to the daemon user's home directory so
-      // an arbitrary `cwd` cannot enumerate the whole filesystem layout.
       searchRoots: z.array(z.string().trim().min(1)).default([]),
     })
     .default({ searchRoots: [] }),
@@ -1273,16 +1219,13 @@ export const configSchema = z.object({
       toolPolicy: z.string().default('policies.yaml'),
       auditLog: z.boolean().default(true),
       sandbox: z.enum(['local', 'docker', 'bubblewrap']).default('local'),
-      // Docker/bubblewrap isolate terminal.run. Keep built-in host-side file
-      // tools out of those profiles by default so they cannot silently pierce the
-      // configured filesystem boundary. `allow` is an explicit compatibility
-      // escape hatch for deployments that still need the legacy behavior.
       sandboxHostFileTools: z.enum(['deny', 'allow']).optional(),
       sandboxDocker: sandboxDockerConfigSchema.optional(),
       sandboxBubblewrap: sandboxBubblewrapConfigSchema.optional(),
       egressAllowlist: z.array(z.string().trim().min(1)).optional(),
       skillSources: skillSourceSecuritySchema,
       webhooks: webhookSecurityPolicyConfigSchema.default(DEFAULT_WEBHOOK_SECURITY_POLICY),
+      browser: browserSecurityConfigSchema,
     })
     .default({
       toolPolicy: 'policies.yaml',
@@ -1291,7 +1234,10 @@ export const configSchema = z.object({
       sandboxDocker: sandboxDockerConfigSchema.parse({}),
       skillSources: skillSourceSecuritySchema.parse({}),
       webhooks: DEFAULT_WEBHOOK_SECURITY_POLICY,
+      browser: browserSecurityConfigSchema.parse({}),
     }),
+  browser: browserConfigSchema,
+  views: viewsConfigSchema,
   share: z
     .object({
       public: z

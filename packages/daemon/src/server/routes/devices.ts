@@ -229,10 +229,9 @@ function detectCapabilities(): string[] {
   const caps: string[] = []
   caps.push('terminal')
   caps.push('filesystem')
-  // Check for docker
   try {
     execFileSync('docker', ['--version'], { stdio: 'ignore' })
     caps.push('docker')
-  } catch { /* docker not installed */ }
+  } catch {}
   return caps
 }

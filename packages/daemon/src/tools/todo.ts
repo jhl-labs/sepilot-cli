@@ -6,11 +6,6 @@ import type { TaskBoardStore } from '../memory/task-board.js'
 
 export interface TodoToolDeps {
   appendEvent: (sessionId: string, event: TodoListEvent) => Promise<void>
-  /**
-   * Optional cross-session task board (P022-T6). When present and the tool call
-   * carries a cwd, the todo list is mirrored into the project-scoped durable
-   * store so a later session can reload the still-open tasks.
-   */
   taskBoard?: TaskBoardStore
 }
 
@@ -23,13 +18,6 @@ const TODO_STATUSES = new Set<string>([
 ])
 const CLOSED_TODO_STATUSES = new Set<TodoItem['status']>(['completed', 'cancelled'])
 
-/**
- * Structurally validate a `todowrite` items payload into TodoItem[].
- * Used by the tool itself and by the agent loop, which mirrors successful
- * todowrite calls into `AgentState.todoList` (first-class loop state) instead
- * of scraping the tool's text output. Returns null when the payload is not a
- * well-formed todo list.
- */
 export function parseTodoItems(value: unknown): TodoItem[] | null {
   if (!Array.isArray(value)) return null
   const items: TodoItem[] = []
@@ -134,13 +122,10 @@ export function createTodoWriteTool(deps: TodoToolDeps): ToolDefinitionRuntime {
         items: parsed,
       }
       await deps.appendEvent(ctx.sessionId, event)
-      // Mirror into the durable project task board so tasks survive the session
-      // (best-effort — a task-board failure must not fail the todo write).
       if (deps.taskBoard && ctx.cwd) {
         try {
           await deps.taskBoard.upsertTasks(hashProjectPath(ctx.cwd), event.items)
         } catch {
-          // Durable mirroring is best-effort; the in-session list already saved.
         }
       }
       return {

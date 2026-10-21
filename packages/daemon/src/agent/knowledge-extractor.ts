@@ -1,6 +1,6 @@
 import { eventsAfterMemoryReset } from '../memory/reset.js'
 import { learnProcedure } from '../memory/procedural-learning.js'
-import type { ILLMProvider, ISemanticIndex, SessionEvent } from '@sepilotd/core'
+import { ThinkingLevel, type ILLMProvider, type ISemanticIndex, type SessionEvent } from '@sepilotd/core'
 import { randomUUID } from 'node:crypto'
 import { createLogger } from '../logger.js'
 import { attachScopeTags, hasScopeTag } from '../memory/scope.js'
@@ -17,27 +17,9 @@ const LOW_SIGNAL_RE =
   /^(?:ok|okay|thanks|thank you|noted|done|sure|알겠|고마워|감사|확인|완료)[.!。！\s]*$/iu
 
 export interface ExtractKnowledgeOptions {
-  /**
-   * Canonical caller/session scope tags. Auto-extracted memories must never be
-   * written as global memories because those are visible to every caller.
-   */
   scopeTags?: string[]
-  /**
-   * Observer invoked for each durable item saved to the semantic index. Lets
-   * callers mirror project-scoped learnings into the project state board
-   * (P022-T8) without coupling the extractor to the file store.
-   */
   onSaved?: (item: { content: string; tags: string[] }) => void
-  /**
-   * Cancels the extraction LLM call when the caller aborts (e.g. session
-   * teardown, shutdown). Without it a stalled provider hangs the extractor.
-   */
   signal?: AbortSignal
-  /**
-   * Provider circuit breaker so a provider outage fast-fails the extraction
-   * call instead of every post-session extraction stacking up against a dead
-   * endpoint.
-   */
   breaker?: ProviderCircuitBreaker
 }
 
@@ -61,10 +43,6 @@ function isDurableExtractedContent(content: string): boolean {
   return true
 }
 
-/**
- * Extract knowledge from a conversation and save to memory.
- * Called after session end or after significant tool use.
- */
 export async function extractKnowledge(
   provider: ILLMProvider,
   events: SessionEvent[],
@@ -77,10 +55,6 @@ export async function extractKnowledge(
   events = eventsAfterMemoryReset(events, resetAt)
   const retiredSources = new Set(await semanticIndex.getRetractedSourceIds?.(options.scopeTags ?? []) ?? [])
   events = events.filter((event) => !retiredSources.has(event.id))
-  // Explicit memory tools own recall and persistence for their turn. Automatic
-  // extraction would re-learn recalled facts as independent stale duplicates,
-  // or bypass a denied/failed explicit write. Conservatively leave those turns
-  // to the memory workflow, preserving unrelated turns for extraction.
   const turns: SessionEvent[][] = []
   for (const event of events) {
     if (!turns.length || event.type === 'user_message') turns.push([])
@@ -136,15 +110,13 @@ ${JSON.stringify(events.filter((event) => event.type === 'tool_result').slice(-1
 Return ONLY valid JSON array, no markdown, no explanation.`
 
   try {
-    // Route through the auxiliary wrapper so this internal call gets a bounded
-    // timeout + circuit breaker. Previously it hit provider.chat directly with
-    // no signal/timeout, so a stalled provider hung the extractor indefinitely.
     const response = await runAuxiliaryLlmChat({
       provider,
       request: {
         model,
         messages: [{ role: 'user', content: prompt }],
         maxTokens: 500,
+        thinkingLevel: ThinkingLevel.Off,
       },
       label: 'Knowledge extractor',
       signal: options.signal,
@@ -170,8 +142,6 @@ Return ONLY valid JSON array, no markdown, no explanation.`
           log.warn('Skipping extracted memory because scope tags could not be attached')
           continue
         }
-        // Auto-extracted content is stored verbatim into a durable index; scrub
-        // any secret/PII the model echoed from the conversation before persisting.
         const content = redactSensitive(item.content).redacted
         await semanticIndex.add({
           id: randomUUID(),

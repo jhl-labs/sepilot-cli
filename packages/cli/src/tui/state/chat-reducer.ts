@@ -1,12 +1,4 @@
-import { DEFAULT_CLI_AGENT_MODE } from '../../chat-options.js'
-// Pure reducer for the cli chat hook.
-//
-// Lives outside useChat.ts because nothing inside it touches the
-// websocket, http client, or any other runtime. It is referentially
-// transparent given (state, action) — every dependency is either
-// imported from helper modules or part of the action payload — which
-// makes it trivial to unit-test the state transitions without
-// rendering the hook.
+import { DEFAULT_TUI_AGENT_MODE } from '../../chat-options.js'
 
 import type {
   ActivityItem,
@@ -32,6 +24,7 @@ import {
   surfaceMessageToCliMessage,
 } from '../utils/surface.js'
 import type { HydratedSessionState } from '../hooks/useSession.js'
+import { terminalSafeText, terminalSafeValue } from '../../utils/terminal-safe-text.js'
 
 export type ChatAction =
   | {
@@ -51,6 +44,7 @@ export type ChatAction =
       approved: boolean
     }
   | { type: 'SET_PENDING_APPROVAL'; approval: ApprovalRequest | null }
+  | { type: 'PARK_APPROVAL'; requestId: string }
   | { type: 'ADD_PENDING_QUESTION'; question: DaemonPendingQuestion }
   | { type: 'QUESTION_ANSWERED'; questionId: string }
   | { type: 'MERGE_ARTIFACTS'; artifacts: DaemonArtifact[] }
@@ -78,9 +72,12 @@ export type ChatAction =
   | { type: 'SET_PROVIDER'; provider: string }
   | { type: 'SET_PROJECT'; projectId: string | null; projectName: string | null }
   | { type: 'SET_MODE'; mode: DaemonAgentMode }
+  | { type: 'SET_BOT'; bot: string | null }
+  | { type: 'SET_ROUTED_BOT'; bot: string | null }
   | {
       type: 'SET_THINKING_LEVEL'
       thinkingLevel: 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max'
+      source?: 'user' | 'default'
     }
   | { type: 'SET_MAX_TOKENS'; maxTokens: number | null }
   | {
@@ -137,8 +134,11 @@ export const initialState: ChatState = {
   projectName: null,
   model: 'default',
   provider: 'default',
-  mode: DEFAULT_CLI_AGENT_MODE,
+  mode: DEFAULT_TUI_AGENT_MODE,
+  bot: null,
+  routedBot: null,
   thinkingLevel: 'medium',
+  thinkingLevelChosen: false,
   maxTokens: null,
   autonomy: 'supervised',
   usage: { input: 0, output: 0, cost: 0 },
@@ -216,13 +216,7 @@ function syncSurfaceMessages(
     providerWait:
       agentState === 'done' || agentState === 'error' ? null : state.providerWait,
     isThinking: agentState === 'thinking' ? state.isThinking : false,
-    // Preserve the latest reasoning segment until the next turn starts so a
-    // brief thinking burst does not disappear as soon as a tool or answer
-    // event follows it.
     thinkingText: state.thinkingText,
-    // Clear the StatusBar's phase/state-board badges once the run ends so a
-    // finished run doesn't keep showing stale phase/criteria/todo counts
-    // from the previous run on the next turn's status line.
     currentPhase:
       agentState === 'done' || agentState === 'error' ? null : state.currentPhase,
     stateBoardCounts:
@@ -246,7 +240,33 @@ function syncSurfaceMessages(
   }
 }
 
+const terminalSafeMessages = new WeakMap<Message, Message>()
+
+function terminalSafeMessage(message: Message): Message {
+  const cached = terminalSafeMessages.get(message)
+  if (cached) return cached
+  const safe = terminalSafeValue(message)
+  terminalSafeMessages.set(message, safe)
+  terminalSafeMessages.set(safe, safe)
+  return safe
+}
+
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
+  const next = reduceChat(state, action)
+  if (next === state) return next
+  const messagesChanged = next.messages !== state.messages
+  const thinkingChanged = next.thinkingText !== state.thinkingText
+  if (!messagesChanged && !thinkingChanged) return next
+  const messages = messagesChanged ? next.messages.map(terminalSafeMessage) : next.messages
+  const unchanged = messages.every((message, index) => message === next.messages[index])
+  return {
+    ...next,
+    ...(unchanged ? {} : { messages, toolCalls: collectToolCalls(messages) }),
+    ...(thinkingChanged ? { thinkingText: terminalSafeText(next.thinkingText) } : {}),
+  }
+}
+
+function reduceChat(state: ChatState, action: ChatAction): ChatState {
   switch (action.type) {
     case 'SEND_MESSAGE':
       return {
@@ -394,8 +414,13 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       }
     case 'SET_PROVIDER_WAIT':
       return { ...state, providerWait: action.wait }
-    case 'SET_CONTEXT_USAGE':
-      return { ...state, contextUsage: action.context }
+    case 'SET_CONTEXT_USAGE': {
+      const { outputTokens, generationMs } = action.context
+      const tokensPerSecond = outputTokens && generationMs && outputTokens >= 8 && generationMs >= 200
+        ? Math.round((outputTokens * 1000) / generationMs)
+        : state.tokensPerSecond ?? null
+      return { ...state, contextUsage: action.context, tokensPerSecond }
+    }
     case 'SYNC_SURFACE_MESSAGES':
       return syncSurfaceMessages(
         state,
@@ -410,9 +435,13 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           ? action.activities(state.activities)
           : action.activities,
       }
-    // Terminal fallback when a done event arrives after the live-stream
-    // binding was torn down (e.g. an approval-response race nulled it).
-    // Without this the elapsed timer and "in progress" status never clear.
+    case 'PARK_APPROVAL':
+      if (state.pendingApproval?.requestId !== action.requestId) return state
+      return {
+        ...state,
+        error: null,
+        pendingApproval: { ...state.pendingApproval, state: 'parked', resumeAvailable: true },
+      }
     case 'STREAM_FINALIZED':
       return {
         ...state,
@@ -438,7 +467,6 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         providerWait: null,
         isThinking: false,
         isHydratingSession: false,
-        // Clear stale StatusBar badges from the failed run.
         currentPhase: null,
         stateBoardCounts: null,
         graphTrace: (state.graphTrace ?? []).map((entry, index, entries) => (
@@ -491,7 +519,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         projectId: state.projectId,
         projectName: state.projectName,
         mode: state.mode,
+        bot: state.bot,
         thinkingLevel: state.thinkingLevel,
+        thinkingLevelChosen: state.thinkingLevelChosen,
         maxTokens: state.maxTokens,
         autonomy: state.autonomy,
       }
@@ -507,8 +537,12 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       }
     case 'SET_MODE':
       return { ...state, mode: action.mode }
+    case 'SET_BOT':
+      return { ...state, bot: action.bot, routedBot: null }
+    case 'SET_ROUTED_BOT':
+      return { ...state, routedBot: action.bot }
     case 'SET_THINKING_LEVEL':
-      return { ...state, thinkingLevel: action.thinkingLevel }
+      return { ...state, thinkingLevel: action.thinkingLevel, thinkingLevelChosen: action.source !== 'default' }
     case 'SET_MAX_TOKENS':
       return { ...state, maxTokens: action.maxTokens }
     case 'SET_AUTONOMY':
@@ -606,4 +640,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     default:
       return state
   }
+}
+
+export function requestedThinkingLevel(
+  state: Pick<ChatState, 'thinkingLevel' | 'thinkingLevelChosen'>,
+): ChatState['thinkingLevel'] | undefined {
+  return state.thinkingLevelChosen ? state.thinkingLevel : undefined
 }
