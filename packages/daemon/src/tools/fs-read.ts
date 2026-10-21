@@ -14,8 +14,8 @@ const BINARY_SAMPLE_BYTES = 8192
 export const FS_READ_OBSERVATION_EOF_LINE = '__observationEofLine'
 
 export function fsReadHasUnreadTail(output: string): boolean {
-  return /call fs\.read again\b[^\]]*\bto continue\]/iu.test(output)
-    || /\[fs\.read:[^\]\n]*\bunread tail outside requested slice; optional next offset=\d+\]/iu.test(output)
+  return /call fs\.read again\b[^\][\n]{0,400}\bto continue\]/iu.test(output)
+    || /\[fs\.read:[^\][\n]{0,400}\bunread tail outside requested slice; optional next offset=\d+\]/iu.test(output)
 }
 
 export function createFsReadTool(): ToolDefinitionRuntime {

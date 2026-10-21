@@ -607,11 +607,21 @@ export async function handleResponse(
   }
 }
 
+export function stripNonContentElements(html: string): string {
+  let previous: string
+  let current = html
+  do {
+    previous = current
+    current = current
+      .replace(/<script\b[\s\S]*?<\/script\b[^>]*>/gi, '')
+      .replace(/<style\b[\s\S]*?<\/style\b[^>]*>/gi, '')
+  } while (current !== previous)
+  return current.replace(/<(?:script|style)\b[\s\S]*$/i, '')
+}
+
 function linkCandidates(body: string, isHtml: boolean): Array<{ rawHref: string; label: string }> {
   if (isHtml) {
-    const contentHtml = body
-      .replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[\s\S]*?<\/style>/gi, '')
+    const contentHtml = stripNonContentElements(body)
     const candidates: Array<{ rawHref: string; label: string }> = []
     const anchorPattern = /<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi
     let anchor: RegExpExecArray | null
@@ -795,9 +805,7 @@ async function discardResponseBody(res: Response, signal?: AbortSignal): Promise
 }
 
 function htmlToText(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
+  return stripNonContentElements(html)
     .replace(
       /<\/(?:tr|li|h[1-6]|p|div|section|article|header|footer|nav|table|tbody|thead|tfoot|caption|blockquote|pre|ul|ol|dl|dt|dd)>/gi,
       '\n',

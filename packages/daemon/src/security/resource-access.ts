@@ -1,5 +1,5 @@
 import type { PolicyCheckResult, ResourceAccessPolicy, ToolExecRequest } from '@sepilotd/core'
-import { lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs'
 import { dirname, isAbsolute, relative, resolve } from 'node:path'
 import { parseApplyPatch } from '../tools/apply-patch-parser.js'
 import { resolveToolCwd, resolveToolPath } from '../tools/path-utils.js'
@@ -57,7 +57,23 @@ export function checkAccessUrl(policy: ResourceAccessPolicy | undefined, value: 
   return undefined
 }
 
-function canonicalPath(value: string): string {
+function readGitFileWithoutFollowing(path: string): string | undefined {
+  let fd: number
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ELOOP' || code === 'EISDIR') return undefined
+    throw error
+  }
+  try {
+    return fstatSync(fd).isFile() ? readFileSync(fd, 'utf8') : undefined
+  } finally {
+    closeSync(fd)
+  }
+}
+
+export function canonicalPath(value: string): string {
   let path = resolve(value)
   const tail: string[] = []
   for (;;) {
@@ -70,7 +86,7 @@ function canonicalPath(value: string): string {
     }
   }
 }
-function within(candidate: string, root: string): boolean {
+export function within(candidate: string, root: string): boolean {
   const r = relative(root, candidate)
   return r === '' || (!r.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) && r !== '..' && !isAbsolute(r))
 }
@@ -121,8 +137,9 @@ export function checkResourceAccess(policy: ResourceAccessPolicy | undefined, re
         return denied
       }
       const git = resolve(repo, '.git')
-      if (lstatSync(git).isFile()) {
-        const match = /^gitdir: (.+)\s*$/.exec(readFileSync(git, 'utf8'))
+      const gitFile = readGitFileWithoutFollowing(git)
+      if (gitFile !== undefined) {
+        const match = /^gitdir: (.+)\s*$/.exec(gitFile)
         if (!match) return block('Git metadata could not be inspected')
         targets.push(resolve(repo, match[1]!))
       } else targets.push(git)

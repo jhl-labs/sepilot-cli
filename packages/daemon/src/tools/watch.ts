@@ -5,6 +5,7 @@ import { SessionInbox, type SessionInboxPublishInput } from '../server/runtime/s
 import type { ManagedProcessRegistry } from './process.js'
 import type { ToolDefinitionRuntime, ToolExecutionContext, ToolResult } from './registry.js'
 import { createLogger } from '../logger.js'
+import { canonicalPath, within } from '../security/resource-access.js'
 
 const log = createLogger('watch')
 
@@ -229,11 +230,13 @@ export class WatchService {
     pattern?: RegExp
     label: string
     timeoutSeconds: number
+    boundaryRoot?: string
   }): WatchSummary {
     const id = `watch-${randomUUID().slice(0, 8)}`
     const createdAt = this.now()
     const expiresAt = createdAt + input.timeoutSeconds * 1_000
     const signature = () => {
+      if (!staysWithin(input.path, input.boundaryRoot)) return 'outside'
       try {
         const stat = statSync(input.path)
         return `${stat.size}:${stat.mtimeMs}`
@@ -255,6 +258,10 @@ export class WatchService {
     const timer = setInterval(() => {
       if (!this.watches.has(id)) return
       const current = signature()
+      if (current === 'outside') {
+        finish('the path now resolves outside the workspace', '')
+        return
+      }
       if (current !== baseline) {
         baseline = current
         if (!input.pattern) {
@@ -375,15 +382,25 @@ function compilePattern(raw: unknown): RegExp | undefined | string {
   catch (patternError) { return `pattern is not a valid regular expression: ${patternError instanceof Error ? patternError.message : String(patternError)}` }
 }
 
-function resolveWatchedPath(raw: string, context: ToolExecutionContext): string | { error: string } {
+function resolveWatchedPath(raw: string, context: ToolExecutionContext): { path: string; boundaryRoot?: string } | { error: string } {
   const base = context.cwd ?? process.cwd()
   const path = isAbsolute(raw) ? resolve(raw) : resolve(base, raw)
-  if (context.workspaceRoot) {
-    const root = resolve(context.workspaceRoot)
-    const rel = relative(root, path)
-    if (rel.startsWith('..') || isAbsolute(rel)) return { error: `path must stay inside the workspace ${root}` }
+  if (!context.workspaceRoot) return { path }
+  const root = resolve(context.workspaceRoot)
+  const rel = relative(root, path)
+  if (rel.startsWith('..') || isAbsolute(rel)) return { error: `path must stay inside the workspace ${root}` }
+  try {
+    const boundaryRoot = canonicalPath(root)
+    if (!within(canonicalPath(path), boundaryRoot)) return { error: `path resolves outside the workspace ${root}` }
+    return { path, boundaryRoot }
+  } catch {
+    return { error: `path could not be safely resolved inside the workspace ${root}` }
   }
-  return path
+}
+
+function staysWithin(path: string, boundaryRoot: string | undefined): boolean {
+  if (!boundaryRoot) return true
+  try { return within(canonicalPath(path), boundaryRoot) } catch { return false }
 }
 
 export function createWatchTools(service: WatchService): ToolDefinitionRuntime[] {
@@ -429,9 +446,9 @@ export function createWatchTools(service: WatchService): ToolDefinitionRuntime[]
         } else if (input.kind === 'file') {
           const raw = text(input.path, 1_000)
           if (!raw) return error("kind 'file' requires path.", 'INVALID_INPUT_PERMANENT', startedAt)
-          const path = resolveWatchedPath(raw, context)
-          if (typeof path !== 'string') return error(path.error, 'WORKSPACE_BOUNDARY_PERMANENT', startedAt)
-          summary = service.watchFile({ sessionId: context.sessionId, path, pattern, label, timeoutSeconds })
+          const target = resolveWatchedPath(raw, context)
+          if ('error' in target) return error(target.error, 'WORKSPACE_BOUNDARY_PERMANENT', startedAt)
+          summary = service.watchFile({ sessionId: context.sessionId, path: target.path, boundaryRoot: target.boundaryRoot, pattern, label, timeoutSeconds })
         } else {
           return error("kind must be 'process_output' or 'file'.", 'INVALID_INPUT_PERMANENT', startedAt)
         }

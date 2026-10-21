@@ -760,12 +760,17 @@ async function shellScriptInputError(
     : [resolve(cwd, script), ...(process.env.PATH ?? '').split(delimiter)
       .filter(Boolean).map(directory => resolve(directory, script))]
   for (const path of candidates) {
-    const info = await stat(path).catch(() => null)
-    if (!info?.isFile()) continue
-    const file = await open(path, 'r').catch(() => null)
-    if (!file) return null
+    let file
+    try {
+      file = await open(path, 'r')
+    } catch (openError) {
+      const code = (openError as NodeJS.ErrnoException).code
+      if (code === 'ENOENT' || code === 'ENOTDIR') continue
+      return null
+    }
     let binary = false
     try {
+      if (!(await file.stat()).isFile()) continue
       const prefix = Buffer.alloc(4)
       const { bytesRead } = await file.read(prefix, 0, 4, 0)
       binary = bytesRead >= 4 && prefix.equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))
