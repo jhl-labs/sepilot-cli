@@ -23,11 +23,11 @@ export interface TeamsChannelConfig {
   allowedServiceHosts?: string[]
 }
 
-const DEFAULT_TEAMS_SERVICE_HOSTS = ['.botframework.com', 'smba.trafficmanager.net']
+export const DEFAULT_TEAMS_SERVICE_HOSTS: readonly string[] = ['.botframework.com', 'smba.trafficmanager.net']
 
 export function isAllowedTeamsServiceHost(
   serviceUrl: string,
-  allowed: string[] = DEFAULT_TEAMS_SERVICE_HOSTS,
+  allowed: readonly string[] = DEFAULT_TEAMS_SERVICE_HOSTS,
 ): boolean {
   let host: string
   try {
@@ -56,7 +56,7 @@ export class TeamsChannel implements IChannel {
   private status: ChannelStatus = 'disconnected'
   private handlers: Array<(msg: IncomingMessage) => Promise<void>> = []
   private allowedTenants: Set<string>
-  private allowedServiceHosts: string[]
+  private allowedServiceHosts: readonly string[]
   private messageCount = new Map<string, { count: number; resetAt: number }>()
   private accessToken: string | null = null
   private tokenExpiry = 0

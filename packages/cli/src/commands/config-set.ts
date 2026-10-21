@@ -33,8 +33,6 @@ function configSetCopy() {
   return CONFIG_SET_COPY[detectCliLocale()] ?? CONFIG_SET_COPY.en
 }
 
-const UNSAFE_CONFIG_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor'])
-
 type ConfigSetValue = string | number | boolean | null | unknown[] | Record<string, unknown>
 
 function coerceTypedValue(value: string, allowStructured: boolean): ConfigSetValue {
@@ -97,31 +95,7 @@ async function configSetViaYaml(
     const content = await readFile(configPath, 'utf-8')
     const config = YAML.parse(content)
 
-    const parts = key.split('.')
-    if (
-      parts.some((part) => part.length === 0)
-      || parts.some((part) => UNSAFE_CONFIG_PATH_SEGMENTS.has(part))
-    ) {
-      throw new Error(`unsafe config path: ${key}`)
-    }
-    if (!config || typeof config !== 'object' || Array.isArray(config)) {
-      throw new Error('config root must be a mapping')
-    }
-    let obj = config as Record<string, unknown>
-    for (let i = 0; i < parts.length - 1; i++) {
-      const part = parts[i]!
-      if (obj[part] === undefined) {
-        obj[part] = {}
-      }
-      const child = obj[part]
-      if (!child || typeof child !== 'object' || Array.isArray(child)) {
-        throw new Error(`config path is not a mapping: ${parts.slice(0, i + 1).join('.')}`)
-      }
-      obj = child as Record<string, unknown>
-    }
-
-    const lastKey = parts[parts.length - 1]!
-    obj[lastKey] = typedValue
+    setConfigPathValue(config, key, typedValue)
 
     await writeFile(configPath, YAML.stringify(config), 'utf-8')
 
@@ -132,4 +106,35 @@ async function configSetViaYaml(
     console.error(chalk.gray(copy.initHint))
     process.exit(1)
   }
+}
+
+function isUnsafeConfigPathSegment(segment: string): boolean {
+  return segment === '__proto__' || segment === 'constructor' || segment === 'prototype'
+}
+
+export function setConfigPathValue(config: unknown, key: string, value: ConfigSetValue): void {
+  const parts = key.split('.')
+  if (parts.some((part) => part.length === 0 || isUnsafeConfigPathSegment(part))) {
+    throw new Error(`unsafe config path: ${key}`)
+  }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new Error('config root must be a mapping')
+  }
+  let obj = config as Record<string, unknown>
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i]!
+    if (isUnsafeConfigPathSegment(part)) throw new Error(`unsafe config path: ${key}`)
+    if (!Object.hasOwn(obj, part)) {
+      Object.defineProperty(obj, part, { value: {}, enumerable: true, writable: true, configurable: true })
+    }
+    const child = obj[part]
+    if (!child || typeof child !== 'object' || Array.isArray(child)) {
+      throw new Error(`config path is not a mapping: ${parts.slice(0, i + 1).join('.')}`)
+    }
+    obj = child as Record<string, unknown>
+  }
+
+  const lastKey = parts[parts.length - 1]!
+  if (isUnsafeConfigPathSegment(lastKey)) throw new Error(`unsafe config path: ${key}`)
+  Object.defineProperty(obj, lastKey, { value, enumerable: true, writable: true, configurable: true })
 }

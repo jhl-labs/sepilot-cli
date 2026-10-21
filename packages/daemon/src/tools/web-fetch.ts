@@ -607,16 +607,74 @@ export async function handleResponse(
   }
 }
 
+const NON_CONTENT_OPENER = /<(script|style)\b/gi
+const NON_CONTENT_OPENER_AT_SPLICE = /<(script|style)\b/i
+const LONGEST_NON_CONTENT_OPENER = '<script'.length
+const NON_CONTENT_CLOSERS: Readonly<Record<string, RegExp>> = {
+  script: /<\/script\b/gi,
+  style: /<\/style\b/gi,
+}
+
 export function stripNonContentElements(html: string): string {
-  let previous: string
-  let current = html
-  do {
-    previous = current
-    current = current
-      .replace(/<script\b[\s\S]*?<\/script\b[^>]*>/gi, '')
-      .replace(/<style\b[\s\S]*?<\/style\b[^>]*>/gi, '')
-  } while (current !== previous)
-  return current.replace(/<(?:script|style)\b[\s\S]*$/i, '')
+  const kept: string[] = []
+  let position = 0
+  for (;;) {
+    NON_CONTENT_OPENER.lastIndex = position
+    const opener = NON_CONTENT_OPENER.exec(html)
+    if (!opener) break
+    if (opener.index > position) kept.push(html.slice(position, opener.index))
+    let blockEnd = rawTextBlockEnd(html, opener[1]!, opener.index + opener[0].length)
+    for (;;) {
+      if (blockEnd < 0) return kept.join('')
+      const spliced = openerSplicedAcrossCut(kept, html, blockEnd)
+      if (!spliced) break
+      dropKeptTail(kept, spliced.keptChars)
+      blockEnd = rawTextBlockEnd(html, spliced.name, blockEnd + spliced.inputChars)
+    }
+    position = blockEnd
+  }
+  kept.push(html.slice(position))
+  return kept.join('')
+}
+
+function rawTextBlockEnd(html: string, name: string, from: number): number {
+  const closer = NON_CONTENT_CLOSERS[name.toLowerCase()]!
+  closer.lastIndex = from
+  const match = closer.exec(html)
+  if (!match) return -1
+  const tagEnd = html.indexOf('>', match.index + match[0].length)
+  return tagEnd < 0 ? -1 : tagEnd + 1
+}
+
+function openerSplicedAcrossCut(
+  kept: readonly string[],
+  html: string,
+  cut: number,
+): { name: string; keptChars: number; inputChars: number } | null {
+  let tail = ''
+  for (let i = kept.length - 1; i >= 0 && tail.length < LONGEST_NON_CONTENT_OPENER; i -= 1) {
+    tail = kept[i]!.slice(-(LONGEST_NON_CONTENT_OPENER - tail.length)) + tail
+  }
+  const window = tail + html.slice(cut, cut + LONGEST_NON_CONTENT_OPENER + 1)
+  const match = NON_CONTENT_OPENER_AT_SPLICE.exec(window)
+  if (!match || match.index >= tail.length) return null
+  return {
+    name: match[1]!,
+    keptChars: tail.length - match.index,
+    inputChars: match.index + match[0].length - tail.length,
+  }
+}
+
+function dropKeptTail(kept: string[], chars: number): void {
+  let remaining = chars
+  while (remaining > 0 && kept.length > 0) {
+    const last = kept.pop()!
+    if (last.length > remaining) {
+      kept.push(last.slice(0, last.length - remaining))
+      return
+    }
+    remaining -= last.length
+  }
 }
 
 function linkCandidates(body: string, isHtml: boolean): Array<{ rawHref: string; label: string }> {

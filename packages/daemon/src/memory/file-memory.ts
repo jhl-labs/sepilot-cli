@@ -536,8 +536,7 @@ function formatDateKey(date: Date): string {
 }
 
 function hasSubstantiveContent(content: string): boolean {
-  const stripped = content
-    .replace(/<!--[\s\S]*?-->/g, '')
+  const stripped = stripHtmlComments(content)
     .replace(/^#{1,6}\s+.*$/gm, '')
     .trim()
 
@@ -545,9 +544,61 @@ function hasSubstantiveContent(content: string): boolean {
 }
 
 function sanitizePromptContent(content: string): string {
-  return content
-    .replace(/<!--[\s\S]*?-->/g, '')
+  return stripHtmlComments(content)
     .replace(/\n{3,}/g, '\n\n')
+}
+
+const COMMENT_OPEN = '<!--'
+const COMMENT_CLOSE = '-->'
+
+export function stripHtmlComments(content: string): string {
+  const kept: string[] = []
+  let position = 0
+  let closerRemains = true
+  for (;;) {
+    let bodyStart: number
+    const splicedChars = splicedCommentOpenerLength(kept, content, position)
+    if (splicedChars > 0) {
+      dropKeptTail(kept, splicedChars)
+      bodyStart = position + COMMENT_OPEN.length - splicedChars
+    } else {
+      const start = content.indexOf(COMMENT_OPEN, position)
+      if (start < 0) break
+      if (start > position) kept.push(content.slice(position, start))
+      bodyStart = start + COMMENT_OPEN.length
+    }
+    const end: number = closerRemains ? content.indexOf(COMMENT_CLOSE, bodyStart) : -1
+    closerRemains = end >= 0
+    position = end < 0 ? bodyStart : end + COMMENT_CLOSE.length
+  }
+  kept.push(content.slice(position))
+  return kept.join('')
+}
+
+function splicedCommentOpenerLength(kept: readonly string[], content: string, position: number): number {
+  if (position === 0) return 0
+  let tail = ''
+  for (let i = kept.length - 1; i >= 0 && tail.length < COMMENT_OPEN.length - 1; i -= 1) {
+    tail = kept[i]!.slice(-(COMMENT_OPEN.length - 1 - tail.length)) + tail
+  }
+  for (let chars = Math.min(tail.length, COMMENT_OPEN.length - 1); chars > 0; chars -= 1) {
+    if (tail.endsWith(COMMENT_OPEN.slice(0, chars)) && content.startsWith(COMMENT_OPEN.slice(chars), position)) {
+      return chars
+    }
+  }
+  return 0
+}
+
+function dropKeptTail(kept: string[], chars: number): void {
+  let remaining = chars
+  while (remaining > 0 && kept.length > 0) {
+    const last = kept.pop()!
+    if (last.length > remaining) {
+      kept.push(last.slice(0, last.length - remaining))
+      return
+    }
+    remaining -= last.length
+  }
 }
 
 const PRIVATE_MARKER = /<!--\s*private(?::[a-zA-Z0-9_-]+)?\s*-->/i

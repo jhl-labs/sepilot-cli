@@ -8,6 +8,8 @@ import {
   webhookPublicRouteFromPath,
   type WebhookEndpointConfig,
 } from '../../channels/webhook.js'
+import { DEFAULT_TEAMS_SERVICE_HOSTS } from '../../channels/teams.js'
+import { isSameCredentialOrigin } from '../../utils/credential-origin.js'
 import {
   discordChannelConfigSchema,
   mattermostChannelConfigSchema,
@@ -95,6 +97,47 @@ function restoreSensitiveStrings(
   return nextValue
 }
 
+interface ChannelCredentialDestination {
+  readonly credentialKeys: readonly string[]
+  sameDestination(existing: Record<string, unknown>, next: Record<string, unknown>): boolean
+}
+
+const CHANNEL_CREDENTIAL_DESTINATIONS: Readonly<Record<string, ChannelCredentialDestination>> = {
+  mattermost: {
+    credentialKeys: ['botToken'],
+    sameDestination: (existing, next) => next.serverUrl === undefined
+      || isSameCredentialOrigin(optionalString(existing.serverUrl), optionalString(next.serverUrl)),
+  },
+  teams: {
+    credentialKeys: ['appPassword'],
+    sameDestination: (existing, next) => {
+      const allowed = new Set(teamsServiceHosts(existing.allowedServiceHosts))
+      return teamsServiceHosts(next.allowedServiceHosts).every((host) => allowed.has(host))
+    },
+  },
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+function teamsServiceHosts(value: unknown): string[] {
+  const hosts = Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string').map((entry) => entry.trim().toLowerCase())
+    : []
+  return hosts.length > 0 ? hosts : [...DEFAULT_TEAMS_SERVICE_HOSTS]
+}
+
+function credentialRestoreSource(type: string | undefined, existing: unknown, next: unknown): unknown {
+  const rule = type ? CHANNEL_CREDENTIAL_DESTINATIONS[type] : undefined
+  if (!rule || !isRecord(existing) || !isRecord(next) || rule.sameDestination(existing, next)) {
+    return existing
+  }
+  const withoutCredentials = { ...existing }
+  for (const key of rule.credentialKeys) delete withoutCredentials[key]
+  return withoutCredentials
+}
+
 export function restoreChannelConfigSecrets<
   T extends { type?: string; config?: unknown; id?: string | number },
 >(existing: readonly T[] | undefined, next: readonly T[]): T[] {
@@ -115,7 +158,10 @@ export function restoreChannelConfigSecrets<
     }
     return {
       ...channel,
-      config: restoreSensitiveStrings(match?.config, channel.config),
+      config: restoreSensitiveStrings(
+        credentialRestoreSource(channel.type, match?.config, channel.config),
+        channel.config,
+      ),
     }
   })
 }
