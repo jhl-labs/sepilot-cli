@@ -108,14 +108,12 @@ export const usageOpenApiOverrides: OpenApiOverrideMap = {
 export async function usageRoutes(app: FastifyInstance) {
   const runtime = app.runtime
 
-  // GET /usage — total usage summary
   app.get('/usage', async (_request, reply) => {
     if (!runtime?.usageTracker) return reply.status(503).send({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Runtime not initialized' } })
     const total = runtime.usageTracker.getTotalUsage()
     return { data: total }
   })
 
-  // GET /usage/daily — daily usage breakdown
   app.get<{ Querystring: UsageDailyQuery }>('/usage/daily', {
     schema: fastifySchemaFromZod({ querystring: usageDailyQuerySchema }),
   }, async (request, reply) => {
@@ -125,14 +123,12 @@ export async function usageRoutes(app: FastifyInstance) {
     return { data: summaries }
   })
 
-  // GET /usage/snapshot — session/message/tool-call totals
   app.get('/usage/snapshot', async (_request, reply) => {
     if (!runtime?.usageTracker) return reply.status(503).send({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Runtime not initialized' } })
     const snapshot = runtime.usageTracker.getSnapshot()
     return { data: snapshot }
   })
 
-  // GET /usage/session/:id — usage for specific session
   app.get<{ Params: UsageSessionParams }>('/usage/session/:id', {
     schema: fastifySchemaFromZod({ params: usageSessionParamsSchema }),
   }, async (request, reply) => {

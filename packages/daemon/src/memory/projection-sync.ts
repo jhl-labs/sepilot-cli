@@ -9,7 +9,6 @@ export const normalizeProjectionText = (text: string) => text.normalize('NFKC').
 export const projectionItems = (text: string) => text.split('\n')
   .filter((line) => /^\s*-\s+/.test(line)).map((line) => normalizeProjectionText(line.replace(/^\s*-\s+/, '')))
 
-/** SQLite outbox survives crashes between the authoritative write and file IO. */
 export class MemoryProjectionSync {
   private flushing?: Promise<void>
   constructor(private readonly db: SqliteDatabase, private readonly registry: ScopedFileMemoryRegistry) {}
@@ -36,8 +35,6 @@ export class MemoryProjectionSync {
       } | undefined
       if (!change) return
       const tags = JSON.parse(change.old_tags) as string[]
-      // A separate instance bypasses the reverse-sync listener. Writes are
-      // awaited, idempotent, and acknowledged only after the projection lands.
       const file = new FileMemory(dirname(this.registry.get(tags).getMemoryPath()))
       for (const section of await file.readMemorySections()) {
         const items = projectionItems(section.content)
@@ -53,7 +50,6 @@ export class MemoryProjectionSync {
     }
   }
 
-  /** Exact provenance-preserving reverse sync, never fuzzy deletion. */
   async reconcileFile(key: string, before: string, after: string): Promise<void> {
     const beforeItems = new Set(projectionItems(before))
     const afterItems = new Set(projectionItems(after))
@@ -77,8 +73,6 @@ export class MemoryProjectionSync {
         }
       }
     })()
-    // File writer already persisted after; outbox replay now has no matching
-    // old item and cannot recreate the deleted content.
     await this.flush()
   }
 }

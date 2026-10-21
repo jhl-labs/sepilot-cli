@@ -35,9 +35,9 @@ export function mergeChildInto(
   parent.totalUsage = childClone.totalUsage
   parent.recentToolResults = childClone.recentToolResults
   parent.toolCallHistory = (childClone.toolCallHistory ?? []).slice(-200)
+  parent.unexecutedToolSelections = childClone.unexecutedToolSelections
   parent.evidenceLedger = childClone.evidenceLedger
   parent.workProgress = childClone.workProgress ?? parent.workProgress
-  // These are run-wide costs, not phase-local allowances.
   parent.recoveryProviderCallTotal = Math.max(parent.recoveryProviderCallTotal ?? 0, childClone.recoveryProviderCallTotal ?? 0)
   parent.recoveryControllerFailureTotal = Math.max(parent.recoveryControllerFailureTotal ?? 0, childClone.recoveryControllerFailureTotal ?? 0)
   parent.recoveryExhaustedFinalCount = Math.max(parent.recoveryExhaustedFinalCount ?? 0, childClone.recoveryExhaustedFinalCount ?? 0)
@@ -48,9 +48,6 @@ export function mergeChildInto(
   parent.toolCalls = []
   parent.toolResults = []
   parent.output = ''
-  // User-owned prerequisites and denied approvals close the whole run, unlike
-  // a child's local iteration limit. Do not let a sibling phase continue or
-  // discard the explanation when merging its evidence.
   if (childClone.userActionRequired || childClone.approvalDenied) {
     parent.userActionRequired = childClone.userActionRequired
     parent.approvalDenied = childClone.approvalDenied
@@ -58,11 +55,6 @@ export function mergeChildInto(
     parent.shouldStop = true
     parent.output = childClone.output
   }
-  // An explicitly closed exact-call workflow is a run-wide user boundary,
-  // not phase-local subgraph state. Once a child executor has recorded every
-  // permitted outcome, the parent must not reopen a verification or discovery
-  // tool surface. Other forced-final reasons remain local to their child
-  // phase and are intentionally not promoted here.
   if (
     childClone.stuckRepeatForcedFinal === true
     && childClone.forcedFinalSynthesisReason === 'exact-tool-budget'

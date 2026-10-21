@@ -54,6 +54,7 @@ export function Composer({
       </Box>
       {leaderArmed && leaderHintText ? <Text color={colors.dimText}>{leaderHintText}</Text> : null}
       {shellMode ? <Text color={colors.warning}>SHELL · Enter:run · Esc:chat · !!:rerun</Text> : null}
+      {!leaderArmed && !shellMode ? <Text color={colors.dimText} wrap="truncate-end">Ctrl+O activity · {value ? "←→ cursor" : "→ tasks"} · /help{busy ? " · Esc stop · Tab follow-up" : " · Ctrl+J newline"}</Text> : null}
       {busy ? (
         <Text color={activityColor} bold>
           {activityFrame ?? '⠋'} {busyLabel ?? 'Working…'}

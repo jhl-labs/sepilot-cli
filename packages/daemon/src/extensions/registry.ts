@@ -101,10 +101,6 @@ export class ExtensionRegistry {
         parsed.records.map((record) => [record.manifest.id, record]),
       )
     } catch (err) {
-      // Same rationale as extension-tokens / audit-logger: silently
-      // booting empty would un-register every previously installed
-      // extension with no operator-visible reason. Rotate the bad
-      // file aside so the operator can inspect it and reinstall.
       const aside = `${this.filePath}.broken-${Date.now()}`
       log.error('extension registry unparseable; rotating aside', {
         path: this.filePath,

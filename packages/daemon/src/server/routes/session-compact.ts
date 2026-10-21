@@ -48,11 +48,6 @@ export function registerSessionCompactRoute(app: FastifyInstance): void {
       })
     }
 
-    // Summarize with the session's own provider/model. `models[0]` is whatever
-    // order the provider returned — alphabetical for Ollama, so an embedding
-    // model can sort first and a manual /compact would try to summarize with a
-    // model that cannot chat. Fall back to the default provider only when the
-    // session's provider is gone.
     const sessionProvider = session.provider
       ? runtime.providerRegistry.get(session.provider)
       : undefined

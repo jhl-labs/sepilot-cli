@@ -10,9 +10,6 @@ export interface InstallPipelineDeps {
   urlSource: SkillSource
   gitSource: SkillSource
   marketplaceSource: SkillSource
-  // Trusted ed25519 public keys (keyId -> base64/PEM public key) used to verify
-  // a skill's advertised signature. Empty by default: no scanner or trust
-  // anchor exists yet, so signatures are recorded but never claimed verified.
   trustedSignatureKeys?: ReadonlyMap<string, string>
 }
 
@@ -128,9 +125,6 @@ function decodeSignature(signature: string): Buffer {
   return Buffer.from(value, 'base64')
 }
 
-// Verify an advertised ed25519 signature over the install digest against a
-// trusted key. Returns false on any failure (unknown key, bad signature,
-// malformed input) so a claimed-but-unverifiable signature is never trusted.
 function verifySkillSignature(
   signature: SkillSignatureRecord | undefined,
   digest: string,
@@ -157,9 +151,6 @@ function securityMetadata(
   const network = hostFromRef(item.source.ref)
   const advertisedSignature = item.signature ?? item.metadata.provenance?.signature
   const signatureVerified = verifySkillSignature(advertisedSignature, digest, trustedKeys)
-  // The digest is a trust-on-first-use transit integrity check (does the
-  // fetched bytes match what the caller pinned?), NOT proof of authorship.
-  // Authenticity only comes from a verified signature.
   const digestMatches = expectedDigest === digest
   const verification: SkillProvenanceRecord['verification'] = signatureVerified
     ? 'signature'
@@ -186,8 +177,6 @@ function securityMetadata(
       ...(item.publisher ? { publisher: item.publisher } : {}),
       ...(item.sourceRef ? { sourceRef: item.sourceRef } : {}),
       ...(signature ? { signature } : {}),
-      // No real content scanner ships yet — record 'unknown' rather than
-      // falsely stamping 'pass'.
       scan: {
         result: 'unknown',
         checkedAt: installedAt,

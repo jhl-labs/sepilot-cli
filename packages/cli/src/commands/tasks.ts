@@ -27,8 +27,6 @@ export async function cancelTask(client: TasksClient, key: string): Promise<unkn
   if (kind === 'run') return client.cancelActiveRun(id)
   if (kind === 'chat') return client.cancelBackgroundChat(id)
   if (kind === 'process') return client.stopManagedProcess(id)
-  // Pausing preserves the recurring task and its evidence. It does not claim
-  // to cancel an already active run; that run has its own entry.
   if (kind === 'schedule') return client.pauseSchedulerJob(id)
   if (kind === 'service') return client.stopService(id)
   throw new Error('Use the approval dialog to review and deny an approval; task cancellation never grants a decision')
@@ -77,7 +75,7 @@ export async function tasksCommand(args: string[], options: { url?: string }): P
         await new Promise(resolve => setTimeout(resolve, 500))
       }
     } finally { process.off('SIGINT', stop) }
-    return // Leaving observation never stops the managed process.
+    return
   }
   const result = await runTasksCommand(client, args)
   output(result, value => {

@@ -12,19 +12,8 @@ export const SEPILOT_APP_SENSITIVE_KEY_PATTERN =
 export type SepilotAppDataPrimitive = string | number | boolean | null
 
 export interface SepilotAppDataPolicy {
-  /**
-   * Whether daemon-side agent tools may read this app's data. Sensitive apps
-   * such as vaults should set this to false unless they expose redacted views.
-   */
   aiReadable?: boolean
-  /**
-   * Whether daemon-side agent tools may mutate this app's data.json. Sensitive
-   * apps should keep this disabled and expose explicit app-owned flows instead.
-   */
   aiWritable?: boolean
-  /**
-   * Whether sandboxed apps may read this app through the inter-app broker.
-   */
   interAppReadable?: boolean
   sensitivePaths?: string[]
   redactedKeys?: string[]

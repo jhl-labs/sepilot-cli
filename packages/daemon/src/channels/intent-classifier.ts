@@ -60,10 +60,6 @@ export interface IntentClassifierConfig {
   maxLlmInputChars: number
   maxOutputTokens: number
   defaultBias: 'parallel_new' | 'correction'
-  // Fail-safe verdict for classifier failures (disabled/rate-limit/no-provider/
-  // timeout/parse-fail). Must NOT be parallel_new: a failed classify must never
-  // silently spawn a mutating second run against the same task. 'status' keeps
-  // the active run and only acknowledges — the safe, no-new-work direction.
   failSafeBias: 'status' | 'correction'
 }
 
@@ -83,11 +79,6 @@ export interface IntentClassifierLogger {
   recordError?: (input: { chatKey: string; reason: 'timeout' | 'parse' | 'thrown'; errorName?: string }) => void
 }
 
-// Explicit slash command, not intent guessing: `/parallel ...`, `/new ...`,
-// `/async ...`, `/fork ...` mean "run this as a separate parallel task". This
-// is parsed (like `/approve`, `/session`), not heuristically inferred — the
-// natural-language case ("아 그리고 미국 주식도 분석해줘") is the LLM classifier's
-// job, never a regex.
 const PARALLEL_COMMAND_PATTERN = /^(\/parallel|\/new|\/async|\/fork)\s+/i
 
 export function explicitParallelCommand(text: string): { matched: boolean; remainder?: string } {

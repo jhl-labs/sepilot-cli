@@ -28,14 +28,6 @@ const cancelSteerRequestSchema = z.union([
 type SteerBody = z.infer<typeof steerRequestSchema>
 type CancelSteerBody = z.infer<typeof cancelSteerRequestSchema>
 
-/**
- * `POST /sessions/:id/steer` — queue a mid-run user steering note (an
- * instruction or question) onto the LIVE, in-flight run's graph state so the
- * running loop picks it up on its next turn (see
- * `agent/graph/state-board.ts` `appendSteeringNote` /
- * `takeUnconsumedSteeringNotes`). 409s when the session has no active run;
- * the note is never appended to a session with nothing running.
- */
 export function registerSessionSteerRoute(app: FastifyInstance): void {
   app.post<{ Params: SessionIdParams; Body: SteerBody }>(
     '/sessions/:id/steer',
@@ -72,24 +64,6 @@ export function registerSessionSteerRoute(app: FastifyInstance): void {
         runtime.activeRuns.queuePendingSteeringNote(sessionId, note)
       }
 
-      // No checkpoint hook here: `runtime.runCheckpoints.save` requires a full
-      // `createGraphRunCheckpoint(state, context, resumeStage, ...)` call, and
-      // the `GraphExecutionContext` (active graph node id/iteration/resume
-      // stage/pending tool execution) is only known to the in-flight graph
-      // engine loop (see `agent/graph/engine.ts` and `agent/graph/nodes.ts`),
-      // not to this HTTP route, which only has `runtime.activeRuns.getLiveState`
-      // (a bare `AgentState`-shaped object, no execution context). Wiring a
-      // route-reachable checkpoint save would mean threading the live
-      // `GraphExecutionContext` out of the engine loop into `activeRuns` just
-      // for this narrow case — nontrivial new plumbing, so it is intentionally
-      // not done here. If the run is admitted but the live state is not
-      // registered yet, `ActiveRunRegistry` carries the pending note forward
-      // into the first live state. The crash window between the steering-note
-      // append/queue above and the next natural engine checkpoint (per graph node, see
-      // `engine.ts` `context.saveRunCheckpoint`) is accepted; the durable
-      // `steering_ack`/`steering_consumed` session events below and in
-      // `agent/graph/nodes.ts` already make the note recoverable from the
-      // session journal even if the in-memory `liveState` copy is lost.
       await runtime.sessions.appendEvent(sessionId, {
         type: 'steering_ack',
         id: randomUUID(),

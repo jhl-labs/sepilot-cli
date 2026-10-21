@@ -1,9 +1,3 @@
-/**
- * Total control-transaction ceiling, separate from provider first-token and
- * active-stream idle guards. Native + JSON repair share this transaction.
- * An operator may disable it explicitly; run/call-count/output budgets and
- * cancellation remain independent. Never derive it from the first-token knob.
- */
 export const DEFAULT_CONTROL_CALL_TIMEOUT_MS = 5 * 60_000
 
 export function resolveControlCallTimeoutMs(

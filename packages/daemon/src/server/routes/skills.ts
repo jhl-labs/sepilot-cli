@@ -130,11 +130,6 @@ function sourceUrlNotAllowedError(error: SkillSourceUrlNotAllowedError) {
 }
 
 function getRouteErrorMessage(_error: unknown, fallback: string): string {
-  // Never surface a raw fetch/exec error to clients: git and network stderr can
-  // embed internal temp paths and source URLs. Callers log the raw error
-  // server-side; the client only gets a stable, generic message. Domain errors
-  // with safe, user-actionable messages (validation, digest, path traversal,
-  // source-url) are handled explicitly before this fallback is reached.
   return fallback
 }
 

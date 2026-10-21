@@ -76,10 +76,6 @@ export function buildToolActivitySummary({
   runActive = false,
 }: BuildToolActivitySummaryOptions): string {
   const counts = createEmptyCounts()
-  // Count only tool/approval executions. Narration items (thinking,
-  // reasoning steps, state notes) are pushed with a permanent `running`
-  // status and never resolved, so counting them inflates the tally into a
-  // bogus "17 running" while a single tool executes.
   const sourceStatuses = activities.length > 0
     ? activities
         .filter((activity) => activity.kind === 'tool' || activity.kind === 'approval')
@@ -100,11 +96,6 @@ export function buildToolActivitySummary({
     segments.push(latestActivitySummary ? `run active · ${latestActivitySummary}` : 'run active')
   }
 
-  // A "running" tally is only meaningful while the run is live — activity
-  // items keep a stale `running` status after the run ends (the stream
-  // controller pushes fresh result items instead of reconciling the original),
-  // so once the run is idle we report what actually happened instead of a
-  // bogus "14 running" count that lingers on screen.
   if (runActive && counts.running > 0) {
     segments.push(formatCount(counts.running, 'running'))
   }

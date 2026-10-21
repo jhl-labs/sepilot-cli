@@ -12,7 +12,6 @@ export async function requestIdPlugin(app: FastifyInstance) {
 
 skipOverride(requestIdPlugin)
 
-/** Get request ID from Fastify request */
 export function getRequestId(request: FastifyRequest): string {
   return request.requestId ?? 'unknown'
 }

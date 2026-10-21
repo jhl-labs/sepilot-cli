@@ -1,17 +1,17 @@
-// AUTO-GENERATED REGION — the bundle build rewrites this file from
-// build.features.yaml and restores this committed stub afterwards.
-// The stub enables EVERY feature (default full build).
 import type { FastifyInstance } from 'fastify'
 import type { ToolRegistry } from '../tools/registry.js'
 import type {
   FeatureToolDeps,
   FeatureRouteDeps,
   FeatureRuntimeToolDeps,
+  FeatureEventRoutingHooks,
+  FeatureEventRoutingRuntime,
+  FeatureEventRoutingStopRuntime,
 } from '../features/types.js'
 import type { ChannelFactoryRegistry } from '../server/runtime/channels.js'
 import type { SepilotdConfig } from '../config/schema.js'
 import type { A2ATaskStore } from '../a2a/server.js'
-import type { ExternalAcpAgentDispatcher } from '../acp/external-agent.js'
+import type { ExternalAgentRuntime } from '../acp/external-agent.js'
 import type { PluginLoader } from '../plugins/loader.js'
 import type { OpenApiComponentOverrides, OpenApiOverrideMap } from '../server/openapi.js'
 
@@ -48,12 +48,14 @@ import * as routesPlugins from '../features/entries/routes-plugins.js'
 import * as routesAcp from '../features/entries/routes-acp.js'
 import * as routesA2a from '../features/entries/routes-a2a.js'
 import * as routesSwarm from '../features/entries/routes-swarm.js'
+import * as routesEventRouting from '../features/entries/routes-event-routing.js'
 
 import * as a2aRuntime from '../features/entries/a2a-runtime.js'
 import * as acpRuntime from '../features/entries/acp-runtime.js'
 import * as plugins from '../features/entries/plugins.js'
 import * as wiki from '../features/entries/wiki.js'
 import * as extensions from '../features/entries/extensions.js'
+import * as eventRoutingRuntime from '../features/entries/event-routing-runtime.js'
 
 export function registerFeatureTools(registry: ToolRegistry, deps: FeatureToolDeps): void {
   lsp.registerTools(registry, deps)
@@ -66,9 +68,6 @@ export function registerFeatureTools(registry: ToolRegistry, deps: FeatureToolDe
   browser.registerTools(registry, deps)
 }
 
-// tools.ts calls this right after createWebSearchTool/createWebFetchTool so
-// market/pages/image-gen keep their original insertion positions in the
-// registry (ToolRegistry.list() order is LLM-visible).
 export function registerPostWebFeatureTools(registry: ToolRegistry, deps: FeatureToolDeps): void {
   market.registerTools(registry, deps)
   pages.registerTools(registry, deps)
@@ -103,7 +102,7 @@ export function createA2aRuntime(
 export function createAcpRuntime(
   registry: ToolRegistry,
   deps: FeatureRuntimeToolDeps,
-): ExternalAcpAgentDispatcher | null {
+): ExternalAgentRuntime | null {
   return acpRuntime.createAcpRuntime(registry, deps)
 }
 
@@ -132,10 +131,6 @@ export function registerFeatureChannelFactories(registry: ChannelFactoryRegistry
   channelLine.registerChannelFactory(registry)
 }
 
-// NOTE: deviation from the brief's single `registerFeatureRoutes`. app.ts
-// interleaves route-feature registration with core route registration at
-// specific positions, so each route feature is exported individually here
-// to preserve exact registration order at each call site.
 export async function registerBrowserFeatureRoutes(
   app: FastifyInstance,
   deps: FeatureRouteDeps,
@@ -199,10 +194,29 @@ export async function registerSwarmFeatureRoutes(
   await routesSwarm.registerRoutes(app, deps)
 }
 
+export async function registerEventRoutingFeatureRoutes(
+  app: FastifyInstance,
+  deps: FeatureRouteDeps,
+): Promise<void> {
+  await routesEventRouting.registerRoutes(app, deps)
+}
+
 export async function registerWikiFeatureRoutes(app: FastifyInstance): Promise<void> {
   await wiki.registerRoutes(app)
 }
 
 export async function registerExtensionsFeatureRoutes(app: FastifyInstance): Promise<void> {
   await extensions.registerRoutes(app)
+}
+
+export function startEventRoutingFeature(runtime: FeatureEventRoutingRuntime): FeatureEventRoutingHooks {
+  return eventRoutingRuntime.startEventRouting(runtime)
+}
+
+export async function stopEventRoutingFeature(runtime: FeatureEventRoutingStopRuntime): Promise<void> {
+  await eventRoutingRuntime.stopEventRouting(runtime)
+}
+
+export function installEventRoutingLlmRunner(app: FastifyInstance): void {
+  eventRoutingRuntime.installLlmRunner(app)
 }

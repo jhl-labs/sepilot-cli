@@ -145,7 +145,6 @@ export class SessionRuntimeSnapshotStore {
       }
 
       void this.refreshSession(sessionId).catch(() => {
-        // Snapshot pre-warming must not affect session watch delivery.
       })
     })
   }

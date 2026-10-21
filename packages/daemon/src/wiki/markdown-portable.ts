@@ -51,7 +51,6 @@ export function titleFromMarkdown(name: string, content: string): string {
   return title.slice(0, 500)
 }
 
-/** Wiki stores the title separately, so remove the H1 used as that title. */
 export function bodyFromMarkdown(content: string): string {
   const normalized = normalizeMarkdown(content)
   const match = normalized.match(MARKDOWN_H1_RE)

@@ -49,7 +49,6 @@ function coerceTypedValue(value: string, allowStructured: boolean): ConfigSetVal
         return parsed as unknown[] | Record<string, unknown>
       }
     } catch {
-      // Preserve a non-JSON value as a string; YAML serialization remains safe.
     }
   }
   return value
@@ -72,9 +71,6 @@ export async function configSetCommand(
       console.log(chalk.gray(copy.appliedViaDaemon))
       return
     } catch (err) {
-      // A server response is authoritative, not an offline condition. In
-      // particular, validation and permission denials must never become local
-      // YAML writes. Remote failure must not mutate an unrelated local profile.
       if (err instanceof ApiHttpError || resolveDaemonEndpointScope(options.url) !== 'loopback') {
         throw err
       }
@@ -129,8 +125,6 @@ async function configSetViaYaml(
 
     await writeFile(configPath, YAML.stringify(config), 'utf-8')
 
-    // Arbitrary config can contain credentials or executable command payloads.
-    // Report the applied key, never the old or new value.
     console.log(chalk.green(`${key}: ${copy.updated}`))
     console.log(chalk.gray(copy.restartHint))
   } catch (err) {

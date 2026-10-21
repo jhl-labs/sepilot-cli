@@ -52,8 +52,6 @@ configureProviderNetworkBlocked(DEFAULT_NETWORK_CONFIG, EXPECTED_REASON)
 let blockedByConfiguredDispatcher = false
 let fetchError: unknown
 try {
-  // No listener is needed: the configured blocked dispatcher must reject
-  // locally before Bun can attempt a native direct connection.
   await globalThis.fetch('http://127.0.0.1:65534/bun-dispatcher-smoke')
 } catch (error) {
   fetchError = error

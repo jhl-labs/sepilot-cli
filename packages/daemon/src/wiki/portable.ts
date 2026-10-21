@@ -87,7 +87,6 @@ function assertBackupSize(archive: WikiPortableBackup): void {
   }
 }
 
-/** Validate the complete portable tree and return parents before descendants. */
 function sortAndValidateGraph(nodes: readonly WikiNode[]): WikiNode[] {
   const byId = new Map<string, WikiNode>()
   for (const node of nodes) {
@@ -398,7 +397,6 @@ export function createWikiPortableService(
           `Wiki backup exceeds the ${MAX_WIKI_BACKUP_NODES} node limit`,
         )
       }
-      // Never offer a download that this same daemon would refuse to import.
       assertBackupSize(backup)
       return backup
     },

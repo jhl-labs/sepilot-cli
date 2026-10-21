@@ -111,10 +111,6 @@ export function surfaceMessageToCliMessage(
   const timestamp =
     options?.timestamp ?? options?.previousMessage?.timestamp ?? Date.now()
 
-  // Switching on role lets the compiler narrow the surface Message variants
-  // exhaustively. The cli Message has no 'todo' or 'context' role of its own
-  // so those branches must be matched explicitly before the user/assistant
-  // fallthrough; otherwise their roles leak into cli Message['role'].
   switch (message.role) {
     case 'tool':
       return {
@@ -136,9 +132,6 @@ export function surfaceMessageToCliMessage(
         }),
       }
     case 'context':
-      // Full snippets remain available through citations and the memory UI.
-      // Keep the inline terminal transcript compact and avoid leaving profile
-      // or document bodies in scrollback on every redraw.
       return {
         id: message.id,
         role: 'system',

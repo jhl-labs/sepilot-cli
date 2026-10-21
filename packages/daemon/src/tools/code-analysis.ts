@@ -11,9 +11,7 @@ import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
 
 export interface CodeDiagnosticsToolDeps {
   getClient: (language: string) => LspClient | null
-  /** File reader for opening the document with the server. Defaults to fs. */
   readFile?: (path: string) => Promise<string>
-  /** Settle window (ms) after a fresh didOpen before reading diagnostics. */
   settleMs?: number
 }
 
@@ -47,10 +45,6 @@ interface DependencyMatch {
   scope: 'local' | 'external'
 }
 
-// Whole-file ES/CommonJS patterns. `[^'";]*?` between `import`/`export` and
-// `from` spans newlines but never crosses a quote or statement terminator, so a
-// multi-line `import {\n a,\n b,\n} from 'mod'` is captured while two adjacent
-// statements never bridge into one another.
 const WHOLE_FILE_DEPENDENCY_PATTERNS: Array<{ pattern: RegExp; kind: string }> = [
   { pattern: /\bimport\b[^'";]*?\bfrom\s*["']([^"']+)["']/g, kind: 'import' },
   { pattern: /\bexport\b[^'";]*?\bfrom\s*["']([^"']+)["']/g, kind: 'export_from' },
@@ -83,9 +77,6 @@ function collectDependencyMatches(content: string): DependencyMatch[] {
     }
   }
 
-  // Python `from pkg import (\n a,\n b,\n)` keeps the module on the `from` line,
-  // so line-oriented matching still captures the dependency. Go/Rust remain
-  // line-oriented too.
   const lines = content.split(/\r?\n/)
   let goImportBlock = false
   lines.forEach((line, index) => {
@@ -218,11 +209,6 @@ export function createCodeDiagnosticsTool(
         }
       }
 
-      // Open the document with the server so it publishes diagnostics for
-      // it — without this, a freshly-started server has nothing to report
-      // and diagnostics were a permanent dead path. Best-effort: a URI
-      // that isn't a readable file simply falls through to whatever the
-      // collector already holds.
       if (typeof client.ensureOpen === 'function') {
         const path = fileUriToPath(uri)
         if (path) {
@@ -255,12 +241,6 @@ export function createCodeDiagnosticsTool(
 }
 
 export interface CodeSymbolsToolDeps {
-  /**
-   * Optional language-server accessor. When a `language` is supplied and a
-   * server is available, `workspace/symbol` results are merged ahead of the
-   * ripgrep matches (precise declarations, labeled [lsp]). Any failure or
-   * missing server falls back to the ripgrep-only behavior.
-   */
   getClient?: (language: string) => LspClient | null
 }
 
@@ -330,8 +310,6 @@ export function createCodeSymbolsTool(deps: CodeSymbolsToolDeps = {}): ToolDefin
         ? Math.max(1, Math.min(500, Math.trunc(input.limit)))
         : 50
       const args = [
-        // Ignore RIPGREP_CONFIG_PATH so a user-level --follow cannot escape
-        // a strict workspace through a symlink during fallback symbol search.
         '--no-config',
         '--line-number',
         '--column',
@@ -357,8 +335,6 @@ export function createCodeSymbolsTool(deps: CodeSymbolsToolDeps = {}): ToolDefin
             code: rejection.code,
           }
         }
-        // Stream rg with a byte cap instead of a 10MB execFile maxBuffer that
-        // throws (losing every match) on huge result sets.
         const maxBytes = resolveToolOutputMaxBytes('code.symbols')
         let stdout: string
         let streamTruncated = false
@@ -442,9 +418,6 @@ export function createCodeDependenciesTool(): ToolDefinitionRuntime {
     },
     async execute(input, context): Promise<ToolResult> {
       const start = Date.now()
-      // Resolve relative paths against the active session cwd, not the daemon's
-      // process.cwd(), so `code.dependencies { path: 'src/x.ts' }` reads the
-      // file the agent means.
       const path = typeof input.path === 'string'
         ? resolveToolPath(input.path.trim(), context?.cwd)
         : ''

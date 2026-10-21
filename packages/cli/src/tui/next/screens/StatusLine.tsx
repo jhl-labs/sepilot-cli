@@ -1,10 +1,14 @@
 import { Box, Text } from 'ink'
 import stringWidth from 'string-width'
 import { colors } from '../../theme.js'
+import { privilegeColor } from '../privilege.js'
 
 export interface StatusLineProps {
   model: string
   mode: string
+  bot?: string
+  engineOverride?: boolean
+  tokensPerSecond?: number | null
   autonomy: string
   contextPercent: number | null
   contextTokens?: number | null
@@ -21,6 +25,9 @@ export interface StatusLineProps {
 export function StatusLine({
   model,
   mode,
+  bot,
+  engineOverride,
+  tokensPerSecond,
   autonomy,
   contextPercent,
   contextTokens = null,
@@ -46,34 +53,60 @@ export function StatusLine({
     contextEstimated,
     true,
   )
-  // Active runs already rerender from the shared activity clock. Reading the
-  // wall clock here keeps elapsed time current without starting a competing
-  // interval that causes another full Ink redraw.
   const elapsedLabel = streamStartedAt == null ? null : formatElapsed(Date.now() - streamStartedAt)
+  const tpsLabel = tokensPerSecond && tokensPerSecond > 0 ? `${tokensPerSecond} tps` : null
+  const contextColor = contextPercent == null ? colors.dimText
+    : contextPercent >= 85 ? colors.error
+    : contextPercent >= 60 ? colors.warning
+    : colors.success
+  const part = (text: string | null, color: string, bold = false): StatusPart | null => text ? { text, color, bold } : null
+  const modeParts = bot === undefined
+    ? [part(`mode ${mode}`, colors.info)]
+    : engineOverride
+      ? [part(`bot ${bot}`, colors.info), part(`engine ${mode}`, colors.warning)]
+      : [part(`bot ${bot}`, colors.info)]
+  const compactModeParts = bot === undefined
+    ? [part(mode, colors.info)]
+    : engineOverride ? [part(bot, colors.info), part(mode, colors.warning)] : [part(bot, colors.info)]
+  const progressPart = part(progressLabel, colors.warning, true)
   const detailedParts = attention
-    ? [progressLabel, model, `mode ${mode}`, `access ${autonomy}`, contextLabel, costLabel]
-    : [model, `mode ${mode}`, `access ${autonomy}`, contextLabel, elapsedLabel ? `elapsed ${elapsedLabel}` : null, costLabel]
+    ? [progressPart, part(model, colors.primary), ...modeParts, part(`privilege ${autonomy}`, privilegeColor(autonomy), autonomy === 'autonomous'), part(contextLabel, contextColor), part(tpsLabel, colors.success), part(costLabel, colors.dimText)]
+    : [part(model, colors.primary), ...modeParts, part(`privilege ${autonomy}`, privilegeColor(autonomy), autonomy === 'autonomous'), part(contextLabel, contextColor), part(tpsLabel, colors.success), part(elapsedLabel ? `elapsed ${elapsedLabel}` : null, colors.dimText), part(costLabel, colors.dimText)]
   const compactParts = attention
-    ? [progressLabel, compactModelLabel(model), mode, autonomy, compactContextLabel]
-    : [compactModelLabel(model), mode, autonomy, compactContextLabel, elapsedLabel, costLabel]
-  const detailedStatus = joinStatusParts(detailedParts)
-  const fittedStatus = stringWidth(detailedStatus) <= width
-    ? detailedStatus
-    : joinStatusParts(compactParts)
-  const status = error
-    ? error
-    : fittedStatus
+    ? [progressPart, part(compactModelLabel(model), colors.primary), ...compactModeParts, part(autonomy, privilegeColor(autonomy), autonomy === 'autonomous'), part(compactContextLabel, contextColor), part(tpsLabel, colors.success)]
+    : [part(compactModelLabel(model), colors.primary), ...compactModeParts, part(autonomy, privilegeColor(autonomy), autonomy === 'autonomous'), part(compactContextLabel, contextColor), part(tpsLabel, colors.success), part(elapsedLabel, colors.dimText), part(costLabel, colors.dimText)]
+  const detailed = detailedParts.filter((entry): entry is StatusPart => entry !== null)
+  const compact = compactParts.filter((entry): entry is StatusPart => entry !== null)
+  const fitted = stringWidth(joinStatusParts(detailed.map((entry) => entry.text))) <= width ? detailed : compact
+  const fittedText = joinStatusParts(fitted.map((entry) => entry.text))
 
+  if (error || stringWidth(fittedText) > width) {
+    return (
+      <Box width={width}>
+        <Text color={error ? colors.error : colors.dimText}>
+          {truncateToWidth(error ?? fittedText, width)}
+        </Text>
+      </Box>
+    )
+  }
   return (
     <Box width={width}>
-      <Text
-        color={error ? colors.error : attention ? colors.warning : colors.dimText}
-        bold={attention && !error}
-      >
-        {truncateToWidth(status, width)}
+      <Text>
+        {fitted.map((entry, index) => (
+          <Text key={index}>
+            {index > 0 ? <Text color={colors.border}>{' · '}</Text> : null}
+            <Text color={entry.color} bold={entry.bold}>{entry.text}</Text>
+          </Text>
+        ))}
       </Text>
     </Box>
   )
+}
+
+interface StatusPart {
+  text: string
+  color: string
+  bold: boolean
 }
 
 function formatContextLabel(

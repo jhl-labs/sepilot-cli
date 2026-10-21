@@ -87,12 +87,6 @@ export async function sessionsRoutes(app: FastifyInstance) {
       workspaceRoot: query.workspaceRoot,
     })
 
-    // Status filter applied after fetch — ISessionStore.list doesn't
-    // know about session.status today, and threading it through every
-    // store impl (jsonl, encrypted) for one cli use case is overkill.
-    // For dozens-of-sessions deployments the post-filter cost is
-    // negligible; if a daemon ever holds 10k+ sessions we'd push it
-    // down to the store.
     const filteredItems = query.status
       ? result.items.filter((session) => session.status === query.status)
       : result.items
@@ -111,11 +105,6 @@ export async function sessionsRoutes(app: FastifyInstance) {
       }
     }
 
-    // Opt-in approval counters: scan each session's events log so the
-    // cli list view can render an `appr: R/A/D · auto: N` column
-    // without N+1 calls back. Costs an extra getEvents() per item;
-    // gated on ?metrics=true so the daemon's default list stays
-    // light for web/desktop.
     const itemsWithMetrics = await Promise.all(
       filteredItems.map(async (session) => {
         const meta = buildSessionMetaSnapshot(runtime!, session)
@@ -145,9 +134,6 @@ export async function sessionsRoutes(app: FastifyInstance) {
             },
           }
         } catch {
-          // If a single session's event log is unreadable, skip the
-          // metrics for that row rather than failing the whole list
-          // — partial data beats blanking the page.
           return meta
         }
       }),
@@ -223,7 +209,6 @@ export async function sessionsRoutes(app: FastifyInstance) {
     }
   })
 
-  // GET /sessions — list sessions
   app.get<{ Querystring: SessionsListQuery }>('/sessions', {
     preValidation: zodRequestValidation({
       query: {
@@ -320,7 +305,6 @@ export async function sessionsRoutes(app: FastifyInstance) {
     return { data: await buildSessionPendingApprovals(runtime, session.id, events) }
   })
 
-  // GET /sessions/:id — get session detail
   app.get<{ Params: SessionIdParams }>('/sessions/:id', {
     preValidation: zodRequestValidation({
       params: {
@@ -656,7 +640,6 @@ export async function sessionsRoutes(app: FastifyInstance) {
     await sendSnapshot()
   })
 
-  // PATCH /sessions/:id — rename or otherwise patch session metadata
   app.patch<{ Params: SessionIdParams; Body: SessionUpdateBody }>('/sessions/:id', {
     preValidation: zodRequestValidation({
       params: {
@@ -689,9 +672,6 @@ export async function sessionsRoutes(app: FastifyInstance) {
       }
     }
 
-    // A workspace mutation participates in the same per-session lock as every
-    // chat transport. Claim first, then re-read the session while holding the
-    // lease so a turn cannot start between an isBusy check and updateMeta.
     const workspaceBindingRequested = body.cwd !== undefined || body.workspaceIsolation !== undefined
     const sessionLease = workspaceBindingRequested && runtime.sessionBusy
       ? runtime.sessionBusy.tryAcquireLease(params.id)
@@ -728,7 +708,6 @@ export async function sessionsRoutes(app: FastifyInstance) {
     }
   })
 
-  // DELETE /sessions/:id — delete session
   app.delete<{ Params: SessionIdParams }>('/sessions/:id', {
     preValidation: zodRequestValidation({
       params: {
@@ -747,7 +726,6 @@ export async function sessionsRoutes(app: FastifyInstance) {
     return reply.status(204).send()
   })
 
-  // GET /sessions/:id/export — export session as markdown or JSON
   app.get<{ Params: SessionIdParams; Querystring: SessionExportQuery }>('/sessions/:id/export', {
     preValidation: zodRequestValidation({
       params: {
@@ -774,13 +752,13 @@ export async function sessionsRoutes(app: FastifyInstance) {
     let sessionForOutput = sessionSnapshot
     let eventsForOutput = events
     if (query.sanitize === '1') {
-      const { sanitizeText, sanitizeEvent } = await import('../../sessions/sanitize.js')
-      const home = process.env.HOME ?? ''
+      const { sanitizeText, sanitizeEvent, credentialValuesFromEnv } = await import('../../sessions/sanitize.js')
+      const options = { home: process.env.HOME ?? '', knownSecrets: credentialValuesFromEnv() }
       sessionForOutput = {
         ...sessionSnapshot,
-        title: sanitizeText(session.title, { home }),
+        title: sanitizeText(session.title, options),
       }
-      eventsForOutput = events.map((ev) => sanitizeEvent(ev, { home }))
+      eventsForOutput = events.map((ev) => sanitizeEvent(ev, options))
     }
 
     if (format === 'json') {
@@ -791,7 +769,6 @@ export async function sessionsRoutes(app: FastifyInstance) {
     return serializeSessionMarkdown(sessionForOutput, eventsForOutput, healthSnapshot)
   })
 
-  // POST /sessions/:id/branch — fork a session
   app.post<{ Params: SessionIdParams; Body: SessionBranchBody }>('/sessions/:id/branch', {
     preValidation: zodRequestValidation({
       params: {
@@ -814,15 +791,8 @@ export async function sessionsRoutes(app: FastifyInstance) {
     const events = await runtime.sessions.getEvents(params.id)
     const fromIndex = body.fromEventIndex ?? events.length
 
-    // Create new session
     const { randomUUID } = await import('node:crypto')
     const branchId = randomUUID()
-    // A branch is a fresh JSONL file, so event ids do not need to be re-minted
-    // to stay unique. Re-minting them (previously `{ ...event, id: randomUUID() }`)
-    // silently broke every cross-reference in the copy: tool_result.toolCallId,
-    // approval_request.toolCallId and approval_response.requestId still pointed at
-    // the *old* ids, so the first branched turn shipped orphan tool_results and
-    // dangling approvals (provider 400). Copy events verbatim to preserve pairing.
     await runtime.sessions.create({
       id: branchId,
       title: `[Branch] ${source.title}`,
@@ -839,8 +809,6 @@ export async function sessionsRoutes(app: FastifyInstance) {
       tags: [...(source.tags ?? []), `branch:${params.id}`],
     })
 
-    // Copy events up to the fork point (verbatim — preserve original ids so
-    // tool_call/tool_result and approval id links survive into the branch).
     for (const event of events.slice(0, fromIndex)) {
       await runtime.sessions.appendEvent(branchId, event)
     }

@@ -56,12 +56,6 @@ export class ConfigRevisionConflictError extends Error {
   }
 }
 
-/**
- * Thrown from inside a config-mutation transaction when the post-mutation
- * config fails cross-field validation (validateConfig). Throwing lets the
- * mutation service roll back the in-memory config and restore extensions,
- * so an incoherent config is never persisted and never bricks the next boot.
- */
 export class ConfigValidationError extends Error {
   readonly code = 'CONFIG_VALIDATION_FAILED' as const
   constructor(
@@ -94,10 +88,6 @@ export async function persistRuntimeConfig(
     if (isRecord(rawConfig)) {
       persistedConfig = rawConfig as SepilotdConfig
 
-      // CAS: verify on-disk revision matches what we expect.
-      // If an external writer (editor, another daemon, hot-reload) changed
-      // config.yaml after we last read it, the revision will differ and
-      // we reject the write to avoid clobbering.
       const diskRevision = persistedConfig.configRevision ?? 0
       if (diskRevision !== currentRevision) {
         throw new ConfigRevisionConflictError(
@@ -112,12 +102,6 @@ export async function persistRuntimeConfig(
           ? updatedValues[key]
           : getConfigUpdateValue(runtime.config, key)
         if (key === 'channels' && Array.isArray(value)) {
-          // The raw environment-owned entry may intentionally contain
-          // `${VAR}` placeholders that are not a valid URL until startup
-          // substitution. It has already been accepted on canonical load,
-          // while every non-managed mutation was validated by its route.
-          // Assign this merged persistence form directly instead of parsing
-          // the unresolved raw entry as a fresh API payload.
           persistedConfig.channels = channelsForPersistence(
             runtime.config,
             persistedConfig.channels,
@@ -135,14 +119,8 @@ export async function persistRuntimeConfig(
     persistedConfig = configForPersistence(runtime.config)
   }
 
-  // The recovery path owns a detached, secret-filtered snapshot. Keep its
-  // persisted revision in lockstep with the in-memory CAS revision just as in
-  // the ordinary read-modify-write path.
   persistedConfig.configRevision = nextRevision
 
-  // Bump in-memory revision only after CAS passes or file was unreadable.
-  // If CAS failed, we already threw above — the in-memory revision is
-  // untouched so the caller can retry.
   runtime.config.configRevision = nextRevision
 
   const yaml = YAML.stringify(persistedConfig)
@@ -204,11 +182,6 @@ export function reconfigureRuntimeAutonomy(
   runtime.channelAcl = buildChannelAcl(runtime.config, runtime.autonomy)
 }
 
-/**
- * Restore the previous network policy during a config transaction rollback.
- * A stale CA in the old snapshot must fail closed without preventing the
- * provider/MCP/channel portions of the rollback from continuing.
- */
 export function restoreRuntimeNetworkPolicy(
   runtime: ConfigRebindCapabilities | undefined,
 ): string | null {

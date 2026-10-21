@@ -1,4 +1,4 @@
-import type { ToolCall, ToolExecutionPosture, ToolSecurityEffect } from '@sepilotd/core'
+import type { ToolCall, ToolExecutionPosture, ToolResultMetadata, ToolSecurityEffect } from '@sepilotd/core'
 import type {
   AgentEvidenceLedger,
   AgentEvidenceLedgerEntry,
@@ -18,6 +18,18 @@ import { searchPathMatchesReadPath } from './repository-path.js'
 
 const MAX_LEDGER_ENTRIES_PER_BUCKET = 80
 const MAX_LEDGER_SUMMARY_CHARS = 220
+const MANAGED_PROCESS_RECEIPT_TOOLS = new Set(['process.start', 'process.read', 'process.follow', 'process.wait'])
+
+function validManagedProcessReceipt(value: unknown): value is NonNullable<ToolResultMetadata['managedProcess']> {
+  if (!value || typeof value !== 'object') return false
+  const receipt = value as Record<string, unknown>
+  return typeof receipt.id === 'string' && receipt.id.length > 0 && receipt.id.length <= 200
+    && typeof receipt.startedAt === 'string' && receipt.startedAt.length <= 40 && Number.isFinite(Date.parse(receipt.startedAt))
+    && (receipt.status === 'running' || receipt.status === 'exited')
+    && (receipt.exitCode === null || (typeof receipt.exitCode === 'number' && Number.isInteger(receipt.exitCode)))
+    && (receipt.signal === null || typeof receipt.signal === 'string')
+    && (receipt.terminationReason === undefined || ['requested', 'ttl', 'daemon-shutdown'].includes(String(receipt.terminationReason)))
+}
 
 const CONTENT_READ_TOOL_NAMES = new Set([
   'fs.read',
@@ -72,13 +84,6 @@ function isNonEvidentialSearchOutput(output: string): boolean {
   return /^\[no matches(?: after offset \d+)?\]$/i.test(output.trim())
 }
 
-/**
- * A read whose output carries no observable content is not evidence. An empty
- * or whitespace-only body and the fs.read past-EOF sentinels tell the agent
- * nothing about the file, yet without this guard they would land in
- * `sourceReads` and could satisfy a contract's source-evidence floor (mirrors
- * the `isNonEvidentialSearchOutput` guard on the search path).
- */
 export function isNonEvidentialReadOutput(output: string): boolean {
   const trimmed = output.trim()
   if (!trimmed) return true
@@ -121,13 +126,22 @@ function terminalRunLooksLikeFileMutation(args: Record<string, unknown> | undefi
   )
 }
 
-/**
- * A shell can return zero even though an earlier validation stage failed.
- * Pipelines without pipefail and explicit fallback branches are useful for
- * diagnostics, but their successful wrapper status is not proof that the
- * underlying check passed. Keep the run in the ledger while withholding the
- * verified bit so downstream completion gates cannot overclaim it.
- */
+const SHELL_STATE_OR_CONTROL_COMMANDS = new Set([
+  '.', 'source', 'eval', 'exec', 'exit', 'return', 'break', 'continue', 'trap', 'set', 'shift',
+  'unset', 'read', 'readarray', 'mapfile', 'getopts', 'let', 'declare', 'typeset',
+  'local', 'export', 'readonly', 'printf', 'builtin', 'command', 'enable',
+  'if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'until', 'do', 'done',
+  'case', 'esac', 'select', 'function', 'coproc', 'time', '[[', ']]',
+])
+
+function cleanupPreservesCapturedShellStatus(cleanup: string): boolean {
+  if (/[\\$=(){}&|<>#!\x60]/u.test(cleanup)) return false
+  return cleanup.replace(/['"]/gu, '').split(/[;\n]/u).every(segment => {
+    const commandName = segment.trim().split(/\s+/u)[0] ?? ''
+    return !SHELL_STATE_OR_CONTROL_COMMANDS.has(commandName)
+  })
+}
+
 export function terminalRunHasReliableSuccessStatus(
   args: Record<string, unknown> | undefined,
 ): boolean {
@@ -138,6 +152,19 @@ export function terminalRunHasReliableSuccessStatus(
   const argv = Array.isArray(args.args)
     ? args.args.filter((entry): entry is string => typeof entry === 'string')
     : []
+  let shellCommandIndex = -1
+  if (['bash', 'sh', 'zsh', 'dash', 'ksh'].includes(executable)) {
+    for (let index = 0; index < argv.length; index += 1) {
+      const option = argv[index]!
+      if (option === '--' || !option.startsWith('-')) break
+      if (/^-[^-]*c/u.test(option)) {
+        shellCommandIndex = index + 1
+        break
+      }
+      if (/^-[^-]*[oO]$/u.test(option)) index += 1
+    }
+  }
+  const shellOptions = shellCommandIndex >= 0 ? argv.slice(0, shellCommandIndex) : []
   const command = typeof args.command === 'string'
     ? args.command
     : typeof args.cmd === 'string'
@@ -145,20 +172,44 @@ export function terminalRunHasReliableSuccessStatus(
       : Array.isArray(args.command) && args.command.every((entry) => typeof entry === 'string')
         ? args.command.join(' ')
     : ['bash', 'sh', 'zsh', 'dash', 'ksh'].includes(executable)
-      ? argv.at(-1) ?? ''
+      ? (shellCommandIndex >= 0 ? argv[shellCommandIndex] : argv.at(-1)) ?? ''
       : ''
   if (!command.trim()) return true
 
-  const normalized = command.replace(/\s+/g, ' ')
+  const assignments = [...command.matchAll(
+    /(?:^|[;\n])\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\$\?\s*;/gu,
+  )]
+  const assignment = assignments.length === 1 ? assignments[0] : undefined
+  const finalExit = command.match(
+    /(?:^|[;\n])\s*exit\s+("?)\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))\1\s*;?\s*$/u,
+  )
+  let statusCommand = command
+  if (assignments.length > 0 || finalExit) {
+    if (assignment?.index === undefined || finalExit?.index === undefined) return false
+    const capturedName = assignment[1]
+    const exitName = finalExit[2] ?? finalExit[3]
+    const cleanup = command.slice(
+      assignment.index + assignment[0].length,
+      finalExit.index,
+    )
+    if (
+      capturedName !== exitName
+      || assignment.index === 0
+      || !cleanupPreservesCapturedShellStatus(cleanup)
+    ) return false
+    statusCommand = command.slice(0, assignment.index)
+  }
+
+  const normalized = statusCommand.replace(/\s+/g, ' ')
   const hasFallbackBranch = /(?:^|\s)\|\|(?:\s|$)/.test(normalized)
   const hasPipeline = /(^|[^|])\|([^|]|$)/.test(normalized)
-  const hasSequence = /(?:^|[^&]);|\n/u.test(command)
-  const pipefailEnabled = /(?:^|[;&]\s*|\s)set\s+-[^;\n]*o\s+pipefail(?:\s|;|$)/.test(command)
+  const hasSequence = /(?:^|[^&]);|\n/u.test(statusCommand)
+  const pipefailEnabled = /(?:^|[;&]\s*|\s)set\s+-[^;\n]*o\s+pipefail(?:\s|;|$)/.test(statusCommand)
     || /(?:^|\s)-(?:[a-zA-Z]*o\s+pipefail|[a-zA-Z]*O\s+pipefail)(?:\s|$)/.test(
-      [executable, ...argv].join(' '),
+      [executable, ...shellOptions].join(' '),
     )
-  const exitOnErrorEnabled = /(?:^|[;\n]\s*)set\s+-[^;\n]*e/u.test(command)
-    || /(?:^|[;\n]\s*)set\s+-o\s+errexit(?:\s|;|$)/u.test(command)
+  const exitOnErrorEnabled = /(?:^|[;\n]\s*)set\s+-[^;\n]*e/u.test(statusCommand)
+    || /(?:^|[;\n]\s*)set\s+-o\s+errexit(?:\s|;|$)/u.test(statusCommand)
   return !hasFallbackBranch
     && (!hasPipeline || pipefailEnabled)
     && (!hasSequence || exitOnErrorEnabled)
@@ -227,20 +278,6 @@ export function toolCallMayMutateFiles(
   return toolName === 'terminal.run' && terminalRunLooksLikeFileMutation(args)
 }
 
-/**
- * Whether a successful call is intended to create the user's durable product,
- * rather than merely having filesystem side effects while observing or
- * validating it. Security policy must continue to use
- * `toolCallMayMutateFiles`: an observation that downloads a fixture still
- * writes files and must remain sandboxed/approval-gated. Agent convergence and
- * evidence semantics use this narrower contract so diagnostic captures,
- * coverage output, and build caches cannot masquerade as implementation.
- *
- * Direct file-edit tools are intrinsically product mutations. A general shell
- * can serve several purposes, so the model must declare `actionPurpose` and
- * the command must also have a structurally observable write effect. Missing
- * or invalid declarations fail safely as non-product progress.
- */
 export function toolCallRepresentsProductMutation(
   toolName: string,
   args: Record<string, unknown> | undefined,
@@ -640,9 +677,6 @@ export function collectRequiredEvidenceArtifactPaths(
   state: AgentState,
   context?: GraphExecutionContext,
 ): string[] {
-  // Seed-first precedence, unified with nodes.ts activeRunContract (PLAN_015-T9).
-  // Grounding mutates s.seedContract in place, so the seed is the live contract;
-  // context.runContract is only the initial run-start snapshot.
   const contract = state.seedContract ?? context?.agentContext.runContract
   const paths = new Set<string>()
   for (const artifact of contract?.requiredArtifacts ?? []) {
@@ -679,7 +713,7 @@ function extractApplyPatchPaths(patch: string): string[] {
   return [...paths]
 }
 
-function extractPathsFromToolCall(toolCall: ToolCall): string[] {
+export function extractPathsFromToolCall(toolCall: ToolCall): string[] {
   const args = toolCall.arguments ?? {}
   if (
     (toolCall.name === 'fs.read' || toolCall.name === 'fs.write' || toolCall.name === 'fs.append' || toolCall.name === 'fs.edit')
@@ -752,12 +786,6 @@ function extractWrittenBytes(toolCall: ToolCall, output: string): number | undef
   return undefined
 }
 
-/**
- * Append an evidence entry to a bucket and keep the bucket bounded to
- * MAX_LEDGER_ENTRIES_PER_BUCKET (PLAN_025, 80/bucket FIFO). The entry is pushed
- * as-is, so any `origin` provenance the caller attached is preserved verbatim —
- * subagent-findings rollup (PLAN_065) relies on this to carry `origin` through.
- */
 export function pushBoundedEvidence(
   list: AgentEvidenceLedgerEntry[],
   entry: AgentEvidenceLedgerEntry,
@@ -807,6 +835,7 @@ export function updateEvidenceLedgerFromToolResult(
   provenance?: {
     executionObserved?: boolean
     securityEffect?: ToolSecurityEffect
+    managedProcess?: unknown
   },
 ): void {
   const ledger = state.evidenceLedger ?? emptyEvidenceLedger()
@@ -854,6 +883,8 @@ export function updateEvidenceLedgerFromToolResult(
     return
   }
 
+  if (toolCall.name === 'tool.output.read') return
+
   if (toolCallRepresentsProductMutation(toolCall.name, toolCall.arguments)) {
     const targets = paths.length > 0 ? paths : [undefined]
     for (const path of targets) {
@@ -862,9 +893,36 @@ export function updateEvidenceLedgerFromToolResult(
     return
   }
 
-  // Empty / past-EOF reads observe nothing, so they must not count as source
-  // evidence (nor as an artifact read-back). Applies to fs.read and every
-  // content-read tool; searches keep their own non-evidential guard below.
+  if (MANAGED_PROCESS_RECEIPT_TOOLS.has(toolCall.name)) {
+    const receipt = provenance?.managedProcess
+    if (provenance?.executionObserved === true && validManagedProcessReceipt(receipt)) {
+      let launch = ledger.validationRuns.find(entry =>
+        entry.managedProcessId === receipt.id && entry.managedProcessStartedAt === receipt.startedAt,
+      )
+      if (toolCall.name === 'process.start' && !launch) {
+        launch = {
+          ...makeEntry(), ts: Date.parse(receipt.startedAt), verified: false,
+          managedProcessId: receipt.id, managedProcessStartedAt: receipt.startedAt,
+          managedProcessReliableStatus: terminalRunHasReliableSuccessStatus(toolCall.arguments),
+        }
+        pushBoundedEvidence(ledger.validationRuns, launch)
+      }
+      if (launch && (toolCall.name === 'process.start' || toolCall.arguments.id === receipt.id) && receipt.status === 'exited') {
+        const changedDuringRun = ledger.artifactWrites.some(entry => entry.status === 'success'
+          && ((entry.order ?? 0) > (launch.order ?? 0) || entry.ts >= launch.ts))
+        Object.assign(launch, {
+          toolCallId: toolCall.id, tool: toolCall.name, summary: compactLedgerSummary(output),
+          verified: receipt.exitCode === 0 && receipt.signal === null && receipt.terminationReason === undefined
+            && launch.managedProcessReliableStatus === true && !changedDuringRun,
+        })
+      }
+    }
+    if (toolCall.name !== 'process.start' && !isNonEvidentialReadOutput(output)) {
+      pushBoundedEvidence(ledger.sourceReads, makeEntry())
+    }
+    return
+  }
+
   if (
     (toolCall.name === 'fs.read' || CONTENT_READ_TOOL_NAMES.has(toolCall.name))
     && isNonEvidentialReadOutput(output)
@@ -875,10 +933,6 @@ export function updateEvidenceLedgerFromToolResult(
   if (toolCall.name === 'fs.read') {
     const targets = paths.length > 0 ? paths : [undefined]
     for (const path of targets) {
-      // The planner may omit requiredArtifacts (for example after a timeout).
-      // A successful write followed by a content read of that same path is
-      // still read-back evidence; requiring a planner declaration here makes
-      // completion impossible even after the requested file was verified.
       const writtenArtifact = path && latestSuccessfulPathEntry(ledger.artifactWrites, path)
       if (isRequiredArtifactPath(path, state, context) || writtenArtifact) {
         pushBoundedEvidence(ledger.artifactReadBacks, { ...makeEntry(path), verified: true })
@@ -910,19 +964,12 @@ export function updateEvidenceLedgerFromToolResult(
   }
 
   if (VALIDATION_TOOL_NAMES.has(toolCall.name)) {
-    // A validation/check run that reached this point succeeded (errors were
-    // routed to the errors bucket above), so it counts as verified evidence.
     const verified = toolCall.name !== 'terminal.run'
       || terminalRunHasReliableSuccessStatus(toolCall.arguments)
     pushBoundedEvidence(ledger.validationRuns, { ...makeEntry(paths[0]), verified })
     return
   }
 
-  // Registry-observe tools are semantically read-only even when they are not
-  // file/content/search tools with a dedicated bucket rule (for example a
-  // remote workspace or page inventory). Record only executor-observed calls;
-  // a policy response or a tool that self-labels its output cannot enter the
-  // criterion-referenceable evidence set through this fallback.
   if (
     provenance?.executionObserved === true
     && provenance.securityEffect === 'observe'
@@ -970,12 +1017,6 @@ function distinctSuccessfulSourceObservations(
   })
 }
 
-/**
- * Every distinct file path the agent has actually observed content for —
- * successful source reads plus required-artifact read-backs. Citation repair
- * consults this (compaction-proof) set so an exact `path:line` reference to a
- * file the agent never read can be flagged as fabricated.
- */
 export function collectObservedSourceReadPaths(state: AgentState): string[] {
   const seen = new Set<string>()
   const ledger = state.evidenceLedger
@@ -1073,16 +1114,6 @@ function hasSuccessfulArtifactReadAfter(
   )
 }
 
-/**
- * A run that wrote nothing, and whose contract declares no durable artifact,
- * has nothing a validation tool could check: every validation tool (command
- * runs, service/process checks) verifies something the run produced or acts
- * on. Requiring a separate validation run there is unsatisfiable by
- * construction, so a lookup run ends INCOMPLETE while holding the answer it
- * was asked for. For those runs the successful retrieval the answer is
- * grounded in settles the requirement. Any run that wrote an artifact, or was
- * contracted to write one, keeps the strict rule.
- */
 function retrievalSettlesValidation(
   ledger: AgentEvidenceLedger | undefined,
   artifactPaths: readonly string[],
@@ -1097,8 +1128,6 @@ export function evaluateContractEvidenceGaps(
   state: AgentState,
   context?: GraphExecutionContext,
 ): string[] {
-  // Seed-first precedence, unified with collectRequiredEvidenceArtifactPaths and
-  // nodes.ts activeRunContract (PLAN_015-T9).
   const contract = state.seedContract ?? context?.agentContext.runContract
   if (!contract) return []
 
@@ -1212,8 +1241,6 @@ function formatLedgerEntry(entry: AgentEvidenceLedgerEntry): string {
         : entry.summary
           ? entry.summary
           : '(no target)'
-  // Provenance suffix for evidence rolled up from an isolated subagent so the
-  // parent prompt can see who found it (PLAN_065 T6).
   const provenance = entry.origin ? ` (via subagent ${entry.origin.category})` : ''
   const defects = entry.defects?.length
     ? ` [defects: ${entry.defects.slice(0, 2).join('; ')}]`

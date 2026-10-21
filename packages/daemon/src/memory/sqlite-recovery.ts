@@ -21,7 +21,6 @@ export function recoverSqliteDatabaseIfCorrupt(dbPath: string): string[] {
       db?.close()
       db = undefined
     } catch {
-      // best effort; proceed with quarantine below
     }
     const suffix = corruptSuffix()
     const renamed: string[] = []
@@ -37,7 +36,6 @@ export function recoverSqliteDatabaseIfCorrupt(dbPath: string): string[] {
     try {
       db?.close()
     } catch {
-      // best effort; the file is about to be quarantined or was already closed
     }
   }
 }

@@ -1,38 +1,17 @@
 import type { IHookRegistry } from '@sepilotd/core'
 
-/**
- * Shared turn-lifecycle hook gates.
- *
- * `pre:user:prompt` and `pre:/post:agent:run` used to fire from a subset of the
- * turn entry points only (HTTP `/chat` and the ReAct engine), so simply
- * switching transport (WS) or mode (graph) silently bypassed moderation /
- * redaction / audit hooks. These helpers centralise the trigger + abort +
- * rewrite handling so every surface (HTTP, WS, cowork, resume) and every mode
- * (react, graph) gates identically.
- */
-
 export interface PreUserPromptContext {
   hookRegistry?: IHookRegistry
   sessionId: string
-  /** Actor label for audit/moderation handlers (e.g. resolved API actor). */
   actor?: string
 }
 
 export interface PreUserPromptOutcome {
-  /** True when a handler aborted the turn — the caller must not proceed. */
   aborted: boolean
-  /** Human-readable reason surfaced to the client on abort. */
   reason?: string
-  /** The (possibly rewritten) prompt to feed the agent and journal. */
   prompt: string
 }
 
-/**
- * Fire `pre:user:prompt` before the prompt is committed to the session journal
- * or fed to the agent. A handler can abort the turn or rewrite the prompt via
- * `modifiedPayload.data.prompt`. With no registry or no handler this is a
- * no-op that returns the original prompt.
- */
 export async function applyPreUserPromptHook(
   prompt: string,
   ctx: PreUserPromptContext,
@@ -50,16 +29,19 @@ export async function applyPreUserPromptHook(
 }
 
 export interface AgentRunHookData {
+  runId: string
   sessionId: string
   mode?: string
   provider?: string
   model?: string
   input?: string
-  /** Present when the run belongs to POST /chat/background. */
   backgroundJobId?: string
   detached?: boolean
   surface?: string
-  /** Completion evidence is attached to post:agent:run only. */
+  resumed?: true
+  roleBotId?: string
+  attempt?: number
+  fallbackPending?: boolean
   status?: 'success' | 'error' | 'aborted' | 'incomplete'
   durationMs?: number
   usage?: { inputTokens: number; outputTokens: number }
@@ -72,11 +54,6 @@ export interface PreAgentRunOutcome {
   reason?: string
 }
 
-/**
- * Fire `pre:agent:run` at the run boundary (mode-router / resume) so graph and
- * resume turns gate identically to ReAct — previously only the ReAct engine
- * fired it, leaving most (graph) turns and every resume ungated.
- */
 export async function triggerPreAgentRun(
   hookRegistry: IHookRegistry | undefined,
   data: AgentRunHookData,
@@ -90,13 +67,10 @@ export async function triggerPreAgentRun(
     if (result.action === 'abort') return { aborted: true, reason: result.reason }
     return { aborted: false }
   } catch {
-    // A crashing gate hook must not take down the turn; fail open like the
-    // engine's own observation-hook isolation.
     return { aborted: false }
   }
 }
 
-/** Fire `post:agent:run`; observation-only, never throws. */
 export async function triggerPostAgentRun(
   hookRegistry: IHookRegistry | undefined,
   data: AgentRunHookData,
@@ -105,6 +79,5 @@ export async function triggerPostAgentRun(
   try {
     await hookRegistry.trigger({ event: 'post:agent:run', data: { ...data } })
   } catch {
-    // Observation hooks must not fail the main agent flow.
   }
 }

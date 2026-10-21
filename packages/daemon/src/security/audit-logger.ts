@@ -24,13 +24,6 @@ export class JsonlAuditLogger implements IAuditLogger {
 
   async init(): Promise<void> {
     await mkdir(dirname(this.logPath), { recursive: true })
-    // Resume from the last entry of the existing log so the
-    // hash-chain (`prev_hash`) and the sequence counter stay
-    // continuous across restarts. The whole point of the audit
-    // log is tamper-evident: if the last line cannot be parsed we
-    // rotate the file aside instead of silently restarting at
-    // `seq=0, prev_hash='genesis'` — that would let a partial-
-    // write or a deliberate truncation hide behind a fresh chain.
     let data: string
     try {
       data = await readFile(this.logPath, 'utf-8')
@@ -62,9 +55,6 @@ export class JsonlAuditLogger implements IAuditLogger {
         error: err instanceof Error ? err.message : String(err),
       })
       await rename(this.logPath, aside)
-      // After rotation we restart with a fresh chain — but the
-      // operator now has a log entry pointing at the salvaged
-      // file plus the broken file itself for forensic review.
     }
   }
 

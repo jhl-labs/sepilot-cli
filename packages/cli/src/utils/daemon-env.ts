@@ -95,13 +95,6 @@ function isNodeFsError(err: unknown, code: string): boolean {
   )
 }
 
-/**
- * Read the daemon-managed `.env` file. Returns an empty record only
- * when the file genuinely does not exist (ENOENT). Every other read
- * error — EACCES, EBUSY, EIO — is rethrown so callers like
- * `updateDaemonEnvFile` cannot silently merge updates into `{}` and
- * truncate the user's existing `.env`.
- */
 export async function readDaemonEnvFile(options: {
   homeDir?: string
   configFilePath?: string
@@ -131,10 +124,6 @@ export async function updateDaemonEnvFile(
 ): Promise<string> {
   const envPath = daemonEnvPath(options)
   const tempPath = `${envPath}.tmp`
-  // Aborts the update on a non-ENOENT read failure rather than
-  // merging into `{}` and writing a near-empty file over the
-  // existing `.env`. The caller surfaces the error to the operator
-  // who can fix the underlying permission/IO problem before retrying.
   const current = await readDaemonEnvFile(options)
   const next = {
     ...current,

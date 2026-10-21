@@ -36,12 +36,10 @@ interface GitHubRelease {
   assets: GitHubAsset[]
 }
 
-/** Resolve `owner/repo` for GitHub Releases (env override → package.json → default). */
 function resolveReleaseRepo(): string {
   const fromEnv = process.env.SEPILOT_UPDATE_REPO?.trim()
   if (fromEnv && /^[^/\s]+\/[^/\s]+$/.test(fromEnv)) return fromEnv
 
-  // Try the CLI's package.json, then the monorepo root, for a `repository` field.
   for (const url of [
     new URL('../../package.json', import.meta.url),
     new URL('../../../../package.json', import.meta.url),
@@ -57,13 +55,11 @@ function resolveReleaseRepo(): string {
         if (m) return m[1]
       }
     } catch {
-      // ignore — fall through to default
     }
   }
   return DEFAULT_REPO
 }
 
-/** Naive numeric `major.minor.patch` compare. Ignores pre-release/build metadata. */
 export function compareSemver(a: string, b: string): number {
   const norm = (v: string) =>
     v
@@ -115,7 +111,6 @@ async function downloadTo(url: string, dest: string): Promise<void> {
   if (!res.ok || !res.body) {
     throw new Error(`Download failed: HTTP ${res.status} ${res.statusText}`)
   }
-  // `res.body` is a web ReadableStream; adapt it to a Node stream and pipe to disk.
   await pipeline(
     Readable.fromWeb(res.body as unknown as WebReadableStream<Uint8Array>),
     createWriteStream(dest),
@@ -132,7 +127,6 @@ function sha256OfFile(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex')
 }
 
-/** Parse a `.sha256` payload of form `<hex>  <filename>` or just `<hex>`. */
 function parseSha256Payload(text: string): string {
   return (text.trim().split(/\s+/, 1)[0] || '').toLowerCase()
 }
@@ -141,7 +135,6 @@ function bestEffortRm(path: string): void {
   try {
     rmSync(path, { force: true })
   } catch {
-    // ignore
   }
 }
 
@@ -178,8 +171,6 @@ export async function upgradeCommand(options: UpgradeOptions = {}): Promise<void
   }
 
   const latestVersion = release.tag_name.replace(/^v/, '')
-  // `0.0.0` is the "version unknown" fallback (a known wart in bundled binaries);
-  // treat it as older than any real tag so `upgrade` still works.
   const cmp = currentVersion === '0.0.0' ? -1 : compareSemver(currentVersion, latestVersion)
   const updateAvailable = cmp < 0
 
@@ -198,7 +189,6 @@ export async function upgradeCommand(options: UpgradeOptions = {}): Promise<void
     return
   }
 
-  // Pick the platform asset + its checksum.
   const ext = os === 'windows' ? '.exe' : ''
   const assetName = `sepilot-${os}-${arch}${ext}`
   const shaName = `${assetName}.sha256`
@@ -236,14 +226,12 @@ export async function upgradeCommand(options: UpgradeOptions = {}): Promise<void
   }
   if (process.platform !== 'win32') chmodSync(tmpPath, 0o755)
 
-  // Swap in the new binary.
   if (process.platform === 'win32') {
     const oldPath = `${selfBinaryPath}.old`
     bestEffortRm(oldPath)
     try {
       renameSync(selfBinaryPath, oldPath)
     } catch (err) {
-      // Can't move the running .exe (AV / locked). Leave the new one as `.new`.
       const newPath = `${selfBinaryPath}.new`
       try {
         if (existsSync(newPath)) bestEffortRm(newPath)
@@ -263,24 +251,21 @@ export async function upgradeCommand(options: UpgradeOptions = {}): Promise<void
     try {
       renameSync(tmpPath, selfBinaryPath)
     } catch (err) {
-      // Roll back the rename of the original, then bail.
       try {
         renameSync(oldPath, selfBinaryPath)
       } catch {
-        // ignore — leave .old in place for manual recovery
       }
       bestEffortRm(tmpPath)
       console.error(chalk.red(err instanceof Error ? err.message : String(err)))
       process.exit(1)
     }
-    bestEffortRm(oldPath) // best-effort; may still be in use
+    bestEffortRm(oldPath)
   } else {
     try {
       renameSync(tmpPath, selfBinaryPath)
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code
       if (code === 'EXDEV') {
-        // Cross-device (shouldn't happen since temp is next to target). Copy + unlink.
         try {
           copyFileSync(tmpPath, selfBinaryPath)
           chmodSync(selfBinaryPath, 0o755)

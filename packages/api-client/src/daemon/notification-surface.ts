@@ -35,11 +35,6 @@ function errorCodeSuffix(errorCode: string | null | undefined): string {
   return errorCode ? ` · ${statusLabel(errorCode)}` : ''
 }
 
-/**
- * Classifies Relay evidence from one notification only. Acceptance is never
- * promoted to final delivery, and callers cannot accidentally combine the
- * acceptance receipt from one notification with provider evidence from another.
- */
 export function daemonNotifyRelayEvidence(
   notification: Pick<DaemonNotificationItem, 'relayDelivery' | 'relayProviderDelivery'>,
 ): DaemonNotifyRelayEvidencePresentation | null {

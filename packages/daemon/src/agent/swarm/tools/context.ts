@@ -9,6 +9,5 @@ export interface SwarmToolContext {
   launcher: AgentLauncher
   runtime?: SwarmAgentRuntimeAdapter
   env?: NodeJS.ProcessEnv
-  /** Returns runId when the agent engine session is a swarm session, else null. */
   resolveRunId: (sessionId: string | undefined) => string | null
 }

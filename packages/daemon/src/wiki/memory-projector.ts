@@ -11,11 +11,6 @@ const WIKI_SOURCE_FILE_PREFIX = 'wiki:'
 const WIKI_DOCUMENT_ID_PREFIX = 'wiki:'
 const GLOBAL_SCOPE_IDENTITY = 'global'
 
-/**
- * listDocuments has no cursor contract, so reconciliation uses a deliberately
- * high but bounded read and refuses to delete anything when that boundary is
- * reached. This avoids silently treating a truncated result as the full set.
- */
 export const WIKI_RECONCILE_DOCUMENT_LIMIT = 10_000
 
 export type WikiMemoryDocumentStore = Pick<
@@ -58,8 +53,6 @@ function wikiMemoryDocumentIdPrefix(scopeTags: readonly string[] | undefined): s
 function wikiDocumentTags(node: WikiNode, scopeTags: readonly string[] | undefined): string[] {
   const tags = [WIKI_SOURCE_TAG, WIKI_TAG]
   const group = node.group?.trim()
-  // A Wiki group is user-authored metadata, not an authorization boundary.
-  // Never let it masquerade as a trusted scope tag.
   if (group && !group.toLowerCase().startsWith('scope:')) tags.push(group)
   tags.push(...durableScopeTags(scopeTags))
   return [...new Map(tags.map((tag) => [tag.toLowerCase(), tag])).values()]
@@ -81,13 +74,6 @@ function isWikiDocumentForScope(document: MemoryDocument, idPrefix: string): boo
     && tags.has(WIKI_TAG)
 }
 
-/**
- * Projects canonical Wiki nodes into semantic document memory.
- *
- * Wiki remains the source of truth. Errors intentionally propagate so callers
- * can report degraded indexing and retry with reconcile without rolling back a
- * successful Wiki write.
- */
 export class WikiMemoryProjector {
   constructor(private readonly documentStore: WikiMemoryDocumentStore) {}
 

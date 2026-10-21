@@ -3,7 +3,6 @@ export interface AgentSteeringNote {
   message: string
   kind: 'instruction' | 'question'
   createdAt: number
-  /** Delivery acknowledgement, not instruction expiry. */
   consumedAt?: number
   cancelledAt?: number
 }

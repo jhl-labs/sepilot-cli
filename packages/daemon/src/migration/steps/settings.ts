@@ -18,9 +18,6 @@ interface SourceSettings {
   llm?: { providerId?: string; modelId?: string }
 }
 
-// Normalize a desktop locale (e.g. 'en', 'en-US', 'ko-KR') to an
-// agent.outputLanguage value. Strips the region subtag; an empty/whitespace
-// locale yields undefined so it is not mapped.
 function localeToOutputLanguage(locale: string): string | undefined {
   const base = locale.trim().split(/[-_]/)[0]?.trim().toLowerCase()
   return base ? base : undefined
@@ -52,9 +49,6 @@ export const settingsStep: MigrationStepDefinition = {
 
     setIfAllowed('theme', src.theme)
     setIfAllowed('locale', src.locale)
-    // Map the imported desktop locale onto agent.outputLanguage so the daemon
-    // answers in the user's chosen language. Previously the top-level `locale`
-    // was dropped by the config schema on load, silently losing the preference.
     if (src.locale !== undefined) {
       const language = localeToOutputLanguage(src.locale)
       if (language) {

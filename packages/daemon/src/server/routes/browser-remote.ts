@@ -1,8 +1,14 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { z } from 'zod'
 import type { RequestAuthContext } from '../auth.js'
+import { randomUUID } from 'node:crypto'
 import { remoteBrowserBridge, remoteFrameSchema } from '../../tools/browser-remote.js'
 import { zodRequestValidation } from './utils.js'
+import {
+  buildSseResponseHeaders,
+  registerSseDisconnectHandler,
+  trackSseConnection,
+} from '../sse-response.js'
 
 const connectSchema = z.object({ label: z.string().trim().min(1).max(100) })
 const exchangeSchema = z.object({
@@ -92,6 +98,47 @@ export async function remoteBrowserRoutes(app: FastifyInstance) {
     },
   )
   app.get('/browser/connections', async () => bridge().list())
+  app.get<{ Params: { id: string } }>('/browser/connections/:id/frames', async (request, reply) => {
+    const { id } = idSchema.parse(request.params)
+    const connection = bridge().list().find((item) => item.id === id)
+    if (!connection) return reply.code(404).send({ error: { message: 'Browser connection not found' } })
+    reply.hijack()
+    reply.raw.writeHead(
+      200,
+      buildSseResponseHeaders(request, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'X-Request-ID': request.requestId ?? randomUUID(),
+      }),
+    )
+    let closed = false
+    const send = (event: string, data: unknown) => {
+      if (closed) return
+      reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    }
+    const heartbeat = setInterval(() => send('heartbeat', { timestamp: new Date().toISOString() }), 15_000)
+    heartbeat.unref?.()
+    let unsubscribe = () => {}
+    const close = () => {
+      if (closed) return
+      closed = true
+      unsubscribe()
+      clearInterval(heartbeat)
+      if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.end()
+    }
+    try {
+      unsubscribe = bridge().subscribeFrames(id, (frame) => send('frame', frame))
+    } catch {
+      close()
+      return
+    }
+    registerSseDisconnectHandler(request, reply, close)
+    trackSseConnection(app, request, reply, { label: 'browser-frames' })
+    send('ready', { id, transport: connection.transport })
+    reply.raw.flushHeaders?.()
+    if (connection.frame) send('frame', connection.frame)
+  })
   app.post<{ Body: z.infer<typeof controlSchema> }>(
     '/browser/control',
     { preValidation: validate(controlSchema) },

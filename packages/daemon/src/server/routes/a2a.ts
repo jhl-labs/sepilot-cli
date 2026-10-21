@@ -116,8 +116,6 @@ export function registerA2ARoutes(app: FastifyInstance, deps: A2ARoutesDeps): vo
       version: deps.agentVersion?.(),
     })
     const etag = agentCardEtag(card)
-    // The card contains an origin. Do not let a shared intermediary reuse a
-    // Host-derived card for another client even when a proxy is misconfigured.
     reply.header('Cache-Control', 'no-store')
     reply.header('ETag', etag)
     reply.header('A2A-Version', A2A_PROTOCOL_VERSION)
@@ -143,8 +141,6 @@ export function registerA2ARoutes(app: FastifyInstance, deps: A2ARoutesDeps): vo
         Connection: 'keep-alive',
         'A2A-Version': A2A_PROTOCOL_VERSION,
       })
-      // Abort the underlying agent run when the client disconnects so a
-      // dropped SSE consumer does not leave a run executing to completion.
       const abortController = new AbortController()
       const onClose = () => abortController.abort()
       reply.raw.on('close', onClose)
@@ -170,11 +166,6 @@ export function registerA2ARoutes(app: FastifyInstance, deps: A2ARoutesDeps): vo
   })
 }
 
-/**
- * Delegation category external A2A callers run under. It constrains the
- * subagent to an empty tool allowlist so an external principal cannot inherit
- * local filesystem, memory, process, or introspection capabilities.
- */
 export const A2A_DISPATCH_CATEGORY = 'a2a-external'
 
 interface A2ASubagentDispatcher {
@@ -206,7 +197,6 @@ export function createA2ADispatch(
     }
     const result = await dispatcher.dispatch({
       prompt,
-      // Enforced (not just prompted): external requests receive no local tools.
       category: A2A_DISPATCH_CATEGORY,
       system: [
         'This task arrived through Agent2Agent (A2A).',

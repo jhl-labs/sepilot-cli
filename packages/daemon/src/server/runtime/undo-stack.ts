@@ -73,11 +73,6 @@ function cloneEvents(events: SessionEvent[]): SessionEvent[] {
   return events.map((event) => JSON.parse(JSON.stringify(event)) as SessionEvent)
 }
 
-/**
- * Trim events back to before the most recent user_message turn boundary.
- * Returns the trimmed events that should be persisted.
- * If no user_message exists, returns null.
- */
 export function trimToPreviousTurn(events: SessionEvent[]): SessionEvent[] | null {
   for (let i = events.length - 1; i >= 0; i -= 1) {
     if (events[i].type === 'user_message') {

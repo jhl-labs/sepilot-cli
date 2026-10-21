@@ -70,15 +70,6 @@ export function scoreRelevantMemory(
         ? 0.03
         : 0.02
   const autoExtractedPenalty = entry.tags?.includes('source:auto') ? 0.04 : 0
-  // Hybrid search can return a tail of weak embedding matches. Source bias
-  // alone previously lifted those above the inclusion threshold even when the
-  // query and memory shared no lexical evidence, which injected unrelated host
-  // hardware/profile facts into focused repository turns. Preserve strong
-  // cross-language semantic hits, but require them to clear a higher bar.
-  // Agglutinative languages attach particles directly to a token, so an exact
-  // identifier in the query ("E2E-1234에서") never equals the same identifier
-  // in the memory ("E2E-1234:"). That is a tokenizer artifact, not missing
-  // lexical evidence, so a distinctive affix match counts as a real overlap.
   const affixOverlap = overlap === 0 && substringBonus === 0
     && hasDistinctiveAffixMatch(queryTokens, contentTokens)
   const semanticOnlyPenalty = overlap === 0 && substringBonus === 0 && !affixOverlap ? 0.16 : 0
@@ -103,11 +94,6 @@ export function tokenizeMemoryText(text: string): string[] {
 
 const DISTINCTIVE_AFFIX_MIN_LENGTH = 4
 
-/**
- * True when a distinctive token from one side is the prefix of a token on the
- * other side. Short tokens are excluded so common words cannot manufacture a
- * match, which keeps this a lexical-evidence signal rather than a fuzzy one.
- */
 export function hasDistinctiveAffixMatch(left: string[], right: string[]): boolean {
   for (const leftToken of left) {
     if (leftToken.length < DISTINCTIVE_AFFIX_MIN_LENGTH) continue

@@ -52,6 +52,13 @@ export function resolveEgressAllowlist(
   ])
 }
 
+export function isEgressAllowlistActive(
+  allowlist: readonly string[] | null | undefined,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return resolveEgressAllowlist(allowlist, env).length > 0
+}
+
 function normalizeHost(hostname: string): string {
   return hostname.replace(/^\[(.*)\]$/, '$1').toLowerCase()
 }

@@ -69,7 +69,6 @@ export class FileMemory {
     )
   }
 
-  /** Clear this bucket only; the global bucket also contains other owners' scopes. */
   async clearAll(reconcileSemantic = true): Promise<void> {
     await this.recoverLongTermChange()
     await mkdir(this.memoryDir, { recursive: true })
@@ -202,11 +201,6 @@ export class FileMemory {
     return searchJournalPage(this.memoryDir, query, options)
   }
 
-  /** Search across daily notes for a substring (case-insensitive). Walks
-   *  the recent dates first so the freshest matches surface early. Returns
-   *  up to `maxMatches` hits as { date, section, line, [contextBefore], [contextAfter] }.
-   *  Caller can pass `withinDays` to bound the scan (default 90) and
-   *  `contextLines` to capture N lines on each side of the match (default 0). */
   async searchDailyNotes(
     query: string,
     options: { maxMatches?: number; withinDays?: number; contextLines?: number } = {},
@@ -272,10 +266,6 @@ export class FileMemory {
     return hits
   }
 
-  /** Enumerate the dates that actually have a daily note on disk, in
-   *  reverse chronological order. Returns up to `limit` entries (default
-   *  14, hard cap 90). Used by memory.daily.list to surface the user's
-   *  recent journal without reading every file. */
   async listDailyNoteDates(limit: number = 14): Promise<string[]> {
     const safeLimit = Math.max(1, Math.min(Math.floor(limit), 90))
     return (await journalInventory(this.memoryDir)).map((entry) => entry.date).slice(0, safeLimit)
@@ -352,15 +342,6 @@ export class FileMemory {
     )
   }
 
-  /**
-   * Remove a single bullet item from a memory section. The item is matched by
-   * substring (case-insensitive) against the normalized bullet text — the
-   * caller does not need to know the exact whitespace/punctuation. If the
-   * section becomes empty afterwards, the entire section is removed.
-   *
-   * Returns `removed: false` when the section is missing or no item matched
-   * (to support agent retries with different phrasing).
-   */
   async removeMemorySectionItem(
     sectionTitle: string,
     itemQuery: string,
@@ -467,9 +448,6 @@ export class FileMemory {
     try {
       let raw = await readFile(path, 'utf-8')
       if (options.stripPrivate) {
-        // The strip pass must see the `<!-- private -->` markers, so
-        // it has to run before sanitizePromptContent strips ALL HTML
-        // comments.
         raw = stripPrivateSections(raw)
       }
       const content = sanitizePromptContent(raw).trim()
@@ -572,17 +550,6 @@ function sanitizePromptContent(content: string): string {
     .replace(/\n{3,}/g, '\n\n')
 }
 
-/**
- * Drop sections whose body starts with `<!-- private -->` (or its
- * `private:high` variant) from the system-prompt inject path. The
- * section header is also removed so the model is not nudged into
- * asking about it. Specific entries inside a private section are
- * still reachable via `memory.search` / `memory.read` / agent tools
- * — this only changes the default inject, not retrieval.
- *
- * Round 6 long-term-memory-exposure plan, mitigation candidate 3
- * ("Sensitivity tagging").
- */
 const PRIVATE_MARKER = /<!--\s*private(?::[a-zA-Z0-9_-]+)?\s*-->/i
 
 function stripPrivateSections(content: string): string {

@@ -184,22 +184,17 @@ function scopeAllowsRoute(
   }
 
   if (scope === 'extensions') {
-    // MCP server config and outbound-webhook config WRITES are
-    // RCE-equivalent: registering an MCP stdio server runs an arbitrary local
-    // command, and outbound-webhook config can exfiltrate to any URL. These
-    // are master-token only. Non-master extension tokens keep read access so
-    // clients can inspect current config, but never mutate it.
     if (
       matchesPrefix(path, '/api/v1/config/mcp/servers')
       || matchesPrefix(path, '/api/v1/config/hooks/outbound-webhooks')
-    ) {
-      return READ_ONLY_METHODS.has(normalizedMethod)
-    }
-    return matchesPrefix(path, '/api/v1/config/channels/webhook/endpoints')
+      || matchesPrefix(path, '/api/v1/config/channels/webhook/endpoints')
       || matchesPrefix(path, '/api/v1/config/channels/telegram')
       || matchesPrefix(path, '/api/v1/config/channels/discord')
       || matchesPrefix(path, '/api/v1/config/channels/mattermost')
-      || path === '/api/v1/mcp/servers'
+    ) {
+      return READ_ONLY_METHODS.has(normalizedMethod)
+    }
+    return path === '/api/v1/mcp/servers'
       || path === '/api/v1/channels'
       || path === '/api/v1/plugins'
   }
@@ -285,11 +280,6 @@ export class ExtensionAccessTokenStore {
     try {
       parsed = JSON.parse(raw)
     } catch (err) {
-      // Corrupt token file silently turning into "no extensions
-      // registered" would 401 every existing extension with no
-      // operator-visible reason. Rotate the bad file aside so
-      // tokens can be reissued and the original is preserved for
-      // forensic review.
       const aside = `${this.filePath}.broken-${Date.now()}`
       log.error('extension token store unparseable; rotating aside', {
         path: this.filePath,

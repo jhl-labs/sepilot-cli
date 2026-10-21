@@ -61,7 +61,7 @@ function isRequest(message: JsonRpcMessage): boolean {
 }
 
 export class AcpStdioClient {
-  private readonly framer: JsonRpcCodec
+  private framer: JsonRpcCodec
   private readonly spawner: AcpSpawner
   private readonly pending = new Map<string, PendingRequest>()
   private proc: AcpChildProcess | null = null
@@ -83,6 +83,7 @@ export class AcpStdioClient {
   start(): void {
     if (this.proc) throw new Error('ACP client already started')
     this.stopped = false
+    this.framer = createJsonRpcFramer(this.spec.framing)
     const proc = this.spawner(this.spec.command, this.spec.args ?? [], {
       cwd: this.spec.cwd,
       env: this.spec.env,
@@ -90,19 +91,24 @@ export class AcpStdioClient {
     this.proc = proc
 
     proc.stdout?.on('data', (chunk: Buffer) => {
+      if (this.stopped || this.proc !== proc) return
       for (const message of this.framer.push(chunk)) {
+        if (this.stopped || this.proc !== proc) break
         void this.handle(message)
       }
     })
     proc.stderr?.on('data', (chunk: Buffer) => {
+      if (this.stopped || this.proc !== proc) return
       this.options.onStderr?.(chunk)
     })
     proc.on('error', (error) => {
+      if (this.proc !== proc) return
       this.proc = null
       this.rejectPending(error)
       this.options.onExit?.(error)
     })
     proc.on('exit', (code, signal) => {
+      if (this.proc !== proc) return
       this.proc = null
       const error = new Error(`ACP agent exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})`)
       this.rejectPending(error)
@@ -211,26 +217,30 @@ export class AcpStdioClient {
   }
 
   private async respondToClientRequest(message: JsonRpcMessage): Promise<void> {
-    if (!this.proc?.stdin) return
+    const proc = this.proc
+    if (!proc?.stdin || this.stopped) return
+    let response: JsonRpcMessage
     try {
       const result = this.options.onClientRequest
         ? await this.options.onClientRequest(message)
         : this.defaultClientRequestResponse(message)
-      this.proc.stdin.write(this.framer.frame({
+      response = {
         jsonrpc: '2.0',
         id: message.id,
         result,
-      }))
+      }
     } catch (error) {
-      this.proc.stdin.write(this.framer.frame({
+      response = {
         jsonrpc: '2.0',
         id: message.id,
         error: {
           code: (error as { code?: number }).code ?? -32601,
           message: error instanceof Error ? error.message : String(error),
         },
-      }))
+      }
     }
+    if (this.stopped || this.proc !== proc) return
+    proc.stdin.write(this.framer.frame(response))
   }
 
   private defaultClientRequestResponse(message: JsonRpcMessage): unknown {

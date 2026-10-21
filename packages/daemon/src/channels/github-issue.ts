@@ -160,9 +160,7 @@ export interface GitHubIssueChannelConfig {
   claimEnabled?: boolean
   claimTtlMs?: number
   pollIntervalMs?: number
-  /** Backoff floor applied after a poll failure. Defaults to max(60s, pollIntervalMs). */
   pollBackoffBaseMs?: number
-  /** Backoff ceiling. Defaults to max(10min, pollBackoffBaseMs). */
   pollBackoffMaxMs?: number
   gatewayUrl?: string
 }
@@ -223,10 +221,6 @@ export class GitHubIssueChannel implements IChannel {
 
   async start(): Promise<void> {
     this.status = 'connecting'
-    // runScheduledPoll owns its own try/catch and never throws; on
-    // failure it surfaces status='error' and arranges an exponential
-    // backoff so a missing/unreachable gateway no longer floods the log
-    // with one ERROR line every poll interval.
     await this.runScheduledPoll('startup')
 
     this.pollTimer = setInterval(() => {
@@ -247,12 +241,6 @@ export class GitHubIssueChannel implements IChannel {
     return this.status
   }
 
-  /**
-   * Last error message captured during poll(), if any. The channel
-   * runtime exposes this via `/api/v1/channels` so an operator can
-   * see why a github-issue channel is stuck — auth revoked, repo
-   * gone, rate-limited — instead of having to inspect server logs.
-   */
   getLastError(): string | null {
     return this.lastError
   }
@@ -320,9 +308,6 @@ export class GitHubIssueChannel implements IChannel {
     }
 
     if (this.consecutivePollFailures === 1 || this.lastPollFailureError !== errorText) {
-      // First failure (or a *new* failure reason) gets a WARN; repeated
-      // identical failures drop to DEBUG so a long gateway outage costs
-      // one visible log line, not one per interval.
       log.warn('github-issue polling unavailable; backing off', payload)
     } else {
       log.debug('github-issue polling still unavailable', payload)
@@ -376,11 +361,6 @@ export class GitHubIssueChannel implements IChannel {
       this.status = 'connected'
       this.lastError = null
     } catch (err) {
-      // Auth revoked, repo deleted, rate-limited, gateway down — every
-      // one of these previously set status='connected'. Surface the
-      // failure on the status field and re-throw so runScheduledPoll
-      // applies backoff + log de-duplication instead of spamming an
-      // ERROR line every interval.
       const message = err instanceof Error ? err.message : String(err)
       this.status = 'error'
       this.lastError = message

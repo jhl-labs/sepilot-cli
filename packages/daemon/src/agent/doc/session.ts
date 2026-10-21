@@ -1,19 +1,3 @@
-// "글쓰기 모드 (canvas)" 의 daemon-측 문서 세션 owner.
-//
-// 책임:
-//   - DocSession 메모리 보관 + 변경 적용 (apply)
-//   - doc.* tool과 desktop user_edit endpoint 모두 한 곳에서 처리
-//   - 변경 시마다 EventEmitter로 'updated' broadcast → server/ws.ts가 desktop에 push
-//   - diff_preview pending 보관 + accept/cancel
-//   - history 보관 (undo/redo는 future; 현재는 history entry만 push)
-//
-// 영속:
-//   - 디스크는 사용자의 명시적 save 시점에만 write
-//   - file watcher는 desktop 측에서 외부 편집(Obsidian 등) 감지용으로 보조 유지 가능
-//
-// 동시성:
-//   - 단일 process 내 single-threaded JS. version 증가만으로 race 감지 (apply에 expectedVersion 인자 둠)
-
 import { randomUUID, createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { readFile, writeFile, stat } from 'node:fs/promises'
@@ -48,8 +32,6 @@ interface MutableSession extends DocSession {
 export class DocRegistry {
   private sessions = new Map<string, MutableSession>()
   private pathToSession = new Map<string, string>()
-  /** 가장 최근에 open되었거나 사용자가 명시적으로 set한 session id. doc.* tool이
-   *  context로 어떤 doc을 쓸지 결정할 때 사용. mode='writing'인 desktop 1개 가정. */
   private activeId: string | null = null
   public events = new EventEmitter()
 
@@ -112,7 +94,7 @@ export class DocRegistry {
     }
     this.sessions.set(id, session)
     if (input.path) this.pathToSession.set(input.path, id)
-    this.activeId = id // 가장 최근 open이 active
+    this.activeId = id
     return stripInternal(session)
   }
 
@@ -132,11 +114,6 @@ export class DocRegistry {
     return parseOutline(s.content)
   }
 
-  /**
-   * 가장 최근 LLM-author change를 undo. user-author 변경은 editor 측 native undo가
-   * 처리하므로 daemon undo는 author='llm' 또는 'external' entry만 대상.
-   * 반환된 version은 적용 후. undo할 entry 없으면 null.
-   */
   undoLastLlmChange(id: string): { version: number } | null {
     const s = this.require(id)
     let idx = -1
@@ -148,7 +125,6 @@ export class DocRegistry {
     }
     if (idx < 0) return null
     const entry = s.history[idx]
-    // entry.reverseChanges는 그 version으로 가게 한 변경의 역. 적용해서 이전 상태 복원.
     s.history.splice(idx, 1)
     return this.apply(id, entry.reverseChanges, 'external', {
       toolName: 'doc.undo',
@@ -156,10 +132,6 @@ export class DocRegistry {
     })
   }
 
-  /**
-   * 변경 적용. expectedVersion 주면 version mismatch 시 거부.
-   * changes는 start ascending 정렬되어야 함 (호출자 책임).
-   */
   apply(
     id: string,
     changes: DocChange[],
@@ -174,7 +146,6 @@ export class DocRegistry {
     }
     if (changes.length === 0) return { version: s.version }
 
-    // descending 순서로 적용해야 offset이 안 깨짐
     const sorted = [...changes].sort((a, b) => b.start - a.start)
     let content = s.content
     const reverseChanges: DocChange[] = []
@@ -183,7 +154,6 @@ export class DocRegistry {
       const replaced = content.slice(ch.start, ch.end)
       const after = content.slice(ch.end)
       content = before + ch.newText + after
-      // reverse: 새 영역(start..start+newText.length)을 원래 텍스트로
       reverseChanges.push({
         start: ch.start,
         end: ch.start + ch.newText.length,
@@ -205,7 +175,7 @@ export class DocRegistry {
     const ev: DocUpdateEvent = {
       type: 'doc.updated',
       sessionId: id,
-      changes: [...sorted].reverse(), // 호출자에게는 ascending이 자연
+      changes: [...sorted].reverse(),
       version: s.version,
       author,
       toolName: meta?.toolName,
@@ -214,8 +184,6 @@ export class DocRegistry {
     this.events.emit('updated', ev)
     return { version: s.version }
   }
-
-  // ------- diff preview -------
 
   createPreview(
     sessionId: string,
@@ -297,8 +265,6 @@ export class DocRegistry {
     return [...s.pendingPreviews.values()]
   }
 
-  // ------- 디스크 sync -------
-
   async saveToDisk(sessionId: string, savePath?: string): Promise<{ path: string; mtimeMs: number }> {
     const s = this.require(sessionId)
     const target = savePath ?? s.path
@@ -315,7 +281,6 @@ export class DocRegistry {
     return { path: target, mtimeMs: st.mtimeMs }
   }
 
-  /** 외부에서 디스크가 바뀐 경우(다른 에디터 등) — content 통째 reload */
   async reloadFromDisk(sessionId: string): Promise<{ version: number }> {
     const s = this.require(sessionId)
     if (!s.path) throw new Error('reload: session has no path')
@@ -332,8 +297,6 @@ export class DocRegistry {
       label: 'reload from disk',
     })
   }
-
-  // ------- helpers for tools -------
 
   findSection(sessionId: string, selector: string | number): DocOutlineEntry | null {
     return findSection(this.outline(sessionId), selector)
@@ -367,7 +330,6 @@ function stripInternal(s: MutableSession): DocSession {
   }
 }
 
-/** Process-wide singleton (daemon 전체에서 같은 registry 공유) */
 let _instance: DocRegistry | null = null
 export function getDocRegistry(): DocRegistry {
   if (!_instance) _instance = new DocRegistry()

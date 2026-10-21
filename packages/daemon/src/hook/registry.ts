@@ -1,13 +1,6 @@
 import type { Disposable } from '@sepilotd/core'
 import type { HookEvent, HookPayload, HookResult, IHookHandler, IHookRegistry } from '@sepilotd/core'
 
-/**
- * Per-handler timeout for hook execution. A programmatic (in-process) hook
- * handler that hangs would otherwise stall the whole turn indefinitely
- * (command/outbound handlers are already bounded elsewhere). When a handler
- * exceeds this budget the registry logs and treats it as `continue` so the turn
- * proceeds. Operator-tunable; floored so it can't be set absurdly low.
- */
 function resolveHookHandlerTimeoutMs(): number {
   const raw = Number(process.env.SEPILOTD_HOOK_HANDLER_TIMEOUT_MS)
   if (Number.isFinite(raw) && raw >= 100) return Math.floor(raw)
@@ -34,7 +27,6 @@ export class HookRegistry implements IHookRegistry {
     }
     const list = this.handlers.get(event)!
     list.push(handler)
-    // Sort by priority (lower = first)
     list.sort((a, b) => a.priority - b.priority)
 
     return {
@@ -59,8 +51,6 @@ export class HookRegistry implements IHookRegistry {
       if (result.modifiedPayload) currentPayload = result.modifiedPayload
     }
 
-    // Surface the chained payload so gating callers (e.g. pre:tool:execute)
-    // can apply handler modifications such as rewritten tool arguments.
     return {
       action: 'continue',
       ...(currentPayload !== payload ? { modifiedPayload: currentPayload } : {}),
@@ -92,7 +82,6 @@ export class HookRegistry implements IHookRegistry {
         resolve({ action: 'continue' })
         controller.abort(new Error(`hook handler timed out after ${timeoutMs}ms`))
       }, timeoutMs)
-      // Do not keep the process alive solely for this timer.
       if (typeof timer.unref === 'function') timer.unref()
     })
     try {

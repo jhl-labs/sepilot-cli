@@ -30,11 +30,9 @@ export class UpdateChecker {
   async start(): Promise<void> {
     this.stopped = false
     if (!this.config.autoCheck) return
-    // Initial check
     await this.check().catch(() => {})
     if (this.stopped) return
-    // Periodic checks
-    const interval = this.config.checkIntervalMs ?? 24 * 60 * 60 * 1000 // 24h default
+    const interval = this.config.checkIntervalMs ?? 24 * 60 * 60 * 1000
     this.timer = setInterval(() => this.check().catch(() => {}), interval)
     this.timer.unref?.()
   }
@@ -62,7 +60,6 @@ export class UpdateChecker {
       const latestVersion = data.tag_name.replace(/^v/, '')
       const updateAvailable = this.compareVersions(latestVersion, this.currentVersion) > 0
 
-      // Filter by channel
       if (this.config.channel === 'stable' && (latestVersion.includes('beta') || latestVersion.includes('dev'))) {
         this.lastCheck = { currentVersion: this.currentVersion, latestVersion: this.currentVersion, updateAvailable: false }
         return this.lastCheck

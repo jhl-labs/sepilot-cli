@@ -37,6 +37,7 @@ import { filterToolsByRole } from '../../tools/role-filter.js'
 import { createDocTools } from '../../agent/doc/tools.js'
 import { getDocRegistry } from '../../agent/doc/session.js'
 import { createTerminalTool } from '../../tools/terminal.js'
+import { createGitTransferTool } from '../../tools/git-transfer.js'
 import { createWebFetchTool } from '../../tools/web-fetch.js'
 import { createWebSearchTool } from '../../tools/web-search.js'
 import { createWorkspacePrepareTool } from '../../tools/workspace-prepare.js'
@@ -46,8 +47,13 @@ import { createSkillTool } from '../../tools/skill.js'
 import { createServiceSupervisorTools } from '../../tools/services.js'
 import { createNativeServiceTools } from '../../tools/native-services.js'
 import type { ServiceSupervisor } from '../../service-supervisor/supervisor.js'
+import type { ResourceAccessPolicy } from '@sepilotd/core'
+import { checkAccessUrl } from '../../security/resource-access.js'
 import { resolveAutonomy } from './providers.js'
 import { ToolRegistry } from '../../tools/registry.js'
+import { observeManagedProcessExits } from './process-exit-receipts.js'
+import { withBackgroundExecution } from '../../tools/terminal-background.js'
+import { WatchService, createWatchTools } from '../../tools/watch.js'
 import {
   registerFeatureTools,
   registerPostWebFeatureTools,
@@ -60,6 +66,7 @@ export function buildToolRegistry(
   skillRegistry: FileSkillRegistry,
   options: {
     serviceSupervisor?: ServiceSupervisor
+    getAccessPolicy?: () => ResourceAccessPolicy | undefined
     dataDir?: string
     getWebSearchTrustedDomains?: () => readonly string[]
   } = {},
@@ -70,6 +77,7 @@ export function buildToolRegistry(
 } {
   const toolRegistry = new ToolRegistry()
   const managedProcesses = new ManagedProcessRegistry()
+  observeManagedProcessExits(managedProcesses)
   const sandboxCacheRoot = options.dataDir
     ? join(options.dataDir, 'cache', 'sandbox-workspaces')
     : undefined
@@ -114,12 +122,15 @@ export function buildToolRegistry(
         readOnlyWorkspace: false,
       })
     : undefined
-  // Reap sandbox containers orphaned by a previous (possibly crashed) daemon.
-  // Best-effort and non-blocking; bubblewrap self-reaps via --die-with-parent.
   if (terminalRunner instanceof DockerTerminalRunner) {
     void terminalRunner.reapOrphans().catch(() => undefined)
   }
-  toolRegistry.register(createTerminalTool({
+  const processStartTool = createManagedProcessStartTool(managedProcesses, {
+    sandboxMode: config.security.sandbox,
+    strictWorkspaceLauncher: strictWorkspaceRunner,
+    strictWorkspaceWriteLauncher: strictWorkspaceWriteRunner,
+  })
+  toolRegistry.register(withBackgroundExecution(createTerminalTool({
     runner: terminalRunner,
     strictWorkspaceRunner,
     strictWorkspaceWriteRunner,
@@ -127,13 +138,8 @@ export function buildToolRegistry(
     strictWorkspaceNetworkWriteRunner,
     getManagedLoopbackConnections: (sessionId, workspaceRoot) =>
       managedProcesses.loopbackConnectionsForScope(sessionId, workspaceRoot),
-  }))
-  toolRegistry.register(createWorkspacePrepareTool())
-  // Built-in host file tools would pierce the Docker/bubblewrap filesystem
-  // namespace. Keep them out of isolated profiles unless the operator
-  // explicitly enables the legacy compatibility escape hatch. Agents can
-  // still inspect and edit the mounted workspace through sandboxed
-  // terminal.run commands.
+  }), processStartTool))
+  toolRegistry.register(createWorkspacePrepareTool({ reviewRunner: strictWorkspaceWriteRunner }))
   const registerHostFileTools =
     config.security.sandbox === 'local'
     || config.security.sandboxHostFileTools === 'allow'
@@ -149,34 +155,27 @@ export function buildToolRegistry(
     toolRegistry.register(createFsEditTool(filePosture))
     toolRegistry.register(createApplyPatchTool(filePosture))
   }
-  const gitToolOptions = { strictWorkspaceRunner }
+  const gitToolOptions = { strictWorkspaceRunner, boundedAccess: () => options.getAccessPolicy?.()?.enabled === true }
   toolRegistry.register(createGitStatusTool(gitToolOptions))
   toolRegistry.register(createGitDiffTool(gitToolOptions))
   toolRegistry.register(createGitLogTool(gitToolOptions))
   toolRegistry.register(createProcessListTool())
   toolRegistry.register(createManagedProcessSessionsTool(managedProcesses))
-  toolRegistry.register(
-    createManagedProcessStartTool(managedProcesses, {
-      sandboxMode: config.security.sandbox,
-      strictWorkspaceLauncher: strictWorkspaceRunner,
-      strictWorkspaceWriteLauncher: strictWorkspaceWriteRunner,
-    }),
-  )
+  toolRegistry.register(processStartTool)
   toolRegistry.register(createManagedProcessReadTool(managedProcesses))
   toolRegistry.register(createManagedProcessWriteTool(managedProcesses))
   toolRegistry.register(createManagedProcessFollowTool(managedProcesses))
   toolRegistry.register(createManagedProcessWaitTool(managedProcesses))
   toolRegistry.register(createManagedProcessStopTool(managedProcesses))
   toolRegistry.register(createProcessSignalTool(managedProcesses))
+  const watchService = new WatchService({ processes: managedProcesses, dataDir: options.dataDir })
+  for (const tool of createWatchTools(watchService)) toolRegistry.register(tool)
   for (const tool of createServiceSupervisorTools(options.serviceSupervisor)) {
     toolRegistry.register(tool)
   }
   for (const tool of createNativeServiceTools()) {
     toolRegistry.register(tool)
   }
-  // 글쓰기 모드 (canvas) doc.* tools. 활성 doc은 process-wide DocRegistry에서 결정
-  // (desktop 1개 + mode='writing' 1개 가정). chat session id마다 다른 doc을 쓰려면
-  // chat-stream에서 context별 docId injection이 필요.
   for (const tool of createDocTools({
     registry: getDocRegistry(),
     resolve: (context) => context.writingDocId ?? getDocRegistry().getActiveId(),
@@ -204,6 +203,8 @@ export function buildToolRegistry(
   }
   registerFeatureTools(toolRegistry, featureDeps)
 
+  toolRegistry.register(createGitTransferTool({ egressAllowlist: config.security.egressAllowlist }))
+
   const egressOptions = { egressAllowlist: config.security.egressAllowlist }
 
   toolRegistry.register(createWebSearchTool({
@@ -217,6 +218,7 @@ export function buildToolRegistry(
   }))
   toolRegistry.register(createWebFetchTool({
     ...egressOptions,
+    checkUrl: url => checkAccessUrl(options.getAccessPolicy?.(), url)?.reason,
     isLocalhostAllowed: isManagedLoopbackUrl,
     managedLoopbackSocketForUrl,
   }))

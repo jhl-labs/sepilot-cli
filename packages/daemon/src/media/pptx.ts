@@ -48,7 +48,6 @@ function pptxLimit(message: string): never {
 }
 
 function findEndOfCentralDirectory(archive: Buffer): number {
-  // EOCD is 22 bytes plus at most a 65,535-byte ZIP comment.
   const floor = Math.max(0, archive.length - 22 - 0xffff)
   for (let offset = archive.length - 22; offset >= floor; offset -= 1) {
     if (archive.readUInt32LE(offset) !== ZIP_EOCD_SIGNATURE) continue
@@ -59,8 +58,6 @@ function findEndOfCentralDirectory(archive: Buffer): number {
 }
 
 function decodeZipEntryName(value: Buffer, utf8: boolean): string {
-  // OOXML part names are ASCII. latin1 is intentionally used for legacy ZIP
-  // names so decoding can never replace bytes into a misleading slash.
   return value.toString(utf8 ? 'utf8' : 'latin1')
 }
 
@@ -162,8 +159,6 @@ function readZipEntry(archive: Buffer, entry: ZipEntry): Buffer {
   } else if (entry.compressionMethod === 8) {
     try {
       output = inflateRawSync(compressed, {
-        // Do not trust the deflate stream even after checking central-directory
-        // sizes. One extra byte lets us distinguish an honest size mismatch.
         maxOutputLength: entry.uncompressedSize + 1,
       })
     } catch (error) {

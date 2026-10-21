@@ -21,12 +21,6 @@ export interface RegisterOptions {
 
 export interface FileSkillRegistryOptions {
   additionalRoots?: string[]
-  /**
-   * When false (default) auto-discovered project/home skills are still loaded
-   * but flagged `autoDiscovered` so the `skill` tool surfaces an untrusted
-   * provenance banner. When true they are treated as trusted (no banner) — an
-   * explicit operator opt-in for a trusted workspace.
-   */
   trustProjectSkills?: boolean
 }
 
@@ -52,7 +46,7 @@ function containedSkillDir(skillsDir: string, id: string): string {
 
 export class FileSkillRegistry implements ISkillRegistry {
   private skillsDir: string
-  private skills = new Map<string, { metadata: SkillMetadata; content: string }>()
+  private skills = new Map<string, { metadata: SkillMetadata; content: string; path?: string }>()
   private validator: ValidatorDeps | null = null
   private additionalRoots: string[]
   private trustProjectSkills: boolean
@@ -91,7 +85,7 @@ export class FileSkillRegistry implements ISkillRegistry {
       }
     }
 
-    this.skills.set(skill.id, { metadata: skill, content })
+    this.skills.set(skill.id, { metadata: skill, content, path: join(dir, 'SKILL.md') })
     await mkdir(dir, { recursive: true })
     const frontmatter: Record<string, unknown> = {
       name: skill.name,
@@ -115,7 +109,7 @@ export class FileSkillRegistry implements ISkillRegistry {
     await writeFile(join(dir, 'SKILL.md'), `+++\n${toml}\n+++\n\n${content}`, 'utf-8')
   }
 
-  async get(id: string): Promise<{ metadata: SkillMetadata; content: string } | null> {
+  async get(id: string): Promise<{ metadata: SkillMetadata; content: string; path?: string } | null> {
     return this.skills.get(id) ?? null
   }
 
@@ -123,7 +117,7 @@ export class FileSkillRegistry implements ISkillRegistry {
     id: string,
     cwd: string | undefined,
     boundaryRoot?: string,
-  ): Promise<{ metadata: SkillMetadata; content: string } | null> {
+  ): Promise<{ metadata: SkillMetadata; content: string; path?: string } | null> {
     if (!cwd) return this.get(id)
     const skills = await this.skillsForCwd(cwd, boundaryRoot)
     return skills.get(id) ?? null
@@ -168,7 +162,6 @@ export class FileSkillRegistry implements ISkillRegistry {
     try {
       await rm(dir, { recursive: true, force: true })
     } catch {
-      // Ignore removal errors
     }
   }
 
@@ -208,11 +201,7 @@ export class FileSkillRegistry implements ISkillRegistry {
   private async skillsForCwd(
     cwd: string,
     boundaryRoot?: string,
-  ): Promise<Map<string, { metadata: SkillMetadata; content: string }>> {
-    // `this.skills` contains managed skills plus user-level compatibility
-    // roots discovered at daemon startup. They are agent control-plane input,
-    // so they remain available inside a strict workspace. Project discovery
-    // below is still canonical-path bounded and cannot walk outside the root.
+  ): Promise<Map<string, { metadata: SkillMetadata; content: string; path?: string }>> {
     const skills = new Map(this.skills)
     for (const root of await projectCompatibleSkillRoots(cwd, boundaryRoot)) {
       if (boundaryRoot && !await canonicalPathIsWithin(boundaryRoot, root)) continue
@@ -223,7 +212,7 @@ export class FileSkillRegistry implements ISkillRegistry {
 
   private async loadSkillRoot(
     root: string,
-    target: Map<string, { metadata: SkillMetadata; content: string }>,
+    target: Map<string, { metadata: SkillMetadata; content: string; path?: string }>,
     opts: LoadRootOptions,
   ): Promise<void> {
     await this.loadSkillDir(root, target, opts)
@@ -234,8 +223,6 @@ export class FileSkillRegistry implements ISkillRegistry {
       return
     }
     for (const entry of entries) {
-      // Do not follow symlinks: an auto-discovered root that symlinks a child
-      // directory could escape the workspace into arbitrary skill content.
       if (!entry.isDirectory()) continue
       await this.loadSkillDir(join(root, entry.name), target, opts)
     }
@@ -243,13 +230,11 @@ export class FileSkillRegistry implements ISkillRegistry {
 
   private async loadSkillDir(
     dir: string,
-    target: Map<string, { metadata: SkillMetadata; content: string }>,
+    target: Map<string, { metadata: SkillMetadata; content: string; path?: string }>,
     opts: LoadRootOptions,
   ): Promise<void> {
     try {
       const skillPath = join(dir, 'SKILL.md')
-      // Reject a symlinked SKILL.md so an auto-discovered root cannot smuggle
-      // content from outside the skill directory.
       const link = await lstat(skillPath)
       if (link.isSymbolicLink()) return
       const raw = await readFile(skillPath, 'utf-8')
@@ -257,10 +242,6 @@ export class FileSkillRegistry implements ISkillRegistry {
       const metadata: SkillMetadata = opts.trusted
         ? parsed.metadata
         : { ...parsed.metadata, autoDiscovered: true }
-      // When a validator is wired, drop disk-loaded skills that fail structural
-      // validation (previously the disk path bypassed validateSkill entirely).
-      // Warnings (e.g. dangerous-pattern heuristics) do not block the load; the
-      // untrusted banner already flags auto-discovered content.
       if (this.validator) {
         const result = validateSkill(
           metadata,
@@ -271,9 +252,8 @@ export class FileSkillRegistry implements ISkillRegistry {
         )
         if (result.errors.length > 0) return
       }
-      target.set(metadata.id, { metadata, content: parsed.content })
+      target.set(metadata.id, { metadata, content: parsed.content, path: skillPath })
     } catch {
-      // Skip directories that are not valid skill packages.
     }
   }
 }

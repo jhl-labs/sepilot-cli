@@ -165,7 +165,6 @@ async function migrateLegacyRegistry(
     await readFile(manifestPath, 'utf8')
     return
   } catch {
-    // Continue and attempt legacy migration.
   }
 
   try {
@@ -177,7 +176,6 @@ async function migrateLegacyRegistry(
     await saveProjectSessionRegistry(workspace, legacy)
     await rm(legacyPath, { force: true })
   } catch {
-    // No legacy registry to migrate.
   }
 }
 

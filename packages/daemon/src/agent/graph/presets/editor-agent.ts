@@ -10,11 +10,7 @@ const editorAgentPrompt = [
 export function buildEditorAgentGraph(deps: Deps) {
   return buildFocusedLoopGraph(deps, {
     systemPrompt: editorAgentPrompt,
-    // Source-editing scope: file + patch tools plus post-edit code analysis.
-    // No terminal.run or browser tools — an editor agent edits, it does not shell out.
     toolAllowlist: ['fs.*', 'apply_patch', 'code.*'],
-    // Editing-heavy preset — analyse blast radius + diagnostics after
-    // every tool batch so the next turn revises with grounded signal.
     enablePostEditAnalysis: true,
   })
 }

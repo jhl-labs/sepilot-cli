@@ -5,9 +5,6 @@ type FileRegistry = Parameters<NonNullable<SemanticMemoryStore['configureFileMem
 type Generation = { store: SemanticMemoryStore; active: number; retired: boolean; unsubscribe: () => void }
 const replacements = new WeakMap<SemanticMemoryStore, (next: SemanticMemoryStore) => Promise<void>>()
 
-/** Keep the identity captured by tools, routers and background services stable
- * across configuration changes. An in-flight call owns its old DB until it
- * settles; subsequent calls use the replacement. */
 export function rebindableSemanticStore(initial: SemanticMemoryStore): SemanticMemoryStore {
   const listeners = new Set<AuditListener>()
   let fileRegistry: FileRegistry | undefined
@@ -88,7 +85,6 @@ export async function replaceSemanticStore(
     await replace(next)
     return previous
   }
-  // Lightweight/injected runtimes may not have assembled a storage layer.
   const facade = rebindableSemanticStore(next)
   previous?.close()
   return facade

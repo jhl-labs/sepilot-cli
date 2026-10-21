@@ -118,12 +118,6 @@ function openBoundedChatStream(
   })
 }
 
-/**
- * Format the autonomy level so the user can tell at a glance how
- * supervised the agent is. `autonomous` is highlighted because it is the
- * level where the daemon will pick tools without asking — running the cli
- * there without realising it is the most common foot-gun.
- */
 function formatAutonomyLabel(level: string | undefined): string {
   switch (level) {
     case 'autonomous':
@@ -294,11 +288,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
   const tokenSpeedTracker = createTokenSpeedTracker()
   let rlRef: readline.Interface | null = null
 
-  // Track pending approvals/questions so the readline prompt can show a counter.
-  // The sets are fed live from stream frames and reconciled
-  // after every send/decision via /api/v1/sessions/:id (which is the
-  // authoritative list, in case the user has multiple cli windows open or
-  // a previous decision timed out).
   const pendingApprovals = new Map<string, string | undefined>()
   const pendingQuestions = new Map<string, string | undefined>()
   const updatePromptIndicator = () => {
@@ -340,7 +329,7 @@ export async function chatCommand(options: { url?: string; model?: string; provi
         pendingQuestions.set(item.id, item.sessionId ?? session.id)
       }
       updatePromptIndicator()
-    } catch { /* best-effort indicator */ }
+    } catch {}
   }
 
   const createPromptEventPrinter = (
@@ -510,13 +499,10 @@ export async function chatCommand(options: { url?: string; model?: string; provi
   }
 
   console.log(chalk.gray(`Mode: ${wsClient ? 'streaming' : 'http'}${currentModel ? ` | Model: ${currentModel}` : ''}${currentProvider ? ` | Provider: ${currentProvider}` : ''}${currentMaxTokens ? ` | Max output: ${currentMaxTokens}` : ''}`))
-  // One-off config fetch so the user sees their safety posture before they
-  // start typing. A failure (daemon down, auth missing) is silent — the
-  // session line above already tells them whether the daemon is reachable.
   try {
     const config = await httpClient.config()
     console.log(chalk.gray(`Autonomy: `) + formatAutonomyLabel(config.agent?.autonomy))
-  } catch { /* best-effort header; falls through to /help line */ }
+  } catch {}
   console.log(chalk.gray('Type /help for commands, "exit" or "/exit" to quit\n'))
 
   const rl = readline.createInterface({
@@ -539,7 +525,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
       return
     }
 
-    // Slash commands
     if (trimmed.startsWith('/')) {
       if (trimmed === '/approvals') {
         if (!sessionId) {
@@ -564,13 +549,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
               for (const approval of session.pendingApprovals) {
                 const askedAgo = relativeTimeLabel(now - new Date(approval.requestedAt).getTime())
                 const expiresIn = relativeTimeLabel(new Date(approval.expiresAt).getTime() - now)
-                // Same fix as cli sessions show (commit 60ea4f1):
-                // relativeTimeLabel returns the bare string `expired`
-                // when delta<=0, and stitching ` until timeout` after
-                // it produced the ungrammatical "expired until
-                // timeout". Render the past-deadline case as a bare
-                // `expired` label so an operator scanning the
-                // /approvals output can grep for it visually.
                 const expiryLabel = expiresIn === 'expired'
                   ? 'expired'
                   : `${expiresIn} until timeout`
@@ -740,11 +718,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
           }
           console.log()
         } catch (error) {
-          // Same rationale as the /approve catch above — route the
-          // ApiHttpError envelope through friendlyErrorMessage so a
-          // 4xx/5xx from the daemon (e.g. session gone, run already
-          // completed) carries its status+code into the chat shell
-          // instead of leaking only the bare envelope message.
           if (!printStreamError(error, { sessionId }) && !printApiError(error)) {
             console.log(chalk.red(`Failed to resume session: ${friendlyErrorMessage(error)}`))
           }
@@ -762,23 +735,11 @@ export async function chatCommand(options: { url?: string; model?: string; provi
         const approved = trimmed === '/approve' || trimmed.startsWith('/approve ')
         const tokens = trimmed.split(' ').filter(Boolean)
         const requestId = tokens[1]
-        // A fresh shell has no request namespace to resolve an id against.
-        // Surface that state before generic syntax help so bare /approve and
-        // /deny match the other session-bound slash command guards.
         if (!requestId && !sessionId) {
           console.log(chalk.gray('No active session'))
           rl.prompt()
           return
         }
-        // --run: approve every tool request spawned by the current user
-        // command. --session-all does the same for the current chat session.
-        // --session: remember this answer for every subsequent call to the
-        // same tool in the active session (handy when an agent legitimately
-        // needs to run `git status` ten times in a row).
-        // --always: persist across sessions until manually revoked.
-        // Plain trailing tokens become a free-form reason that gets
-        // forwarded to the agent as the approval `note`, so a denial isn't
-        // a dead end — the agent can read why and pick a different path.
         let scope: 'once' | 'session' | 'always' | 'run' | 'session-all' = 'once'
         const noteTokens: string[] = []
         for (let i = 2; i < tokens.length; i++) {
@@ -806,9 +767,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
           return
         }
         if (!approved && scope !== 'once') {
-          // Persisting a denial across calls is a bigger policy decision
-          // than a one-off "no" — keep it explicit until we add a real
-          // tool/path-scoped block command.
           console.log(chalk.red(
             'Scoped denials (--run / --session-all / --session / --always) are not supported on /deny. Use /approve --run or edit the policy file.',
           ))
@@ -863,12 +821,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
                 `${approved ? 'Approved' : 'Denied'} request ${requestId}${scopeLabel}.`,
               ),
             )
-            // Same surface contract as the cli verb: when scope is
-            // session/always, surface the derived rule pattern so the
-            // operator sees exactly which future invocations the daemon
-            // will short-circuit on. Without it, an operator
-            // approving `ls /tmp/X` --session would be surprised when
-            // `ls /tmp/Y` re-prompts.
             if (resolution.rule?.pattern) {
               console.log(
                 chalk.gray(`  pattern: ${resolution.rule.tool} → ${resolution.rule.pattern}`),
@@ -880,20 +832,8 @@ export async function chatCommand(options: { url?: string; model?: string; provi
           if (resolution.outcome === 'resumed' || resolution.outcome === 'recovered') {
             console.log()
           }
-          // Resync from the daemon after a decision: the daemon is the
-          // source of truth for which requestIds are still pending (the
-          // user might have approved on another surface, or this very
-          // decision could have unblocked a chain that produced a fresh
-          // request).
           await syncPendingWaits(approvalSessionId)
         } catch (error) {
-          // ApiHttpError carries the daemon's structured envelope
-          // (status + code + message). Without friendlyErrorMessage
-          // the user sees the bare envelope.message — e.g. "approval
-          // X expired at ..." with no clue that the daemon returned
-          // 410 APPROVAL_EXPIRED. Surface the full status+code so
-          // a chat-shell operator gets the same diagnostic the cli
-          // verb already prints.
           console.log(chalk.red(`Failed to resolve approval: ${friendlyErrorMessage(error)}`))
         }
         rl.prompt()
@@ -901,17 +841,9 @@ export async function chatCommand(options: { url?: string; model?: string; provi
       }
 
       if (trimmed === '/decisions' || trimmed.startsWith('/decisions ')) {
-        // Mirror `sepilot decisions list/clear` from the cli surface so
-        // an operator inside the chat shell can audit and prune
-        // remembered approval rules without dropping out to a separate
-        // terminal. Default action is `list` to match the verb's most
-        // common need (quick "what rules am I running with?").
         const tokens = trimmed.split(/\s+/).filter(Boolean)
         const action = tokens[1] ?? 'list'
         if (action === 'list') {
-          // Mirror the cli verb's --stale / --scope / --tool filters
-          // so chat-shell operators don't need to drop out for
-          // audits.
           const tail = tokens.slice(2)
           const staleOnly = tail.includes('--stale')
           let scopeFilter: 'session' | 'always' | undefined
@@ -960,10 +892,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
               for (const decision of sortedItems) {
                 const verb = decision.approved ? chalk.green('approved') : chalk.red('denied')
                 const sessionLabel = decision.sessionId ? ` · session ${decision.sessionId}` : ''
-                // Match `sepilot decisions list` so the chat shell
-                // surfaces the same usage signal — a hits=0 rule is
-                // a cleanup candidate; a hot rule warrants policy
-                // re-examination.
                 const hits = typeof decision.hitCount === 'number'
                   ? chalk.gray(` · hits: ${decision.hitCount}`)
                   : ''
@@ -976,9 +904,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
               }
               const staleCount = sortedItems.filter((d) => isStaleRule(d, now)).length
               if (staleCount > 0 && !staleOnly) {
-                // Hint suppressed when --stale already narrowed the
-                // view; otherwise the operator just sees "N stale"
-                // applied to the very rows they explicitly asked for.
                 console.log('')
                 console.log(chalk.gray(
                   `  ${staleCount} rule${staleCount === 1 ? '' : 's'} flagged stale (no hits, ≥7d old). List with /decisions list --stale, prune with /decisions clear --scope <session|always>.`,
@@ -994,9 +919,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
           return
         }
         if (action === 'show') {
-          // Verbose detail for a tool's rule(s). Mirrors `sepilot
-          // decisions show <tool>` so chat-shell operators don't need
-          // to drop out for the deep view.
           const targetTool = tokens[2]?.trim()
           if (!targetTool) {
             console.log(chalk.red('Usage: /decisions show <tool>'))
@@ -1051,11 +973,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
           return
         }
         if (action === 'clear') {
-          // Parse optional `--scope session|always` (omit to clear all
-          // scopes). `--session <id>` is intentionally not exposed here:
-          // the chat shell already has the active sessionId pinned, so
-          // we apply scope filtering only — narrowing by other session
-          // ids belongs in the cli verb where automation handles it.
           let scope: 'session' | 'always' | undefined
           let stale = false
           let toolFilter: string | undefined
@@ -1098,11 +1015,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
         return
       }
 
-      // /sessions list — REPL parity with `sepilot sessions list`.
-      // Lets an operator pivot to a different session without
-      // dropping out of the chat shell. `/session` (singular) still
-      // shows the current session detail; `/sessions` (plural) maps
-      // to the list verb so the muscle memory matches.
       if (trimmed === '/sessions' || trimmed.startsWith('/sessions ')) {
         const tokens = trimmed.split(/\s+/).filter(Boolean)
         const action = tokens[1] ?? 'list'
@@ -1153,8 +1065,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
                   ? `  ${chalk.gray(`appr: ${counters.approvalsRequested}/${counters.approvalsApproved}/${counters.approvalsDenied}`
                     + (counters.autoApprovalsApproved > 0 ? ` · auto: ${counters.autoApprovalsApproved}` : ''))}`
                   : ''
-                // Mirror cli verb's fixed-width row so an operator
-                // glancing across surfaces sees the same shape.
                 const idCol = s.id.length > 18 ? `${s.id.slice(0, 17)}…` : s.id.padEnd(18)
                 const titleCol = (s.title ?? '').length > 30
                   ? `${(s.title ?? '').slice(0, 29)}…`
@@ -1178,13 +1088,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
           return
         }
         if (action === 'show') {
-          // In-REPL deep view: pairs with /sessions list so an
-          // operator who spotted an interesting row can pivot to its
-          // detail inline. Mirrors `sepilot sessions show <id>` text
-          // mode — Approvals block + Working memory keyDecisions +
-          // pending count + small events tail. Skips the verbose
-          // events tail (10 rows in cli verb) for a 5-row preview
-          // since chat shell screen real estate is tighter.
           const targetId = tokens[2]?.trim()
           if (!targetId) {
             console.log(chalk.red('Usage: /sessions show <id>'))
@@ -1238,10 +1141,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
             if (events.length > 0) {
               console.log(chalk.gray(`  events (${events.length}, last ${Math.min(events.length, tailLimit)}):`))
               for (const event of events.slice(-tailLimit)) {
-                // Compact one-line per event — full render lives in
-                // the cli verb. Use the type tag so an operator can
-                // tell at a glance "approval_request, approval_response,
-                // tool_call, etc." without parsing free-form copy.
                 const tag = `[${event.type}]`
                 const summary = (() => {
                   if (event.type === 'user_message' || event.type === 'assistant_message') {
@@ -1273,9 +1172,6 @@ export async function chatCommand(options: { url?: string; model?: string; provi
         return
       }
 
-      // /stats — REPL parity with `sepilot stats`. Shares the same
-      // buildStats + formatStatsSnapshot helpers as the cli verb so
-      // the dashboard layout is byte-identical across surfaces.
       if (trimmed === '/stats') {
         try {
           const [sessions, decisionsResp] = await Promise.all([
@@ -1322,16 +1218,8 @@ export async function chatCommand(options: { url?: string; model?: string; provi
     try {
       await sendPrompt(trimmed)
       console.log()
-      // A run can leave new approvals pending or resolve old ones (e.g.
-      // an approval on another surface, or a checkpoint replay). Reconcile
-      // before drawing the next prompt so the indicator never lies.
       await syncPendingWaits()
     } catch (err) {
-      // Surface the same friendly stream / http copy as `sepilot ask` so
-      // the interactive shell doesn't drop the user back to the prompt
-      // with an opaque `Error: terminated`. Falls through to the raw
-      // message only if the error isn't a stream/http failure we know
-      // how to classify.
       if (!printStreamError(err, { sessionId }) && !printApiError(err)) {
         console.log(chalk.red(`Error: ${err instanceof Error ? err.message : err}\n`))
       }
@@ -1607,7 +1495,7 @@ Commands:
         try {
           const config = await ctx.httpClient.config()
           console.log(chalk.gray('Autonomy: ') + formatAutonomyLabel(config.agent?.autonomy))
-        } catch { /* fall through */ }
+        } catch {}
         console.log(chalk.red(`Usage: /autonomy <${valid.join('|')}>`))
         return {}
       }
@@ -1617,8 +1505,6 @@ Commands:
         })
         console.log(chalk.gray('Autonomy: ') + formatAutonomyLabel(level))
         if (level === 'autonomous') {
-          // Loud warning so the user can't accidentally page-up the cli
-          // history later and miss that they turned approvals off.
           console.log(
             chalk.red(
               '  Warning: tools will now run without approval prompts. Use `/autonomy supervised` to revert.',
@@ -1657,8 +1543,6 @@ Commands:
     case '/usage':
       try {
         const usage = await ctx.httpClient.usage()
-        // Match `sepilot usage summary` formatting so the two paths
-        // present the same numbers in the same shape.
         console.log(chalk.gray(`  Input tokens:  ${usage.inputTokens.toLocaleString()}`))
         console.log(chalk.gray(`  Output tokens: ${usage.outputTokens.toLocaleString()}`))
         console.log(chalk.gray(`  Cost:          $${usage.costUsd.toFixed(4)}`))

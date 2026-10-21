@@ -1,5 +1,5 @@
 import { mkdir, readFile, readdir, rm, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { resolve, sep } from 'node:path'
 import type {
   ActiveSkillExecutionPolicy,
   AgentRunContract,
@@ -14,10 +14,6 @@ import type { AgentState as GraphAgentState } from '../../agent/graph/types.js'
 
 const log = createLogger('approval-checkpoints')
 
-/**
- * Clone a checkpoint scope at the trust boundary. A malformed persisted scope
- * must stop resume instead of silently degrading to an unscoped/global run.
- */
 export function cloneCheckpointScopeTags(scopeTags: unknown): string[] | undefined {
   if (scopeTags === undefined) return undefined
   if (!Array.isArray(scopeTags) || scopeTags.some((tag) => typeof tag !== 'string')) {
@@ -26,11 +22,6 @@ export function cloneCheckpointScopeTags(scopeTags: unknown): string[] | undefin
   return [...scopeTags]
 }
 
-/**
- * Clone the structured skill ids that define execution invariants for a turn.
- * Persisted checkpoint JSON is an external trust boundary, so malformed ids
- * must fail resume instead of silently disabling the selected skill behavior.
- */
 export function cloneCheckpointExecutionSkillIds(
   executionSkillIds: unknown,
 ): string[] | undefined {
@@ -53,6 +44,17 @@ export function cloneCheckpointSkillToolNames(value: unknown): string[] | undefi
     throw new Error('Checkpoint skillToolNames must be an array of strings')
   }
   return [...value]
+}
+
+export function cloneCheckpointMemoryPolicy(value: unknown): ApprovalRunCheckpoint['memoryPolicy'] {
+  if (value === undefined) return undefined
+  if (!isRecord(value) || typeof value.read !== 'boolean' || typeof value.write !== 'boolean'
+    || ['automaticRead', 'automaticWrite'].some(key => value[key] !== undefined && typeof value[key] !== 'boolean')) {
+    throw new Error('Checkpoint memoryPolicy must contain boolean read/write restrictions')
+  }
+  return { read: value.read, write: value.write,
+    ...(typeof value.automaticRead === 'boolean' ? { automaticRead: value.automaticRead } : {}),
+    ...(typeof value.automaticWrite === 'boolean' ? { automaticWrite: value.automaticWrite } : {}) }
 }
 
 export function cloneCheckpointToolAllowlist(value: unknown): string[] | undefined {
@@ -240,6 +242,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export interface ApprovalRunCheckpoint {
+  deadlineAt?: number
   autonomy?: import('@sepilotd/core').AutonomyLevel
   requestId: string
   sessionId: string
@@ -251,16 +254,13 @@ export interface ApprovalRunCheckpoint {
   cwd?: string
   workspaceRoot?: string
   workspaceIsolation?: 'policy' | 'strict'
-  /** Caller memory scope preserved across approval pauses. */
   scopeTags?: string[]
-  /** Structured skill execution invariants preserved across approval pauses. */
   executionSkillIds?: string[]
-  /** Declared tool surface and execution profile preserved across approval pauses. */
   skillToolNames?: string[]
-  /** Exact tool registry surface used before the approval pause. */
+  memoryPolicy?: { read: boolean; write: boolean; automaticRead?: boolean; automaticWrite?: boolean }
   toolAllowlist?: string[]
+  delegationToolAllowlist?: string[]
   skillExecutionPolicies?: ActiveSkillExecutionPolicy[]
-  /** Preserve the per-turn explicit tool-approval guard across approval pauses. */
   requireToolApproval?: boolean
   messages: Message[]
   toolCalls: ToolCall[]
@@ -269,6 +269,7 @@ export interface ApprovalRunCheckpoint {
   iteration: number
   maxIterations: number
   thinkingLevel?: string
+  thinkingLevelSource?: import('../../providers/thinking-policy.js').ThinkingLevelSource
   textDeltaMode?: 'buffered' | 'live'
   graphState?: GraphAgentState
   runContract?: AgentRunContract
@@ -303,7 +304,16 @@ export class ApprovalCheckpointStore {
   }
 
   async get(requestId: string): Promise<ApprovalRunCheckpoint | null> {
-    const path = this.filePath(requestId)
+    let path: string
+    try {
+      path = this.filePath(requestId)
+    } catch (err) {
+      log.warn('rejected unsafe checkpoint requestId', {
+        requestId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return null
+    }
     let raw: string
     try {
       raw = await readFile(path, 'utf-8')
@@ -335,7 +345,13 @@ export class ApprovalCheckpointStore {
   }
 
   async delete(requestId: string): Promise<void> {
-    await rm(this.filePath(requestId), { force: true })
+    let path: string
+    try {
+      path = this.filePath(requestId)
+    } catch {
+      return
+    }
+    await rm(path, { force: true })
   }
 
   async deleteForSession(
@@ -414,7 +430,12 @@ export class ApprovalCheckpointStore {
   }
 
   private filePath(requestId: string): string {
-    return join(this.checkpointDir, `${requestId}.json`)
+    const root = resolve(this.checkpointDir) + sep
+    const resolved = resolve(this.checkpointDir, `${requestId}.json`)
+    if (!resolved.startsWith(root)) {
+      throw new Error(`unsafe checkpoint requestId: ${requestId}`)
+    }
+    return resolved
   }
 
   private async readEntries(): Promise<string[]> {

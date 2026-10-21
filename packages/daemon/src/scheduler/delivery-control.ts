@@ -20,11 +20,6 @@ function dispositionFromMetadata(
   return control.disposition
 }
 
-/**
- * Capture a built-in monitor's structured delivery decision from one agent
- * run. Tool-call identity is joined locally so model prose and plugin metadata
- * cannot suppress a scheduled message by imitating the result shape.
- */
 export class ScheduledDeliveryTracker {
   private readonly toolNames = new Map<string, string>()
   private disposition: ScheduledDeliveryDisposition | null = null

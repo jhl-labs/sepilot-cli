@@ -1,6 +1,7 @@
 import { Box, Static, Text } from 'ink'
 import { useRef } from 'react'
 import wrapAnsi from 'wrap-ansi'
+import type { ActivityItem } from '@sepilotd/api-client'
 import type { Message, ToolCallState } from '../../types.js'
 import { colors } from '../../theme.js'
 import { MessageBubble } from '../../components/MessageBubble.js'
@@ -10,6 +11,24 @@ import { createCommitLog, selectCommits } from '../runtime/commit-log.js'
 
 export const LIVE_REGION_MAX_ROWS = 12
 const MAX_VISIBLE_TOOLS = 3
+const MAX_VISIBLE_DELEGATES = 3
+
+export function selectLiveDelegates(activities: readonly ActivityItem[] | undefined): Array<{ id: string; label: string; detail: string }> {
+  if (!activities?.length) return []
+  const latest = new Map<string, ActivityItem>()
+  for (const activity of activities) {
+    if (activity.kind !== 'subagent' || !activity.meta) continue
+    latest.set(activity.meta, activity)
+  }
+  return [...latest.values()]
+    .filter((activity) => activity.status === 'running')
+    .slice(-MAX_VISIBLE_DELEGATES)
+    .map((activity) => ({
+      id: activity.meta!,
+      label: activity.label.replace(/^subagent(?: · )?/u, '') || 'subagent',
+      detail: activity.detail,
+    }))
+}
 
 export interface ConversationProps {
   messages: Message[]
@@ -18,13 +37,8 @@ export interface ConversationProps {
   runningTools: ToolCallState[]
   compactTools?: boolean
   showBrandMark?: boolean
-  /** Shared run activity frame; avoids a second tool-only animation timer. */
   activityFrame?: string | null
-  /**
-   * Keep already committed scrollback mounted, but freeze the mutable tail.
-   * Full-height inline dialogs use this so Ink never renders a frame taller
-   * than the terminal and promotes the dialog itself into host scrollback.
-   */
+  activities?: readonly ActivityItem[]
   suspended?: boolean
 }
 
@@ -33,6 +47,7 @@ export function Conversation({
   isStreaming,
   width,
   runningTools,
+  activities,
   compactTools = true,
   showBrandMark = true,
   activityFrame = null,
@@ -53,7 +68,8 @@ export function Conversation({
     0,
     runningTools.filter(({ status }) => status === 'running').length - MAX_VISIBLE_TOOLS,
   )
-  const liveRowBudget = LIVE_REGION_MAX_ROWS - (visibleTools.length > 0 ? 1 : 0)
+  const delegates = suspended || !isStreaming ? [] : selectLiveDelegates(activities)
+  const liveRowBudget = LIVE_REGION_MAX_ROWS - (visibleTools.length > 0 ? 1 : 0) - delegates.length
   const visibleLive = live.slice(-liveRowBudget)
   const messageRowBudget = Math.max(1, Math.floor(liveRowBudget / Math.max(1, visibleLive.length)))
   const toolSpinner = activityFrame ?? '[-]'
@@ -67,7 +83,7 @@ export function Conversation({
       <Static items={commits}>
         {(item) => <MessageBlock key={item.id} message={item} width={width} compactTools={compactTools} />}
       </Static>
-      {live.length > 0 || visibleTools.length > 0 ? (
+      {live.length > 0 || visibleTools.length > 0 || delegates.length > 0 ? (
         <Box flexDirection="column">
           {visibleLive.map((item) => (
             <LiveMessageBlock
@@ -86,6 +102,11 @@ export function Conversation({
               }`}
             </Text>
           ) : null}
+          {delegates.map((delegate) => (
+            <Text key={delegate.id} color={colors.dimText} wrap="truncate-end">
+              {`    ↳ ${delegate.label} · ${delegate.detail}`}
+            </Text>
+          ))}
         </Box>
       ) : null}
     </Box>
@@ -121,12 +142,15 @@ function LiveMessageBlock({
     return <MessageBlock message={message} width={width} compactTools />
   }
 
-  const marker = message.variant === 'thinking' ? '◐ Thinking · ' : `${roleMarker(message.role)} `
+  const thinking = message.variant === 'thinking'
+  const marker = thinking ? '' : `${roleMarker(message.role)} `
   const wrapped = wrapAnsi(`${marker}${message.content}`, Math.max(1, width), {
     hard: true,
     trim: false,
   }).split('\n')
-  const visible = wrapped.slice(-Math.max(1, rowBudget))
+  const budget = thinking ? Math.min(4, rowBudget) : rowBudget
+  const visible = wrapped.slice(-Math.max(1, budget - (thinking ? 1 : 0)))
+  if (thinking && budget > 1) visible.unshift('◐ Thinking · Ctrl+O expand')
 
   return (
     <Text wrap="truncate-end" color={message.variant === 'thinking' ? colors.dimText : message.role === 'user' ? colors.primary : colors.text}>

@@ -1,4 +1,5 @@
 import type {
+  ChatRequest,
   AgentContext,
   AgentEvent,
   AgentExecutionCapability,
@@ -14,8 +15,14 @@ import type {
   MemoryDocumentChunk,
   MemoryEntry,
   Message,
+  TokenUsage,
 } from '@sepilotd/core'
 import { randomUUID } from 'node:crypto'
+import { recallObservedMaxOutputTokens, resolveModelOutputAllowance } from './max-output-token-recovery.js'
+import { hasBinaryThinkingControl, resolveControlThinkingLevel, type ThinkingLevelSource } from '../providers/thinking-policy.js'
+
+const CONTROL_PLANNER_REASONING_HEADROOM_CAP_TOKENS = 32_000
+import { fitControlRequest } from './context-manager.js'
 import { createToolDiscoveryContext } from './tool-discovery-context.js'
 import { createAbortError, getAbortError, isAbortError } from '../abort.js'
 import type { HookRegistry } from '../hook/registry.js'
@@ -35,12 +42,14 @@ import {
   type ProviderCircuitBreaker,
 } from '../providers/circuit-breaker.js'
 import type { PolicyEngine } from '../security/policy-engine.js'
-import type { ActiveRunRegistry } from '../server/runtime/active-runs.js'
+import type { ActiveRunRegistry, SessionRunContextUpdate } from '../server/runtime/active-runs.js'
+import { isApprovalParkedError } from '../server/runtime/approvals.js'
 import {
   cloneCheckpointExecutionSkillIds,
   cloneCheckpointScopeTags,
   cloneCheckpointSkillExecutionPolicies,
   cloneCheckpointSkillToolNames,
+  cloneCheckpointMemoryPolicy,
   cloneCheckpointToolAllowlist,
   type ApprovalRunCheckpoint,
 } from '../server/runtime/checkpoints.js'
@@ -72,6 +81,9 @@ import {
 } from './iteration-budget.js'
 import type { GraphAgentRegistry, GraphBuilder } from './graph/registry.js'
 import type { AgentState, GraphExecutionContext } from './graph/types.js'
+import { stopReasonUserAbort, stopReasonWallClock } from './stop-reason.js'
+import { resolveRunWallClock } from './progress-signal.js'
+import { withEscalationOffer } from './graph/run-escalation.js'
 import { resolveInstantModeToolNames } from './instant-mode-tool-intent.js'
 import { latestUserText } from './memory-write-completion.js'
 import {
@@ -95,6 +107,7 @@ import {
 import { buildRetrievalQuery } from './query-context.js'
 import { checkSpendBudget, type SpendBudgetConfig } from './spend-guard.js'
 import {
+  acceptsRunContractAuthority,
   buildDurableRunContractGroundingAuditRequest,
   buildDurableRunContractPlanningRequest,
   continueRunContractForTurn,
@@ -102,6 +115,7 @@ import {
   DURABLE_RUN_CONTRACT_TOOL_NAME,
   formatRunContractForPrompt,
   parseDurableRunContractPlan,
+  RUN_CONTRACT_AUTHORITY_TOOL_NAME,
 } from './task-contract.js'
 import {
   cloneMessage,
@@ -149,7 +163,11 @@ function observeAgentRunHookEvent(
   } else if (event.type === 'message') {
     observation.output = event.content.slice(-64_000)
   } else if (event.type === 'done') {
-    observation.status = 'success'
+    const kind = event.stopReason?.kind
+    if (kind === 'incomplete' || kind === 'blocked') observation.status = 'incomplete'
+    else if (kind === 'cancelled') observation.status = 'aborted'
+    else if (kind === 'error') observation.status = 'error'
+    else observation.status = 'success'
     observation.usage = { ...event.usage }
   } else if (event.type === 'error') {
     observation.status = 'error'
@@ -184,6 +202,23 @@ function completeAgentRunHookData(
   }
 }
 
+function callerDeadlineOutcome(
+  deadlineAt: number | undefined,
+  usage: TokenUsage = { inputTokens: 0, outputTokens: 0 },
+): AgentEvent[] | null {
+  if (deadlineAt === undefined || resolveRunWallClock(Date.now(), deadlineAt, '').budgetMs !== 0) return null
+  const stopReason = stopReasonWallClock(0)
+  return [{ type: 'message', content: stopReason.summary ?? 'Run deadline reached.' }, { type: 'done', usage, stopReason }]
+}
+
+function safeFallbackPending(probe: () => boolean): boolean {
+  try {
+    return probe() === true
+  } catch {
+    return false
+  }
+}
+
 export { isAutoRouterExcludedGraphMode } from './mode-catalog.js'
 
 const MEMORY_SEARCH_LIMIT = 6
@@ -198,44 +233,34 @@ type MemoryContextSemanticIndex = ISemanticIndex & Partial<IDocumentMemoryStore>
 export interface ModeRouterOptions {
   provider: ILLMProvider
   tools: ToolRegistry
-  /** Authorization ceiling retained independently from initial schema projection. */
   authorizedTools?: ToolRegistry
+  delegationTools?: ToolRegistry
   activeRemoteBrowser?: boolean
   policy: PolicyEngine
   autonomy: AutonomyLevel
   semanticIndex?: MemoryContextSemanticIndex
   systemPrompt?: string
+  systemToolGuidance?: import('./system-prompt.js').SystemToolGuidanceOptions
   maxIterations?: number
   previousMessages?: Message[]
   defaultMode?: AgentMode
   auditLogger?: IAuditLogger
   usageTracker?: UsageTracker
-  /**
-   * Daily/session USD spend caps checked once per turn before dispatch (covers
-   * both react and graph modes). undefined means unlimited.
-   */
   spendBudget?: SpendBudgetConfig
   hookRegistry?: HookRegistry
   deviceName?: string
   thinkingLevel?: string
+  thinkingLevelSource?: ThinkingLevelSource
   maxTokens?: number
   temperature?: number
   auxModel?: string
   textDeltaMode?: 'buffered' | 'live'
-  /** When explicitly false, skip document RAG retrieval for this turn. */
   ragEnabled?: boolean
-  /** Roster forwarded to the persona-panel graph; other modes ignore it. */
   panelPersonas?: import('./personas.js').Persona[]
-  /** How the persona-panel graph schedules the resolved roster. */
   panelStrategy?: 'sequential' | 'moderated'
   llmCache?: LLMCache
   providerCircuitBreaker?: ProviderCircuitBreaker
   auxiliaryLlmBudget?: AuxiliaryLlmTurnBudget
-  /**
-   * Cooldown for optional auxiliary stages that keep timing out on the
-   * active provider/model. `null` disables the breaker; omitted uses the
-   * process-wide instance.
-   */
   auxiliaryStageCircuit?: AuxiliaryStageCircuit | null
   graphRegistry?: GraphAgentRegistry
   graphNodeModelOverrides?: import('../config/schema.js').SepilotdConfig['agent']['graphNodeModelOverrides']
@@ -263,22 +288,11 @@ export interface ModeRouterOptions {
   strictFinalAnswerProtocol?: boolean
   reviewToollessFinals?: boolean
   durableRunContracts?: boolean
+  stagePolicy?: import('./bots/types.js').RoleBotStagePolicy
+  memoryRetrieval?: boolean
   maxContinuationCycles?: number
-  /**
-   * Explicit hard cap. Only benches/automation set this; a client-supplied
-   * `maxIterations` alone is a requested budget and keeps continuation cycles.
-   */
   hardMaxIterations?: boolean
-  /** Execution surface used to pick iteration/continuation defaults (default `chat`). */
   budgetSurface?: RunBudgetSurface
-  /**
-   * Per-turn mode decision from the cheap intent router, when one ran. Auto
-   * routing trusts a confident, non-fallback hint instead of re-routing the
-   * same turn with a second LLM call — the two routers previously decided
-   * independently and the cheap router's choice was always discarded. Low or
-   * medium confidence (or a fallback decision) keeps the contract-aware auto
-   * router in charge.
-   */
   intentModeHint?: {
     mode: string
     confidence: 'high' | 'medium' | 'low'
@@ -286,11 +300,6 @@ export interface ModeRouterOptions {
     executionIntent?: import('@sepilotd/core').AgentExecutionIntent
     contractRelation?: 'continue' | 'new' | 'review'
   }
-  /**
-   * Persist a transport-flip observed during the run to session storage so the
-   * next turn can seed it (see SessionMeta.preferPromptReact). Invoked only when
-   * the flip value actually changed during the run.
-   */
   persistTransportPreference?: (
     sessionId: string,
     preferPromptReact: boolean | undefined,
@@ -325,6 +334,17 @@ function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T
   })
 }
 
+function requestAuthorityForRecord(
+  context: AgentContext,
+): Pick<SessionRunContextUpdate, 'toolNames' | 'bot' | 'surface'> {
+  const none = context.requestAuthorityComplete === true ? null : undefined
+  return {
+    toolNames: context.requestedToolNames ?? none,
+    bot: context.roleBotId ?? none,
+    surface: context.surface ?? none,
+  }
+}
+
 export class AgentModeRouter {
   private options: ModeRouterOptions
   private transferredGraphState?: AgentState
@@ -332,14 +352,26 @@ export class AgentModeRouter {
   private graphCache = new Map<string, AgentGraph>()
   private activeReactEngine: AgentEngine | null = null
   private activeGraphState: AgentState | null = null
+  private activeGraphContext: GraphExecutionContext | null = null
+  private stopRequested = false
+  private readonly graphDeps = new Map<string, { autonomy: AutonomyLevel }>()
   private activeGraphAbortController: AbortController | null = null
   private activeRunAbortController: AbortController | null = null
+  private lastRunSessionId?: string
 
   constructor(options: ModeRouterOptions) {
     this.options = {
       ...options,
       auxiliaryLlmBudget: options.auxiliaryLlmBudget ?? createAuxiliaryLlmTurnBudget(),
     }
+  }
+
+  setAutonomy(level: AutonomyLevel): void {
+    this.options = { ...this.options, autonomy: level }
+    this.activeReactEngine?.setAutonomy(level)
+    if (this.activeGraphContext) this.activeGraphContext.autonomy = level
+    for (const deps of this.graphDeps.values()) deps.autonomy = level
+    if (this.lastRunSessionId) this.options.activeRuns?.updateRecordedAutonomy(this.lastRunSessionId, level)
   }
 
   private createReactEngine(
@@ -362,12 +394,14 @@ export class AgentModeRouter {
       hardMaxIterations: overrides.hardMaxIterations ?? this.options.hardMaxIterations,
       modeControl: this.modeControl,
       semanticRouting: true,
+      systemToolGuidance: this.options.systemToolGuidance,
       auditLogger: this.options.auditLogger,
       usageTracker: this.options.usageTracker,
       spendBudget: this.options.spendBudget,
       hookRegistry: this.options.hookRegistry,
       deviceName: this.options.deviceName,
       thinkingLevel: this.options.thinkingLevel,
+      thinkingLevelSource: this.options.thinkingLevelSource,
       maxTokens: this.options.maxTokens,
       temperature: this.options.temperature,
       textDeltaMode,
@@ -394,9 +428,6 @@ export class AgentModeRouter {
       reviewOutcomes: overrides.reviewOutcomes,
       reviewToollessFinals: overrides.reviewToollessFinals ?? this.options.reviewToollessFinals,
       maxContinuationCycles: this.maxContinuationCycles(),
-      // The mode-router owns the pre:/post:agent:run gate at its run boundary so
-      // react and graph turns gate identically; suppress the engine's own firing
-      // to avoid double-firing for react turns routed through here.
       emitAgentRunHooks: false,
     })
   }
@@ -420,12 +451,12 @@ export class AgentModeRouter {
     const contractRelation = this.confidentContractRelationHint()
     let continuingContract = !restoredFromPreviousTurn
       ? context.runContract
-      : contractRelation === 'continue'
+      : context.completionRequest === undefined && contractRelation === 'continue'
         ? continueRunContractForTurn(context.runContract, input)
-        : contractRelation === 'new' || contractRelation === 'review'
-          ? undefined
-          : undefined
-    const executionIntentHint = this.confidentExecutionIntentHint()
+        : undefined
+    const executionIntentHint = context.completionRequest === undefined
+      ? this.confidentExecutionIntentHint()
+      : undefined
     if (contractRelation === 'continue' && continuingContract && executionIntentHint) {
       continuingContract = {
         ...continuingContract,
@@ -433,7 +464,7 @@ export class AgentModeRouter {
       }
     }
     const resolved = this.resolveAgentContext(context, input)
-    if (restoredFromPreviousTurn && context.runContract && !continuingContract && contractRelation !== 'new') {
+    if (restoredFromPreviousTurn && context.runContract && !continuingContract && contractRelation !== 'new' && context.completionRequest === undefined) {
       resolved.previousMessages = [
         { role: 'system', content: '[Previous task context: reference only; determine whether the current request continues this goal.]\n' + formatRunContractForPrompt(context.runContract) },
         ...(resolved.previousMessages ?? []),
@@ -452,7 +483,8 @@ export class AgentModeRouter {
   }
 
   private durableRunContractPlannerEnabled(): boolean {
-    return process.env.SEPILOTD_RUN_CONTRACT_PLANNER !== '0'
+    return this.options.stagePolicy?.contractPlanner !== false
+      && process.env.SEPILOTD_RUN_CONTRACT_PLANNER !== '0'
   }
 
   private shouldPlanDurableRunContract(mode: AgentMode): boolean {
@@ -465,12 +497,6 @@ export class AgentModeRouter {
     contract: AgentRunContract,
   ): boolean {
     if (mode === 'instant') return false
-    // ReAct owns a lean execution loop, not a separate evidence policy. Keep
-    // conversational turns contract-free, while attaching the deterministic
-    // fallback whenever semantic routing or structural parsing established a
-    // non-conversational execution boundary. This gives operational and
-    // inspection turns the same durable ledger/evaluation surface as graph
-    // modes without adding a contract-planner request to the latency path.
     if (mode === 'react') {
       return Boolean(
         contract.executionIntent
@@ -489,14 +515,17 @@ export class AgentModeRouter {
     if (mode === 'instant' || !this.durableRunContractsEnabled() || context.runContract) {
       return context
     }
-    const executionIntentHint = this.confidentExecutionIntentHint()
+    const completionInput = context.completionRequest ?? input
+    const executionIntentHint = context.completionRequest === undefined
+      ? this.confidentExecutionIntentHint()
+      : undefined
     const fallback: AgentRunContract = {
-      source: 'fallback', summary: input,
-      acceptanceCriteria: [{ id: 'outcome', text: 'Complete the current request and substantiate any actions with tool evidence.' }],
+      source: 'fallback', summary: completionInput,
+      acceptanceCriteria: [{ id: 'outcome', text: context.completionRequest ?? 'Complete the current request and substantiate any actions with tool evidence.' }],
       constraints: [], outOfScope: [],
       ...(executionIntentHint ? { executionIntent: executionIntentHint } : {}),
     }
-    if (!this.shouldAttachDurableRunContract(mode, fallback)) {
+    if (!this.shouldAttachDurableRunContract(mode, fallback) && context.completionRequest === undefined) {
       return context
     }
     if (
@@ -506,11 +535,7 @@ export class AgentModeRouter {
     ) {
       return context
     }
-    // A single literal substitution already has a conservative structural
-    // boundary and the coder graph routes it through a file-only loop. A
-    // second model call cannot add useful decomposition or evidence policy,
-    // but it delays the first read substantially on local/remote models.
-    if (isFocusedSingleFileReplacement(input)) {
+    if (isFocusedSingleFileReplacement(completionInput)) {
       return {
         ...context,
         runContract: fallback,
@@ -535,10 +560,6 @@ export class AgentModeRouter {
       context.model,
     )
     if (stageCircuit?.isOpen(circuitKey)) {
-      // This model has repeatedly failed to plan a contract inside the
-      // auxiliary budget. Spending the full timeout again before returning the
-      // same fallback only delays the turn; the fallback contract is the
-      // honest result either way.
       await logAgentDebugTrace({
         event: 'aux.stage.skipped',
         source: 'mode-router',
@@ -557,27 +578,70 @@ export class AgentModeRouter {
       const nativeToolUse = this.options.provider.models.find(
         (candidate) => candidate.id === context.model,
       )?.capabilities.toolUse !== false
-      const request = buildDurableRunContractPlanningRequest({
-        model: context.model,
-        userRequest: input,
-        cwd: context.cwd,
-        fallback,
-        nativeToolUse,
-        availableToolNames: this.options.tools.list().map((tool) => tool.name),
-      })
-      const response = await runAuxiliaryLlmChat({
+      const modelInfo = this.options.provider.models.find(model => model.id === context.model)
+      const buildPlanningRequest = (native: boolean): ChatRequest => {
+        const planning = buildDurableRunContractPlanningRequest({
+          model: context.model,
+          userRequest: completionInput,
+          cwd: context.cwd,
+          fallback,
+          nativeToolUse: native,
+          availableToolNames: this.options.tools.list().map((tool) => tool.name),
+        })
+        const plannerDecisionTokens = planning.maxTokens!
+        const plannerAllowance = modelInfo?.capabilities.thinking
+          ? Math.min(Math.max(plannerDecisionTokens * 12, 8_000), CONTROL_PLANNER_REASONING_HEADROOM_CAP_TOKENS)
+          : plannerDecisionTokens
+        planning.maxTokens = Math.min(plannerAllowance, resolveModelOutputAllowance({
+          requested: this.options.maxTokens,
+          modelMaximum: modelInfo?.maxOutputTokens,
+          observedMaximum: recallObservedMaxOutputTokens(this.options.provider.id, context.model),
+          fallback: plannerAllowance,
+        }))
+        planning.thinkingLevel = resolveControlThinkingLevel(this.options.thinkingLevel ?? 'auto', {
+          binaryThinking: hasBinaryThinkingControl(modelInfo),
+          source: this.options.thinkingLevelSource,
+        })
+        Object.assign(planning, fitControlRequest(planning, modelInfo))
+        return planning
+      }
+      const runPlanner = (planning: ChatRequest, label: string) => runAuxiliaryLlmChat({
         provider: this.options.provider,
-        request,
-        label: 'Durable run contract planner',
+        request: planning,
+        label,
         breaker: this.options.providerCircuitBreaker,
         signal,
         sessionId: context.sessionId,
-        // Contract construction is required execution control-plane work, not
-        // optional enrichment. A slow intent/router call must not consume the
-        // planner's entire wall-clock allowance and silently replace the
-        // user's concrete completion criteria with the generic fallback.
         budget: createAuxiliaryLlmTurnBudget(),
       })
+      let plannerNativeToolUse = nativeToolUse
+      let request = buildPlanningRequest(plannerNativeToolUse)
+      let response: Awaited<ReturnType<typeof runAuxiliaryLlmChat>>
+      try {
+        response = await runPlanner(request, 'Durable run contract planner')
+      } catch (error) {
+        if (
+          !plannerNativeToolUse
+          || !(error instanceof AuxiliaryLlmTimeoutError || error instanceof AuxiliaryLlmBudgetExhaustedError)
+        ) throw error
+        await logAgentDebugTrace({
+          event: 'aux.stage.retried',
+          source: 'mode-router',
+          sessionId: context.sessionId,
+          runId: context.sessionId,
+          status: 'retry',
+          data: {
+            stage: 'durable-run-contract-planner',
+            provider: this.options.provider.id,
+            model: context.model,
+            reason: error instanceof Error ? error.message : String(error),
+            transport: 'prompt-json',
+          },
+        })
+        plannerNativeToolUse = false
+        request = buildPlanningRequest(plannerNativeToolUse)
+        response = await runPlanner(request, 'Durable run contract planner (prompt retry)')
+      }
       stageCircuit?.recordSuccess(circuitKey)
       const structuredContract = response.message.toolCalls?.find(
         (toolCall) => toolCall.name === DURABLE_RUN_CONTRACT_TOOL_NAME,
@@ -588,15 +652,10 @@ export class AgentModeRouter {
           : this.extractAutoModeResponse(response.message.content),
         fallback,
         {
-          userRequest: input,
+          userRequest: completionInput,
           availableToolNames: this.options.tools.list().map((tool) => tool.name),
         },
       )
-      // Invalid/malformed planning already returned the conservative fallback;
-      // there is no model-authored scope to audit and another call would only
-      // add latency. A valid candidate receives one independent semantic
-      // authority audit. If that audit fails or is malformed, its parser
-      // returns fallback rather than executing an ungrounded candidate.
       if (candidate === fallback) {
         return {
           ...context,
@@ -605,12 +664,15 @@ export class AgentModeRouter {
       }
       const auditRequest = buildDurableRunContractGroundingAuditRequest({
         model: context.model,
-        userRequest: input,
+        userRequest: completionInput,
         cwd: context.cwd,
         candidate,
         fallback,
-        nativeToolUse,
+        nativeToolUse: plannerNativeToolUse,
       })
+      auditRequest.maxTokens = request.maxTokens
+      auditRequest.thinkingLevel = request.thinkingLevel
+      Object.assign(auditRequest, fitControlRequest(auditRequest, this.options.provider.models.find(model => model.id === context.model)))
       const auditResponse = await runAuxiliaryLlmChat({
         provider: this.options.provider,
         request: auditRequest,
@@ -620,21 +682,21 @@ export class AgentModeRouter {
         budget: createAuxiliaryLlmTurnBudget(),
         sessionId: context.sessionId,
       })
-      const auditedStructuredContract = auditResponse.message.toolCalls?.find(
-        (toolCall) => toolCall.name === DURABLE_RUN_CONTRACT_TOOL_NAME,
-      )?.arguments
+      const auditCalls = auditResponse.message.toolCalls ?? []
+      const validAuditSurface = plannerNativeToolUse
+        ? auditCalls.length === 1 && auditCalls[0]?.name === RUN_CONTRACT_AUTHORITY_TOOL_NAME
+        : auditCalls.length === 0
+      const auditedStructuredContract = validAuditSurface ? auditCalls[0]?.arguments : undefined
+      const accepted = validAuditSurface && auditResponse.finishReason !== 'length' && acceptsRunContractAuthority(
+        auditedStructuredContract
+          ? JSON.stringify(auditedStructuredContract)
+          : this.extractAutoModeResponse(auditResponse.message.content),
+        completionInput,
+        candidate,
+      )
       return {
         ...context,
-        runContract: parseDurableRunContractPlan(
-          auditedStructuredContract
-            ? JSON.stringify(auditedStructuredContract)
-            : this.extractAutoModeResponse(auditResponse.message.content),
-          fallback,
-          {
-            userRequest: input,
-            availableToolNames: this.options.tools.list().map((tool) => tool.name),
-          },
-        ),
+        runContract: accepted ? candidate : fallback,
       }
     } catch (error) {
       if (isAbortError(error)) {
@@ -804,6 +866,7 @@ export class AgentModeRouter {
     input: string,
     context: AgentContext,
   ): Promise<{ relevantMemories: string[]; relevantContextItems: MemoryContextItem[] }> {
+    if (context.memoryPolicy?.read === false || context.memoryPolicy?.automaticRead === false) return { relevantMemories: [], relevantContextItems: [] }
     const query = buildRetrievalQuery(
       context.memoryQuery ?? input,
       context.previousMessages ?? [],
@@ -834,10 +897,6 @@ export class AgentModeRouter {
         documentResults = filterAppIndexEntries(
           await this.options.semanticIndex.searchDocuments(query, {
             type: 'hybrid',
-            // Scope filtering happens after retrieval because visibility can
-            // match any user/group/project tag or the first-party legacy
-            // capability. Over-fetch scoped candidates so foreign top hits do
-            // not starve a visible document that ranks just below them.
             limit: context.scopeTags?.length ? SCOPED_MEMORY_SEARCH_LIMIT : 3,
             minScore: 0.08,
           }),
@@ -891,9 +950,11 @@ export class AgentModeRouter {
   }
 
   private async hydrateResolvedAgentContext(input: string, resolved: AgentContext): Promise<AgentContext> {
+    if (resolved.memoryPolicy?.read === false || resolved.memoryPolicy?.automaticRead === false) return { ...resolved, relevantMemories: [], relevantContextItems: [] }
     if (resolved.relevantMemories?.length || resolved.relevantContextItems?.length) {
       return resolved
     }
+    if (this.options.memoryRetrieval === false) return resolved
 
     const { relevantMemories, relevantContextItems } = await this.resolveRelevantContext(
       input,
@@ -928,16 +989,19 @@ export class AgentModeRouter {
   private getGraph(mode: string, builder: GraphBuilder): AgentGraph {
     let cached = this.graphCache.get(mode)
     if (!cached) {
-      cached = builder({
+      const deps = {
         provider: this.options.provider,
         tools: this.options.tools,
         policy: this.options.policy,
         autonomy: this.options.autonomy,
         semanticIndex: this.options.semanticIndex,
         systemPrompt: this.options.systemPrompt,
+        systemToolGuidance: this.options.systemToolGuidance,
         usageTracker: this.options.usageTracker,
         providerCircuitBreaker: this.options.providerCircuitBreaker,
-      })
+      }
+      this.graphDeps.set(mode, deps)
+      cached = builder(deps)
       this.graphCache.set(mode, cached)
     }
     return cached
@@ -966,10 +1030,6 @@ export class AgentModeRouter {
     return Boolean(graph?.source === 'capability' && graph.capabilities?.direct)
   }
 
-  /**
-   * A confident, non-fallback mode decision from the per-turn intent router,
-   * or null when auto routing should decide on its own.
-   */
   private confidentIntentModeHint(): string | null {
     const hint = this.options.intentModeHint
     if (!hint || hint.fallback || hint.confidence !== 'high') {
@@ -980,11 +1040,6 @@ export class AgentModeRouter {
     return graph && !isAutoRouterExcludedGraphMode(graph.id) && !graph.capabilities?.direct ? hint.mode : null
   }
 
-  /**
-   * Preserve a successful semantic posture classification independently from
-   * mode selection. Durable contract planning may refine it, but a planner
-   * timeout or malformed response must not downgrade it to `unspecified`.
-   */
   private confidentExecutionIntentHint(): import('@sepilotd/core').AgentExecutionIntent | undefined {
     const hint = this.options.intentModeHint
     if (!hint || hint.fallback || hint.confidence !== 'high' || !hint.executionIntent) {
@@ -1018,14 +1073,6 @@ export class AgentModeRouter {
   }
 
   private contractHasDurableArtifactWork(contract: AgentContext['runContract']): boolean {
-    // Use the SAME document-vs-source predicate that grounding
-    // (groundSeedContractToDeliverable) applies. Previously this returned true
-    // for any requiredArtifacts/artifactSections (including plain source-file
-    // edit targets), so a source-only contract routed to the artifact-writer
-    // graph — which then had its contract stripped by grounding, leaving an
-    // empty contract. Aligning the predicates keeps routing and grounding
-    // consistent: only genuine durable *document* work is promoted to the
-    // artifact-writer graph; source edits stay on the react/coder path.
     return contractHasDocumentArtifactWork(contract)
   }
 
@@ -1046,6 +1093,13 @@ export class AgentModeRouter {
     return 'unknown'
   }
 
+  private resolveStagePolicy(mode: string): import('./bots/types.js').RoleBotStagePolicy | undefined {
+    if (this.options.graphRegistry?.get(mode)?.capabilities?.auxiliaryStages === 'none') {
+      return { contractPlanner: false, outcomeReview: false, completionGate: false, recoveryController: false }
+    }
+    return this.options.stagePolicy
+  }
+
   private buildGraphContext(
     input: string | undefined,
     context: AgentContext,
@@ -1056,6 +1110,8 @@ export class AgentModeRouter {
   ): GraphExecutionContext {
     return {
       graphId: mode,
+      stagePolicy: this.resolveStagePolicy(mode),
+      executionControl: this.options.graphRegistry?.get(mode)?.capabilities?.executionControl,
       modeControl: this.modeControl,
       agentContext: this.resolveAgentContext(context, input),
       toolsForbiddenByUser: this.options.tools.list().length === 0 && !this.modeControl?.tools.length,
@@ -1068,10 +1124,12 @@ export class AgentModeRouter {
       semanticIndex: this.options.semanticIndex,
       systemPrompt: this.options.systemPrompt ?? context.systemPrompt,
       usageTracker: this.options.usageTracker,
+      systemToolGuidance: this.options.systemToolGuidance,
       auditLogger: this.options.auditLogger,
       hookRegistry: this.options.hookRegistry,
       deviceName: this.options.deviceName,
       thinkingLevel: this.options.thinkingLevel,
+      thinkingLevelSource: this.options.thinkingLevelSource,
       maxTokens: this.options.maxTokens,
       temperature: this.options.temperature,
       auxModel: this.options.auxModel,
@@ -1112,7 +1170,8 @@ export class AgentModeRouter {
       strictFinalAnswerProtocol:
         this.options.strictFinalAnswerProtocol
         ?? (process.env.SEPILOTD_STRICT_ANSWER_PROTOCOL === '1'),
-      maxContinuationCycles: this.maxContinuationCycles(),
+      maxContinuationCycles: this.options.graphRegistry?.get(mode)?.capabilities?.executionControl === 'model-directed'
+        ? 0 : this.maxContinuationCycles(),
     }
   }
 
@@ -1121,6 +1180,7 @@ export class AgentModeRouter {
     context: AgentContext,
     mode: string,
   ): AgentState {
+    const modelDirected = this.options.graphRegistry?.get(mode)?.capabilities?.executionControl === 'model-directed'
     return {
       input,
       currentUserContent: context.currentUserContent,
@@ -1142,10 +1202,10 @@ export class AgentModeRouter {
       iteration: context.executionHandoff?.iterations ?? 0,
       maxIterations: resolveRunIterationBudget({
         surface: this.options.budgetSurface ?? 'chat',
-        requested: this.options.maxIterations,
+        requested: this.options.maxIterations ?? (modelDirected ? this.resolveGraphMaxIterations(mode) : undefined),
         graphPreset: this.resolveGraphMaxIterations(mode),
         contract: context.runContract,
-        hardMaxIterations: this.options.hardMaxIterations,
+        hardMaxIterations: this.options.hardMaxIterations || modelDirected,
       }).maxIterations,
       shouldStop: false,
       seedContract: context.runContract,
@@ -1157,8 +1217,6 @@ export class AgentModeRouter {
         toolCallHistory: this.transferredGraphState.toolCallHistory,
         recentToolResults: this.transferredGraphState.recentToolResults,
       } : {}),
-      // Seed the persisted transport-flip so a known-bad-native model starts the
-      // turn already in prompt-react instead of re-paying the detection cost.
       preferPromptReact: context.preferPromptReact,
     }
   }
@@ -1263,13 +1321,16 @@ export class AgentModeRouter {
     return state
   }
 
-  /** Run with explicit mode or auto-detect */
   async *run(input: string, context: AgentContext, mode?: AgentMode): AsyncIterable<AgentEvent> {
-    // Decode transport content before any run-boundary policy observes the
-    // turn. Extracted text attachments are model context, while the first text
-    // part is the instruction used by hooks, routing, contracts, and evidence
-    // policy. Native parts use the react bridge unless a graph explicitly
-    // declares support for structured currentUserContent.
+    if (this.stopRequested) {
+      yield { type: 'done', usage: { inputTokens: 0, outputTokens: 0 }, stopReason: stopReasonUserAbort() }
+      return
+    }
+    const expired = callerDeadlineOutcome(context.deadlineAt)
+    if (expired) {
+      yield* expired
+      return
+    }
     const decodedContentParts = decodeMultimodalInput(input)
     const nativeMultimodalInput = decodedContentParts
       ? requiresNativeMultimodalInput(decodedContentParts)
@@ -1283,11 +1344,8 @@ export class AgentModeRouter {
         input = primaryInstruction
       }
     }
-    // Run-boundary gate: fires pre:/post:agent:run once per turn for *every*
-    // mode (react + graph) and transport. The ReAct engine's own firing is
-    // suppressed (emitAgentRunHooks:false in createReactEngine) so this is the
-    // single, mode-independent gate — graph turns were previously ungated.
     const runHookData: AgentRunHookData = {
+      runId: randomUUID(),
       sessionId: context.sessionId,
       mode: mode ?? this.options.defaultMode ?? 'instant',
       provider: context.provider,
@@ -1298,13 +1356,25 @@ export class AgentModeRouter {
         detached: true,
       } : {}),
       ...(context.surface ? { surface: context.surface } : {}),
+      ...(context.roleBotId ? { roleBotId: context.roleBotId } : {}),
+      ...(context.providerAttempt ? { attempt: context.providerAttempt.attempt } : {}),
     }
+    const isFallbackPending = context.providerAttempt?.isFallbackPending
     const hookObservation = createAgentRunHookObservation()
     const runAbortController = new AbortController()
     this.activeRunAbortController = runAbortController
-    const unregisterCanceller = this.options.activeRuns?.registerCanceller(context.sessionId, () => this.stop(), { ifAbsent: true })
-    // Admit steering while routing is still in flight; the selected engine
-    // adopts queued notes when it registers its live state.
+    const unregisterCanceller = this.options.activeRuns?.registerCanceller(context.sessionId, () => this.stop())
+    const unregisterPrivilege = this.options.activeRuns?.registerPrivilegeSetter(context.sessionId, (level) => this.setAutonomy(level))
+    this.lastRunSessionId = context.sessionId
+    this.options.activeRuns?.recordRunContext(context.sessionId, {
+      mode: mode ?? this.options.defaultMode,
+      cwd: context.cwd,
+      workspaceRoot: context.workspaceRoot,
+      provider: context.provider,
+      model: context.model,
+      autonomy: this.options.autonomy,
+      ...requestAuthorityForRecord(context),
+    })
     this.options.activeRuns?.upsert({ sessionId: context.sessionId, currentNode: 'routing',
       iteration: 0, maxIterations: this.options.maxIterations ?? 10 })
     const { signal } = runAbortController
@@ -1321,9 +1391,6 @@ export class AgentModeRouter {
         }
         return
       }
-      // Spend-cap gate — one pre-dispatch check per turn covers both react and
-      // graph modes so a runaway turn cannot burn unbounded provider dollars.
-      // Only priced (costKnown) spend counts; local models are never blocked.
       if (this.options.usageTracker && this.options.spendBudget) {
         const spend = checkSpendBudget(this.options.usageTracker, this.options.spendBudget, {
           sessionId: context.sessionId,
@@ -1337,6 +1404,14 @@ export class AgentModeRouter {
         }
       }
       triggerPostRun = true
+      const expiredAfterHooks = callerDeadlineOutcome(context.deadlineAt)
+      if (expiredAfterHooks) {
+        for (const event of expiredAfterHooks) {
+          observeAgentRunHookEvent(hookObservation, event)
+          yield event
+        }
+        return
+      }
     const executionPolicy = context.executionPolicy ?? {
       configuredAutonomy: this.options.autonomy,
       effectiveAutonomy: this.options.autonomy,
@@ -1356,20 +1431,11 @@ export class AgentModeRouter {
       data: { ...executionPolicy },
     })
     yield { type: 'execution_policy', policy: executionPolicy }
-    // A durable contract belongs to the turn that created it. Carry it across
-    // turns only for an explicit action follow-up such as "continue" or "fix
-    // it". New requests and answer/review follow-ups must not inherit stale
-    // artifact requirements from an earlier failed run.
     context = this.beginTurnAgentContext(context, input)
     const requestedMode = mode ?? this.options.defaultMode ?? 'instant'
-    // Legacy graphs use the content-aware react fallback for native parts.
-    // Graphs that opt into structured content retain their capability boundary.
     let nonAutoRouteReason: string | undefined
     let nonAutoRouteFallback = false
     const isMultimodal = nativeMultimodalInput
-    // Natural-language meaning belongs to the semantic decision. A missing or
-    // failed advisory router starts in the bounded controller, where the main
-    // model can answer or transfer with its actual context and tool catalog.
     const autoFallbackMode = resolveAutoFallbackMode({
       surface: context.surface,
       activeRemoteBrowser: this.options.activeRemoteBrowser,
@@ -1393,7 +1459,6 @@ export class AgentModeRouter {
             : 'The bounded controller will answer or select an execution mode from the request and available capabilities.'
     }
 
-    // Instant skips contract construction, while preserving explicit current-turn constraints.
     const turnContext: AgentContext = context
 
     if (this.isDirectCapabilityMode(resolvedMode)) {
@@ -1415,6 +1480,14 @@ export class AgentModeRouter {
       this.hydrateAgentContext(input, turnContext),
       signal,
     )
+    const expiredAfterHydration = callerDeadlineOutcome(context.deadlineAt)
+    if (expiredAfterHydration) {
+      for (const event of expiredAfterHydration) {
+        observeAgentRunHookEvent(hookObservation, event)
+        yield event
+      }
+      return
+    }
     const resolvedContext = await raceWithAbort(
       this.withDurableRunContract(input, hydratedContext, resolvedMode, signal),
       signal,
@@ -1450,6 +1523,7 @@ export class AgentModeRouter {
     } finally {
       if (this.activeRunAbortController === runAbortController) {
         unregisterCanceller?.()
+        unregisterPrivilege?.()
         this.options.activeRuns?.finish(context.sessionId)
         this.activeRunAbortController = null
       }
@@ -1457,8 +1531,14 @@ export class AgentModeRouter {
         if (signal.aborted) hookObservation.status = 'aborted'
         await triggerPostAgentRun(
           this.options.hookRegistry,
-          completeAgentRunHookData(runHookData, hookObservation),
+          {
+            ...completeAgentRunHookData(runHookData, hookObservation),
+            ...(isFallbackPending ? { fallbackPending: safeFallbackPending(isFallbackPending) } : {}),
+          },
         )
+        if (hookObservation.status !== 'incomplete') {
+          await this.options.workspaceMutationTracker?.cleanupScratch(context.sessionId).catch(() => {})
+        }
       }
     }
   }
@@ -1472,8 +1552,24 @@ export class AgentModeRouter {
   }
 
   private async *resumeCheckpoint(checkpoint: ApprovalRunCheckpoint | SessionRunCheckpoint, approved?: boolean | ApprovalDecision): AsyncIterable<AgentEvent> {
+    if (this.stopRequested) {
+      yield { type: 'done', usage: { inputTokens: 0, outputTokens: 0 }, stopReason: stopReasonUserAbort() }
+      return
+    }
+    const expired = callerDeadlineOutcome(checkpoint.deadlineAt, checkpoint.totalUsage)
+    if (expired) {
+      yield* expired
+      return
+    }
     const mode = checkpoint.modeControlState?.mode ?? checkpoint.mode ?? 'react'
-    const hookData: AgentRunHookData = { sessionId: checkpoint.sessionId, mode, provider: checkpoint.provider, model: checkpoint.model }
+    const hookData: AgentRunHookData = {
+      runId: randomUUID(),
+      sessionId: checkpoint.sessionId,
+      mode,
+      provider: checkpoint.provider,
+      model: checkpoint.model,
+      resumed: true,
+    }
     const observation = createAgentRunHookObservation()
     const preRun = await triggerPreAgentRun(this.options.hookRegistry, hookData)
     if (preRun.aborted) {
@@ -1482,7 +1578,7 @@ export class AgentModeRouter {
     }
     const controller = new AbortController()
     this.activeRunAbortController = controller
-    const unregisterCanceller = this.options.activeRuns?.registerCanceller(checkpoint.sessionId, () => this.stop(), { ifAbsent: true })
+    const unregisterCanceller = this.options.activeRuns?.registerCanceller(checkpoint.sessionId, () => this.stop())
     try {
       const context: AgentContext = {
         sessionId: checkpoint.sessionId, provider: checkpoint.provider, model: checkpoint.model,
@@ -1491,7 +1587,10 @@ export class AgentModeRouter {
         scopeTags: cloneCheckpointScopeTags(checkpoint.scopeTags),
         executionSkillIds: cloneCheckpointExecutionSkillIds(checkpoint.executionSkillIds),
         skillToolNames: cloneCheckpointSkillToolNames(checkpoint.skillToolNames),
+        deadlineAt: checkpoint.deadlineAt,
+        memoryPolicy: cloneCheckpointMemoryPolicy(checkpoint.memoryPolicy),
         toolAllowlist: cloneCheckpointToolAllowlist(checkpoint.toolAllowlist),
+        delegationToolAllowlist: cloneCheckpointToolAllowlist(checkpoint.delegationToolAllowlist),
         skillExecutionPolicies: cloneCheckpointSkillExecutionPolicies(checkpoint.skillExecutionPolicies),
         requireToolApproval: checkpoint.requireToolApproval,
         systemPrompt: checkpoint.systemPrompt, previousMessages: checkpoint.messages.map(cloneMessage),
@@ -1499,6 +1598,7 @@ export class AgentModeRouter {
       }
       yield* observeAgentRunEvents(this.dispatch(latestUserText(checkpoint.messages), context, mode, { checkpoint, approved }), observation)
     } catch (error) {
+      if (isApprovalParkedError(error)) throw error
       const event: AgentEvent = { type: 'error', error: toProviderApiError(error) }
       observeAgentRunHookEvent(observation, event)
       yield event
@@ -1507,6 +1607,9 @@ export class AgentModeRouter {
       unregisterCanceller?.()
       if (this.activeRunAbortController === controller) this.activeRunAbortController = null
       await triggerPostAgentRun(this.options.hookRegistry, completeAgentRunHookData(hookData, observation))
+      if (observation.status !== 'incomplete') {
+        await this.options.workspaceMutationTracker?.cleanupScratch(checkpoint.sessionId).catch(() => {})
+      }
     }
   }
 
@@ -1561,6 +1664,7 @@ export class AgentModeRouter {
       originalOptions.authorizedTools ?? originalOptions.tools,
       context.toolAllowlist,
     )
+    const delegationBase = originalOptions.delegationTools ?? originalOptions.authorizedTools ?? originalOptions.tools
     const turnMaxIterations = context.modeControlState?.turnMaxIterations ?? originalOptions.maxIterations ?? 50
     if (resume) {
       this.options = { ...originalOptions, maxIterations: turnMaxIterations,
@@ -1573,17 +1677,24 @@ export class AgentModeRouter {
     try {
       for (let transfers = context.modeControlState?.transferCount ?? 0; transfers <= 4; transfers += 1) {
         if (this.activeRunAbortController?.signal.aborted) return
+        const expired = callerDeadlineOutcome(
+          currentContext.deadlineAt, resume?.checkpoint.totalUsage ?? currentContext.executionHandoff?.usage,
+        )
+        if (expired) {
+          yield* expired
+          return
+        }
         let pending: { transfer: ModeTransfer; snapshot: ExecutionHandoff } | undefined
-        // Same catalog the intent router advertises: engine modes plus graphs
-        // that opted into semantic routing. Graph targets are withheld for
-        // native multimodal turns, which stay in the content-aware engines.
         const multimodalTurn = requiresNativeMultimodalInput(Array.isArray(currentContext.currentUserContent) ? currentContext.currentUserContent : decodeMultimodalInput(input) ?? [])
         const modes = listSemanticModes(this.options.graphRegistry)
           .filter((mode) => !multimodalTurn || mode.id === 'instant' || mode.id === 'react')
         const contractCeiling = withOptionalToolNameAllowlist(withOptionalToolNameAllowlist(ceiling, currentContext.toolAllowlist), currentContext.runContract?.executionIntent?.allowedTools)
+        const delegationCeiling = withOptionalToolNameAllowlist(delegationBase, currentContext.delegationToolAllowlist ?? currentContext.toolAllowlist)
+        const delegationContractCeiling = withOptionalToolNameAllowlist(delegationCeiling, currentContext.runContract?.executionIntent?.allowedTools)
         const discoveryContext = await raceWithAbort(discover(contractCeiling, currentContext), this.activeRunAbortController?.signal ?? new AbortController().signal)
         this.modeControl = createModeControl({
           currentMode, modes, tools: contractCeiling, context: currentContext,
+          delegationTools: delegationContractCeiling,
           discoveryContext,
           transferCount: transfers, turnMaxIterations,
           activeToolNames: currentMode === 'instant'
@@ -1621,9 +1732,11 @@ export class AgentModeRouter {
         }
         const selectedGroups = transfer.executionIntent.capabilities.flatMap((capability) => capabilityGroups[capability] ? [capabilityGroups[capability]!] : [])
         const projected = withContextualToolExposure(nextCeiling, { routedMode: transfer.mode, semanticRouting: true, selectedGroups, activeRemoteBrowser: originalOptions.activeRemoteBrowser })
-        const selectedNames = new Set([...projected.list().map((tool) => tool.name), ...transfer.tools])
+        const carried = transfer.mode === 'instant' ? [] : this.options.tools.list().map((tool) => tool.name)
+        const selectedNames = new Set([...projected.list().map((tool) => tool.name), ...transfer.tools, ...carried])
         this.options = {
           ...originalOptions,
+          autonomy: this.options.autonomy,
           tools: withToolNameAllowlist(nextCeiling, selectedNames),
           maxIterations: turnMaxIterations,
           hardMaxIterations: true,
@@ -1634,6 +1747,7 @@ export class AgentModeRouter {
           ...currentContext,
           executionHandoff: snapshot,
           toolAllowlist: nextCeiling.list().map((tool) => tool.name),
+          delegationToolAllowlist: withOptionalToolNameAllowlist(delegationContractCeiling, transfer.executionIntent.allowedTools).list().map((tool) => tool.name),
           runContract: mergeModeTransferContract(
             this.transferredGraphState?.seedContract ?? currentContext.runContract,
             transfer,
@@ -1647,7 +1761,7 @@ export class AgentModeRouter {
         }
       }
     } finally {
-      this.options = originalOptions
+      this.options = { ...originalOptions, autonomy: this.options.autonomy }
       this.transferredGraphState = undefined
       this.modeControl = undefined
       this.graphCache.clear()
@@ -1672,6 +1786,9 @@ export class AgentModeRouter {
         this.options.maxIterations ?? 50,
       ),
       hardMaxIterations: true,
+    } : this.options.stagePolicy?.outcomeReview === false ? {
+      reviewOutcomes: false,
+      reviewToollessFinals: false,
     } : {})
     this.activeReactEngine = engine
     try {
@@ -1700,13 +1817,21 @@ export class AgentModeRouter {
     const state = this.buildInitialGraphState(input, graphContext.agentContext, mode)
     const seededPreferPromptReact = state.preferPromptReact
     this.activeGraphState = state
+    this.activeGraphContext = graphContext
     this.activeGraphAbortController = abortController
+    const escalation = this.options.graphRegistry?.get(mode)?.capabilities?.escalation
     try {
       try {
-        yield* this.getGraph(mode, builder).run(
-          state,
-          graphContext,
-        )
+        for await (const event of this.getGraph(mode, builder).run(state, graphContext)) {
+          if (event.type === 'done' && event.stopReason && escalation) {
+            yield {
+              ...event,
+              stopReason: withEscalationOffer(event.stopReason, state, escalation),
+            }
+            continue
+          }
+          yield event
+        }
       } catch (error) {
         yield {
           type: 'error',
@@ -1720,8 +1845,6 @@ export class AgentModeRouter {
       if (this.activeGraphAbortController === abortController) {
         this.activeGraphAbortController = null
       }
-      // Persist an observed transport-flip so the next turn seeds it and skips
-      // re-detection. Only when the value actually changed during the run.
       if (
         this.options.persistTransportPreference
         && state.preferPromptReact !== seededPreferPromptReact
@@ -1732,13 +1855,13 @@ export class AgentModeRouter {
             state.preferPromptReact,
           )
         } catch {
-          // Persistence is best-effort; never fail the turn on it.
         }
       }
     }
   }
 
   async stop(): Promise<void> {
+    this.stopRequested = true
     this.activeRunAbortController?.abort(createAbortError('Agent execution stopped'))
     if (this.activeGraphState) {
       this.activeGraphState.shouldStop = true

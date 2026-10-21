@@ -5,13 +5,6 @@ import { publishQuickInput } from '../../quickinput/bus.js'
 import { readConfigYaml, writeConfigYamlAtomic } from '../../config/yaml-store.js'
 import { openJsonWatch } from './watch-sse.js'
 
-// A "Quick Question" is a user-defined global hotkey that, when
-// pressed, opens the main window and starts a fresh chat with a
-// pre-filled prompt + the current clipboard contents combined into a
-// single user message. Mirrors the sepilot_desktop-private pattern:
-// `${prompt}\n\n${clipboard}` for fast translate / summarize / review
-// flows from outside the app. Capped at 16 entries to keep the global
-// shortcut budget predictable.
 const QuickQuestionSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1).max(80),

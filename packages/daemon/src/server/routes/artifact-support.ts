@@ -20,7 +20,6 @@ export async function extractAndStoreArtifacts(
       artifacts.map((artifact) => store.save(sessionId, artifact)),
     )
   } catch {
-    // Artifact persistence should not fail the parent run.
   }
 
   return artifacts
@@ -42,7 +41,6 @@ export async function extractAndStoreUserImageArtifacts(
       artifacts.map((artifact) => store.save(sessionId, artifact)),
     )
   } catch {
-    // Artifact persistence should not fail the parent run.
   }
 
   return artifacts

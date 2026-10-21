@@ -45,8 +45,6 @@ export async function historyCommand(query: string, options: { url?: string; lim
     console.log(chalk.gray(copy.foundPrefix(sessions.totalCount, query)))
 
     for (const s of items) {
-      // ISO date so the output is locale-independent — matches what
-      // sessions list / sessions show produce.
       const ts = new Date(s.updatedAt).toISOString().slice(0, 16).replace('T', ' ')
       const id = s.id.length > 18 ? `${s.id.slice(0, 17)}…` : s.id.padEnd(18)
       console.log(`  ${chalk.cyan(id)}  ${chalk.gray(ts)}  ${s.title ?? copy.untitled}`)

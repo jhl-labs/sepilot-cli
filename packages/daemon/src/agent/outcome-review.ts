@@ -25,13 +25,7 @@ export interface RunOutcomeReview {
   reason: string
   instruction?: string
   recoveryMode?: 'tool' | 'synthesis' | 'user-input'
-  /**
-   * Structured cause for a recovery request. Historical execution claims are
-   * grounded against the trusted current-turn result ledger before they can
-   * influence the agent loop; semantic evidence-quality judgments are not.
-   */
   recoveryBasis?: RunOutcomeReviewRecoveryBasis
-  /** Exact registry names claimed to lack a successful current-turn result. */
   missingToolNames?: string[]
   toolCalls?: Array<{
     name: string
@@ -42,13 +36,6 @@ export interface RunOutcomeReview {
 export const OUTCOME_REVIEW_MAX_TOKENS = 2048
 const OUTCOME_REVIEW_CANDIDATE_MAX_CHARS = 12_000
 export const MAX_OUTCOME_REVIEW_REPAIRS = 4
-/**
- * Rewriting a final from an unchanged evidence snapshot can improve semantic
- * coverage, but repeated verifier/writer ping-pong cannot discover new facts.
- * Allow two comprehensive correction passes, then fail closed. Tool-backed
- * recovery keeps the broader MAX_OUTCOME_REVIEW_REPAIRS budget because each
- * executed result can materially change the evidence available to the judge.
- */
 export const MAX_OUTCOME_REVIEW_SYNTHESIS_REPAIRS = 2
 const OUTCOME_REVIEW_RECOVERY_MARKER = '[LLM outcome review]'
 const GENERATED_OR_VENDOR_PATH_SEGMENTS = new Set([
@@ -93,6 +80,50 @@ function compactBoundaries(value: string, max: number): string {
   const headLength = Math.ceil(available * 0.6)
   const tailLength = available - headLength
   return `${normalized.slice(0, headLength).trimEnd()}${marker}${normalized.slice(-tailLength).trimStart()}`
+}
+
+const CITATION_URL = /https?:\/\/[^\s<>"'`)\]]+/g
+const CITATION_QUOTED = /["“]([^"”\n]{4,120})["”]/g
+const CITATION_NUMBER = /\b\d{1,3}(?:,\d{3})+\b|\b\d{4,}\b/g
+const CITATION_REF = /\be\d{1,4}\b/g
+const MAX_CITATION_TOKENS = 24
+const MAX_CITED_LINES = 12
+const MAX_CITED_LINE_CHARS = 320
+
+export function extractCandidateCitationTokens(answer: string): string[] {
+  const tokens = new Set<string>()
+  for (const match of answer.matchAll(CITATION_URL)) tokens.add(match[0].replace(/[.,;:!?]+$/, ''))
+  for (const match of answer.matchAll(CITATION_QUOTED)) tokens.add(match[1]!.trim())
+  for (const match of answer.matchAll(CITATION_NUMBER)) tokens.add(match[0])
+  for (const match of answer.matchAll(CITATION_REF)) tokens.add(match[0])
+  return Array.from(tokens).filter((token) => token.length >= 4).slice(0, MAX_CITATION_TOKENS)
+}
+
+function compactWithCitations(value: string, max: number, citationTokens: readonly string[]): string {
+  const normalized = value.trim().replace(/\s+/g, ' ')
+  if (normalized.length <= max || citationTokens.length === 0) return compactBoundaries(value, max)
+  const cited: string[] = []
+  const seen = new Set<string>()
+  for (const rawLine of value.split('\n')) {
+    const line = rawLine.trim().replace(/\s+/g, ' ')
+    if (!line || seen.has(line)) continue
+    if (!citationTokens.some((token) => line.includes(token))) continue
+    seen.add(line)
+    cited.push(line.length > MAX_CITED_LINE_CHARS ? `${line.slice(0, MAX_CITED_LINE_CHARS)}…` : line)
+    if (cited.length >= MAX_CITED_LINES) break
+  }
+  if (cited.length === 0) return compactBoundaries(value, max)
+  const marker = ' [lines cited by the candidate] '
+  const citedBudget = Math.floor(max * 0.45)
+  let citedBlock = ''
+  for (const line of cited) {
+    const next = citedBlock ? `${citedBlock} | ${line}` : line
+    if (next.length > citedBudget) break
+    citedBlock = next
+  }
+  if (!citedBlock) return compactBoundaries(value, max)
+  const boundaryBudget = Math.max(120, max - marker.length - citedBlock.length)
+  return `${compactBoundaries(value, boundaryBudget)}${marker}${citedBlock}`
 }
 
 function formatCandidateAnswerForReview(value: string): string {
@@ -212,10 +243,6 @@ function looksLikeEscapedContentLiteral(value: string): boolean {
     return false
   }
 
-  // normalizeEvidencePath intentionally accepts Windows separators. Preserve
-  // file-like Windows paths such as `src\\new\\file.ts`, but do not turn an
-  // escaped read-back such as `key=value\\nnext=value\\n` into the synthetic
-  // repository path `key=value/nnext=value/n`.
   return !pathHasFileExtension(normalizeEvidencePath(trimmed))
 }
 
@@ -258,9 +285,6 @@ function looksLikeRepositoryPath(value: string, source: 'code' | 'bare' = 'code'
   const trimmed = value.trim()
   if (
     !trimmed
-    // URI schemes may have opaque paths without // (module identifiers,
-    // package URLs, resource URNs). Their slash does not imply a local file.
-    // Keep drive-letter paths eligible for ordinary repository verification.
     || (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(trimmed)
       && !/^[A-Za-z]:[\\/]/.test(trimmed)
       && !hasExplicitRepositoryPathPrefix(originalValue.trim()))
@@ -319,34 +343,92 @@ function isGeneratedOrVendorClaimPath(value: string): boolean {
 }
 
 function normalizeClaimedPath(value: string): string {
-  return normalizeEvidencePath(
-    stripPathLineReferenceSuffix(
-      value
-        .trim()
-        .replace(/^["'([]+|[)"'\].,;:]+$/g, ''),
-    ),
-  )
+  return normalizeEvidencePath(stripPathLineReferenceSuffix(value.trim()))
+}
+
+function claimedLiteralContents(value: string): string {
+  const trimmed = value.trim()
+  const quoted = trimmed.match(/^(?:[rub]|br|rb)?(["'])((?:\\.|(?!\1)[^\\])*)\1$/iu)
+  return quoted?.[2] ?? trimmed
+}
+
+function isAnchoredPatternLiteral(value: string): boolean {
+  return /^(?:\^|\\A)/u.test(value) && /(?:\$|\\[Zz])$/u.test(value)
+}
+
+function qualifiedReferenceFile(value: string): string | null {
+  const boundary = value.indexOf('::')
+  if (boundary < 0) return null
+  const file = value.slice(0, boundary)
+  if (!pathHasFileExtension(normalizeEvidencePath(file))) return null
+  const selector = value.slice(boundary + 2)
+  if (!/^[\p{ID_Start}_$][\p{ID_Continue}$.-]*(?:\[[^\[\]\r\n`]*\])?(?:::[\p{ID_Start}_$][\p{ID_Continue}$.-]*(?:\[[^\[\]\r\n`]*\])?)*$/u.test(selector)) return null
+  return file
+}
+
+function isCompoundCodeExpression(value: string): boolean {
+  const closing = value.startsWith('[') ? ']' : value.startsWith('{') ? '}' : value.startsWith('(') ? ')' : null
+  if (closing && value.endsWith(closing)) return true
+  if (/^[\p{ID_Start}_$][\p{ID_Continue}.$]*\s*:?=/u.test(value)) return true
+  if (pathHasFileExtension(value) && !/["']/.test(value)) return false
+  return /^[\p{ID_Start}_$][\p{ID_Continue}.$]*\s*(?:\(|\[)/u.test(value)
+}
+
+function replaceCompleteCodeSpans(text: string, visit: (contents: string) => void): string {
+  const delimiters = Array.from(text.matchAll(/`+/g))
+  const nextByLength = new Map<number, number>()
+  const closing = new Map<number, number>()
+  for (let index = delimiters.length - 1; index >= 0; index--) {
+    const length = delimiters[index]![0].length
+    const next = nextByLength.get(length)
+    if (next !== undefined) closing.set(index, next)
+    nextByLength.set(length, index)
+  }
+  const prose: string[] = []
+  let cursor = 0
+  for (let index = 0; index < delimiters.length; index++) {
+    const endIndex = closing.get(index)
+    if (endIndex === undefined) continue
+    const start = delimiters[index]!
+    const end = delimiters[endIndex]!
+    prose.push(text.slice(cursor, start.index), ' ')
+    visit(text.slice(start.index + start[0].length, end.index))
+    cursor = end.index + end[0].length
+    index = endIndex
+  }
+  prose.push(text.slice(cursor))
+  return prose.join('')
 }
 
 function extractClaimedRepositoryPaths(text: string): string[] {
   const paths = new Set<string>()
-  const codeSpanPattern = /`([^`\r\n]{1,180})`/g
-  let match: RegExpExecArray | null
-  while ((match = codeSpanPattern.exec(text)) !== null) {
-    const normalized = normalizeClaimedPath(match[1] ?? '')
-    if (looksLikeRepositoryPath(normalized, 'code', match[1])) {
+  const bareText = replaceCompleteCodeSpans(text, (contents) => {
+    const literal = claimedLiteralContents(contents)
+    if (literal === contents.trim() && isCompoundCodeExpression(literal)) return
+    if (isAnchoredPatternLiteral(literal)) return
+    const referenceFile = qualifiedReferenceFile(literal)
+    const pathLiteral = referenceFile ?? literal
+    const normalized = normalizeClaimedPath(pathLiteral)
+    if (looksLikeRepositoryPath(normalized, 'code', pathLiteral)) {
       paths.add(normalized)
     }
-  }
+  })
   const barePathPattern =
     /(?:^|[\s("'[])(\.{0,2}\/?[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@*{}[\]-]+)+(?:\.[A-Za-z0-9][A-Za-z0-9_-]{0,15})?\/?)(?=$|[\s"',.)\]])/g
-  while ((match = barePathPattern.exec(text)) !== null) {
+  let match: RegExpExecArray | null
+  while ((match = barePathPattern.exec(bareText)) !== null) {
     const normalized = normalizeClaimedPath(match[1] ?? '')
-    if (looksLikeRepositoryPath(normalized, 'bare')) {
+    if (looksLikeRepositoryPath(normalized, 'bare') && !isWebAddressWrittenWithoutScheme(normalized, text)) {
       paths.add(normalized)
     }
   }
   return Array.from(paths).slice(0, 24)
+}
+
+function isWebAddressWrittenWithoutScheme(claimedPath: string, text: string): boolean {
+  const host = claimedPath.replace(/^\.{0,2}\//, '').split('/')[0] ?? ''
+  if (!/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(host) || !/\.[A-Za-z]{2,24}$/.test(host)) return false
+  return new RegExp(`[A-Za-z][A-Za-z0-9+.-]*://${host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:[/:?#]|$)`, 'i').test(text)
 }
 
 function evidencePathsReferToSameFile(left: string, right: string): boolean {
@@ -493,19 +575,26 @@ function ledgerHasArtifactReadBackForPath(
 function outputMentionsPath(output: string, path: string): boolean {
   const normalizedPath = normalizeEvidencePath(path)
   const claimLooksLikeFile = pathHasFileExtension(normalizedPath)
+  const matches = (linePath: string): boolean =>
+    linePath === normalizedPath
+    || linePath.endsWith(`/${normalizedPath}`)
+    || normalizedPath.endsWith(`/${linePath}`)
+    || (!claimLooksLikeFile && linePath.startsWith(`${normalizedPath}/`))
   return output
     .split(/\r?\n/)
-    .map((line) =>
-      normalizeEvidencePath(
-        (line.trim().split(/\s+/)[0] ?? '').replace(/:\d+(?::\d+)?(?::.*)?$/g, ''),
+    .some((line) => {
+      const trimmed = line.trim()
+      if (!trimmed) return false
+      const first = normalizeEvidencePath(
+        (trimmed.split(/\s+/)[0] ?? '').replace(/:\d+(?::\d+)?(?::.*)?$/g, ''),
       )
-    )
-    .some((linePath) =>
-      linePath === normalizedPath
-      || linePath.endsWith(`/${normalizedPath}`)
-      || normalizedPath.endsWith(`/${linePath}`)
-      || (!claimLooksLikeFile && linePath.startsWith(`${normalizedPath}/`))
-    )
+      if (matches(first)) return true
+      return trimmed
+        .split(/[\s"'`<>()\[\],]+/)
+        .filter((token) => token.includes('/'))
+        .map((token) => normalizeEvidencePath(token.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, '').replace(/[?#].*$/, '')))
+        .some(matches)
+    })
 }
 
 function evidencePathSupportsClaim(evidencePath: string, claimedPath: string): boolean {
@@ -729,9 +818,6 @@ function markdownHeadingTitles(content: string): string[] {
   const body = stripToolSummaryPrefix(content)
   return body
     .split(/\r?\n/)
-    // fs.read prefixes text with display-only `NNN<TAB>` line numbers. The
-    // evidence floor consumes the tool result, not raw file bytes, so remove
-    // that presentation prefix before recognising Markdown headings.
     .map((line) => line.replace(/^\s*\d+\t/, ''))
     .map((line) => line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/)?.[1] ?? '')
     .filter(Boolean)
@@ -809,7 +895,6 @@ function fileMutationPaths(toolName: string, args: Record<string, unknown>): str
   if ((toolName === 'fs.write' || toolName === 'fs.append' || toolName === 'fs.edit') && typeof args.path === 'string') {
     return [args.path]
   }
-  // A move mutates both ends, so both count as touched paths.
   if (toolName === 'fs.move') {
     return [args.from, args.to].filter((value): value is string => typeof value === 'string')
   }
@@ -833,6 +918,7 @@ interface SuccessfulToolExecutions {
 }
 
 function toolResultMessageSucceeded(message: Message): boolean {
+  if (message.metadata?.toolResultExecutionObserved === false) return false
   const status = message.metadata?.toolResultStatus
   if (status === 'error' || status === 'blocked') return false
   if (status === 'success') return true
@@ -928,7 +1014,13 @@ function classifyFileMutationResult(
   return isSuccessfulFileMutationResult(toolName, content) ? 'success' : 'error'
 }
 
-export function unavailableOutcomeReviewReason(messages: Message[]): string | null {
+export function unavailableOutcomeReviewReason(
+  messages: Message[],
+  runContract?: AgentRunContract,
+): string | null {
+  if (runContract?.executionIntent?.workspaceMutation === 'required') {
+    return 'Completion review was unavailable for required workspace work. The requested final state has not been validated as a complete result.'
+  }
   return collectFileMutationEvidence(messages).length > 0
     ? 'Completion review was unavailable after file-edit attempts. The current changes have not been validated as a complete result.'
     : null
@@ -997,11 +1089,6 @@ function isSuccessfulValidationToolResult(content: string): boolean {
     && !/\bexit code\s+(?!0\b)\d+\b/i.test(trimmed)
 }
 
-/**
- * Read-only lookups whose successful output is what an answer can be grounded
- * in when the run produces nothing to validate. Deliberately narrow: retrieval
- * and inspection tools only, never a mutation or a command run.
- */
 const LOOKUP_EVIDENCE_TOOL_NAMES = new Set([
   'memory.search',
   'memory.list',
@@ -1294,20 +1381,6 @@ function validationEvidenceRequirements(contract: AgentRunContract | undefined):
     .filter(Boolean) ?? []
 }
 
-/**
- * A run that wrote nothing, and whose contract asks for no durable artifact,
- * has nothing a validation tool could check: every validation tool verifies
- * something the run produced or acts on. Demanding a separate validation run
- * there is unsatisfiable by construction — a live "what is my primary
- * language, look it up in memory" run searched memory successfully and was
- * still blocked to INCOMPLETE. For those runs the successful lookup the answer
- * is grounded in settles the requirement. Any run that wrote something, or was
- * contracted to, keeps the strict rule.
- *
- * The graph's own contract-gap check carries the same rule; this is the second
- * gate, on the path that keeps no evidence ledger, so the signals come from the
- * messages as well.
- */
 function retrievalSettlesValidation(
   messages: Message[],
   contract: AgentRunContract | undefined,
@@ -2152,9 +2225,6 @@ function evaluateUnsupportedPathClaims(
         || requirement.sourceToolNames?.some((name) => name.startsWith('fs.') || name.startsWith('git.') || name.startsWith('code.'))
       ))
     )) === true
-  // A source observation can be a web/App document. Do not turn examples in
-  // that source into workspace existence claims. Explicit repository breadth,
-  // source readers, and mixed filesystem contracts retain the local floor.
   const isExplicitExternalEvidenceInspection =
     executionIntent?.kind === 'inspection'
     && executionIntent.workspaceMutation === 'forbidden'
@@ -2203,6 +2273,7 @@ function formatToolEvidenceForReview(
   messages: Message[],
   contract: AgentRunContract | undefined,
   evidenceLedger?: AgentEvidenceLedger,
+  assistantAnswer?: string,
 ): string {
   const ledgerStats = ledgerEvidenceStats(evidenceLedger)
   const toolCallsById = new Map<string, ToolCall>()
@@ -2293,7 +2364,11 @@ function formatToolEvidenceForReview(
   const successfulWrites = writeOperations.filter((entry) => entry.status === 'success')
   const failedWrites = writeOperations.filter((entry) => entry.status === 'error')
   const pendingWrites = writeOperations.filter((entry) => entry.status === 'unknown')
-  const toolResultExcerpts = formatToolResultExcerpts(messages, toolCallsById)
+  const toolResultExcerpts = formatToolResultExcerpts(
+    messages,
+    toolCallsById,
+    assistantAnswer ? extractCandidateCitationTokens(assistantAnswer) : [],
+  )
 
   return [
     `Read file content via fs.read: ${readFiles.size > 0 ? Array.from(readFiles).join(', ') : '(none)'}`,
@@ -2323,6 +2398,7 @@ function formatToolEvidenceForReview(
 function formatToolResultExcerpts(
   messages: Message[],
   toolCallsById: ReadonlyMap<string, ToolCall>,
+  citationTokens: readonly string[] = [],
 ): string {
   const allResults = messagesSinceLastUser(messages).flatMap((message) => {
     if (message.role !== 'tool' || !message.toolCallId) return []
@@ -2338,24 +2414,15 @@ function formatToolResultExcerpts(
   })
   if (allResults.length === 0) return '(none)'
 
-  // Keep every result for normal and long-but-bounded operational runs. For an
-  // unusually large trace, retain both ends of the observation sequence so
-  // initial inventory and terminal verification remain represented without
-  // making the judge request unbounded.
   const selected = allResults.length <= 80
     ? allResults
     : [...allResults.slice(0, 40), ...allResults.slice(-40)]
-  // Spend the existing aggregate budget adaptively. A fixed 900-character cap
-  // discarded middle scalar fields even when a short operational run had only
-  // a handful of modest JSON results and the aggregate packet had ample room.
-  // Keep such results complete; large traces/results remain bounded by the
-  // 20k aggregate share and a 5k per-result ceiling.
   const perResultBudget = Math.min(5_000, Math.max(250, Math.floor(20_000 / selected.length)))
   const lines = selected.map((entry) => {
     const identityBudget = Math.min(220, Math.max(100, Math.floor(perResultBudget * 0.45)))
     const identity = compact(`${entry.id} ${entry.args || entry.tool}`, identityBudget)
     const resultBudget = Math.max(100, perResultBudget - identity.length - 7)
-    return `- ${identity} => ${compactBoundaries(entry.result, resultBudget)}`
+    return `- ${identity} => ${compactWithCitations(entry.result, resultBudget, citationTokens)}`
   })
   if (selected.length !== allResults.length) {
     lines.splice(40, 0, `- (${allResults.length - selected.length} middle tool results omitted by bounded review context)`)
@@ -2412,16 +2479,12 @@ function formatRequestedPathCoverage(
 }
 
 function currentTurnUserMessageIndex(messages: Message[]): number {
-  // Internal continuation prompts may use the user role. The runtime's
-  // persisted turn marker, not their position or wording, defines the task
-  // whose execution evidence the judge must review.
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]
     if (message.role === 'user' && message.metadata?.[CURRENT_AGENT_TURN_USER_METADATA_KEY] === true) {
       return index
     }
   }
-  // Older checkpoints and callers without a marker retain their old boundary.
   return messages.findLastIndex((message) => message.role === 'user')
 }
 
@@ -2567,13 +2630,15 @@ export function buildRunOutcomeReviewRequest(options: {
           'The authoritative successful-execution summary and result excerpts are trusted runtime facts. Never claim a listed successful tool was unattempted, unexecuted, or missing. A missing-tool-execution claim that contradicts that ledger will be discarded deterministically; request insufficient-tool-evidence instead when the result content, selector, scope, or returned fields are inadequate.',
           'The Candidate transport line states whether the candidate is complete or a bounded head/tail excerpt. Do not call the assistant answer truncated merely because a bounded transport-omission marker is present; that marker is not part of the answer. Judge visible semantic gaps normally, and request recovery for actual unfinished syntax or missing requested content only when the complete candidate is shown or the visible head/tail establishes the defect.',
           'When needs_recovery can be advanced by concrete read-only evidence collection, include up to 4 concrete toolCalls using only fs.read, fs.glob, or fs.search. Omit toolCalls when recovery requires judgment, writing, user input, or an unsafe/state-changing action.',
-          'If the user requested creating, writing, updating, or saving a named file/artifact, use needs_recovery unless the recent tool trace shows a successful file-writing/editing tool call for that deliverable, or the assistant states a concrete blocker. A prose answer that merely summarizes or claims the file will be written is not complete.',
+          'When the request only requires ensuring an end state, a current-turn successful read/check proving that the state already satisfies every criterion can complete without a redundant write. This exception does not satisfy an explicit new artifact or required write. If the user requested creating, writing, updating, or saving a named file/artifact, use needs_recovery unless the recent tool trace shows a successful file-writing/editing tool call for that deliverable, or the assistant states a concrete blocker. A prose answer that merely summarizes or claims the file will be written is not complete.',
           'Hard fail for file/artifact requests: returning the artifact body inside chat, markdown fences, or a code block is NOT the same as writing the requested file. A named-file deliverable is complete only when the tool trace proves a successful fs.write/fs.append/fs.edit/apply_patch/terminal write for that deliverable, or the candidate answer states a real policy/tool blocker. If there is no such write trace, return needs_recovery even if the candidate answer looks polished.',
           'For broad or deep artifact requests such as full-codebase analysis, architecture reconstruction, requirement extraction, long reports, or presentation-style documents, also judge whether the run contract, recent tool trace, source-content read list, search evidence, and file-write preview show enough evidence and scope for that request. Use needs_recovery when a broad artifact is only a short overview, lacks the requested sections or diagrams, has no evidence trail, or follows only shallow exploration. This is a semantic quality check, not a fixed keyword or size rule.',
           'If the latest request asks for exhaustive, whole-codebase, or requirement-extraction work, the burden is higher than "a file was written": the artifact must either be grounded in broad, representative repository evidence or explicitly mark itself partial/incomplete with the remaining scope. Do not accept source-of-truth links, package-name lists, or artifact self-claims as substitutes for observed evidence.',
           'When a run contract evidence requirement has requiresArtifactEvidenceMap=true, the written artifact must trace its claims to observed source paths or source scopes from the tool evidence summary. Use needs_recovery if the artifact does not expose that traceability or coverage map.',
           'When a run contract evidence requirement has requiresArtifactSelfReview=true, the written artifact must include an explicit self-review or acceptance checklist that closes the run contract acceptance criteria by id. Use needs_recovery if those criterion ids are not traceable in the artifact read-back.',
           'Use the tool evidence summary as authoritative over the candidate answer. If the answer claims it read or verified files that only appear in glob/list evidence, the written artifact preview, or the artifact itself, treat that claim as unsupported and request recovery unless the answer clearly labels it as existence-only evidence.',
+          'The first character of the reply must be { and the last must be }. Do not deliberate in prose before the JSON; a verdict that is still being reasoned out is not a reply.',
+          'Large tool results are shown as bounded excerpts: the beginning, the end, and, after the marker [lines cited by the candidate], the exact result lines that contain what the candidate answer cites (URLs, quoted names, numbers, refs). Verify cited claims against those lines; the omitted middle is not evidence of absence.',
           'For factual status, measurement, identity, count, or configuration claims derived from external or runtime observations, compare the candidate claim itself with the exact current-turn tool result excerpts. If a claim reverses, changes, or invents an observed value, resource, or outcome, use needs_recovery with recoveryMode=synthesis when the existing evidence is sufficient to correct the answer.',
           'When recoveryMode=synthesis is appropriate, identify every material mismatch or omission visible in the current candidate in this one review rather than returning only the first defect. Put the full bounded correction checklist in instruction so the next synthesis can repair all observed resources, values, counts, polarity, and requested disclosure boundaries in one pass.',
           'When the run contract lists required artifacts or the latest user request names specific file or directory scopes, compare each scope against the Required/requested path coverage line. If a required scope has no evidence, or only list evidence while the answer claims content-level analysis, use needs_recovery.',
@@ -2592,7 +2657,7 @@ export function buildRunOutcomeReviewRequest(options: {
           formatActiveUserInstructions(options.userInstructions),
           '',
           '[Tool evidence summary]',
-          formatToolEvidenceForReview(options.messages, options.runContract, options.evidenceLedger),
+          formatToolEvidenceForReview(options.messages, options.runContract, options.evidenceLedger, options.assistantAnswer),
           '',
           '[Recent conversation after the latest user request]',
           formatConversationForReview(options.messages) || '[none]',
@@ -2620,16 +2685,9 @@ export function parseRunOutcomeReview(content: string): RunOutcomeReview | null 
   const complete = parseCompleteRunOutcomeReviewJson(content)
   if (complete) return complete
 
-  // Some local providers cut short small JSON-only judge replies. A visible
-  // needs_recovery status is still a conservative repair signal.
   return parsePartialRunOutcomeReview(content)
 }
 
-/**
- * Prefer the provider's visible control reply, but allow a JSON-only outcome
- * review returned in a non-visible reasoning field to pass through the same
- * schema normalization. The thinking text itself never becomes user output.
- */
 export function parseRunOutcomeReviewTransport(
   visibleContent: string,
   thinking: string | undefined,
@@ -3111,14 +3169,6 @@ export function enforceRunOutcomeReviewEvidenceFloor(options: {
   }
 }
 
-/**
- * Drop earlier copies of this block before a new one is pushed.
- *
- * Every review that finds the same gap emits the same 1,300-character
- * instruction, and they were appended rather than replaced — captured requests
- * carried two verbatim copies. Only the newest can be acted on, and the text
- * does not vary with the attempt, so nothing is lost by keeping one.
- */
 export function dropStaleRunOutcomeReviewRecovery(messages: Message[]): void {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]

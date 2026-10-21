@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyError } from 'fastify'
 import { createLogger } from '../logger.js'
 import { ConfigRevisionConflictError } from '../server/runtime/config-runtime.js'
+import { redactUrlForLog } from './log-url.js'
 import { skipOverride } from './skip-override.js'
 
 const logger = createLogger('error')
@@ -9,9 +10,8 @@ export async function errorHandlerPlugin(app: FastifyInstance) {
   app.setErrorHandler((error: FastifyError, request, reply) => {
     const requestId = request.requestId ?? 'unknown'
 
-    // Config revision conflict — external writer modified config.yaml
     if (error instanceof ConfigRevisionConflictError) {
-      logger.warn(`${request.method} ${request.url}: ${error.message}`, { requestId })
+      logger.warn(`${request.method} ${redactUrlForLog(request.url)}: ${error.message}`, { requestId })
       reply.status(409).send({
         error: {
           code: 'CONFIG_REVISION_CONFLICT',
@@ -22,10 +22,8 @@ export async function errorHandlerPlugin(app: FastifyInstance) {
       return
     }
 
-    // Log the error
-    logger.error(`${request.method} ${request.url}: ${error.message}`, { requestId, statusCode: error.statusCode })
+    logger.error(`${request.method} ${redactUrlForLog(request.url)}: ${error.message}`, { requestId, statusCode: error.statusCode })
 
-    // Format response
     const statusCode = error.statusCode ?? 500
     const code = statusCode === 400 ? 'INVALID_REQUEST'
       : statusCode === 401 ? 'UNAUTHORIZED'
@@ -42,7 +40,6 @@ export async function errorHandlerPlugin(app: FastifyInstance) {
     })
   })
 
-  // Handle 404s
   app.setNotFoundHandler((request, reply) => {
     reply.status(404).send({
       error: {

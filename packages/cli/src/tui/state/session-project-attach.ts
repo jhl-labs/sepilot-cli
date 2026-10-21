@@ -1,16 +1,3 @@
-// Pulled out of App.tsx so the "should the current session be
-// attached to the selected project right now?" decision can be
-// reasoned about without the surrounding effect/closure noise. The
-// helper is pure: it inspects state and returns a tagged action the
-// effect should perform — reset the dedup ref, record an existing
-// link, skip, or fire the attach call.
-//
-// The actual attach call + state updates stay in the effect because
-// they touch React-side setters (setProjects, dispatch) and the
-// outcome interleaves with the dedup ref. Keeping the decision
-// pure-functional makes the gate logic unit-testable in isolation
-// while leaving the effect body small and top-down.
-
 import type { ProjectSelectionSource } from '../hooks/useProjectSelection.js'
 
 interface ProjectLike {

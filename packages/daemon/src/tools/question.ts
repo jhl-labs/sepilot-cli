@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { AutonomyLevel } from '@sepilotd/core'
 import type { ToolDefinitionRuntime, ToolResult, ToolExecutionContext } from './registry.js'
 
 export interface PendingQuestion {
@@ -35,7 +36,6 @@ export class PendingQuestionStore {
     try {
       this.onEnqueueListener?.(q)
     } catch {
-      // Listener must not affect question persistence.
     }
   }
 
@@ -61,7 +61,6 @@ export class PendingQuestionStore {
       try {
         this.onAnswerListener?.(q, answer)
       } catch {
-        // Listener must not affect question cancellation.
       }
       cancelled += 1
     }
@@ -76,7 +75,6 @@ export class PendingQuestionStore {
     try {
       this.onAnswerListener?.(q, answer)
     } catch {
-      // Listener must not affect question resolution.
     }
     return true
   }
@@ -111,7 +109,6 @@ export function createQuestionRequester(
     })
     if (onEnqueue) {
       void Promise.resolve(onEnqueue({ id, sessionId, prompt, choices })).catch(() => {
-        // Question visibility must not affect the blocking question itself.
       })
     }
     return answer
@@ -138,6 +135,14 @@ export function createQuestionTool(deps: QuestionToolDeps): ToolDefinitionRuntim
       const start = Date.now()
       if (!ctx?.sessionId) {
         return { output: 'no session context', status: 'error', durationMs: Date.now() - start }
+      }
+      if (ctx.autonomy === AutonomyLevel.Autonomous) {
+        return {
+          output: 'question is unavailable in autonomous mode; proceed using a reasonable assumption and state it in the final response.',
+          status: 'error',
+          code: 'AUTONOMOUS_QUESTION_BLOCKED',
+          durationMs: Date.now() - start,
+        }
       }
       const answer = await requestQuestion({
         sessionId: ctx.sessionId,

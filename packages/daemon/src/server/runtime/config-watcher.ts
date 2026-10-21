@@ -11,14 +11,8 @@ export interface ConfigWatcherDeps {
   readConfig: () => Promise<SepilotdConfig>
   onMcpChange: (mcp: McpCfg) => Promise<void> | void
   onOtherChange?: (changedSections: string[]) => void
-  /** Called after every successful config re-read so callers can sync state
-   *  (e.g. in-memory configRevision) with the new on-disk snapshot AND
-   *  reconfigure live services so config and services stay in lockstep.
-   *  Awaited so a slow reconfigure finishes before onMcpChange/onOtherChange. */
   onConfigReloaded?: (config: SepilotdConfig) => void | Promise<void>
-  /** Defer reload while the daemon is writing config itself. */
   shouldDeferReload?: () => boolean
-  /** True when a re-read snapshot is already reflected in runtime state. */
   isCurrentConfig?: (config: SepilotdConfig) => boolean
   debounceMs?: number
 }
@@ -30,14 +24,9 @@ export class ConfigWatcher {
   constructor(private deps: ConfigWatcherDeps) {}
 
   async start(initial: SepilotdConfig): Promise<void> {
-    // Call readConfig once at startup to align the mock call sequence used in tests.
-    // The caller-supplied `initial` is always used as the baseline for diffing so
-    // that the watcher reports changes relative to the config that was in effect
-    // when the daemon started, not a freshly re-read snapshot.
     try {
       await this.deps.readConfig()
     } catch {
-      // ignore startup read errors; we will still watch for future changes
     }
     this.lastConfig = initial
     try {
@@ -89,11 +78,6 @@ export class ConfigWatcher {
     try {
       await this.deps.onConfigReloaded?.(next)
     } catch (err) {
-      // A reload callback may reject a value that is structurally valid but
-      // unusable at runtime (for example an unreadable custom CA). Keep the
-      // prior diff baseline so a corrected file is retried against the last
-      // successfully applied config, and do not fan the rejected snapshot out
-      // to MCP/other-section callbacks.
       log.warn('Config reload validation/reconfiguration failed; keeping current config', {
         error: err instanceof Error ? err.message : String(err),
       })

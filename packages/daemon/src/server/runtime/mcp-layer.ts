@@ -17,12 +17,6 @@ export interface McpLayer {
   mcpConfigWriter: ConfigWriter | null
 }
 
-/**
- * MCP subsystem: the manager that spawns/connects servers, the
- * per-server prompt registry, the marketplace catalog + its query
- * source, and the optional config writer that persists new MCP
- * server entries back to config.yaml.
- */
 export async function assembleMcpLayer(args: {
   dataDir: string
   configPath: string | undefined

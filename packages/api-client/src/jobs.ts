@@ -1,16 +1,3 @@
-/**
- * Standalone factory client for the daemon's `/api/v1/jobs/*` routes.
- *
- * This is a lightweight, fetch-injectable client used by surfaces (e.g.
- * the CLI batch facade) that want a small surface area without pulling
- * in the full `DaemonClient`. Tests inject `fetch`; production code
- * passes the real `globalThis.fetch`.
- *
- * URL convention matches the rest of the api-client: every path is
- * prefixed with `/api/v1` so it lines up with how the daemon registers
- * routes (`registerJobsRoutes(..., { prefix: '/api/v1' })`).
- */
-
 import { ApiHttpClient } from './http.js'
 
 const API_PREFIX = '/api/v1'

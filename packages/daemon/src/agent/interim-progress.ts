@@ -5,9 +5,6 @@ import { currentTurnMessages } from './policy-failure.js'
 
 export const MAX_EMPTY_FINAL_REPAIRS = 2
 export const MAX_INTERIM_PROGRESS_REPAIRS = 4
-// The stem is a presentation contract, not semantic work. One provider turn
-// is enough to repair it; after that, preserve the latest usable candidate
-// instead of multiplying final-synthesis calls after tool work is complete.
 export const MAX_MISSING_ANSWER_PROTOCOL_REPAIRS = 1
 export const MAX_UNSUPPORTED_CITATION_REPAIRS = 2
 const MAX_EMPTY_FINAL_TOOL_LINES = 3
@@ -16,7 +13,7 @@ const FILE_EDIT_TOOL_NAMES = new Set(['fs.write', 'fs.append', 'fs.edit', 'apply
 const PLANNER_FENCE_PATTERN = /\n?```(?:planner|json:planner)\s*\n[\s\S]*?\n?```\s*/gi
 const JSON_FENCE_PATTERN = /\n?```json\s*\n([\s\S]*?)\n?```\s*/gi
 export const ANSWER_PROTOCOL_SYSTEM_PROMPT = [
-  'Final-answer protocol: when you send user-visible assistant text instead of a tool call, start the response with `ANSWER:`.',
+  'Final-answer protocol: when you send user-visible assistant text instead of a tool call, start the response with `ANSWER:`, written as plain text without backticks or bold.',
   'These stems are literal runtime markers: never translate them. After the marker, follow the user-requested body format directly, without another answer label or preamble.',
   'If you cannot provide the finished answer yet and no tool call is being made in this reply, start with `INCOMPLETE:` and state the concrete blocker or next required action.',
   'If the active specialist prompt explicitly requires another terminal stem such as `VERIFIED:` or `UNVERIFIED:`, use that specialist stem instead of `ANSWER:`.',
@@ -25,11 +22,7 @@ export const ANSWER_PROTOCOL_SYSTEM_PROMPT = [
   'When the tool-use progress contract is present, its structured action annotation may accompany that same tool response; do not send the annotation as a separate prose-only turn.',
 ].join(' ')
 const ANSWER_PROTOCOL_MARKER = 'Final-answer protocol:'
-const ANSWER_PROTOCOL_STEM_PATTERN = /^[ \t]*(ANSWER|INCOMPLETE):[ \t]*(.*)$/i
-// Completion-gate bookkeeping lines the model is instructed to emit before the
-// final stem (`CRITERION AC1: MET`). They are loop-control protocol, never part
-// of the user-facing answer, so the stem scanner skips them and the final
-// sanitizers drop them outside code fences.
+const ANSWER_PROTOCOL_STEM_PATTERN = /^[ \t]*(`|\*\*|__)?(ANSWER|INCOMPLETE)(?::\1|\1:)[ \t]*(.*)$/i
 const CRITERION_PROTOCOL_LINE_PATTERN = /^[ \t]*CRITERION\s+\S+:\s*(?:MET|UNMET)\b.*$/i
 const APPROXIMATE_LINE_REFERENCE_PATTERN =
   /(?:\bline(?:s)?\s*~\s*\d+\b|\b~\s*line(?:s)?\s*\d+\b|:[ \t]*~\s*\d+\b|\|\s*~\s*\d+\s*\||\b(?:around|approximately|roughly)\s+line(?:s)?\s+\d+\b)/i
@@ -128,10 +121,10 @@ function findAnswerProtocolStem(content: string): FoundAnswerProtocolStem | null
       continue
     }
 
-    const stem = match[1]!.toUpperCase() as AnswerProtocolStem
+    const stem = match[2]!.toUpperCase() as AnswerProtocolStem
     candidates.push({
       stem,
-      body: match[2] ?? '',
+      body: match[3] ?? '',
       lineIndex: i,
       lines,
     })
@@ -139,9 +132,6 @@ function findAnswerProtocolStem(content: string): FoundAnswerProtocolStem | null
 
   if (candidates.length === 0) return null
 
-  // A protocol block at the beginning owns the whole response, including any
-  // later duplicated marker. When prose or a rendered preview precedes the
-  // protocol, the last independent marker is the terminal handoff.
   return hasSubstantivePreamble ? candidates.at(-1)! : candidates[0]!
 }
 
@@ -170,8 +160,8 @@ function stripProtocolStemsOutsideCodeFences(lines: string[]): string[] {
       result.push(line)
       continue
     }
-    const stem = match[1]!.toUpperCase() as AnswerProtocolStem
-    result.push(stripRepeatedProtocolStem(match[2] ?? '', stem))
+    const stem = match[2]!.toUpperCase() as AnswerProtocolStem
+    result.push(stripRepeatedProtocolStem(match[3] ?? '', stem))
   }
   return result
 }
@@ -306,9 +296,6 @@ export function hasUnsupportedCitationPattern(content: string): boolean {
   return APPROXIMATE_LINE_REFERENCE_PATTERN.test(content)
 }
 
-// Exact `path/to/file.ext:123` citations. Requires a real file extension so we
-// do not match prose like "step 3:12" or bare `foo:1`. Used to cross-check the
-// cited files against the evidence ledger's observed reads.
 const EXACT_FILE_LINE_CITATION_PATTERN =
   /\b([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,10}):(\d+)\b/g
 
@@ -535,10 +522,6 @@ export function buildInterimProgressFallbackMessage(
     ? 'INCOMPLETE: The run completed some tool work but ended with a progress-only reply instead of a finished answer.'
     : 'INCOMPLETE: The run ended with a progress-only reply instead of a finished answer.'
 
-  // A multi-line progress body is often a substantive draft (e.g. the
-  // completion gate's explicitly-unverified draft). Keep its structure and
-  // cap generously instead of squashing it into one 180-char line — real
-  // tool work must not be reduced to an ellipsis.
   const progressBlock = !progressText
     ? ''
     : progressText.includes('\n')

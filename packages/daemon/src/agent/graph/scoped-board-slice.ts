@@ -2,25 +2,12 @@ import type { AgentState } from './types.js'
 
 const MAX_SLICE_LIST_ITEMS = 8
 
-/**
- * Minimal structural view of a shared-board entry, declared locally so this
- * pure graph module does not import the server/runtime SharedBoard type.
- */
 export interface ScopedBoardSiblingEntry {
   origin: { sessionId: string; category?: string }
   kind: 'failed_attempt' | 'open_question' | 'evidence'
   payload: Record<string, unknown>
 }
 
-/**
- * Render the scoped board slice a subagent should start from: the run goal, its
- * acceptance criteria, open questions, and — for categories where repeating a
- * dead-end is the risk — the parent's known failed attempts (agent-1hour's
- * "block failures across agents"). This is a deterministic text block built from
- * structured board fields only; it is a *slice*, never the parent's full state
- * (no messages, no raw tool output), so depth-1 isolation and context hygiene
- * are preserved. PLAN_065 T3.
- */
 export function buildScopedBoardSlice(
   parent: Pick<AgentState, 'seedContract' | 'failedAttempts' | 'openQuestions'>,
   opts: { category: string; siblingEntries?: ScopedBoardSiblingEntry[] },
@@ -56,9 +43,6 @@ export function buildScopedBoardSlice(
     )
   }
 
-  // Explore-style read-only scouts do not act, so parent dead-ends are not
-  // relevant to them; acting categories (coder/general/…) inherit the failed
-  // attempts so they do not re-run a known-bad approach.
   const includeFailedAttempts = opts.category !== 'explore'
   const failedAttempts = parent.failedAttempts ?? []
   if (includeFailedAttempts && failedAttempts.length > 0) {
@@ -72,10 +56,6 @@ export function buildScopedBoardSlice(
     )
   }
 
-  // Findings from concurrent sibling subagents under the same parent run, so a
-  // subagent inherits a sibling's dead-end/open-question instead of
-  // rediscovering it (opencode shared-block). Best-effort: may be empty when
-  // this subagent starts before siblings have reported.
   const siblingLines = renderSiblingEntries(opts.siblingEntries ?? [], opts.category)
   if (siblingLines.length > 0) {
     sections.push(['Findings from sibling subagents:', ...siblingLines].join('\n'))

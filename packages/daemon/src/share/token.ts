@@ -1,12 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 
-/**
- * Upper bound on share-token TTL. Public /share URLs cannot be
- * revoked — once a token is minted, anyone holding the URL has read
- * access to the session content for the full TTL. Capping at 24h
- * limits the blast radius of an accidentally-pasted URL (browser
- * history, referrer, CDN logs).
- */
 export const SHARE_TOKEN_MAX_TTL_SECONDS = 24 * 60 * 60
 
 export interface ShareTokenInput {
@@ -50,9 +43,6 @@ function constantTimeEquals(a: string, b: string): boolean {
 export function createShareToken(input: ShareTokenInput, secret: string): string {
   if (!secret) throw new Error('share token secret is required')
   if (input.ttlSeconds <= 0) throw new Error('share token ttl must be positive')
-  // Cap server-side regardless of operator config — verifyShareToken
-  // mirrors this so a previously-minted longer token is also rejected
-  // after the cap is in place.
   const cappedTtl = Math.min(input.ttlSeconds, SHARE_TOKEN_MAX_TTL_SECONDS)
   const payload: ShareTokenPayload = {
     sid: input.sessionId,
@@ -80,10 +70,6 @@ export function verifyShareToken(token: string, secret: string): VerifyShareToke
     if (parsed.exp < nowSeconds) {
       return { valid: false, reason: 'expired' }
     }
-    // Refuse tokens whose remaining lifetime exceeds the cap, even if
-    // they were minted before the cap was added or by a misconfigured
-    // operator. A 30-day token suddenly becomes a 24-hour token on
-    // upgrade, matching the security contract documented above.
     if (parsed.exp - nowSeconds > SHARE_TOKEN_MAX_TTL_SECONDS) {
       return { valid: false, reason: 'expired' }
     }

@@ -54,7 +54,6 @@ function executableExists(command: string, env: NodeJS.ProcessEnv): boolean {
       accessSync(candidate, constants.X_OK)
       return true
     } catch {
-      /* try next path */
     }
   }
   return false

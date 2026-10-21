@@ -5,8 +5,8 @@ import type { ISandbox, RunOptions, RunResult } from '@sepilotd/core'
 
 export interface DockerSandboxConfig {
   image?: string
-  cpuLimit?: string // e.g. "1.0"
-  memoryLimit?: string // e.g. "512m"
+  cpuLimit?: string
+  memoryLimit?: string
   networkMode?: 'none' | 'bridge' | 'host'
   readOnlyRootfs?: boolean
   pidsLimit?: number
@@ -20,12 +20,6 @@ export class DockerSandbox implements ISandbox {
   constructor(config?: DockerSandboxConfig) {
     this.docker = new Docker()
     this.config = config ?? {}
-    // `networkMode: 'host'` shares the host network namespace with the
-    // container, which means a workload run inside the "sandbox" can still
-    // hit `127.0.0.1:17600` (the daemon itself) and any other loopback
-    // service. That defeats the network-isolation purpose of the sandbox
-    // — refuse it outright unless the operator explicitly acks it. The
-    // legitimate cases are 'none' (default) and 'bridge'.
     if (this.config.networkMode === 'host') {
       const ack = process.env.SEPILOTD_SANDBOX_ALLOW_HOST_NETWORK
       if (ack !== 'YES_I_UNDERSTAND') {
@@ -44,7 +38,6 @@ export class DockerSandbox implements ISandbox {
     const timeoutMs = options?.timeoutMs ?? 300000
 
     try {
-      // Create container
       const container = await this.docker.createContainer({
         Image: image,
         Cmd: ['sh', '-c', command],
@@ -65,7 +58,6 @@ export class DockerSandbox implements ISandbox {
 
       this.containerId = container.id
 
-      // Start and wait
       await container.start()
 
       const waitPromise = container.wait()
@@ -75,7 +67,6 @@ export class DockerSandbox implements ISandbox {
 
       const { StatusCode } = await Promise.race([waitPromise, timeoutPromise])
 
-      // Get logs
       const logs = await container.logs({
         stdout: true,
         stderr: true,
@@ -91,14 +82,12 @@ export class DockerSandbox implements ISandbox {
         durationMs: Date.now() - start,
       }
     } catch (err: unknown) {
-      // Cleanup on error
       if (this.containerId) {
         try {
           const c = this.docker.getContainer(this.containerId)
           await c.stop().catch(() => {})
           await c.remove().catch(() => {})
         } catch {
-          // ignore cleanup errors
         }
         this.containerId = null
       }
@@ -148,13 +137,11 @@ export class DockerSandbox implements ISandbox {
         await container.stop().catch(() => {})
         await container.remove().catch(() => {})
       } catch {
-        // ignore cleanup errors
       }
       this.containerId = null
     }
   }
 
-  /** Check if Docker is available */
   static async isAvailable(): Promise<boolean> {
     try {
       const docker = new Docker()

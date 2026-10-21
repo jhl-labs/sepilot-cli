@@ -1,7 +1,5 @@
-// Common types
 export type { Timestamp, ID, DeviceId, SessionId } from './types/common.js'
 
-// Writing-mode (canvas) doc session — daemon-owned doc + LLM doc.* tools
 export type {
   DocSession,
   DocOutlineEntry,
@@ -19,8 +17,14 @@ export type { ApiError, ErrorCode } from './types/errors.js'
 export type { PaginationParams, PaginatedResult } from './types/pagination.js'
 export type { Disposable } from './disposable.js'
 
-// Agent
 export { AutonomyLevel, ThinkingLevel } from './agent/types.js'
+export type {
+  LiveView,
+  LiveViewController,
+  LiveViewKind,
+  LiveViewRecord,
+  LiveViewStill,
+} from './views/types.js'
 export type {
   MessageRole,
   ContentPart,
@@ -30,6 +34,7 @@ export type {
   ToolDefinition,
   ToolSecurityDescriptor,
   ToolSecurityEffect,
+  ToolReach,
   ToolCall,
   ChatRequest,
   TokenUsage,
@@ -95,7 +100,6 @@ export {
 } from './agent/execution-posture.js'
 export { assertNever } from './agent/assert-never.js'
 
-// Channel
 export type {
   ChannelType,
   ChannelSender,
@@ -108,7 +112,6 @@ export type {
 } from './channel/types.js'
 export type { IChannel } from './channel/channel.js'
 
-// Memory
 export type {
   SessionEvent,
   SessionStartEvent,
@@ -173,11 +176,11 @@ export type {
   DocumentUpdateInput,
 } from './memory/semantic-index.js'
 
-// Security
 export type {
   ToolPolicyMode,
   PolicyRule,
   PolicyConfig,
+  ResourceAccessPolicy,
   PolicyCheckResult,
 } from './security/types.js'
 export type { ToolExecRequest, IToolPolicy } from './security/policy.js'
@@ -202,11 +205,9 @@ export {
   isStaleRememberedDecision,
 } from './security/approval-decisions.js'
 
-// Hook
 export type { HookEvent, HookPayload, HookResult, IHookHandler } from './hook/types.js'
 export type { IHookRegistry } from './hook/registry.js'
 
-// Canvas / A2UI
 export type {
   A2UIComponent,
   A2UIText,
@@ -254,7 +255,6 @@ export {
   providerSupportsImageCanvasOperation,
 } from './canvas/image.js'
 
-// Skill
 export type {
   SkillSourceType,
   SkillSourceRecord,
@@ -273,7 +273,6 @@ export type {
 } from './skill/types.js'
 export type { ISkillRegistry } from './skill/registry.js'
 
-// Control Plane
 export type {
   TicketStatus,
   CreateTicketInput,
@@ -313,7 +312,6 @@ export type {
 } from './control-plane/knowledge.js'
 export type { DeviceMessage, Device, IMessageService } from './control-plane/message.js'
 
-// Scheduler
 export type {
   JobKind,
   JobRunStatus,
@@ -331,5 +329,4 @@ export type {
 } from './scheduler/types.js'
 export { DEFAULT_RETRY_POLICY, nextRetryAt } from './scheduler/types.js'
 
-// Swarm
 export * from './swarm/types.js'

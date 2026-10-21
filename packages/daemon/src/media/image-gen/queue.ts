@@ -101,8 +101,6 @@ export function createQueue(providers: Map<string, Provider>): ImageGenQueue {
 
   async function tick(): Promise<void> {
     if (running) return
-    // In tests, the underlying database may be closed while an unref'd
-    // interval is still pending. Bail out cleanly instead of throwing.
     if (!db.open) return
     const next = db
       .prepare(`SELECT * FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1`)
@@ -160,9 +158,6 @@ export function createQueue(providers: Map<string, Provider>): ImageGenQueue {
           emit(rowToJob({ ...next, status: 'running', progress: p }))
         },
       })
-      // The generate() await can span a shutdown: the entry guard only covers
-      // tick start, so every resumption point must re-check before touching
-      // the connection or the settle path throws as an unhandled rejection.
       if (!db.open) return
       const current = db.prepare('SELECT * FROM jobs WHERE id=?').get(next.id) as JobRow | undefined
       if (!current) return
@@ -265,8 +260,6 @@ export function createQueue(providers: Map<string, Provider>): ImageGenQueue {
       timer = setInterval(() => {
         void tick()
       }, 50)
-      // Don't block event loop; tests and clean shutdowns don't need to
-      // wait for the queue interval to exit.
       if (typeof (timer as unknown as { unref?: () => void }).unref === 'function') {
         ;(timer as unknown as { unref: () => void }).unref()
       }

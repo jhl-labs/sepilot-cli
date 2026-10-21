@@ -21,9 +21,6 @@ const log = createLogger('bwrap-runner')
 
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024
 
-// Read-only system paths the sandboxed command needs for a working
-// toolchain. Each is bound only if it exists on the host (checked at
-// run time); none expose user data, credentials, or daemon state.
 const SYSTEM_RO_PATHS = [
   '/usr',
   '/bin',
@@ -53,14 +50,6 @@ function hasNonLoopbackNameserver(content: string): boolean {
   })
 }
 
-/**
- * Prefer a resolver file containing real upstream servers for host-network
- * sandboxes. Some Linux hosts expose a systemd-resolved loopback stub through
- * /etc/resolv.conf while the daemon itself resolves through NSS/D-Bus. The
- * isolated mount namespace does not expose that D-Bus socket, so copying the
- * stub makes ordinary package-manager DNS fail even though host networking is
- * authorized.
- */
 export async function resolveNetworkResolvConfPath(
   candidates: readonly string[] = NETWORK_RESOLV_CONF_CANDIDATES,
 ): Promise<string | null> {
@@ -69,7 +58,6 @@ export async function resolveNetworkResolvConfPath(
       const content = await readFile(candidate, 'utf8')
       if (hasNonLoopbackNameserver(content)) return candidate
     } catch {
-      // Try the next well-known non-stub resolver file.
     }
   }
   return null
@@ -176,25 +164,9 @@ export interface SandboxReadOnlyBind {
   target: string
 }
 
-/**
- * Host-DoS guardrails for the sandbox tier. Three layers, each applied when its
- * mechanism is available (probed at run time), so a missing tool degrades the
- * cap instead of breaking the sandbox:
- *  - pids: a cgroup `TasksMax` via `systemd-run --user --scope` — the correct
- *    fork-bomb cap. (RLIMIT_NPROC is deliberately NOT used: it is keyed on the
- *    real UID globally and breaks bwrap's user-namespace creation.)
- *  - memory: cgroup `MemoryMax` (when the systemd scope is used) plus a
- *    `prlimit --as` virtual-address-space cap — bounds unbounded malloc.
- *  - tmpfs: a size-bounded `/tmp` (bwrap `--size`, >= 0.8) — bounds `dd`/fill.
- * Defaults are generous enough for ordinary build/test commands; operators can
- * widen or (with 0) disable a specific cap.
- */
 export interface SandboxResourceLimits {
-  /** cgroup TasksMax — max processes/threads; caps fork bombs. 0 disables. */
   pidsMax: number
-  /** Max memory in bytes — cgroup MemoryMax + prlimit --as. 0 disables. */
   memoryMaxBytes: number
-  /** tmpfs size for /tmp in bytes; caps `dd`/fill attacks. 0 uses bwrap default. */
   tmpfsSizeBytes: number
 }
 
@@ -204,11 +176,8 @@ export const DEFAULT_SANDBOX_RESOURCE_LIMITS: SandboxResourceLimits = {
   tmpfsSizeBytes: 256 * 1024 * 1024,
 }
 
-/** Which limiter mechanisms are available on this host (probed at run time). */
 export interface SandboxLauncherCapabilities {
-  /** `systemd-run --user --scope` works — enables cgroup pids/memory caps. */
   cgroup: boolean
-  /** `prlimit` is present — enables the --as address-space cap. */
   prlimit: boolean
 }
 
@@ -216,9 +185,6 @@ function resolveResourceLimits(partial?: Partial<SandboxResourceLimits>): Sandbo
   return { ...DEFAULT_SANDBOX_RESOURCE_LIMITS, ...(partial ?? {}) }
 }
 
-// The `--size` tmpfs modifier only exists in bwrap >= 0.8. Probe `--help` once
-// per binary and cache: on older bwrap the size cap is silently skipped rather
-// than passing an unknown option that would abort every sandboxed command.
 const bwrapSizeSupport = new Map<string, Promise<boolean>>()
 
 function bwrapSupportsSizeOption(bwrapPath: string): Promise<boolean> {
@@ -246,8 +212,6 @@ function bwrapSupportsSizeOption(bwrapPath: string): Promise<boolean> {
   return probe
 }
 
-// Probe whether a binary can run at all (present on PATH / spawnable). Cached
-// per binary so the check runs once.
 const binaryAvailability = new Map<string, Promise<boolean>>()
 
 function probeBinaryRuns(bin: string, args: string[]): Promise<boolean> {
@@ -271,18 +235,12 @@ function probeBinaryRuns(bin: string, args: string[]): Promise<boolean> {
 
 async function resolveLauncherCapabilities(): Promise<SandboxLauncherCapabilities> {
   const [cgroup, prlimit] = await Promise.all([
-    // A transient user scope that runs a trivial command proves cgroup capping
-    // is usable without root on this host's user session.
     probeBinaryRuns('systemd-run', ['--user', '--scope', '--quiet', '--', 'true']),
     probeBinaryRuns('prlimit', ['--as=4294967296', '--', 'true']),
   ])
   return { cgroup, prlimit }
 }
 
-// A non-zero exit whose stderr matches a sandbox *setup* failure (the limiter
-// prelude could not exec bwrap, or bwrap itself failed to build the namespace)
-// means the command never ran inside the sandbox — report an honest host
-// fallback instead of a false active:true posture.
 export function isSandboxSetupFailure(stderr: string): boolean {
   return (
     /prlimit: failed to execute/i.test(stderr) ||
@@ -293,65 +251,35 @@ export function isSandboxSetupFailure(stderr: string): boolean {
   )
 }
 
-/** `bwrap` was active, but the requested target executable was not present. */
 export function isSandboxTargetExecutableMissing(stderr: string): boolean {
   return /bwrap:\s+execvp\s+[^:\r\n]+:\s+No such file or directory/i.test(stderr)
 }
 
 export interface BubblewrapTerminalRunnerConfig {
-  /** 'none' unshares the network namespace; 'host' keeps host networking. */
   networkMode?: 'none' | 'host'
-  /** Bind the workspace read-only (commands cannot mutate files). */
   readOnlyWorkspace?: boolean
-  /** Override the bwrap binary path (default: 'bwrap' on PATH). */
   bwrapPath?: string
-  /**
-   * `namespace` creates a private PID namespace and mounts a fresh procfs.
-   * `container-boundary` delegates PID isolation to an outer container and
-   * exposes that container's procfs read-only. The latter is intended for
-   * nested bubblewrap where Docker/OCI blocks mounting procfs in a user
-   * namespace; filesystem, user, IPC, UTS, and network isolation remain.
-   */
   processIsolation?: 'namespace' | 'container-boundary'
-  /** Host-DoS resource caps; defaults to DEFAULT_SANDBOX_RESOURCE_LIMITS. */
   resourceLimits?: Partial<SandboxResourceLimits>
-  /** Project verified host development toolchains read-only (default: true). */
   projectHostToolchains?: boolean
-  /** Pre-resolved projection for deterministic embedding/tests. */
   toolchainProjection?: SandboxToolchainProjection
-  /**
-   * Daemon-owned root for per-workspace package/build caches. Each workspace
-   * receives a hash-isolated directory and only that directory is mounted,
-   * so repeated sandbox calls can reuse public dependencies without exposing
-   * host HOME, credentials, daemon configuration, or another repository's
-   * cache.
-   */
   cacheRoot?: string
 }
 
 export interface BubblewrapArgvInput {
   workspace: string
-  /** Working directory inside the mounted workspace; defaults to the root. */
   cwd?: string
   executable: string
   args: string[]
   networkMode: 'none' | 'host'
   readOnlyWorkspace: boolean
-  /** Process isolation strategy; defaults to a private PID namespace. */
   processIsolation?: 'namespace' | 'container-boundary'
-  /** tmpfs size for /tmp in bytes; 0/undefined uses the bwrap default. */
   tmpfsSizeBytes?: number
-  /** Exact host files exposed read-only for an internal capability. */
   readOnlyBinds?: SandboxReadOnlyBind[]
-  /** Exact daemon-owned host paths exposed read-write for IPC or tool caches. */
   readWriteBinds?: SandboxReadOnlyBind[]
-  /** Environment added by the daemon for the same internal capability. */
   capabilityEnv?: Record<string, string>
-  /** Sanitized PATH containing only mounted system and projected toolchains. */
   sandboxPath?: string
-  /** Absolute executable path inside the sandbox after capability binding. */
   sandboxExecutable?: string
-  /** Host resolver file with non-loopback nameservers for host-network mode. */
   resolvConfPath?: string
 }
 
@@ -368,14 +296,6 @@ function sandboxCacheEnv(): Record<string, string> {
   }
 }
 
-/**
- * Build the `bwrap` argument vector for a sandboxed command. Pure: the
- * workspace is bound (rw or ro) at its own path, system toolchain dirs
- * are read-only, /tmp is a private tmpfs, and the process runs in fresh
- * pid/ipc/uts/user namespaces that die with the parent. Host home, SSH keys,
- * and daemon state are never bound. An internally authorized kubectl-readonly
- * capability may mount exactly one kubeconfig file read-only.
- */
 export function buildBubblewrapArgv(input: BubblewrapArgvInput): string[] {
   const argv: string[] = [
     '--die-with-parent',
@@ -387,9 +307,6 @@ export function buildBubblewrapArgv(input: BubblewrapArgvInput): string[] {
     '--setenv', 'CI', '1',
     '--setenv', 'HOME', '/tmp',
     '--setenv', 'PATH', input.sandboxPath ?? '/usr/local/bin:/usr/bin:/bin',
-    // Python's py_compile/compileall write bytecode even when -B is present.
-    // Redirect that incidental cache into the private writable tmpfs so
-    // syntax checks work with an immutable workspace mount.
     '--setenv', 'PYTHONPYCACHEPREFIX', '/tmp/sepilot-pycache',
     '--setenv', 'SEPILOTD_SANDBOX', 'bubblewrap',
     '--dev', '/dev',
@@ -399,28 +316,18 @@ export function buildBubblewrapArgv(input: BubblewrapArgvInput): string[] {
     argv.splice(1, 0, '--unshare-pid')
     argv.push('--proc', '/proc')
   } else {
-    // Nested OCI containers can permit user/mount/network namespaces while
-    // denying a procfs mount. The outer container is already the PID boundary;
-    // retain observability without granting procfs writes.
     argv.push('--ro-bind', '/proc', '/proc')
   }
 
-  // Size-bounded /tmp tmpfs so a `dd`/fill attack cannot exhaust host memory.
-  // `--size` is a modifier applied to the following `--tmpfs` (bwrap >= 0.5).
   if (input.tmpfsSizeBytes && input.tmpfsSizeBytes > 0) {
     argv.push('--size', String(input.tmpfsSizeBytes))
   }
   argv.push('--tmpfs', '/tmp')
 
   for (const path of SYSTEM_RO_PATHS) {
-    // --ro-bind-try skips paths that don't exist instead of failing.
     argv.push('--ro-bind-try', path, path)
   }
 
-  // This bind intentionally comes after /etc/resolv.conf in SYSTEM_RO_PATHS,
-  // replacing a potentially unusable loopback stub only for authorized
-  // host-network runs. Network-isolated sandboxes retain the host file and
-  // still unshare the network namespace below.
   if (input.networkMode === 'host' && input.resolvConfPath) {
     argv.push('--ro-bind', input.resolvConfPath, '/etc/resolv.conf')
   }
@@ -476,7 +383,6 @@ async function executablePathOnHost(executable: string): Promise<string | null> 
       await access(candidate, constants.X_OK)
       return await realpath(candidate)
     } catch {
-      // Continue through PATH; missing and non-executable candidates fail closed.
     }
   }
   return null
@@ -495,7 +401,6 @@ async function kubeconfigPathOnHost(): Promise<string | null> {
       const resolved = isAbsolute(candidate) ? candidate : resolve(candidate)
       if ((await stat(resolved)).isFile()) return await realpath(resolved)
     } catch {
-      // Try the next configured kubeconfig path.
     }
   }
   return null
@@ -513,7 +418,6 @@ async function teaExecutablePathOnHost(): Promise<string | null> {
       await access(candidate, constants.X_OK)
       return await realpath(candidate)
     } catch {
-      // Only fixed system and user-local candidates may back this capability.
     }
   }
   return null
@@ -530,7 +434,6 @@ async function teaConfigPathOnHost(): Promise<string | null> {
       const resolved = isAbsolute(candidate) ? candidate : resolve(candidate)
       if ((await stat(resolved)).isFile()) return await realpath(resolved)
     } catch {
-      // Missing configuration makes tea fail closed without a login.
     }
   }
   return null
@@ -636,13 +539,6 @@ async function prepareCapabilityInvocation(
   }
 }
 
-/**
- * Build the full spawn command by wrapping bwrap in the available limiters:
- *   systemd-run --user --scope (cgroup pids + memory)  →  prlimit --as  →  bwrap
- * Each layer is included only when its capability is present and its limit is
- * non-zero, so a host without systemd or prlimit still runs the sandbox (with a
- * weaker cap) rather than failing. Pure — no process is started.
- */
 export function buildBubblewrapCommand(
   input: BubblewrapArgvInput,
   limits: SandboxResourceLimits,
@@ -651,8 +547,6 @@ export function buildBubblewrapCommand(
 ): { command: string; argv: string[] } {
   const bwrapArgv = buildBubblewrapArgv({ ...input, tmpfsSizeBytes: limits.tmpfsSizeBytes })
 
-  // Innermost: prlimit --as (virtual-address-space cap). RLIMIT_NPROC is
-  // intentionally excluded — it breaks user-namespace creation.
   let command = bwrapPath
   let argv = bwrapArgv
   if (caps.prlimit && limits.memoryMaxBytes > 0) {
@@ -660,7 +554,6 @@ export function buildBubblewrapCommand(
     command = 'prlimit'
   }
 
-  // Outermost: cgroup pids/memory caps via a transient user scope.
   if (caps.cgroup && (limits.pidsMax > 0 || limits.memoryMaxBytes > 0)) {
     const scopeFlags = ['--user', '--scope', '--quiet']
     if (limits.pidsMax > 0) scopeFlags.push('-p', `TasksMax=${limits.pidsMax}`)
@@ -718,13 +611,6 @@ export function buildBubblewrapExecutionPosture(input: {
   }
 }
 
-/**
- * terminal.run sandbox tier backed by bubblewrap (user-namespace
- * container, no daemon). Lighter than Docker — no image, no socket — and
- * isolates the host filesystem to the workspace. If bwrap is missing or
- * fails to start, the runner reports an honest non-active posture and
- * surfaces an error rather than silently running unsandboxed.
- */
 export class BubblewrapTerminalRunner implements TerminalRunner {
   private readonly bwrapPath: string
   private readonly networkMode: 'none' | 'host'
@@ -761,8 +647,6 @@ export class BubblewrapTerminalRunner implements TerminalRunner {
     try {
       canonicalWorkspace = await realpath(canonicalWorkspace)
     } catch {
-      // The normal workspace validation reports a missing root. Keep cache
-      // addressing deterministic without changing that error path.
     }
     const workspaceKey = createHash('sha256')
       .update(canonicalWorkspace)
@@ -776,12 +660,6 @@ export class BubblewrapTerminalRunner implements TerminalRunner {
     }
   }
 
-  /**
-   * Prepare a long-lived managed child with the exact same namespace,
-   * filesystem, network, and resource-limit posture as terminal.run. The
-   * caller owns process lifecycle and output capture; this method never falls
-   * back to a host command when bubblewrap is unavailable.
-   */
   async prepareManagedProcess(spec: {
     executable: string
     args: string[]
@@ -892,8 +770,6 @@ export class BubblewrapTerminalRunner implements TerminalRunner {
     throwIfAborted(spec.signal, `Command ${spec.executable} aborted`)
     const workspace = spec.workspaceRoot ?? spec.cwd ?? process.cwd()
     const cwd = spec.cwd ?? workspace
-    // Only cap the tmpfs when this bwrap understands `--size` (>= 0.8);
-    // otherwise the option would abort every command on older bwrap.
     const sizeSupported =
       this.resourceLimits.tmpfsSizeBytes > 0
         ? await bwrapSupportsSizeOption(this.bwrapPath)
@@ -1022,15 +898,10 @@ export class BubblewrapTerminalRunner implements TerminalRunner {
         if (stderr.length < MAX_OUTPUT_BYTES) stderr += chunk.toString('utf8')
       })
       child.on('error', (err) => {
-        // ENOENT etc. — bwrap binary missing. Honest host fallback.
         settle(fallback(`bubblewrap not available: ${err.message}`, 'SANDBOX_UNAVAILABLE'))
       })
       child.on('close', (exitCode) => {
         if (isAbortError(undefined) || spec.signal?.aborted) return
-        // Distinguish a sandbox setup failure (prlimit couldn't exec bwrap, or
-        // bwrap couldn't build the namespace) from an ordinary in-sandbox
-        // command failure: the former never isolated the command, so report an
-        // honest non-active fallback instead of active:true.
         if (exitCode !== 0 && isSandboxSetupFailure(stderr)) {
           settle(fallback(`bubblewrap sandbox setup failed: ${stderr.trim()}`, 'SANDBOX_UNAVAILABLE'))
           return

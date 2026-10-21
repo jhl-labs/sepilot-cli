@@ -55,8 +55,6 @@ export class ChannelOriginStore {
           records.push(parsed)
         }
       } catch {
-        // Ignore unreadable forensic leftovers; the in-memory origin guard
-        // remains fail-closed when a record cannot be restored.
       }
     }
     return records

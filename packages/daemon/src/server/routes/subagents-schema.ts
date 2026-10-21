@@ -1,14 +1,5 @@
 import { z } from 'zod'
 
-/**
- * Request body for `POST /api/v1/subagents/dispatch`.
- *
- * The route is a thin HTTP wrapper over `SubagentDispatcher.dispatch`.
- * Schema mirrors `SubagentDispatchInput` and applies minimal validation
- * (non-empty prompt, positive integer maxIterations, non-empty tool
- * names) — privilege-escalation rejection happens inside the dispatcher
- * and surfaces as a 400 with `code: 'SUBAGENT_TOOL_ESCALATION'`.
- */
 export const subagentDispatchRequestSchema = z.object({
   prompt: z.string().refine((value) => value.trim().length > 0, 'prompt required'),
   system: z.string().optional(),
@@ -21,4 +12,8 @@ export const subagentDispatchRequestSchema = z.object({
   contextPacket: z.string().optional(),
   cwd: z.string().min(1).optional(),
   isolation: z.literal('worktree').optional(),
+  worktreeBase: z.enum(['head', 'working-tree']).optional(),
+  contextMode: z.enum(['packet', 'fork']).optional(),
+  background: z.boolean().optional(),
+  requestKey: z.string().min(1).max(128).optional(),
 })

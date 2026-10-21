@@ -2,11 +2,7 @@ import { readFile, stat } from 'node:fs/promises'
 import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
 import { resolveToolPath } from './path-utils.js'
 
-// Upper bound on a notebook file read. `.ipynb` is JSON, so an oversized file
-// (e.g. a notebook with megabytes of embedded base64 image outputs, or a
-// mislabeled multi-GB file) would be read fully into memory and then
-// JSON.parsed — a daemon OOM. Stat the file first and refuse before reading.
-const MAX_NOTEBOOK_SIZE = 25 * 1024 * 1024 // 25MB
+const MAX_NOTEBOOK_SIZE = 25 * 1024 * 1024
 
 function toText(value: unknown): string {
   if (typeof value === 'string') {
@@ -64,8 +60,6 @@ export function createNotebookInspectTool(): ToolDefinitionRuntime {
         : 400
 
       try {
-        // Pre-read size guard: refuse an oversized notebook before it is read
-        // into memory and parsed.
         try {
           const info = await stat(path)
           if (info.isFile() && info.size > MAX_NOTEBOOK_SIZE) {
@@ -77,7 +71,6 @@ export function createNotebookInspectTool(): ToolDefinitionRuntime {
             }
           }
         } catch {
-          // Let the downstream read surface a proper ENOENT/permission error.
         }
         const raw = JSON.parse(await readFile(path, 'utf-8')) as {
           metadata?: Record<string, unknown>

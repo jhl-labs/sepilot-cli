@@ -31,7 +31,6 @@ export async function prometheusRoutes(app: FastifyInstance) {
     const runtime = app.runtime
     const lines: string[] = []
 
-    // Process metrics
     lines.push(`# HELP sepilotd_uptime_seconds Daemon uptime in seconds`)
     lines.push(`# TYPE sepilotd_uptime_seconds gauge`)
     lines.push(`sepilotd_uptime_seconds ${process.uptime().toFixed(1)}`)
@@ -62,7 +61,7 @@ export async function prometheusRoutes(app: FastifyInstance) {
         lines.push(`# HELP sepilotd_requests_total Total LLM requests`)
         lines.push(`# TYPE sepilotd_requests_total counter`)
         lines.push(`sepilotd_requests_total ${usage.requestCount}`)
-      } catch { /* usage tracker not available */ }
+      } catch {}
 
       lines.push(`# HELP sepilotd_providers_count Number of configured providers`)
       lines.push(`# TYPE sepilotd_providers_count gauge`)

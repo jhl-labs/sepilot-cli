@@ -32,11 +32,6 @@ function withoutQuotedExamples(input: string): string {
     .replace(/["“”][^"“”\r\n]*["“”]/g, ' ')
 }
 
-/**
- * Detect explicit control of an already-installed desktop application. It is
- * deliberately narrower than generic "app" requests so authoring or
- * explaining desktop software still goes through the normal agent router.
- */
 export function isExplicitDesktopGuiControlRequest(input: string): boolean {
   const actionable = withoutQuotedExamples(input).trim()
   if (!actionable || DESKTOP_CONTROL_NEGATION_RE.test(actionable)) return false
@@ -47,12 +42,6 @@ export function isExplicitDesktopGuiControlRequest(input: string): boolean {
   ) || DESKTOP_CONTROL_ACTION_EN_RE.test(actionable)
 }
 
-/**
- * Detect a request for a user-visible browser surface. Besides explicit
- * commands, a bounded map-result fragment is accepted as a conversational
- * UI request because the policy still asks before changing desktop focus.
- * Search/research and technical render validation stay on headless tools.
- */
 export function isVisibleUrlOpenRequest(input: string): boolean {
   const actionable = withoutQuotedExamples(input).trim()
   if (!actionable || VISIBLE_URL_NEGATION_RE.test(actionable)) return false

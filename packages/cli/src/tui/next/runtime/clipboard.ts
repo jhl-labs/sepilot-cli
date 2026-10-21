@@ -2,7 +2,6 @@ export interface ClipboardDeps {
   platform: NodeJS.Platform
   env: Record<string, string | undefined>
   writeStdout(data: string): void
-  /** Resolves true when the command accepted the complete payload. */
   spawn(command: string, args: string[], input: string): Promise<boolean>
 }
 
@@ -18,8 +17,6 @@ interface ClipboardCandidate {
   args: string[]
 }
 
-// Terminals vary widely. Keeping the encoded sequence at 1 MiB avoids writing
-// an unbounded escape payload while still supporting substantial responses.
 const OSC52_MAX_ENCODED_BYTES = 1_000_000
 
 export function encodeOsc52(text: string): string {
@@ -77,8 +74,6 @@ export async function copyToClipboard(
         return { ok: true, via: 'command', command: candidate.command }
       }
     } catch {
-      // A missing helper and a non-zero exit both move to the next candidate.
-      // The injected contract intentionally exposes only success/failure.
     }
   }
 

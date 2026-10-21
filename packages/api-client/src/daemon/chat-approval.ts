@@ -24,14 +24,6 @@ export function buildRecoveredApprovalPrompt(
 
 export interface ApprovalDecisionResult {
   outcome: 'resumed' | 'recovered' | 'recorded' | 'resolved'
-  /**
-   * Carried over from the daemon\'s respond envelope when scope
-   * is session/always — the cli surfaces tool+pattern in the
-   * /approve success line so operators can predict short-circuit
-   * behaviour without grepping `decisions list`. Undefined for
-   * once-scope (default), feedback, or stale resume paths
-   * (those never hit the live respond envelope).
-   */
   rule?: { tool: string; pattern: string }
 }
 
@@ -40,7 +32,7 @@ export async function resolveApprovalDecision(params: {
   approved: boolean | import('@sepilotd/core').ApprovalDecisionStatus
   toolName: string
   sessionId?: string
-  approvalState?: 'live' | 'stale'
+  approvalState?: 'live' | 'stale' | 'parked'
   resumeAvailable?: boolean
   note?: string
   resumeStaleApproval?: () => Promise<void>
@@ -49,7 +41,7 @@ export async function resolveApprovalDecision(params: {
     input: RecoverApprovalDecisionInput,
   ) => Promise<void>
 }): Promise<ApprovalDecisionResult> {
-  const requiresStaleRecovery = params.approvalState === 'stale'
+  const requiresStaleRecovery = params.approvalState === 'stale' || params.approvalState === 'parked'
 
   if (
     requiresStaleRecovery

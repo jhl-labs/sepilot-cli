@@ -32,9 +32,6 @@ export async function mcpInstallCommand(name: string, options: McpInstallOptions
     options.marketplace,
     parseVariables(options.var),
   )
-  // Wrap the daemon record in an {ok} envelope so the --json output
-  // matches every other mutation command. The text formatter still
-  // sees the inner record via `data.result`.
   const envelope = {
     ok: result.installed,
     requested: name,

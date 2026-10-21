@@ -17,13 +17,13 @@ import {
 } from '../../agent/auto-compaction.js'
 import { applyPreUserPromptHook } from '../../agent/turn-hooks.js'
 import { resolveApiActor } from '../request-actor.js'
-import { buildSystemPrompt } from '../../agent/system-prompt.js'
+import { buildDeferredSystemPrompt } from '../../agent/system-prompt.js'
 import { collectAgentsMd, formatAgentsMdSection } from '../../memory/agents-md.js'
 import { triggerDreamingTurn } from '../../memory/dreaming.js'
 import { resolveScopedFileMemoryReadView } from '../../memory/scoped-file-memory-read-view.js'
 import { getPersona } from '../../agent/personas.js'
 import { extractAndStoreArtifacts } from './artifact-support.js'
-import { chatRequestSchema, resolveChatMaxIterations, type ChatBody } from './chat-schema.js'
+import { chatRequestSchema, excludesLocalContext, resolveChatMaxIterations, type ChatBody } from './chat-schema.js'
 import {
   resolveOfficeAutoSkillContent,
   resolveSkillRefsContent,
@@ -305,9 +305,6 @@ export async function coworkRoutes(app: FastifyInstance) {
       let lifecycle: ReturnType<typeof createSseLifecycle> | null = null
       let clientClosed = false
       try {
-        // pre:user:prompt — fires on the cowork path too (was HTTP /chat-only)
-        // so moderation/redaction is not bypassed by using cowork. Runs before
-        // the SSE stream starts, so an abort can still return a clean 400.
         const promptGate = await applyPreUserPromptHook(message, {
           hookRegistry: runtime.hookRegistry,
           sessionId,
@@ -407,6 +404,7 @@ export async function coworkRoutes(app: FastifyInstance) {
         const personaObj = persona ? getPersona(persona) : undefined
         const agentsFiles = await collectAgentsMd({
           cwd: requestCwd,
+          includeUserLevel: !excludesLocalContext(body),
           boundaryRoot: requestWorkspaceRoot,
         })
         const agentsMemory = formatAgentsMdSection(agentsFiles) ?? undefined
@@ -441,7 +439,7 @@ export async function coworkRoutes(app: FastifyInstance) {
           registry: app.chatKnowledgeProviders,
           message: finalPrompt,
           previousMessages,
-          allowLocalKnowledge: request.authContext?.kind !== 'extension',
+          allowLocalKnowledge: request.authContext?.kind !== 'extension' && !excludesLocalContext(body),
         })
         const directApiToolRegistry = withWritingDocTools(
           withSwarmToolsForSession(
@@ -451,8 +449,6 @@ export async function coworkRoutes(app: FastifyInstance) {
             ),
             sessionId,
           ),
-          // The same expression the doc.* tools resolve with; cowork carries no
-          // writingDocId of its own.
           getDocRegistry().getActiveId(),
         )
         const agentToolRegistry = withContextualToolExposure(directApiToolRegistry, {
@@ -468,11 +464,11 @@ export async function coworkRoutes(app: FastifyInstance) {
           finalPrompt,
           directApiToolRegistry.list(),
         ) !== null
-        const baseSystemPrompt = await buildSystemPrompt({
+        const { prompt: baseSystemPrompt, systemToolGuidance } = await buildDeferredSystemPrompt({
           config: runtime.config,
           tools: agentToolRegistry,
           skills: runtime.skillRegistry,
-          fileMemory: resolveScopedFileMemoryReadView(
+          fileMemory: excludesLocalContext(body) ? undefined : resolveScopedFileMemoryReadView(
             runtime.fileMemory,
             runtime.fileMemoryRegistry,
             scopeTags,
@@ -500,12 +496,13 @@ export async function coworkRoutes(app: FastifyInstance) {
         const requestQuestion = createQuestionRequester(runtime.questions)
 
         const modeRouter = new AgentModeRouter({
+          systemToolGuidance,
           provider,
           tools: agentToolRegistry,
           policy: runtime.policyEngine,
           autonomy: effectiveAutonomy,
           auxiliaryLlmBudget,
-          semanticIndex: runtime.semanticIndex,
+          semanticIndex: excludesLocalContext(body) ? undefined : runtime.semanticIndex,
           systemPrompt,
           previousMessages,
           maxIterations: resolveChatMaxIterations(body),
@@ -573,7 +570,6 @@ export async function coworkRoutes(app: FastifyInstance) {
         lifecycle = createSseLifecycle({
           reply,
           inactivityMs: AGENT_INACTIVITY_MS,
-          // A run blocked on a pending approval/question is not stalled.
           pendingDecision: () => inactivityProbe.pendingDecision(),
           decisionTimeoutMs: resolvePendingDecisionTimeoutMs(),
           onInactivity: () => {
@@ -672,7 +668,7 @@ export async function coworkRoutes(app: FastifyInstance) {
               timestamp: new Date().toISOString(),
               content: finalContent,
             })
-            triggerDreamingTurn(runtime.dreaming, sessionId, 'cowork', scopeTags)
+            if (!excludesLocalContext(body)) triggerDreamingTurn(runtime.dreaming, sessionId, 'cowork', scopeTags)
           }
 
           if (!clientClosed && terminalStateChangeEvent) {
@@ -706,7 +702,6 @@ export async function coworkRoutes(app: FastifyInstance) {
                 reply.raw.end()
               }
             } catch {
-              /* best-effort */
             }
             return
           }
@@ -726,7 +721,6 @@ export async function coworkRoutes(app: FastifyInstance) {
             )
           }
         } catch {
-          /* best-effort */
         }
         throw err
       } finally {
@@ -734,7 +728,6 @@ export async function coworkRoutes(app: FastifyInstance) {
         try {
           if (!reply.raw.writableEnded) reply.raw.end()
         } catch {
-          /* noop */
         }
         runLease?.release()
         sessionLeaseLifecycle.releaseRun()

@@ -52,9 +52,7 @@ export interface SchedulerDeliveryOutboxSummary {
   delivering: number
   failed: number
   delivered: number
-  /** Earliest due time across pending and failed rows. */
   nextAttemptAt: number | null
-  /** Earliest retry time across failed rows only. */
   nextRetryAt: number | null
 }
 
@@ -391,7 +389,6 @@ export function createSchedulerDeliveryWorker(
 
   let activeDrain: Promise<number> | null = null
   const drainOnce = (): Promise<number> => {
-    // A slow channel must not be reclaimed as stale by the next timer tick.
     if (activeDrain) return activeDrain
     activeDrain = Promise.resolve().then(() => outbox.drainDue(deliver, batchSize))
       .finally(() => { activeDrain = null })

@@ -208,11 +208,6 @@ export async function buildSessionDetail(
     contractLedger: sessionContracts.contractLedger,
     evidenceManifest: sessionContracts.evidenceManifest,
     evaluationGate: sessionContracts.evaluationGate,
-    // Raw (not the summarized SessionEditRollback[] shape used elsewhere in
-    // sessionContracts) so these match exactly what the live SSE
-    // onEditCheckpointResolved / onDebateRound / onPlannerWorkingMemoryUpdated
-    // callbacks already send — the desktop/CLI clients can feed both through
-    // the same store actions without an adapter.
     editRollbacks: buildSessionRawEditCheckpoints(events),
     debateRounds: buildSessionDebateRounds(events),
     plannerWorkingMemory: buildSessionPlannerWorkingMemory(events),

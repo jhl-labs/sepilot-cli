@@ -532,10 +532,6 @@ async function runReactSimpleQaBenchmark(): Promise<ReactSimpleQaBenchmark> {
 }
 
 function extractToolMessageText(request: ChatRequest): string {
-  // Prompt-ReAct rewrites native `role: 'tool'` messages into user-visible
-  // `<tool_result>` blocks before invoking providers. Accept both transport
-  // shapes so this benchmark measures the loop instead of replaying one tool
-  // call until the iteration guard stops it.
   const toolMessage = [...request.messages]
     .reverse()
     .find((message) =>
@@ -702,9 +698,6 @@ async function runGraphCoderStreamBenchmark(): Promise<GraphCoderStreamBenchmark
       trailingDelayMs: 12,
     }),
   )
-  // This scenario measures graph streaming, so use a read-only request that
-  // is safe to stream live. Artifact-changing requests intentionally buffer
-  // candidate text until completion and outcome gates accept it.
   const router = createRouterFixture(provider, { textDeltaMode: 'live' })
   const metrics = await collectRunMetrics(
     router.run(
@@ -880,7 +873,6 @@ async function runSingleSemanticSearchBenchmark(): Promise<SemanticSearchBenchma
 }
 
 async function runSemanticSearchBenchmark(): Promise<SemanticSearchBenchmark> {
-  // Smooth sporadic native/sqlite cold-start spikes without hiding systematic regressions.
   const samples: SemanticSearchBenchmark[] = []
   for (let index = 0; index < SEMANTIC_SEARCH_BENCHMARK_SAMPLES; index++) {
     samples.push(await runSingleSemanticSearchBenchmark())

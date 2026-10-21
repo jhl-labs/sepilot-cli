@@ -6,7 +6,6 @@ import type { ScopedFileMemoryRegistry } from './scoped-file-memory.js'
 import { canonicalFileMemoryScopeKey } from './scoped-file-memory.js'
 import { memoryResetOwner } from './reset.js'
 
-/** Caller-owned reset. A shared ACL grants access, not ownership of another user's memories. */
 export async function forgetAllOwnedMemory(index: Pick<SemanticMemoryStore, 'forgetOwnedMemory' | 'previewForgetOwnedMemory'>, registry: ScopedFileMemoryRegistry, scopeTags: string[], options: { dryRun?: boolean } = {}) {
   if (!index.forgetOwnedMemory) throw new Error('Semantic memory reset is unavailable')
   const ownsFileBucket = canonicalFileMemoryScopeKey(scopeTags) !== 'global' || !scopeTags.some((tag) => tag.startsWith('scope:'))
@@ -15,8 +14,6 @@ export async function forgetAllOwnedMemory(index: Pick<SemanticMemoryStore, 'for
     ? registry.list().find((bucket) => bucket.key === canonicalFileMemoryScopeKey(scopeTags))?.fileMemory ?? registry.get(scopeTags)
     : undefined
   if (file) {
-    // Existing sanitized bucket names can collide. Never clear a manifest owned
-    // by someone else merely because its filesystem name matches this caller.
     const manifest = await readFile(join(dirname(file.getMemoryPath()), '.scope.json'), 'utf8').catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return null
       throw error
@@ -37,8 +34,6 @@ export async function forgetAllOwnedMemory(index: Pick<SemanticMemoryStore, 'for
       retained, snapshotOnly: true }
   }
   const result = await index.forgetOwnedMemory(scopeTags)
-  // Semantic deletion already applied ownership checks. Do not reverse-delete
-  // shared semantic entries just because their text was mirrored in this file.
   if (file) await file.clearAll(false)
   return { ...result, fileMemoryCleared: Boolean(file), retained }
 }

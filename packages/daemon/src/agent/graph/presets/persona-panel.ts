@@ -1,27 +1,3 @@
-// Persona-panel graph: a moderator first gathers meeting constraints, then
-// runs a moderated discussion where the next speaker is selected from the
-// evolving transcript instead of walking the roster once in order.
-//
-// Why a dedicated graph?
-//
-// The cowork graph also runs multiple agents in sequence, but it
-// *decomposes* one task into role-specific subtasks. Persona-panel does
-// the opposite — every panelist participates in the *same* meeting from
-// their own system-prompted point of view. Reusing the cowork pipeline
-// would have meant either teaching the LLM decomposition prompt to "split"
-// the question into N copies of itself, or introducing a branch flag that
-// swaps half the orchestrator behavior. A small dedicated graph is clearer
-// and keeps the cowork specialist contract untouched.
-//
-// Streaming contract
-//
-// - `panel_open`   — emitted once with the resolved panelist roster
-//   (id / name / avatar) so the UI can paint a header before any LLM call.
-// - `panel_turn_start` / `panel_turn_complete` when the moderator grants
-//   the floor to a persona. `_failed` is emitted instead when the provider
-//   call throws, so one bad panelist doesn't stop the run.
-// - `panel_synthesizing` then a final assistant message via state.output.
-
 import { AgentGraph } from '../engine.js'
 import { recordUsage, type Deps } from '../nodes.js'
 import { ThinkingLevel, type ChatRequest, type Message } from '@sepilotd/core'
@@ -512,10 +488,6 @@ export function buildPersonaPanelGraph(deps: Deps): AgentGraph {
     })
   }
 
-  // A successful HTTP response is not a completed intervention. In particular,
-  // reasoning tokens can consume the small speech budget before any usable text.
-  // Retain usage for both attempts, publish only a complete turn, and never let
-  // a moderator summary hide a missing required perspective.
   const completePanelistTurn = async (
     state: AgentState,
     context: GraphExecutionContext | undefined,
@@ -655,9 +627,6 @@ export function buildPersonaPanelGraph(deps: Deps): AgentGraph {
     async function* (state: AgentState, context?: GraphExecutionContext) {
       const personas = (context?.panelPersonas ?? []).slice(0, MAX_PANELISTS)
       if (personas.length === 0) {
-        // No panelists configured — degrade to a single plain assistant
-        // turn instead of failing the whole stream. The user sees the
-        // model's default voice; the UI can warn that the panel was empty.
         const model = context?.agentContext.model ?? deps.provider.models[0]?.id ?? 'default'
         const request: ChatRequest = {
           model,
@@ -1051,8 +1020,6 @@ export function buildPersonaPanelGraph(deps: Deps): AgentGraph {
           )
           const message = error instanceof Error ? error.message : String(error)
           state.stopReason ??= stopReasonCompletionGate({ unmet: [`${persona.name}: ${message}`] })
-          // A failed provider attempt consumes a turn too. Otherwise repeated
-          // failures leave the loop counter unchanged and can run forever.
           speakingCounts.set(persona.id, (speakingCounts.get(persona.id) ?? 0) + 1)
           turns.push({
             personaId: persona.id,
@@ -1092,9 +1059,6 @@ export function buildPersonaPanelGraph(deps: Deps): AgentGraph {
         }
       }
 
-      // Stash the per-turn payload so the synthesize node can read it
-      // without rerunning the provider; agent-state has no first-class
-      // panel field, so we serialize into `coworkPlan`-style memories.
       state.input = `Topic: ${meeting.topic}\nSetup: ${meeting.setupAnswer || 'default'}`
       state.memories = formatPanelMemories(turns)
       return state
@@ -1105,14 +1069,8 @@ export function buildPersonaPanelGraph(deps: Deps): AgentGraph {
   graph.addNode(
     'synthesize',
     async function* (state: AgentState, context?: GraphExecutionContext) {
-      // panel node already populated state.output for the single-panelist
-      // path; in that case skip the extra LLM round-trip.
       if (state.output) return state
       if (context?.panelStrategy === 'sequential' && state.memories.length > 0) {
-        // The sequential contract is one real intervention per selected
-        // persona; later speakers already receive earlier perspectives.
-        // Re-authoring these turns as a simulated meeting invents speakers,
-        // timestamps and additional rebuttals. Publish the recorded turns.
         state.output = state.memories.join('\n\n')
         return state
       }
@@ -1176,8 +1134,6 @@ export function buildPersonaPanelGraph(deps: Deps): AgentGraph {
           undefined,
           error,
         )
-        // Fall back to concatenated panel notes so the user still sees
-        // something, even if the moderator pass failed.
         state.output = state.memories.join('\n\n')
         state.stopReason ??= stopReasonCompletionGate({ unmet: ['The panel synthesis failed; only individual notes are available.'] })
       }

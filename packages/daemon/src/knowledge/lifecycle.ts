@@ -97,7 +97,6 @@ export function createKnowledgeLifecycle(repo: KnowledgeRepo, now = Date.now) {
         if ((current?.revision ?? null) !== input.expectedRevision)
           knowledgeError('복원 대상이 변경되었습니다. 현재 지식과 다시 비교하세요.', 409)
         const snapshot = input.snapshot
-        // Backups are untrusted input. Restore content as a candidate, never imported approval or execution history.
         const write = KnowledgeWrite.parse({
           id: snapshot.id,
           expectedRevision: current?.revision,

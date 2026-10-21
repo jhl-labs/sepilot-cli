@@ -17,12 +17,6 @@ export interface Reminder {
   firedAt?: string
   cancelledAt?: string
   reason?: string
-  /**
-   * IANA timezone (e.g. 'Asia/Seoul') the wall-clock time in the original
-   * request was expressed in. When set, callers should resolve the due instant
-   * with parseReminderTime(value, now, timezone) so "tomorrow 9am" means 9am in
-   * the user's zone, not the server's. Absent → server-local (legacy behavior).
-   */
   timezone?: string
 }
 
@@ -38,11 +32,6 @@ export interface RemindersStore {
 
 const FILE_HEADER = '# sepilotd reminders.jsonl — one Reminder per line. Do not edit by hand.'
 
-/**
- * Append-only JSONL-backed reminders store. Each mutation writes a new
- * line with the full Reminder snapshot; on init we replay to compute
- * the latest state for each id.
- */
 export class JsonlRemindersStore implements RemindersStore {
   private readonly reminders = new Map<string, Reminder>()
   private initialized = false
@@ -61,11 +50,9 @@ export class JsonlRemindersStore implements RemindersStore {
           const entry = JSON.parse(trimmed) as Reminder
           if (entry.id) this.reminders.set(entry.id, entry)
         } catch {
-          // skip malformed line
         }
       }
     } catch {
-      // file missing — start fresh
       try {
         await writeFile(this.path, `${FILE_HEADER}\n`, 'utf-8')
       } catch (err) {
@@ -164,7 +151,6 @@ export interface RemindersSchedulerOptions {
   onDue: (reminder: Reminder) => Promise<void> | void
 }
 
-/** Periodically sweeps a RemindersStore for due reminders and fires onDue. */
 export class RemindersScheduler {
   private readonly store: RemindersStore
   private readonly options: Required<RemindersSchedulerOptions>
@@ -193,7 +179,6 @@ export class RemindersScheduler {
     this.timer = undefined
   }
 
-  /** Visible to tests so they can flush deterministically. */
   async sweep(now: Date = new Date()): Promise<number> {
     if (this.firing) return 0
     this.firing = true
@@ -201,12 +186,6 @@ export class RemindersScheduler {
     try {
       const due = await this.store.due(now)
       for (const reminder of due) {
-        // Claim the reminder BEFORE delivering. markFired is idempotent and
-        // returns null if the reminder was already fired or cancelled, so a
-        // crash after delivery — or a re-entrant sweep of the same overdue
-        // backlog after downtime — can never re-deliver it. This trades a lost
-        // delivery on a hard crash mid-onDue for never spamming the user with
-        // duplicates, which is the safer default for notifications.
         const claimed = await this.store.markFired(reminder.id, now.toISOString())
         if (!claimed) continue
         try {
@@ -231,7 +210,7 @@ const ISO_DATE_TIME_HINT = /\d{4}-\d{2}-\d{2}/
 
 const KO_DAY_OFFSETS: Record<string, number> = {
   '오늘': 0, '내일': 1, '모레': 2, '글피': 3,
-  '어제': -1, // never accepted but kept for completeness; rejected later
+  '어제': -1,
 }
 const EN_DAY_OFFSETS: Record<string, number> = {
   today: 0, tomorrow: 1, tonight: 0,
@@ -256,18 +235,6 @@ const EN_WEEKDAYS: Record<string, number> = {
   saturday: 6, sat: 6,
 }
 
-/**
- * Parse "in 30m", "in 2 hours", "tomorrow 9am", "내일 오후 3시",
- * "다음주 월요일 9시", "next monday 3pm", "2026-05-09T15:00:00Z",
- * or a Date-acceptable ISO string into an absolute timestamp.
- * Returns null on failure (callers should reject INVALID_INPUT).
- *
- * When `timezone` (IANA name) is given, wall-clock expressions ("tomorrow 9am",
- * "월요일 15시") are interpreted in that zone and returned as the correct UTC
- * instant. Timezone-independent forms (relative durations, ISO/epoch) are
- * unaffected. Omitting `timezone` preserves the exact legacy server-local
- * behavior.
- */
 export function parseReminderTime(
   value: string,
   now: Date = new Date(),
@@ -276,19 +243,13 @@ export function parseReminderTime(
   if (!timezone) return parseReminderTimeNaive(value, now)
   const raw = value.trim()
   if (!raw) return null
-  // Relative durations and ISO/epoch timestamps resolve to the same absolute
-  // instant in every zone — parse them against the real `now`.
   if (isTimezoneIndependent(raw)) return parseReminderTimeNaive(raw, now)
-  // Wall-clock expressions: parse the calendar/clock components as if `now` were
-  // the user's local time (so the correct day/weekday is picked in their zone),
-  // then map those wall components back to a real UTC instant for that zone.
   try {
     const naiveNow = zonedNaive(now, timezone)
     const naive = parseReminderTimeNaive(raw, naiveNow)
     if (!naive) return null
     return naiveWallToUtc(naive, timezone)
   } catch {
-    // Invalid IANA zone or Intl failure — fall back to server-local parsing.
     return parseReminderTimeNaive(value, now)
   }
 }
@@ -301,11 +262,6 @@ function isTimezoneIndependent(raw: string): boolean {
   return RELATIVE_DURATION_PATTERN.test(durationCandidate)
 }
 
-/**
- * Return a Date whose LOCAL getters (getHours, getDate, …) read back `date`'s
- * wall-clock in `timeZone`. Used to run the naive parser as if the process were
- * in the user's zone.
- */
 function zonedNaive(date: Date, timeZone: string): Date {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone,
@@ -319,14 +275,10 @@ function zonedNaive(date: Date, timeZone: string): Date {
   }).formatToParts(date)
   const get = (type: string): number => Number(parts.find((part) => part.type === type)?.value)
   let hour = get('hour')
-  if (hour === 24) hour = 0 // Intl can emit '24' for midnight in some engines.
+  if (hour === 24) hour = 0
   return new Date(get('year'), get('month') - 1, get('day'), hour, get('minute'), get('second'))
 }
 
-/**
- * Interpret the LOCAL wall-clock components of `naive` as a wall-clock in
- * `timeZone` and return the corresponding real UTC instant.
- */
 function naiveWallToUtc(naive: Date, timeZone: string): Date {
   const asUtc = Date.UTC(
     naive.getFullYear(),
@@ -336,7 +288,6 @@ function naiveWallToUtc(naive: Date, timeZone: string): Date {
     naive.getMinutes(),
     naive.getSeconds(),
   )
-  // Offset (ms) that the zone runs ahead of UTC at this instant.
   const offset = zoneOffsetMs(new Date(asUtc), timeZone)
   return new Date(asUtc - offset)
 }
@@ -358,7 +309,6 @@ function parseReminderTimeNaive(value: string, now: Date = new Date()): Date | n
   const raw = value.trim()
   if (!raw) return null
 
-  // Bare day-anchor words
   const lower = raw.toLowerCase()
   if (raw === '내일' || lower === 'tomorrow') {
     const next = startOfDay(now)
@@ -379,7 +329,6 @@ function parseReminderTimeNaive(value: string, now: Date = new Date()): Date | n
     return next
   }
 
-  // "in 30m" / "in 2 hours" / "after 1d"
   const inMatch = lower.match(/^(?:in|after)\s+(.+)$/)
   const durationCandidate = inMatch?.[1] ?? lower
   const durationMatch = durationCandidate.replace(/\s+/g, '').match(RELATIVE_DURATION_PATTERN)
@@ -392,7 +341,6 @@ function parseReminderTimeNaive(value: string, now: Date = new Date()): Date | n
     }
   }
 
-  // ISO-like timestamp
   if (ISO_DATE_TIME_HINT.test(raw) || /^\d{10,}$/.test(raw)) {
     const parsed = new Date(raw)
     if (!Number.isNaN(parsed.valueOf()) && parsed.getTime() > now.getTime() - 60_000) {
@@ -400,19 +348,15 @@ function parseReminderTimeNaive(value: string, now: Date = new Date()): Date | n
     }
   }
 
-  // Korean: "내일 오후 3시", "오늘 23시", "내일 9:30", "내일 오전 9시 30분"
   const koDayTime = matchKoDayTime(raw, now)
   if (koDayTime) return koDayTime
 
-  // Korean: "월요일 9시", "다음주 화요일 오후 3시", "다음 월요일 9시"
   const koWeekdayTime = matchKoWeekdayTime(raw, now)
   if (koWeekdayTime) return koWeekdayTime
 
-  // English: "tomorrow 3pm", "today at 9", "tonight 8pm"
   const enDayTime = matchEnDayTime(lower, now)
   if (enDayTime) return enDayTime
 
-  // English: "next monday", "next monday 3pm", "monday 9am"
   const enWeekdayTime = matchEnWeekdayTime(lower, now)
   if (enWeekdayTime) return enWeekdayTime
 
@@ -427,7 +371,6 @@ function applyTimeOfDay(target: Date, hours: number, minutes: number, now: Date)
   const result = new Date(target)
   result.setHours(hours, minutes, 0, 0)
   if (result.getTime() <= now.getTime()) {
-    // Same-day request that's already past — caller patterns handle their own rules.
   }
   return result
 }
@@ -436,7 +379,6 @@ function parseHourMinute(input: string): { hour: number; minute: number } | null
   const text = input.trim()
   if (!text) return null
 
-  // 한국어 시·분 표현
   const koAmpm = text.match(/^(오전|오후)\s*(\d{1,2})(?:시)?(?:\s*(\d{1,2})\s*분)?$/)
   if (koAmpm) {
     let hour = Number(koAmpm[2])
@@ -454,12 +396,10 @@ function parseHourMinute(input: string): { hour: number; minute: number } | null
     return { hour, minute }
   }
 
-  // 영어 H[:MM] (am|pm)?
   const enAmpm = text.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)$/i)
   if (enAmpm) {
     let hour = Number(enAmpm[1])
     const minute = enAmpm[2] ? Number(enAmpm[2]) : 0
-    // am/pm only accepts 1-12 in the hour slot.
     if (hour < 1 || hour > 12) return null
     if (!isMinute(minute)) return null
     const isPm = /^p/i.test(enAmpm[3])
@@ -468,7 +408,6 @@ function parseHourMinute(input: string): { hour: number; minute: number } | null
     return { hour, minute }
   }
 
-  // 24h: 9:30 / 09 / 23:15
   const numeric = text.match(/^(\d{1,2})(?::(\d{2}))?$/)
   if (numeric) {
     const hour = Number(numeric[1])
@@ -536,9 +475,6 @@ function matchEnWeekdayTime(lower: string, now: Date): Date | null {
 }
 
 function nextWeekday(now: Date, target: number, _forceNextWeek: boolean): Date {
-  // Treat "next monday" / "다음주 월요일" / bare "monday" the same way:
-  // the upcoming Monday after today. If today is the target weekday, jump
-  // a full week — never schedule a reminder for "today, but earlier".
   const start = startOfDay(now)
   const today = start.getDay()
   let delta = (target - today + 7) % 7

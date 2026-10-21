@@ -69,13 +69,6 @@ function resolveSurfaceState(
   return manifestStatus === 'ready' ? 'ready' : 'in_progress'
 }
 
-/**
- * Projects daemon-owned evidence into one surface-neutral view model.
- *
- * The daemon's verdict boolean is false while a gate is still running, so it
- * is only exposed after a terminal evaluation status. This prevents clients
- * from presenting an in-progress run as a failed or rejected one.
- */
 export function buildSessionEvidenceSurfaceModel(
   input: SessionEvidenceSurfaceInput | null | undefined,
 ): SessionEvidenceSurfaceModel | null {

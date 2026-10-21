@@ -60,11 +60,6 @@ export function currentTurnMessages(messages: readonly Message[]): readonly Mess
   return turnStart >= 0 ? messages.slice(turnStart) : messages
 }
 
-/**
- * Successful evidence must belong to the active user turn. An older session
- * result cannot justify answering a new request after one of its required
- * reads was blocked.
- */
 export function hasSuccessfulToolEvidenceInCurrentTurn(
   messages: readonly Message[],
 ): boolean {
@@ -73,13 +68,6 @@ export function hasSuccessfulToolEvidenceInCurrentTurn(
     && message.metadata?.[TOOL_RESULT_STATUS_METADATA_KEY] === 'success')
 }
 
-/**
- * A requested live action is evidenced by a tool result from this user turn,
- * even when the command itself reports failure. For example, a test process
- * exiting 1 is still fresh execution evidence that the agent must summarize.
- * Policy denial is handled as a separate terminal state before completion
- * guards run, so it cannot be misrepresented as a successful execution.
- */
 export function hasToolResultEvidenceInCurrentTurn(
   messages: readonly Message[],
 ): boolean {
@@ -88,11 +76,6 @@ export function hasToolResultEvidenceInCurrentTurn(
     && message.metadata?.[TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY] === true)
 }
 
-/**
- * Return the latest policy rejection in this user turn. The metadata is added
- * by the daemon after policy evaluation and is never copied from tool output,
- * so a plugin cannot spoof a policy blocker by printing matching text.
- */
 export function latestTrustedPolicyFailure(
   messages: readonly Message[],
   ignoredToolCallIds: ReadonlySet<string> = new Set(),
@@ -162,12 +145,6 @@ function toolCallForFailure(
   return null
 }
 
-/**
- * A shell wrapper rejected by ReadOnly is an invocation-shape failure, not
- * evidence that the requested observation itself is forbidden. The runtime
- * never unwraps or executes the script: it may only give the model one chance
- * to reconstruct the operation as a normal policy-checked tool call.
- */
 export function isRepairableReadOnlyInvocationFailure(
   messages: readonly Message[],
   failure: TrustedPolicyFailure,

@@ -10,9 +10,7 @@ export interface AcpServerStreams {
 }
 
 export interface AcpServerHandle {
-  /** Resolves when stdin emits 'end' or 'close'. */
   closed: Promise<void>
-  /** Force close the server (does not kill the streams). */
   stop(): void
 }
 

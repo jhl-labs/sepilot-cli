@@ -41,7 +41,6 @@ const legacyContextUsageQuerySchema = contextUsageRequestSchema.omit({ input: tr
 
 type ContextUsageRequest = z.infer<typeof contextUsageRequestSchema>
 
-/** Read-only context inspector used by trusted local operator surfaces. */
 export async function contextUsageRoutes(app: FastifyInstance) {
   app.route<{ Body: ContextUsageRequest; Querystring: ContextUsageRequest }>({
     method: ['GET', 'POST'],
@@ -99,9 +98,6 @@ export async function contextUsageRoutes(app: FastifyInstance) {
     const providerId = requestedProviderId || session?.provider || provider?.id || 'unknown'
     const modelId = requestedModelId || session?.model || provider?.models[0]?.id || 'unknown'
     const modelInfo = provider?.models.find((candidate) => candidate.id === modelId)
-    // The inspector must report the window the run loops actually plan
-    // against; a friendlier guess here only produced a usage bar that
-    // disagreed with the engine.
     const contextWindow = modelInfo?.contextWindow ?? DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW
     const reservedOutputTokens = body.maxOutputTokens
       ? Math.min(body.maxOutputTokens, contextWindow)
@@ -116,10 +112,6 @@ export async function contextUsageRoutes(app: FastifyInstance) {
           hooks: runtime.hookRegistry,
           maxMessages: resolveSessionContextMaxMessages(),
           charsPerToken,
-          // Describing the context must not change it. Without this the
-          // inspector would summarize the session with an LLM call and persist
-          // a `context_compact` event as a side effect of being asked how full
-          // the window is.
           inspectOnly: true,
         })).messages
       : []

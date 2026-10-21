@@ -15,6 +15,7 @@ import { ThinkingLevel } from '@sepilotd/core'
 import { extractContent, toApiError, wrapError } from './utils.js'
 import { normalizeToolSchema } from './schema-normalize.js'
 import { partitionSystemMessages } from './system-messages.js'
+import { RUNTIME_CONTROLS_METADATA_KEY } from '../agent/prompt-sections.js'
 
 export interface AnthropicProviderConfig {
   apiKey: string
@@ -68,7 +69,7 @@ function mapMessages(
   const result: Anthropic.MessageParam[] = []
 
   for (const msg of messages) {
-    if (msg.role === 'system') continue // handled separately
+    if (msg.role === 'system') continue
 
     if (msg.role === 'user') {
       result.push({ role: 'user', content: toAnthropicUserContent(msg) })
@@ -148,8 +149,19 @@ function getThinkingBudget(
   }
 }
 
-function markLastMessageCacheBreakpoint(messages: Anthropic.MessageParam[]): void {
-  const lastMessage = messages[messages.length - 1]
+const MIN_ANTHROPIC_THINKING_BUDGET = 1024
+
+export function fitThinkingBudget(
+  budget: number | undefined,
+  maxTokens: number,
+): number | undefined {
+  if (budget === undefined) return undefined
+  const fitted = Math.min(budget, maxTokens - 1)
+  return fitted >= MIN_ANTHROPIC_THINKING_BUDGET ? fitted : undefined
+}
+
+function markLastMessageCacheBreakpoint(messages: Anthropic.MessageParam[], index = messages.length - 1): void {
+  const lastMessage = messages[index]
   if (!lastMessage) return
 
   if (typeof lastMessage.content === 'string') {
@@ -183,16 +195,10 @@ export function buildAnthropicParams(
   const params: Anthropic.MessageCreateParamsNonStreaming = {
     model: request.model,
     messages: mapMessages(normalized.messages),
-    // Default to the model's output cap (not a hard 4096 floor) so large
-    // tool-call / write turns are not truncated. An explicit request.maxTokens
-    // always wins; 4096 remains only as a last resort when no model info.
     max_tokens: request.maxTokens ?? defaultMaxTokens ?? 4096,
   }
 
   if (normalized.systemText) {
-    // The system slot holds only the stable prefix: partitionSystemMessages
-    // moves per-turn context into the latest user message, so this cache
-    // breakpoint (and the history behind it) survives across turns.
     params.system = [
       {
         type: 'text' as const,
@@ -211,7 +217,6 @@ export function buildAnthropicParams(
     } else if (request.toolChoice === 'none') {
       params.tool_choice = { type: 'none' }
     }
-    // Cache tool definitions (they rarely change within a session)
     if (params.tools.length > 0) {
       const lastTool = params.tools[params.tools.length - 1] as typeof params.tools[number] & {
         cache_control?: { type: 'ephemeral' }
@@ -226,20 +231,24 @@ export function buildAnthropicParams(
     params.stop_sequences = request.stopSequences
   }
 
-  const thinkingBudget = getThinkingBudget(request.thinkingLevel)
+  const thinkingBudget = fitThinkingBudget(getThinkingBudget(request.thinkingLevel), params.max_tokens)
   if (thinkingBudget) {
     params.thinking = {
       type: 'enabled',
       budget_tokens: thinkingBudget,
     }
-    // Anthropic requires temperature=1 when thinking is enabled
     delete params.temperature
   }
 
-  markLastMessageCacheBreakpoint(params.messages)
+  const stableTail = normalized.messages.findLastIndex(
+    (message) => message.metadata?.[RUNTIME_CONTROLS_METADATA_KEY] !== true,
+  )
+  markLastMessageCacheBreakpoint(params.messages, stableTail >= 0 ? stableTail : params.messages.length - 1)
 
   return params
 }
+
+const ANTHROPIC_CLIENT_TIMEOUT_MS = 10 * 60 * 1000
 
 export class AnthropicProvider implements ILLMProvider {
   readonly id = 'anthropic'
@@ -252,6 +261,7 @@ export class AnthropicProvider implements ILLMProvider {
       apiKey: config.apiKey,
       baseURL: config.baseUrl,
       defaultHeaders: config.headers,
+      timeout: ANTHROPIC_CLIENT_TIMEOUT_MS,
     })
     this.models = config.models.map((m) => ({
       id: m,
@@ -372,7 +382,6 @@ export class AnthropicProvider implements ILLMProvider {
             }
           }
         } else if (event.type === 'content_block_stop') {
-          // We don't know block type here; tool_call_end is best-effort
         } else if (event.type === 'message_delta') {
           const deltaEvent = event as Anthropic.RawMessageDeltaEvent
           if (deltaEvent.usage) {

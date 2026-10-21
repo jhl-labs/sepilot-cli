@@ -27,7 +27,6 @@ export function remoteAgentCwd(cwd: string): string {
 }
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
 
-/** Only structured targets and an allowlisted agent cross the remote shell boundary. */
 export function sshAgentLaunch(command: string, cwd: string, target: DesktopAgentSshTarget) {
   const ssh = desktopAgentSshSchema.parse(target)
   if (!['claude', 'codex', 'gemini', 'opencode'].includes(command))

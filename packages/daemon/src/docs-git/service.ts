@@ -96,7 +96,6 @@ export function createDocsGitService(store: Store, changed: () => void) {
       activity.finish(id, { preview: { lastSync: state.lastSync } })
       return result
     } catch (error) {
-      // Git stderr can contain credential-bearing remote URLs. Keep it out of UI/audit.
       state.error =
         error instanceof SyncError
           ? error.message
@@ -177,7 +176,6 @@ export function createDocsGitService(store: Store, changed: () => void) {
     connect: (raw: unknown) =>
       exclusive('Docs·Wiki Git 저장소 연결', async () => {
         const input = Connection.parse(raw)
-        // Credentials belong to Git's credential helper / SSH agent, never this config.
         if (/^[a-z]+:\/\//iu.test(input.source)) {
           const url = new URL(input.source)
           if (
@@ -267,8 +265,6 @@ export function createDocsGitService(store: Store, changed: () => void) {
           if (choice === 'local') uploads[change.key] = text
           else imports.push(decode(text))
         }
-        // Import first, before any await, while the local snapshot still matches the preview.
-        // An interrupted push retains local commits and retries without force-pushing.
         activity.event(
           activityId,
           `Git → 앱 ${imports.length}개, 앱 → Git ${Object.keys(uploads).length}개; 충돌 선택 ${Object.keys(resolutions).length}개`,

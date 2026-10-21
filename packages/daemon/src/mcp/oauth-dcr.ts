@@ -1,15 +1,3 @@
-/**
- * RFC 7591 Dynamic Client Registration helper for MCP OAuth servers.
- *
- * Happy path:
- *   1. GET {authBase}/.well-known/oauth-authorization-server
- *   2. If `registration_endpoint` is present, POST a DCR request there.
- *   3. Return the issued client_id (and optional client_secret).
- *
- * All failures are returned as structured results rather than thrown — the
- * caller decides whether to fall back to a pre-registered credential flow.
- */
-
 export interface DcrInput {
   redirectUris: readonly string[]
   clientName?: string

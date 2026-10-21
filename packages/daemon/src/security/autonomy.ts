@@ -1,23 +1,5 @@
 import { AutonomyLevel } from '@sepilotd/core'
 
-/**
- * Autonomy levels do NOT form a single permissiveness line — they vary on
- * two independent axes:
- *
- *  - approval axis: supervised requires a human prompt for every
- *    non-read tool, while accept-edits / workspace-write auto-allow file
- *    edits without one. From configured `supervised`, requesting
- *    `accept-edits` would *remove* the operator's approval gate.
- *  - write-scope axis: accept-edits / workspace-write / autonomous
- *    enforce the workspace write boundary, supervised does not (any path
- *    with approval). From configured `workspace-write`, requesting
- *    `supervised` would *widen* the writable scope.
- *
- * This partial order is used only where the product declares a real ceiling,
- * such as an untrusted channel ACL. `agent.autonomy` is the local session
- * default, not such a ceiling; conflating the two made an explicit
- * `/autonomy workspace-write` selection silently collapse back to readonly.
- */
 export const ALLOWED_DOWNGRADES: Readonly<Record<AutonomyLevel, readonly AutonomyLevel[]>> = {
   [AutonomyLevel.ReadOnly]: [AutonomyLevel.ReadOnly],
   [AutonomyLevel.AcceptEdits]: [AutonomyLevel.ReadOnly, AutonomyLevel.AcceptEdits],
@@ -36,11 +18,6 @@ export const ALLOWED_DOWNGRADES: Readonly<Record<AutonomyLevel, readonly Autonom
   ],
 }
 
-/**
- * Backward-compatible alias retained for callers that imported the old name.
- * `configured` is a default, so any valid explicit per-turn selection wins.
- * Actual ceilings are enforced separately by channel ACL and policy layers.
- */
 export function clampRequestedAutonomy(
   configured: AutonomyLevel,
   requested: string | undefined,
@@ -56,7 +33,6 @@ export interface AutonomyResolution {
   reason?: string
 }
 
-/** Resolve autonomy and retain the evidence surfaces need to explain clamps. */
 export function resolveRequestedAutonomy(
   configured: AutonomyLevel,
   requested: string | undefined,

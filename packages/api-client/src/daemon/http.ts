@@ -1,5 +1,6 @@
 import { ApiHttpClient, type ApiRequestInit, type MemoryScope, type Resolvable } from '../http.js'
-import type { ApprovalDecisionStatus } from '@sepilotd/core'
+import type { ApprovalDecisionStatus, ApprovalScope } from '@sepilotd/core'
+import { parseJsonSseStream } from './stream.js'
 import type {
   ApiEnvelope,
   DaemonAgentMode,
@@ -90,6 +91,7 @@ import type {
   DaemonModelSwitchInput,
   DaemonModelSwitchResult,
   DaemonPersona,
+  DaemonRoleBot,
   DaemonPolicySnapshot,
   DaemonProviderInfo,
   DaemonProviderMutationResult,
@@ -170,6 +172,18 @@ import type {
   DaemonOutboundWebhookSummary,
   DaemonWebhookEndpointConfig,
   DaemonWebhookEndpointSummary,
+  DaemonEventRoutingDestination,
+  DaemonEventRoutingDestinationInput,
+  DaemonEventRoutingRule,
+  DaemonEventRoutingRuleInput,
+  DaemonEventRoutingEvent,
+  DaemonEventRoutingEventDetail,
+  DaemonEventRoutingEventStatus,
+  DaemonEventRoutingDelivery,
+  DaemonEventRoutingDeliveryStatus,
+  DaemonEventRoutingDeliveryOutcome,
+  DaemonEventRoutingDryRunResult,
+  DaemonEventRoutingDestinationTestOutcome,
   DaemonExtensionTokenSummary,
   DaemonIssueExtensionTokenInput,
   DaemonIssuedExtensionToken,
@@ -248,89 +262,36 @@ export interface ChatSkillRef {
 export type ChatTextDeltaMode = 'buffered' | 'live'
 
 export interface ChatOptions {
-  /**
-   * Stable client-generated id for this user turn. The daemon scopes it to
-   * the session and reuses the existing result/job when a transport retry
-   * submits the same id again.
-   */
+  deadlineAt?: number
+  completionRequest?: string
   messageId?: string
   model?: string
   provider?: string
-  /** Optional session labels persisted on newly-created chat sessions. */
   tags?: string[]
   thinkingLevel?: string
   persona?: string
-  /**
-   * Persona roster for the `persona-panel` mode. Each id resolves to a
-   * built-in or custom persona on the daemon; ignored by other modes.
-   * Capped at 6 server-side.
-   */
+  bot?: string
+  bots?: string[]
   personaIds?: string[]
-  /**
-   * Execution policy for `persona-panel` turns. `sequential` calls every
-   * resolved persona exactly once in roster order and gives each caller the
-   * accumulated transcript. `moderated` keeps the dynamic meeting workflow.
-   */
   panelStrategy?: 'sequential' | 'moderated'
   mode?: DaemonAgentMode
-  /** Desktop writing-canvas document id bound to this chat turn. */
   writingDocId?: string
   projectId?: string
   maxTokens?: number
-  /**
-   * Agent-loop iteration cap for this turn. One iteration is one LLM round
-   * (which may emit multiple parallel tool calls). Defaults to the daemon's
-   * `SEPILOTD_CHAT_MAX_ITERATIONS` env or `50` if unset. Bump explicitly
-   * for multi-pass skills (e.g. `software-architect`'s reverse-engineering
-   * mode on a non-trivial codebase, where 50 may not be enough to inventory
-   * + write the full document chain in one turn). Hard ceiling 500.
-   */
   maxIterations?: number
-  /** Treat maxIterations as a hard cap: disables continuation cycles and repair slack. Automation/bench only. */
   hardMaxIterations?: boolean
-  /** Sampling temperature (0~2). Daemon clamps and forwards to provider. */
   temperature?: number
   cwd?: string
-  /**
-   * Strict filesystem boundary for this turn. Tools may not read or mutate
-   * paths outside this root, and approval never widens it.
-   */
   workspaceRoot?: string
-  /**
-   * Optional list of skill references the daemon should resolve and
-   * prepend to the system prompt before running the agent loop. Daemon
-   * accepts `{ name }` objects and 404s on unknown names; callers that
-   * never use skills can omit this field. See
-   * `packages/daemon/src/server/routes/chat-schema.ts` for the
-   * authoritative server-side shape.
-   */
   skillRefs?: ChatSkillRef[]
-  /**
-   * Optional per-turn tool allowlist. Omit to expose the daemon's normal tool
-   * set; pass an empty array for a tool-free chat turn.
-   */
   toolNames?: string[]
-  /** Toggle daemon-side RAG retrieval for this turn. */
+  memoryPolicy?: { read?: boolean; write?: boolean }
   ragEnabled?: boolean
-  /** Tell daemon the user opted into image generation for this turn. */
   imageGenEnabled?: boolean
-  /** Surface input-trust level so daemon can tighten approvals on untrusted input. */
   inputTrustLevel?: 'trusted' | 'untrusted'
-  /**
-   * Explicit per-turn autonomy selection. The daemon applies independent
-   * channel ACL and tool-policy ceilings after resolving this session value.
-   */
+  localContext?: 'default' | 'none'
   autonomy?: 'readonly' | 'accept-edits' | 'workspace-write' | 'supervised' | 'autonomous'
-  /**
-   * Require a fresh human approval for every side-effecting tool in this turn.
-   * This does not relax policy denials, read-only mode, or workspace bounds.
-   */
   requireToolApproval?: boolean
-  /**
-   * Per-turn control for daemon intent routing. Set `{ enabled: false }`
-   * when the caller's persona/skill selection should be honored verbatim.
-   * Explicit concrete modes are authoritative even when routing is enabled.
-   */
   intentRouting?: {
     enabled?: boolean
   }
@@ -338,15 +299,7 @@ export interface ChatOptions {
 
 export interface ChatStreamOptions extends ChatOptions {
   fileIds?: string[]
-  /** Last SSE cursor seen by the caller; forwarded as body + Last-Event-ID. */
   lastEventId?: string
-  /**
-   * Streaming-only opt-in. The default `buffered` preserves the daemon's
-   * historical behavior: provider text is parsed first, then emitted as a
-   * final text_delta. `live` asks native tool-use turns to forward safe final
-   * answer chunks after the daemon sees the answer protocol stem; raw tool-call
-   * text and interim-progress replies are not live-streamed.
-   */
   textDeltaMode?: ChatTextDeltaMode
 }
 
@@ -356,15 +309,8 @@ export interface DaemonRequestControlOptions {
   signal?: AbortSignal
 }
 
-/**
- * Control plane for the compatibility synchronous chat endpoint. Unlike SSE,
- * this request cannot use heartbeat frames to distinguish a live long-running
- * agent from a dead connection, so callers that deliberately need one final
- * JSON envelope may provide a bounded wall-clock timeout explicitly.
- */
 export interface DaemonChatRequestControlOptions extends DaemonRequestControlOptions {
   timeoutMs?: number
-  /** Node/Bun transport whose dispatcher lifetime is at least timeoutMs. */
   fetch?: typeof fetch
 }
 
@@ -379,10 +325,6 @@ export const DEFAULT_CHAT_OPTION_DEFAULTS = Object.freeze({
   mode: 'auto',
   thinkingLevel: 'medium',
   persona: 'default',
-  // 'default' is the TUI's sentinel for "let the daemon resolve provider/model".
-  // Strip it here so the literal string never reaches the daemon, where it would
-  // be looked up as a provider/model id and fail with 503 "No provider" on any
-  // deployment whose default provider isn't literally named 'default'.
   provider: 'default',
   model: 'default',
 } satisfies ChatOptionDefaults)
@@ -396,32 +338,12 @@ type SanitizableChatOptions = ChatOptions & {
 export interface DaemonListSessionsOptions {
   page?: number
   perPage?: number
-  /** Return only sessions bound to this exact immutable workspace root. */
   workspaceRoot?: string
-  /**
-   * Opt-in: when true, daemon scans each session's event log to fill
-   * `approvalCounters` per item. Costs an extra getEvents per row,
-   * so default off for backward compat — light list views (web,
-   * desktop overlay) leave it false; cli passes true so the audit
-   * column shows up.
-   */
   metrics?: boolean
-  /**
-   * Narrow the list to a single session status. Daemon filters
-   * post-fetch and adjusts totalCount so "showing X of Y" reflects
-   * the filtered set. Useful for cli operators who want only active
-   * runs (drops abandoned/completed noise) or only completed
-   * (audit-after-the-fact).
-   */
   status?: 'active' | 'completed' | 'abandoned'
 }
 
 export interface DaemonSessionExportOptions {
-  /**
-   * Ask the daemon to redact common secret and local-path patterns before
-   * returning the export. Omit to preserve the daemon's historical raw export
-   * behavior; pass false when the caller is making an explicit raw-export UI.
-   */
   sanitize?: boolean
 }
 
@@ -430,7 +352,6 @@ export type DaemonSessionUpdateInput = {
   status?: 'active' | 'completed' | 'abandoned'
   cwd?: string | null
   workspaceIsolation?: 'policy' | 'strict'
-  /** Ordered persona roster. `[]` explicitly restores the default assistant. */
   personaIds?: string[]
   starred?: boolean
   tags?: string[]
@@ -510,13 +431,14 @@ export interface DaemonUpdateProjectInput {
 
 export interface SubagentDispatchInput {
   isolation?: 'worktree'
+  worktreeBase?: 'head' | 'working-tree'
+  contextMode?: 'packet' | 'fork'
   cwd?: string
   prompt: string
   system?: string
   category?: string
   agentId?: string
   maxIterations?: number
-  /** Treat maxIterations as a hard cap: disables continuation cycles and repair slack. Automation/bench only. */
   hardMaxIterations?: boolean
   tools?: string[]
   model?: string
@@ -526,7 +448,7 @@ export interface SubagentDispatchInput {
 export interface SessionInboxItem {
   seq: number
   sessionId: string
-  source: 'subagent' | 'hook' | 'monitor' | 'scheduler'
+  source: 'subagent' | 'hook' | 'monitor' | 'scheduler' | 'process' | 'wakeup'
   sourceId: string
   title: string
   body: string
@@ -543,10 +465,22 @@ export interface WorkItem {
   title: string
   detail: string
   action: string
+  startedAt?: string
 }
 
 export interface SubagentDispatchResult {
-  worktree?: { path: string; branch: string; baseCommit: string; retained: boolean; reason: string }
+  worktree?: {
+    path: string
+    branch: string
+    baseCommit: string
+    base?: 'head' | 'working-tree'
+    seedCommit?: string
+    repoRoot?: string
+    retained: boolean
+    reason: string
+    patchPath?: string
+    mergeCommand?: string
+  }
   output: string
   sessionId: string
   category?: string
@@ -634,7 +568,6 @@ export interface WorkPlanStartInput {
   model?: string
   tools?: string[]
   maxIterations?: number
-  /** Treat maxIterations as a hard cap: disables continuation cycles and repair slack. Automation/bench only. */
   hardMaxIterations?: boolean
 }
 
@@ -674,14 +607,7 @@ export interface ExternalAcpDispatchResult {
 export interface DaemonClientOptions {
   baseUrl?: string
   token?: string | null
-  /** UI/client surface label sent as X-Sepilotd-Surface for routing and diagnostics. */
   surface?: Resolvable<string | null | undefined>
-  /**
-   * Memory scope to attach to outgoing requests as X-Memory-Scope-*
-   * headers. Surfaces typically resolve this lazily by fetching
-   * GET /api/v1/system/scope once on boot. Resolvable so the value can
-   * arrive after the client is constructed.
-   */
   memoryScope?: Resolvable<MemoryScope | null | undefined>
 }
 
@@ -835,9 +761,6 @@ export function sanitizeChatOptions(
     delete next.maxTokens
   }
 
-  // Clamp to the same [1, 500] range the daemon's chat-schema enforces, so
-  // callers get a predictable rejection (drop) rather than a 400 when they
-  // pass nonsense.
   if (
     typeof options.maxIterations === 'number' &&
     Number.isFinite(options.maxIterations) &&
@@ -847,6 +770,10 @@ export function sanitizeChatOptions(
   } else {
     delete next.maxIterations
   }
+  if (options.deadlineAt !== undefined) {
+    if (!Number.isSafeInteger(options.deadlineAt) || options.deadlineAt <= 0) throw new RangeError('deadlineAt must be a positive safe integer')
+    next.deadlineAt = options.deadlineAt
+  } else delete next.deadlineAt
   if (options.hardMaxIterations === true) next.hardMaxIterations = true
   else delete next.hardMaxIterations
 
@@ -1055,21 +982,10 @@ export class DaemonClient {
     })
   }
 
-  /**
-   * Trigger a graceful daemon shutdown via HTTP. The daemon replies before
-   * tearing the process down, so the returned promise resolves once the
-   * acknowledgement is received — not when the daemon has fully exited.
-   * Callers that need to wait for full exit should health-poll until it fails.
-   */
   async systemShutdown(options?: DaemonRequestControlOptions): Promise<{ status: string }> {
     return this.post('/system/shutdown', undefined, { signal: options?.signal })
   }
 
-  /**
-   * Snapshot of active WS/SSE connections plus the daemon's idle window. The
-   * desktop tray polls this so it can show "N connected" before the user
-   * picks Quit; idle reaper consumers (operations dashboards) read it too.
-   */
   async systemClients(options?: DaemonRequestControlOptions): Promise<{
     count: number
     byKind: { ws: number; sse: number }
@@ -1085,7 +1001,6 @@ export class DaemonClient {
     return this.get('/system/clients', { signal: options?.signal })
   }
 
-  /** Non-secret readiness of the runtime capabilities used by assistant mode. */
   async assistantRuntimeStatus(
     options?: DaemonRequestControlOptions,
   ): Promise<DaemonAssistantRuntimeStatus> {
@@ -1301,7 +1216,7 @@ export class DaemonClient {
   async startBackgroundChat(
     message: string,
     sessionId?: string,
-    options?: ChatOptions,
+    options?: ChatOptions & { fileIds?: string[] },
   ): Promise<DaemonChatBackgroundStartResult> {
     return this.post('/chat/background', {
       message,
@@ -1323,6 +1238,30 @@ export class DaemonClient {
 
   backgroundChatJobs(): Promise<DaemonChatBackgroundListResult> {
     return this.get('/chat/background')
+  }
+
+  async *streamBackgroundChatEvents(
+    jobId: string,
+    options: { after?: number; signal?: AbortSignal } = {},
+  ): AsyncIterable<{ event: string; data: unknown; id?: string }> {
+    const query = options.after ? `?after=${encodeURIComponent(String(options.after))}` : ''
+    const response = await this.fetch(apiPath(`/chat/background/${encodeURIComponent(jobId)}/events${query}`), {
+      method: 'GET',
+      signal: options.signal,
+      headers: { accept: 'text/event-stream' },
+    })
+    if (!response.ok || !response.body) {
+      throw new Error(`Background chat stream failed (${response.status})`)
+    }
+    for await (const frame of parseJsonSseStream<unknown>(response.body)) {
+      yield frame
+      if (frame.event === 'background_end') return
+    }
+  }
+
+  cancelJob(jobId: string): Promise<unknown> {
+    return this.request<ApiEnvelope<unknown>>(apiPath(`/jobs/${encodeURIComponent(jobId)}`), { method: 'DELETE' })
+      .then((envelope) => envelope.data)
   }
 
   chatStream(
@@ -1418,11 +1357,6 @@ export class DaemonClient {
     return this.get(`/sessions/${encodeURIComponent(id)}`)
   }
 
-  /**
-   * Queue a mid-run steering note (an instruction or question) onto a live,
-   * in-flight run. 202s with the queued note id; daemon 409s if the session
-   * has no active run (surfaced as a request error by the shared transport).
-   */
   async steerSession(
     sessionId: string,
     message: string,
@@ -1441,7 +1375,6 @@ export class DaemonClient {
       : { noteId }
   }
 
-  /** Retract steering that has not yet been consumed by the active run. */
   async cancelSessionSteering(
     sessionId: string,
     target: { selector: 'latest' | 'all' } | { noteId: string },
@@ -1456,7 +1389,6 @@ export class DaemonClient {
     )
   }
 
-  /** Fetch the agent state board for a run (D4 canonical endpoint). */
   async stateBoard(sessionId: string): Promise<DaemonStateBoardResponse> {
     return this.get(`/runs/${encodeURIComponent(sessionId)}/state`)
   }
@@ -1579,6 +1511,13 @@ export class DaemonClient {
     return this.post(`/sessions/${encodeURIComponent(id)}/agent`, { agentId })
   }
 
+  async setSessionPrivilege(
+    id: string,
+    level: 'readonly' | 'accept-edits' | 'workspace-write' | 'supervised' | 'autonomous',
+  ): Promise<{ sessionId: string; level: string; applied: boolean }> {
+    return this.post(`/sessions/${encodeURIComponent(id)}/privilege`, { level })
+  }
+
   async answerSessionQuestion(
     id: string,
     questionId: string,
@@ -1605,7 +1544,6 @@ export class DaemonClient {
       scope?: 'once' | 'session' | 'always' | 'run' | 'session-all'
       rule?: { tool: string; pattern: string }
       note?: string
-      /** With a denial: stop the run immediately instead of granting a read-only follow-up turn. */
       stop?: boolean
     } & DaemonRequestControlOptions = {},
   ): Promise<DaemonApprovalResponseResult> {
@@ -1631,17 +1569,18 @@ export class DaemonClient {
     approved: boolean | ApprovalDecisionStatus,
     sessionId?: string,
     note?: string,
-    request?: DaemonRequestControlOptions,
+    request?: DaemonRequestControlOptions & { scope?: ApprovalScope },
   ): Promise<Response> {
     const body =
       typeof approved === 'boolean'
-        ? { requestId, approved, sessionId, note }
+        ? { requestId, approved, sessionId, note, scope: request?.scope }
         : {
             requestId,
             decision: approved,
             approved: approved === 'approved',
             sessionId,
             note,
+            scope: request?.scope,
           }
     return this.fetch(apiPath('/approvals/resume'), {
       method: 'POST',
@@ -1692,14 +1631,8 @@ export class DaemonClient {
     params: {
       scope?: 'session' | 'always'
       sessionId?: string
-      /** When true, sends ?stale=true so the daemon only removes
-       * rules matching isStaleRememberedDecision (hitCount=0,
-       * createdAt ≥ STALE_RULE_THRESHOLD_DAYS old). */
       stale?: boolean
-      /** Exact tool name; daemon removes only entries with matching
-       * tool. Pairs with cli `decisions list --tool`. */
       tool?: string
-      /** Optional outcome filter. */
       approved?: boolean
     } = {},
   ): Promise<void> {
@@ -1840,10 +1773,6 @@ export class DaemonClient {
     return this.get('/config')
   }
 
-  /** Read-only snapshot of the active tool policy. Includes the rule
-   * table the daemon is enforcing right now (defaults, per-tool modes,
-   * deny lists, allow lists). Useful for surfaces that want to render the
-   * current safety posture without reading the YAML file directly. */
   async policy(): Promise<DaemonPolicySnapshot> {
     return this.get('/policy')
   }
@@ -2034,6 +1963,95 @@ export class DaemonClient {
     return this.post(`/config/channels/webhook/endpoints/${encodeURIComponent(id)}/enable`, {
       enabled,
     })
+  }
+
+  async eventRoutingDestinations(): Promise<DaemonEventRoutingDestination[]> {
+    return this.get('/event-routing/destinations')
+  }
+
+  async createEventRoutingDestination(
+    input: DaemonEventRoutingDestinationInput,
+  ): Promise<DaemonEventRoutingDestination> {
+    return this.post('/event-routing/destinations', input)
+  }
+
+  async updateEventRoutingDestination(
+    id: string,
+    input: DaemonEventRoutingDestinationInput,
+  ): Promise<DaemonEventRoutingDestination> {
+    return this.put(`/event-routing/destinations/${encodeURIComponent(id)}`, input)
+  }
+
+  async deleteEventRoutingDestination(id: string): Promise<void> {
+    return this.del(`/event-routing/destinations/${encodeURIComponent(id)}`)
+  }
+
+  async testEventRoutingDestination(
+    id: string,
+  ): Promise<DaemonEventRoutingDestinationTestOutcome> {
+    return this.post(`/event-routing/destinations/${encodeURIComponent(id)}/test`)
+  }
+
+  async eventRoutingRules(): Promise<DaemonEventRoutingRule[]> {
+    return this.get('/event-routing/rules')
+  }
+
+  async createEventRoutingRule(input: DaemonEventRoutingRuleInput): Promise<DaemonEventRoutingRule> {
+    return this.post('/event-routing/rules', input)
+  }
+
+  async updateEventRoutingRule(
+    id: string,
+    input: DaemonEventRoutingRuleInput,
+  ): Promise<DaemonEventRoutingRule> {
+    return this.put(`/event-routing/rules/${encodeURIComponent(id)}`, input)
+  }
+
+  async deleteEventRoutingRule(id: string): Promise<void> {
+    return this.del(`/event-routing/rules/${encodeURIComponent(id)}`)
+  }
+
+  async dryRunEventRoutingRule(
+    id: string,
+    sample: { source: string; type: string; payload?: Record<string, unknown> },
+  ): Promise<DaemonEventRoutingDryRunResult> {
+    return this.post(`/event-routing/rules/${encodeURIComponent(id)}/dry-run`, sample)
+  }
+
+  async eventRoutingEvents(query?: {
+    source?: string
+    status?: DaemonEventRoutingEventStatus
+    limit?: number
+  }): Promise<DaemonEventRoutingEvent[]> {
+    const searchParams = new URLSearchParams()
+    if (query?.source) searchParams.set('source', query.source)
+    if (query?.status) searchParams.set('status', query.status)
+    if (typeof query?.limit === 'number') searchParams.set('limit', String(query.limit))
+    const suffix = searchParams.size > 0 ? `?${searchParams.toString()}` : ''
+    return this.get(`/event-routing/events${suffix}`)
+  }
+
+  async eventRoutingEvent(id: string): Promise<DaemonEventRoutingEventDetail> {
+    return this.get(`/event-routing/events/${encodeURIComponent(id)}`)
+  }
+
+  async eventRoutingDeliveries(query?: {
+    status?: DaemonEventRoutingDeliveryStatus
+    limit?: number
+  }): Promise<DaemonEventRoutingDelivery[]> {
+    const searchParams = new URLSearchParams()
+    if (query?.status) searchParams.set('status', query.status)
+    if (typeof query?.limit === 'number') searchParams.set('limit', String(query.limit))
+    const suffix = searchParams.size > 0 ? `?${searchParams.toString()}` : ''
+    return this.get(`/event-routing/deliveries${suffix}`)
+  }
+
+  async replayEventRoutingDelivery(id: string): Promise<DaemonEventRoutingDelivery> {
+    return this.post(`/event-routing/deliveries/${encodeURIComponent(id)}/replay`)
+  }
+
+  async ackEventRoutingDelivery(id: string): Promise<DaemonEventRoutingDeliveryOutcome> {
+    return this.post(`/event-routing/deliveries/${encodeURIComponent(id)}/ack`)
   }
 
   async telegramChannel(): Promise<DaemonTelegramChannelSummary | null> {
@@ -2500,8 +2518,6 @@ export class DaemonClient {
     return this.getCapability(`/scheduler/jobs/${encodeURIComponent(id)}/notifications`)
   }
 
-  // --- /scheduled-tasks REST surface (natural-language `when`, retry/timezone) ---
-
   async createScheduledTask(input: DaemonScheduledTaskInput): Promise<DaemonSchedulerJob> {
     return this.post('/scheduled-tasks', input)
   }
@@ -2635,10 +2651,6 @@ export class DaemonClient {
     return this.postCapability(`/scheduler/jobs/${encodeURIComponent(id)}/resume`, {})
   }
 
-  /**
-   * Let a job run without a human present: its tool calls stop waiting on
-   * approval prompts that nobody would answer while it fires.
-   */
   async setSchedulerJobUnattended(id: string, unattended: boolean): Promise<DaemonSchedulerJob> {
     return this.postCapability(`/scheduler/jobs/${encodeURIComponent(id)}/unattended`, { unattended })
   }
@@ -2894,11 +2906,6 @@ export class DaemonClient {
     return this.post('/config/providers/discover-models', input)
   }
 
-  /**
-   * Server-side model rediscovery for a stored provider. The daemon uses its
-   * own (unredacted) stored credentials, so this works for key-protected
-   * providers where the client only ever sees a redacted apiKey.
-   */
   async refreshProviderModels(providerId: string): Promise<DaemonProviderRefreshModelsResult> {
     return this.post(`/config/providers/${encodeURIComponent(providerId)}/refresh-models`)
   }
@@ -2919,6 +2926,10 @@ export class DaemonClient {
 
   async personas(): Promise<DaemonPersona[]> {
     return this.get('/personas')
+  }
+
+  async bots(): Promise<DaemonRoleBot[]> {
+    return this.get('/bots')
   }
 
   async devices(): Promise<DaemonDevice[]> {
@@ -2976,11 +2987,6 @@ export class DaemonClient {
     return this.post(`/sessions/${encodeURIComponent(sessionId)}/redo`, {})
   }
 
-  /**
-   * Durable committed edit checkpoints for a session, oldest first. File
-   * time travel — distinct from conversation undo/redo above, which
-   * rewrites the event log without touching the working tree.
-   */
   async listSessionCheckpoints(sessionId: string): Promise<EditCheckpointSummary[]> {
     const { checkpoints } = await this.get<{ checkpoints: EditCheckpointSummary[] }>(
       `/sessions/${encodeURIComponent(sessionId)}/checkpoints`,
@@ -2992,6 +2998,10 @@ export class DaemonClient {
     const query = new URLSearchParams()
     for (const [key, value] of Object.entries(options)) if (value !== undefined) query.set(key, String(value))
     return this.get(`/sessions/${encodeURIComponent(sessionId)}/inbox?${query}`)
+  }
+
+  async openSessionInboxResult(sessionId: string, seq: number): Promise<{ sessionId: string }> {
+    return this.post(`/sessions/${encodeURIComponent(sessionId)}/inbox/open`, { seq })
   }
 
   async listWork(): Promise<{ items: WorkItem[]; unavailable: string[]; truncated: string[] }> {
@@ -3007,7 +3017,7 @@ export class DaemonClient {
     return result
   }
 
-  async readManagedProcess(id: string, offsets: { stdoutOffset?: number; stderrOffset?: number } = {}): Promise<{ status: string; stdout: string; stderr: string; screen?: string; nextStdoutOffset: number; nextStderrOffset: number }> {
+  async readManagedProcess(id: string, offsets: { stdoutOffset?: number; stderrOffset?: number; tail?: number } = {}): Promise<{ status: string; stdout: string; stderr: string; screen?: string; nextStdoutOffset: number; nextStderrOffset: number }> {
     const query = new URLSearchParams()
     for (const [key, value] of Object.entries(offsets)) if (value !== undefined) query.set(key, String(value))
     return this.get(`/work/process/${encodeURIComponent(id)}?${query}`)
@@ -3025,11 +3035,6 @@ export class DaemonClient {
     return this.post(`/sessions/${encodeURIComponent(sessionId)}/inbox/ack`, { seq })
   }
 
-  /**
-   * Restore every file touched at or after the checkpoint to its state
-   * before it, then drop the rewound checkpoints — git-reset semantics:
-   * history past the rewind point no longer describes the working tree.
-   */
   async rewindSessionFiles(
     sessionId: string,
     checkpointId: string,
@@ -3464,14 +3469,6 @@ export class DaemonClient {
     return this.post('/observability/prune', {})
   }
 
-  /**
-   * Dispatch an isolated subagent on the daemon. The HTTP route returns the
-   * raw `SubagentDispatchResult` (no `ApiEnvelope` wrap) — we hit it via
-   * `fetch` so the caller does not lose the `error` field on the typed
-   * result. Privilege-escalation rejections surface as a 400 with
-   * `code: 'SUBAGENT_TOOL_ESCALATION'`; the helper preserves that signal
-   * by throwing an `Error` whose message contains the error code.
-   */
   async dispatchSubagent(input: SubagentDispatchInput): Promise<SubagentDispatchResult> {
     const response = await this.fetch(apiPath('/subagents/dispatch'), {
       method: 'POST',
@@ -3487,7 +3484,6 @@ export class DaemonClient {
         if (body?.error?.code) code = body.error.code
         if (body?.error?.message) message = body.error.message
       } catch {
-        /* non-JSON error body — fall through to status-only message */
       }
       const err = new Error(`${code}: ${message}`) as Error & {
         code?: string
@@ -3515,7 +3511,6 @@ export class DaemonClient {
         }
         if (body?.error?.message) message = body.error.message
       } catch {
-        /* non-JSON error body — fall through to status-only message */
       }
       throw new Error(message)
     }
@@ -3588,7 +3583,6 @@ export class DaemonClient {
         if (body?.error?.code) code = body.error.code
         if (body?.error?.message) message = body.error.message
       } catch {
-        /* non-JSON error body — fall through to status-only message */
       }
       const err = new Error(`${code}: ${message}`) as Error & {
         code?: string

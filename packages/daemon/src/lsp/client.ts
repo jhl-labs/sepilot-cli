@@ -100,9 +100,6 @@ export class LspClient {
       }
     })
     proc.on('exit', (code) => {
-      // Server died (crash or graceful exit). Reject any in-flight
-      // requests so callers don't hang, then clear local state and
-      // notify the layer so it can decide whether to respawn.
       for (const [id, req] of this.pending) {
         if (req.timer) clearTimeout(req.timer)
         req.reject(new Error(`LSP server exited (code=${code ?? 'null'})`))
@@ -116,17 +113,9 @@ export class LspClient {
         try {
           cb(code)
         } catch {
-          // exit handlers are best-effort
         }
       }
     })
-    // Real LSP servers complete the handshake only after the client sends
-    // the `initialized` notification, and only push diagnostics for
-    // documents that were opened via `textDocument/didOpen`. Previously
-    // `initialize` was fire-and-forget with neither follow-up, so
-    // diagnostics/hover/definition were a permanent dead path on a live
-    // server. Await the initialize response, then send `initialized` and
-    // flush any documents opened before the handshake finished.
     void this.request(
       'initialize',
       {
@@ -149,16 +138,9 @@ export class LspClient {
         }
       })
       .catch(() => {
-        // Server never answered initialize (crash/stop). Leave the client
-        // un-initialized; callers see empty diagnostics, not a hang.
       })
   }
 
-  /**
-   * Open a document with the server so it starts publishing diagnostics
-   * for it. Idempotent per URI. If the handshake has not completed yet the
-   * open is deferred and flushed once `initialized` is sent.
-   */
   ensureOpen(uri: string, languageId: string, text: string): boolean {
     if (this.openDocs.has(uri)) return false
     this.openDocs.set(uri, { languageId, text })
@@ -178,12 +160,6 @@ export class LspClient {
     this.send({ jsonrpc: '2.0', method, params })
   }
 
-  /**
-   * Register a one-shot or persistent exit listener. Useful for the
-   * LspLayer to clear caches and apply a restart policy when the
-   * underlying server dies. Only one listener is supported — second
-   * call replaces the first.
-   */
   onExit(cb: (code: number | null) => void): void {
     this.exitCallback = cb
   }
@@ -204,11 +180,6 @@ export class LspClient {
     this.openDocs.clear()
   }
 
-  /**
-   * Send an LSP request and wait for its response. Returns the `result`
-   * field on success, throws on RPC error or timeout. Used by
-   * higher-level wrappers like `documentSymbol` and `references`.
-   */
   async request<T = unknown>(
     method: string,
     params: Record<string, unknown>,
@@ -232,21 +203,12 @@ export class LspClient {
     return promise
   }
 
-  /**
-   * `textDocument/documentSymbol` — flat or hierarchical list of
-   * declarations in the file. Used to find the first exported symbol
-   * position when callers only have a URI.
-   */
   documentSymbol(uri: string): Promise<LspDocumentSymbol[]> {
     return this.request<LspDocumentSymbol[]>('textDocument/documentSymbol', {
       textDocument: { uri },
     })
   }
 
-  /**
-   * `textDocument/references` — list of reference Locations for the
-   * symbol at (line, character). 0-based, matching the LSP spec.
-   */
   references(uri: string, line: number, character: number): Promise<LspLocation[]> {
     return this.request<LspLocation[]>('textDocument/references', {
       textDocument: { uri },
@@ -255,11 +217,6 @@ export class LspClient {
     })
   }
 
-  /**
-   * `textDocument/definition` — declaration site(s) for the symbol at
-   * (line, character), 0-based. A server may return a single Location or
-   * an array; this normalizes to an array.
-   */
   async definition(uri: string, line: number, character: number): Promise<LspLocation[]> {
     const result = await this.request<LspLocation | LspLocation[] | null>(
       'textDocument/definition',
@@ -269,7 +226,6 @@ export class LspClient {
     return Array.isArray(result) ? result : [result]
   }
 
-  /** `textDocument/hover` — type/doc info for the symbol at (line, character). */
   hover(uri: string, line: number, character: number): Promise<LspHover | null> {
     return this.request<LspHover | null>('textDocument/hover', {
       textDocument: { uri },
@@ -277,7 +233,6 @@ export class LspClient {
     })
   }
 
-  /** `workspace/symbol` — project-wide symbol search by name. */
   async workspaceSymbol(query: string): Promise<LspWorkspaceSymbol[]> {
     const result = await this.request<LspWorkspaceSymbol[] | null>('workspace/symbol', {
       query,
@@ -286,7 +241,6 @@ export class LspClient {
   }
 
   private handle(msg: JsonRpcMessage): void {
-    // Response routing first — match by id when present.
     if (typeof msg.id === 'number' && this.pending.has(msg.id)) {
       const pending = this.pending.get(msg.id)!
       this.pending.delete(msg.id)

@@ -6,20 +6,12 @@ import type {
   RunStopReason,
 } from '@sepilotd/core'
 
-/**
- * Builders for the structured `RunStopReason` attached to the terminal `done`
- * event. Every termination site threads real data (budget, tool, request id)
- * into one of these instead of relying on sentence sentinels in the final
- * assistant message.
- */
-
 export const INCOMPLETE_OUTPUT_PREFIX = 'INCOMPLETE:'
 
 export function isIncompleteOutput(content: string | undefined): boolean {
   return typeof content === 'string' && content.trimStart().startsWith(INCOMPLETE_OUTPUT_PREFIX)
 }
 
-/** Layers that end a run with an exhausted bounded budget. */
 export type BudgetStopLayer =
   | 'iteration'
   | 'node'
@@ -55,10 +47,6 @@ export function stopReasonCompleted(input?: {
   }
 }
 
-/**
- * A bounded budget ended the run before the agent declared completion. The
- * run checkpoint is retained, so the user can resume or raise the budget.
- */
 export function stopReasonBudget(
   layer: 'iteration' | 'node' | 'exact_tool',
   budget: number | undefined,
@@ -133,7 +121,6 @@ export function stopReasonNoProgress(input?: {
 
 export function stopReasonStuckRepeat(input?: {
   tool?: string
-  /** `question`: the user chose to stop when asked about the repeated call. */
   layer?: 'question'
   contract?: AgentRunContract
 }): RunStopReason {
@@ -153,19 +140,56 @@ export function stopReasonStuckRepeat(input?: {
   }
 }
 
+export type CompletionGateSource =
+  | 'gate'
+  | 'self_reported'
+  | 'provider_no_progress'
+  | 'answer_verification'
+  | 'quality_phase'
+
+const MAX_REPORTED_REASON_CHARS = 300
+
+export function incompleteOutputReason(content: string | undefined): string | undefined {
+  if (!isIncompleteOutput(content)) return undefined
+  const body = content!.trimStart().slice(INCOMPLETE_OUTPUT_PREFIX.length)
+  const line = body.split('\n').map((part) => part.trim()).find(Boolean)
+  if (!line) return undefined
+  return line.length > MAX_REPORTED_REASON_CHARS ? `${line.slice(0, MAX_REPORTED_REASON_CHARS - 1)}…` : line
+}
+
+function completionGateSummary(source: CompletionGateSource, reason: string | undefined): string {
+  switch (source) {
+    case 'self_reported':
+      return reason ? `Agent reported the work incomplete: ${reason}` : 'Agent reported the work incomplete.'
+    case 'provider_no_progress':
+      return 'Provider responses made no progress; the run ended without a usable final response.'
+    case 'answer_verification':
+      return reason ? `Final answer verification did not pass: ${reason}` : 'Final answer verification did not pass.'
+    case 'quality_phase':
+      return 'The required quality phase did not establish acceptance.'
+    case 'gate':
+      return reason
+        ? `Completion gate block budget exhausted with unmet acceptance criteria: ${reason}`
+        : 'Completion gate block budget exhausted with unmet acceptance criteria.'
+  }
+}
+
 export function stopReasonCompletionGate(input: {
   unmet?: string[]
   budget?: number
   used?: number
+  source?: CompletionGateSource
 }): RunStopReason {
+  const source = input.source ?? 'gate'
   return {
     kind: 'incomplete',
     code: 'completion_gate',
-    summary: 'Completion gate block budget exhausted with unmet acceptance criteria.',
+    summary: completionGateSummary(source, input.unmet?.[0]),
     ...withDetail({
       budget: input.budget,
       used: input.used,
       criteria: input.unmet && input.unmet.length > 0 ? [...input.unmet] : undefined,
+      layer: source === 'gate' ? undefined : source,
     }),
     resumable: true,
     nextActions: ['resume', 'raise_budget'],
@@ -303,7 +327,6 @@ export function stopReasonProviderError(input?: {
   }
 }
 
-/** True when a stop reason means the run did not reach a clean completion. */
 export function isTruncatedStopReason(reason: RunStopReason | undefined): boolean {
   return reason != null && reason.kind !== 'completed' && reason.kind !== 'error'
     && reason.kind !== 'cancelled'
@@ -327,9 +350,9 @@ const STOP_KIND_BY_CODE: Record<RunStopCode, RunStopKind> = {
   inactivity: 'error',
   user_abort: 'cancelled',
   provider_error: 'error',
+  agent_incomplete: 'incomplete',
 }
 
-/** Default kind for a code, for callers that only hold the code. */
 export function stopKindForCode(code: RunStopCode): RunStopKind {
   return STOP_KIND_BY_CODE[code]
 }

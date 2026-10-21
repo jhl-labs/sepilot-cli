@@ -32,7 +32,6 @@ export function useInputHistory(cwd: string = process.cwd()): UseInputHistory {
       })
 
       void appendHistory(cwd, text, lastEntry).catch(() => {
-        // Swallow disk failures; in-memory copy already updated.
       })
     },
     [cwd],

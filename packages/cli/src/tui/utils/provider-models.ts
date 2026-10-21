@@ -21,6 +21,21 @@ export interface ProviderModelOption {
   synthetic?: boolean
 }
 
+export interface ProviderPickerOption {
+  kind: 'provider'
+  providerId: string
+  providerName: string
+  provider: DaemonProviderInfo
+  modelCount: number
+  defaultModelId: string | null
+  isCurrent: boolean
+  isDefault: boolean
+  healthStatus: DaemonProviderInfo['health']['status']
+  healthMessage?: string
+  missingEnvVars?: string[]
+  shortcut?: number
+}
+
 interface ProviderPickerActionOption {
   kind: 'action'
   action: 'setup' | 'setup-preset' | 'edit-provider' | 'set-default-provider' | 'delete-provider' | 'sync-session-default'
@@ -40,6 +55,8 @@ interface ProviderPickerActionOption {
 export type ProviderModelPickerItem =
   | ProviderModelOption
   | ProviderPickerActionOption
+
+export type ProviderPickerItem = ProviderPickerOption | ProviderPickerActionOption
 
 interface ProviderMatchResult {
   match: DaemonProviderInfo | null
@@ -95,6 +112,26 @@ function compareOption(
   }
 
   return left.modelId.localeCompare(right.modelId)
+}
+
+function compareProviderOption(
+  left: ProviderPickerOption,
+  right: ProviderPickerOption,
+): number {
+  if (left.isCurrent !== right.isCurrent) {
+    return left.isCurrent ? -1 : 1
+  }
+
+  if (left.isDefault !== right.isDefault) {
+    return left.isDefault ? -1 : 1
+  }
+
+  const healthCompare = healthRank(left.healthStatus) - healthRank(right.healthStatus)
+  if (healthCompare !== 0) {
+    return healthCompare
+  }
+
+  return left.providerId.localeCompare(right.providerId)
 }
 
 function flattenProviderModels(
@@ -182,6 +219,16 @@ function matchesQuery(option: ProviderModelOption, query: string): boolean {
     return isSubsequenceMatch(normalizedQuery, `${option.providerId}/${option.modelId}`.toLowerCase())
   }
   return false
+}
+
+function matchesProviderQuery(option: ProviderPickerOption, query: string): boolean {
+  const normalizedQuery = query.trim().toLowerCase()
+  if (!normalizedQuery) return true
+  return matchesNormalizedQuery([
+    option.providerId,
+    option.providerName,
+    `${option.providerName} (${option.providerId})`,
+  ], normalizedQuery)
 }
 
 function buildPresetActionDetail(preset: ProviderWizardPreset): string {
@@ -505,6 +552,51 @@ export function buildProviderModelPickerList(
     ordered: orderedItems.map((item, index) => ({
       ...item,
       shortcut: !trimmedQuery && index < 9 ? index + 1 : undefined,
+    })),
+  }
+}
+
+export function buildProviderPickerList(
+  providers: DaemonProviderInfo[],
+  currentProviderId: string,
+  defaultProviderId: string,
+  defaultModelId: string,
+  query = '',
+): { ordered: ProviderPickerItem[] } {
+  const providerOptions = providers
+    .map((provider) => ({
+      kind: 'provider' as const,
+      providerId: provider.id,
+      providerName: provider.name,
+      provider,
+      modelCount: provider.models.length || provider.configuredModelIds.length,
+      defaultModelId: provider.id === defaultProviderId
+        ? defaultModelId || provider.models[0]?.id || provider.configuredModelIds[0] || null
+        : provider.models[0]?.id || provider.configuredModelIds[0] || null,
+      isCurrent: provider.id === currentProviderId,
+      isDefault: provider.id === defaultProviderId,
+      healthStatus: provider.health.status,
+      healthMessage: provider.health.message,
+      missingEnvVars: provider.health.missingEnvVars,
+    }))
+    .filter((provider) => matchesProviderQuery(provider, query))
+    .sort(compareProviderOption)
+
+  const actions = buildProviderManagementActions(
+    providers,
+    currentProviderId,
+    '',
+    defaultProviderId,
+    defaultModelId,
+    query,
+    providerOptions.length,
+  )
+
+  const ordered = [...providerOptions, ...actions]
+  return {
+    ordered: ordered.map((item, index) => ({
+      ...item,
+      shortcut: !query.trim() && index < 9 ? index + 1 : undefined,
     })),
   }
 }

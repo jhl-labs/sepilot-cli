@@ -76,11 +76,6 @@ export function findPendingApproval(
   )
 }
 
-/**
- * Return the latest recorded response only when the request itself exists in
- * this session. This lets approval responses be safely retried without turning
- * an already-handled notification action into a misleading 404.
- */
 export function findApprovalResolution(
   events: SessionEvent[],
   requestId: string,

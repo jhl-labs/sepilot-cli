@@ -16,28 +16,23 @@ export async function initCommand(options?: {
     throw new Error(`Invalid device role '${role}'. Expected one of: desktop, server, edge.`)
   }
 
-  // Check if already initialized
   try {
     await access(join(dataDir, 'config.yaml'))
     console.log(`sepilotd is already initialized at ${dataDir}`)
     console.log('To reinitialize, delete the directory first.')
     return
   } catch {
-    // Not initialized yet — proceed
   }
 
   console.log(`Initializing sepilotd at ${dataDir}...\n`)
 
-  // Create directory structure
   const dirs = ['sessions', 'memory', 'skills', 'security', 'cache', 'logs']
   for (const dir of dirs) {
     await mkdir(join(dataDir, dir), { recursive: true })
   }
 
-  // Generate device ID
   const deviceId = randomUUID()
   const deviceName = options?.deviceName ?? homedir().split('/').pop() ?? 'default'
-  // Generate Ed25519 key pair
   const { publicKey, privateKey } = generateKeyPairSync('ed25519', {
     publicKeyEncoding: { type: 'spki', format: 'pem' },
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
@@ -45,17 +40,14 @@ export async function initCommand(options?: {
   await writeFile(join(dataDir, 'security', 'device.key'), privateKey, { mode: 0o600 })
   await writeFile(join(dataDir, 'security', 'device.pub'), publicKey, { mode: 0o644 })
 
-  // Generate data encryption key (32 random bytes)
   const dataKey = randomBytes(32)
   await writeFile(join(dataDir, 'security', 'data.key'), dataKey, { mode: 0o600 })
 
-  // Generate auth tokens
   const daemonToken = randomBytes(32).toString('hex')
   const gatewayToken = randomBytes(32).toString('hex')
   await writeFile(join(dataDir, 'security', 'daemon.token'), daemonToken, { mode: 0o600 })
   await writeFile(join(dataDir, 'security', 'gateway.token'), gatewayToken, { mode: 0o600 })
 
-  // Create default config
   const config = {
     version: 1,
     device: { id: deviceId, name: deviceName, role },
@@ -82,13 +74,11 @@ export async function initCommand(options?: {
   }
   await writeFile(join(dataDir, 'config.yaml'), YAML.stringify(config), { mode: 0o600 })
 
-  // Create default policies
   const policies = createDefaultPolicy()
   await writeFile(join(dataDir, 'security', 'policies.yaml'), YAML.stringify(policies), {
     mode: 0o644,
   })
 
-  // Auto-detect Ollama
   console.log('\nChecking for local LLM...')
   try {
     const ollamaRes = await fetch('http://localhost:11434/api/tags')
@@ -109,7 +99,6 @@ export async function initCommand(options?: {
     console.log('  Ollama not detected. Install from https://ollama.com')
   }
 
-  // Create sample skills
   console.log('\nCreating sample skills...')
   const sampleSkills = [
     {
@@ -173,7 +162,6 @@ that clearly in the final answer.
     console.log(`  Created skill: ${skill.name}`)
   }
 
-  // Print summary
   console.log('Created directories:')
   for (const dir of dirs) console.log(`  ${dataDir}/${dir}/`)
   console.log('')

@@ -5,7 +5,7 @@ import { loadDaemonToken, resolveDaemonBaseUrl } from './token.js'
 export class DaemonWsClient extends SharedDaemonWsClient {
   constructor(baseUrl?: string) {
     const resolvedBaseUrl = resolveDaemonBaseUrl(baseUrl)
-    const token = loadDaemonToken()
+    const token = loadDaemonToken(resolvedBaseUrl)
     super({
       baseUrl: resolvedBaseUrl,
       token,

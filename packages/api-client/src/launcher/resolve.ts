@@ -89,7 +89,6 @@ function scanPnpmPackageEntry(
       }
     }
   } catch {
-    // Ignore missing packaged pnpm layout.
   }
 
   return null
@@ -106,7 +105,6 @@ function resolveRuntimePackageInvocation(
   const execPath = options.execPath ?? process.execPath
   const home = options.homeDir ?? homedir()
 
-  // 1. Explicit env var — highest priority
   const explicit = config.envNames
     .map((name) => env[name]?.trim())
     .find((value): value is string => Boolean(value))
@@ -114,7 +112,6 @@ function resolveRuntimePackageInvocation(
     return invocationFromTarget(explicit, execPath)
   }
 
-  // 2. Resource roots — packaged binary or module
   for (const root of resourceSearchRoots) {
     const candidates = [
       join(root, config.packageName, 'index.js'),
@@ -128,7 +125,6 @@ function resolveRuntimePackageInvocation(
     }
   }
 
-  // 3. Module search roots — node_modules/@sepilotd/daemon/dist/index.js
   for (const root of moduleSearchRoots) {
     const candidate = join(
       root,
@@ -143,7 +139,6 @@ function resolveRuntimePackageInvocation(
     }
   }
 
-  // 4. pnpm layout scan
   if (scanPnpm) {
     for (const root of [...moduleSearchRoots, ...resourceSearchRoots]) {
       const pnpmEntry = scanPnpmPackageEntry(root, config.packageName)
@@ -153,7 +148,6 @@ function resolveRuntimePackageInvocation(
     }
   }
 
-  // 5. Relative sibling paths from each module root
   for (const root of moduleSearchRoots) {
     const candidates = [
       join(root, '..', config.packageName, 'dist', 'index.js'),
@@ -167,7 +161,6 @@ function resolveRuntimePackageInvocation(
     }
   }
 
-  // 6. Home directory fallback
   const homeCandidate = join(
     home,
     '.local',
@@ -182,7 +175,6 @@ function resolveRuntimePackageInvocation(
     return { command: execPath, args: [homeCandidate], kind: 'module' }
   }
 
-  // 7. $PATH fallback
   const fromPath = findExecutableInPath(config.pathBinaryName, env)
   if (fromPath) {
     return { command: fromPath, args: [], kind: 'binary' }

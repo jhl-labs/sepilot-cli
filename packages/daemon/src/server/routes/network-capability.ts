@@ -66,8 +66,6 @@ function readNetworkStatus(app: FastifyInstance): NetworkStatus {
 }
 
 async function writeNetwork(app: FastifyInstance, next: NetworkConfig): Promise<NetworkConfig> {
-  // Resolve proxy and CA inputs before touching disk or replacing a working
-  // global dispatcher. This turns unreadable/invalid CA files into a clear 400.
   planProviderDispatcher(next)
 
   const runtime = app.runtime
@@ -199,8 +197,6 @@ export async function registerNetworkCapabilityRoutes(
       })
       const ProbeBody = z.object({
         url: z.string().url().superRefine((value, context) => {
-          // Zod keeps running refinements after `.url()` has recorded an
-          // invalid string. Keep malformed requests on the 400 path.
           let url: URL
           try {
             url = new URL(value)

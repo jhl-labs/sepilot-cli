@@ -158,9 +158,6 @@ function ensureSchema(db: SqliteDatabase): void {
       db.prepare(`ALTER TABLE notifications ADD COLUMN ${name} ${type}`).run()
     }
   }
-  // Upgrade accepted receipts from older daemons into the durable status-check
-  // lifecycle. Using the persisted acceptance timestamp makes this idempotent
-  // and immediately due after an old daemon has been offline for the delay.
   db.prepare(
     `UPDATE notifications
      SET relay_provider_next_check_at = relay_completed_at + ?
@@ -210,7 +207,6 @@ function parseCorrelation(raw: string | null | undefined): NotificationCorrelati
       }
     }
   } catch {
-    // Fail closed: malformed local metadata is not operational evidence.
   }
   return null
 }
@@ -239,7 +235,6 @@ export interface NotificationsRepo {
     audience?: string[] | null
     correlation?: NotificationCorrelation | null
     createdAt?: number
-    /** Queue external Relay delivery atomically with the notification row. */
     relayDeliveryPending?: boolean
   }): NotificationItem
   markRead(id: string, options?: { surface?: string | null }): boolean
@@ -658,11 +653,6 @@ export function createNotificationsRepo(): NotificationsRepo {
       }
     },
     prune(options) {
-      // Two-tier sweep so notifications cannot grow unbounded (there was no
-      // delete path before): (1) drop read notifications older than the age
-      // ceiling, (2) cap the table to the newest-K by deleting the oldest
-      // beyond it. Unread notifications survive the age sweep so a pending
-      // action is never silently dropped.
       const now = options?.now ?? Date.now()
       const maxAgeDays = options?.maxAgeDays ?? DEFAULT_NOTIFICATION_MAX_AGE_DAYS
       const keepLatest = options?.keepLatest ?? DEFAULT_NOTIFICATION_KEEP_LATEST
@@ -676,9 +666,6 @@ export function createNotificationsRepo(): NotificationsRepo {
             SELECT id FROM notifications ORDER BY created_at DESC LIMIT ?
           )`,
         ).run(keepLatest)
-        // Relay outbox rows intentionally store only notification identity and
-        // retry state. Remove terminal or pending orphans in the same sweep so
-        // delivery metadata remains bounded by the notification retention cap.
         db.prepare(
           `DELETE FROM notification_relay_outbox
            WHERE notification_id NOT IN (SELECT id FROM notifications)`,
@@ -687,9 +674,6 @@ export function createNotificationsRepo(): NotificationsRepo {
       })()
     },
     markAllRead(options) {
-      // A presentation list is intentionally capped at 200, but "all" is a
-      // state transition over every retained notification visible to the
-      // requesting surface. Never reuse the bounded list as mutation scope.
       const unread = visibleNotificationRows(db, { ...options, unreadOnly: true })
       if (unread.length === 0) return 0
       const timestamp = Date.now()

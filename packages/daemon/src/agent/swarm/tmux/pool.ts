@@ -12,16 +12,6 @@ export interface CreateOpts {
   env?: Record<string, string>
   paneWidth?: number
   paneHeight?: number
-  /**
-   * Optional command to run AS the pane's process (instead of the user's
-   * default shell). Required for TUI agents (claude/codex/gemini/opencode) that
-   * detect TTY ownership at startup — running them via shell+send-keys
-   * leaves them launched but with no rendering.
-   *
-   * The command is exec'd directly by tmux (no shell), so callers should
-   * pass an array of `[binary, ...args]`. Use this with `-c <cwd>` semantics
-   * via `opts.cwd` so the command starts in the right directory.
-   */
   command?: string[]
 }
 
@@ -40,10 +30,6 @@ export class TmuxSessionPool {
   private lastCaptures = new Map<string, string>()
   private locks = new Map<string, Promise<unknown>>()
 
-  /**
-   * Run `fn` serialized per `name`. Concurrent callers for the same name queue
-   * behind earlier work; different names run in parallel.
-   */
   private async withLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.locks.get(name) ?? Promise.resolve()
     let release!: () => void
@@ -77,9 +63,6 @@ export class TmuxSessionPool {
       '-y',
       String(opts.paneHeight ?? 50),
     ]
-    // If a command is supplied, append it as the pane's process so TUI
-    // agents own the PTY directly. tmux treats every arg after the flags
-    // as `command [args...]`.
     const allArgs = opts.command?.length
       ? [...baseArgs, ...opts.command]
       : baseArgs
@@ -93,7 +76,6 @@ export class TmuxSessionPool {
     try {
       await run('tmux', ['kill-session', '-t', name])
     } catch {
-      /* may already be dead */
     }
     this.cursors.delete(name)
     this.lastCaptures.delete(name)
@@ -109,7 +91,6 @@ export class TmuxSessionPool {
     }
   }
 
-  /** Serialized per session — concurrent calls for the same name queue. */
   async sendKeys(
     name: string,
     text: string,
@@ -159,7 +140,6 @@ export class TmuxSessionPool {
     return cleanAnsi(await this.captureRaw(name, lines))
   }
 
-  /** Serialized per session — cursor reads/writes are atomic per name. */
   async readNewOutput(name: string): Promise<string> {
     return this.withLock(name, async () => {
       const cleaned = await this.captureClean(name, INCREMENTAL_CAPTURE_LINES)

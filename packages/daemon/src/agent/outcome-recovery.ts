@@ -81,11 +81,6 @@ function messagesSinceLastUser(messages: Message[]): Message[] {
   return messages.slice(lastUserIndex + 1)
 }
 
-/**
- * Latest todo list since the last user turn, taken from structured
- * `todowrite` tool-call arguments (first-class todo state) — never scraped
- * out of the tool's rendered output text.
- */
 function latestTodoItems(messages: Message[]): TodoItem[] | null {
   for (const message of [...messages].reverse()) {
     if (message.role !== 'assistant' || !message.toolCalls?.length) continue
@@ -122,8 +117,6 @@ function latestToolResultIsFailure(messages: Message[]): boolean {
   if (!latestToolMessage) {
     return false
   }
-  // A trusted operator denial is a human decision the model was already told
-  // to finish around (grace turn), not a failed execution to recover from.
   if (recordedApprovalFailureStatus(latestToolMessage) === 'denied') {
     return false
   }
@@ -193,10 +186,6 @@ export function evaluateRunOutcome(options: {
   availableToolNames?: string[]
   commandEvidenceToolNames?: string[]
   inferActionsFromWording?: boolean
-  /**
-   * Structured todo loop state (AgentState.todoList). When provided it wins
-   * over deriving the list from todowrite tool calls in the history.
-   */
   todoList?: TodoItem[]
 }): RunOutcomeEvaluation {
   const { messages, content } = options

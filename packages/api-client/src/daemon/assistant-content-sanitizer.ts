@@ -21,8 +21,6 @@ const MAX_ANSWER_PROTOCOL_STEM_SCAN_NONEMPTY_LINES = 4
 type AnswerProtocolStem = 'ANSWER' | 'INCOMPLETE'
 
 function parseAnswerProtocolLine(line: string): { stem: AnswerProtocolStem; body: string } | null {
-  // Separate the fixed prefix from its body. Overlapping whitespace and dot
-  // repetitions ending at `$` backtrack on Unicode line separators.
   const match = line.match(ANSWER_PROTOCOL_STEM_PATTERN)
   if (!match) return null
   let bodyStart = match[0].length
@@ -30,8 +28,6 @@ function parseAnswerProtocolLine(line: string): { stem: AnswerProtocolStem; body
   return { stem: match[1]!.toUpperCase() as AnswerProtocolStem, body: line.slice(bodyStart) }
 }
 
-// Large enough to keep a gate-rejected "unverified draft" (often a full
-// markdown report) readable instead of cutting it off mid-section.
 const MAX_DETAIL_BLOCK_CHARS = 6000
 
 function compactLine(value: string): string {
@@ -40,12 +36,6 @@ function compactLine(value: string): string {
   return `${normalized.slice(0, 219).trimEnd()}...`
 }
 
-/**
- * Format a captured detail for display. Short single-line details stay inline
- * after the label; multi-line details (often a nearly-complete markdown
- * answer) keep their line breaks as an indented block instead of being
- * squashed into one truncated line.
- */
 function formatDetail(label: string, value: string): string[] {
   const trimmed = value.trim()
   if (!trimmed) return []
@@ -60,9 +50,6 @@ function formatDetail(label: string, value: string): string[] {
 }
 
 function stripThinkingArtifacts(text: string): string {
-  // Match only fixed-size tags, then pair them in linear passes. Retrying a
-  // wildcard block regex at every unclosed opener makes model output quadratic.
-  // Preserve the old non-nesting semantics and unmatched literal tags.
   const tags = [...text.matchAll(/<\/?(?:think|thinking)>/gi)]
   const closingForOpening = new Map<number, number>()
   const nextClosing = new Map<string, number>()
@@ -157,26 +144,14 @@ function isInternalAgentFallbackResponse(responseText: string): boolean {
 }
 
 export interface SanitizeAssistantContentOptions {
-  /**
-   * Structured stop cause of the run that produced this content. When
-   * present, it wins over the `INCOMPLETE:` prose protocol: the stem is
-   * stripped and the blocker text is returned bare so the surface's stop
-   * card carries the reason instead of a reconstructed sentence.
-   */
   stopReason?: RunStopReason | null
 }
 
 export interface SanitizedAssistantContent {
   text: string
-  /** True when the model reply was a protocol/fallback message, not an answer. */
   internalFallback: boolean
 }
 
-/**
- * Turn model-facing reply protocol (`ANSWER:`/`INCOMPLETE:` stems, thinking
- * tags, daemon fallback prose) into user-facing text. Pure and shared by
- * every chat surface so the transcript never shows raw protocol stems.
- */
 export function sanitizeAssistantContent(
   responseText: string,
   options: SanitizeAssistantContentOptions = {},
@@ -192,8 +167,6 @@ export function sanitizeAssistantContent(
     const blocker = stripProtocolStem(visibleText)
     const stopReason = options.stopReason
     if (stopReason && stopReason.code !== 'completed') {
-      // The stop card renders the localized reason; keep only the blocker
-      // detail (often a partial answer) as the message body.
       return { internalFallback: true, text: blocker }
     }
     return {
@@ -222,11 +195,6 @@ export function sanitizeAssistantContent(
   }
 }
 
-/**
- * Apply `sanitizeAssistantContent` to the assistant message a stream is
- * writing (by id) or, when no id is given, to the last assistant message.
- * Returns the same array when nothing changed.
- */
 export function sanitizeAssistantMessages<T extends { id: string; role: string; content: string }>(
   messages: T[],
   options: SanitizeAssistantContentOptions & { assistantId?: string } = {},

@@ -29,17 +29,6 @@ export interface RememberUserMemoryResult {
 const DEFAULT_SECTION_TITLE = 'User Memory'
 const MAX_MEMORY_CHARS = 1200
 
-/**
- * Parse the explicit `/remember <text>` slash command into a memory directive.
- *
- * Only the slash command is parsed here — it is an unambiguous command, like
- * `/approve`. Natural-language "remember X" / "기억해줘 X" / "X 라고 기록해놔" is
- * NOT regex-detected anymore: those messages flow through the normal agent
- * turn, and the agent saves them via the `memory.remember` tool (the system
- * prompt instructs it to do so on any explicit "remember/save/store" request,
- * and memory.remember is auto-approved as a user-memory write). This keeps the
- * channel free of intent-guessing heuristics.
- */
 export function extractExplicitMemoryDirective(text: string): { content: string } | null {
   const command = text.trim().match(/^\/remember(?:@\S+)?\s+([\s\S]+)$/i)
   if (!command?.[1]) return null
@@ -56,8 +45,6 @@ export async function rememberUserMemory(
   if (content.length > MAX_MEMORY_CHARS) return { status: 'too-long' }
   if (options.evidence) memoryEvidenceSchema.parse(options.evidence)
   if (looksSensitive(content)) {
-    // Do not echo the raw secret/PII back to the caller (it may be logged or
-    // surfaced in a UI) — return the redacted form.
     return { status: 'sensitive', content: redactSensitive(content).redacted }
   }
   if (!options.fileMemory && !options.semanticIndex) {
@@ -70,12 +57,8 @@ export async function rememberUserMemory(
 
   const suppliedTags = uniqueTags(['explicit-memory', ...(options.tags ?? [])])
   const hasDurableScope = suppliedTags.some((tag) => tag.toLowerCase().startsWith('scope:') && !tag.toLowerCase().startsWith('scope:session:'))
-  // A new session is provenance, not an ownership transfer of a durable fact.
   const tags = hasDurableScope ? suppliedTags.filter((tag) => !tag.toLowerCase().startsWith('scope:session:')) : suppliedTags
   const id = `user-${stableMemoryHash(memoryIdentitySeed(options.evidence?.subject || options.evidence?.reality ? JSON.stringify([content, options.evidence.subject, options.evidence.reality]) : content, tags))}`
-  // Plain markdown has no expiry/provenance enforcement. Keep managed facts in
-  // the authoritative index so future, temporary and inferred claims cannot
-  // silently turn into permanent user instructions in the prompt.
   const projectToFile = !options.evidence || (options.evidence.status === 'active'
     && options.evidence.origin === 'user' && !options.evidence.subject && !options.evidence.reality && !options.evidence.validFrom && !options.evidence.validUntil)
   if (!projectToFile && !options.semanticIndex) return { status: 'unavailable', errors: ['Evidence-managed memory requires a semantic store.'] }
@@ -87,8 +70,6 @@ export async function rememberUserMemory(
       }, tags })
       semanticMemorySaved = true
     } catch (error) {
-      // Never create an untracked file copy after the authoritative store rejects
-      // a write (for example scope, evidence, or reset validation).
       return { status: 'unavailable', id, semanticMemorySaved: false, fileMemoryAdded: 0,
         errors: [`semantic:${error instanceof Error ? error.message : String(error)}`] }
     }

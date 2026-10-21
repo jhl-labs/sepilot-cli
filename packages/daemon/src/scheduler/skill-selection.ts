@@ -23,12 +23,6 @@ export interface ResolvedScheduledSkillContext {
   skillExecutionPolicies?: ReturnType<typeof resolveSkillExecutionContext>['skillExecutionPolicies']
 }
 
-/**
- * Rehydrate the same structured skill selection used by interactive chat.
- * A persisted selection is an execution contract: missing registries,
- * disabled/missing skills, malformed metadata, and policy incompatibilities
- * all fail the run instead of silently executing the bare instruction.
- */
 export async function resolveScheduledSkillContext(
   metadata: Record<string, unknown> | null | undefined,
   deps: ScheduledSkillResolverDeps,

@@ -22,7 +22,7 @@ import type {
   Root,
   Tool as SdkTool,
 } from '@modelcontextprotocol/sdk/types.js'
-import type { ChatResponse, ContentPart, ILLMProvider, Message } from '@sepilotd/core'
+import type { ChatResponse, ContentPart, ILLMProvider, Message, ToolSecurityDescriptor } from '@sepilotd/core'
 import type { ToolDefinitionRuntime, ToolExecutionContext, ToolResult } from '../tools/registry.js'
 import { DAEMON_VERSION } from '../version.js'
 import { createMcpTransport } from './transport.js'
@@ -638,8 +638,25 @@ export class McpClient {
   async discoverTools(): Promise<ToolDefinitionRuntime[]> {
     if (!this.connected) throw new Error('MCP client not connected')
     if (!this.hasCapability('tools')) return []
-    const { tools } = await this.client.listTools()
-    return tools.map((tool) => this.wrapMcpTool(tool))
+    const tools: SdkTool[] = []
+    const names = new Set<string>()
+    const cursors = new Set<string>()
+    const options: RequestOptions = { signal: AbortSignal.timeout(30_000), timeout: 10_000 }
+    let cursor: string | undefined
+    for (let pageIndex = 0; pageIndex < 100; pageIndex++) {
+      const page = await this.client.listTools(cursor === undefined ? undefined : { cursor }, options)
+      if (tools.length + page.tools.length > 10_000) throw new Error('MCP catalog exceeds the tool limit')
+      for (const tool of page.tools) {
+        if (names.has(tool.name)) throw new Error('MCP catalog contains a duplicate tool name')
+        names.add(tool.name)
+        tools.push(tool)
+      }
+      if (page.nextCursor === undefined) return tools.map(tool => this.wrapMcpTool(tool))
+      if (cursors.has(page.nextCursor)) throw new Error('MCP catalog repeated a pagination cursor')
+      cursors.add(page.nextCursor)
+      cursor = page.nextCursor
+    }
+    throw new Error('MCP catalog exceeds the pagination limit')
   }
 
   async discoverPrompts(): Promise<PromptDescriptor[]> {
@@ -761,10 +778,20 @@ export class McpClient {
     inputSchema: Record<string, unknown>
   }): ToolDefinitionRuntime {
     const prefix = `mcp.${this.config.name}`
+    const declaredEffect = this.config.toolSecurity?.[mcpTool.name]
     return {
       name: `${prefix}.${mcpTool.name}`,
       description: mcpTool.description ?? `MCP tool: ${mcpTool.name}`,
       inputSchema: mcpTool.inputSchema ?? { type: 'object', properties: {} },
+      ...(declaredEffect
+        ? {
+            security: {
+              effect: declaredEffect,
+              executionCapabilities: this.config.toolCapabilities?.[mcpTool.name],
+              rationale: `Operator-declared effect for MCP server "${this.config.name}" tool "${mcpTool.name}"`,
+            } satisfies ToolSecurityDescriptor,
+          }
+        : {}),
       execute: async (
         input: Record<string, unknown>,
         context?: ToolExecutionContext,

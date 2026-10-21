@@ -59,10 +59,6 @@ export async function registerWikiRoutes(
     task: (projector: WikiMemoryProjector, scopeTags: string[]) => Promise<unknown>,
     options: { reconcile?: boolean; once?: boolean } = {},
   ): void => {
-    // Wiki is currently daemon-global first-party local knowledge. Its Memory
-    // projection intentionally uses the same legacy-global visibility model:
-    // first-party callers receive the server-derived legacy read capability,
-    // while extensions neither trigger nor retrieve this derived copy.
     if (!memoryProjector || request.authContext?.kind === 'extension') return
     if (options.once && (memoryReconciled || pendingReconcileCount > 0)) return
     if (options.reconcile) pendingReconcileCount += 1
@@ -87,8 +83,6 @@ export async function registerWikiRoutes(
         }
       },
       (error) => {
-        // Any failed incremental projection makes the derived index suspect;
-        // the next tree read must be allowed to run a full reconciliation.
         memoryReconciled = false
         if (options.reconcile) {
           pendingReconcileCount = Math.max(0, pendingReconcileCount - 1)

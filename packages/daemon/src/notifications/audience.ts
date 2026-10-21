@@ -34,17 +34,10 @@ export function notificationVisibleToSurface(
   audience: NotificationAudience | undefined,
   surface: string | null | undefined,
 ): boolean {
-  // No audience restriction → visible to everyone.
   if (audience == null) return true
-  // `undefined` = no surface filter requested (internal/admin list-all): show
-  // everything. `null` = a client resolved to no surface label (unlabeled
-  // client) — that is an identified request context, so it is fail-closed below.
   if (surface === undefined) return true
   const normalizedSurface = normalizeSurfaceLabel(surface)
   if (!normalizedSurface) {
-    // Fail-CLOSED for an unlabeled/unrecognized surface: a restricted
-    // notification must not leak to a client we cannot identify. Only a
-    // wildcard (broadcast) audience is visible without a known surface.
     return audience.includes(ALL_NOTIFICATION_AUDIENCES)
   }
   if (audience.includes(`!${normalizedSurface}`)) return false

@@ -1,17 +1,3 @@
-// Pulled out of App.tsx so the open-overlay and other gated
-// callbacks share one named pre-condition instead of each
-// duplicating the same templated guard returns inline. Two helpers:
-//
-//   - decideStreamApprovalGate:   streaming + pending-approval only
-//                                 (rewind, branch, set-as-default).
-//   - decideOpenOverlayGate:      streaming + pending-approval +
-//                                 overlay-block (the five picker
-//                                 openers).
-//
-// Both are pure. Callers translate `block` outcomes into a
-// SYSTEM_MESSAGE dispatch and an early return; `proceed` means the
-// caller can run the actual side effects.
-
 import type {
   OverlayOpenTarget,
   OverlayStateSnapshot,
@@ -27,9 +13,6 @@ export type StreamApprovalGateDecision =
 export function decideStreamApprovalGate(opts: {
   isStreaming: boolean
   hasPendingApproval: boolean
-  // Gerund or noun phrase that completes "Wait for the current
-  // stream to finish before ___." and "Resolve the pending approval
-  // before ___." e.g. "switching sessions", "rewinding".
   action: string
 }): StreamApprovalGateDecision {
   if (opts.isStreaming) {

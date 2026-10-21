@@ -86,7 +86,7 @@ function enforceWritableLimit(raw: WritableLike, hardLimit: number): void {
   try {
     raw.destroy?.(error)
   } catch {
-    try { raw.end?.() } catch { /* noop */ }
+    try { raw.end?.() } catch {}
   }
   throw error
 }
@@ -168,7 +168,6 @@ export function sendJsonWs(
     try {
       socket.close(1013, 'WebSocket buffer limit exceeded')
     } catch {
-      /* noop */
     }
     return false
   }

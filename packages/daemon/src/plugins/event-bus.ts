@@ -66,8 +66,6 @@ export class PluginEventBus {
       try {
         calls.push((handler as (p: PluginEventMap[E]) => void | Promise<void>)(payload))
       } catch (err) {
-        // Plugin error must not break daemon flow — log and keep
-        // dispatching to remaining handlers.
         log.error(`handler for ${event} threw`, {
           event,
           error: err instanceof Error ? err.message : String(err),

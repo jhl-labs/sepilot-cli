@@ -1,30 +1,9 @@
-// Structured JSONL diagnostics for the interactive TUI.
-//
-// Field reports like "Esc then /resume failed then BUSY" are impossible to
-// reconstruct without a client-side trace: the daemon logs its side, but the
-// TUI's view (what it sent, which stream events arrived, when the user
-// cancelled, what the error payload actually was) lived only in the terminal
-// scrollback. This logger appends one JSON object per line to
-// `~/.sepilotd/logs/cli-tui.jsonl` so a session can be replayed after the
-// fact with `jq`. No file is created unless SEPILOT_DEBUG=1.
-//
-// Knobs:
-//   SEPILOT_DEBUG=1            enable debug logging
-//   SEPILOT_CLI_LOG=0          disable only the TUI debug log
-//   SEPILOT_CLI_LOG_LEVEL=debug  also log every stream payload type
-//                                (default `info` logs lifecycle + decisions
-//                                + errors only)
-//
-// Never throws and never blocks the render path: writes are fire-and-forget
-// appendFile calls, errors are swallowed (a broken log must not break chat).
-
 import { appendFile, chmod, mkdir, rename, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 const MAX_LOG_BYTES = 5 * 1024 * 1024
 
-/** Resolved per call so tests (and operators) can redirect via env. */
 function logFile(): string {
   return (
     process.env.SEPILOT_CLI_LOG_FILE || join(homedir(), '.sepilotd', 'logs', 'cli-tui.jsonl')
@@ -33,7 +12,6 @@ function logFile(): string {
 
 const dirReadyByPath = new Map<string, Promise<void>>()
 let writeChain: Promise<void> = Promise.resolve()
-/** Correlates all lines from one TUI process. */
 const instanceId = Math.random().toString(36).slice(2, 10)
 
 function enabled(): boolean {
@@ -63,14 +41,9 @@ async function rotateIfNeeded(file: string): Promise<void> {
       await rename(file, `${file}.1`)
     }
   } catch {
-    // Missing file (first write) or rename race — either way, keep writing.
   }
 }
 
-/**
- * Append one structured line. `data` values should already be small
- * (ids, enum strings, short previews) — this is a trace, not a transcript.
- */
 export function tuiLog(event: string, data?: Record<string, unknown>): void {
   if (!enabled()) return
   const line = `${JSON.stringify({
@@ -80,7 +53,6 @@ export function tuiLog(event: string, data?: Record<string, unknown>): void {
     event,
     ...data,
   })}\n`
-  // Serialize writes so rotation and appends can't interleave mid-line.
   writeChain = writeChain
     .then(async () => {
       const file = logFile()
@@ -90,16 +62,13 @@ export function tuiLog(event: string, data?: Record<string, unknown>): void {
       await chmod(file, 0o600).catch(() => {})
     })
     .catch(() => {
-      // Logging must never surface as a chat error.
     })
 }
 
-/** Await all queued writes — for tests only. */
 export function flushTuiLog(): Promise<void> {
   return writeChain
 }
 
-/** Convenience wrapper that serializes an unknown error safely. */
 export function tuiLogError(
   event: string,
   error: unknown,
@@ -112,7 +81,6 @@ export function tuiLogError(
   tuiLog(event, { ...data, error: detail })
 }
 
-/** Trim potentially long user/model text to a loggable preview. */
 export function logPreview(text: string | undefined | null, max = 120): string | undefined {
   if (!text) return undefined
   const singleLine = text.replace(/\s+/g, ' ').trim()

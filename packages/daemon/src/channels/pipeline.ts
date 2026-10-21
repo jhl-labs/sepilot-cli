@@ -162,9 +162,6 @@ type ChannelApprovalOrigin = {
   sequence: number
   toolName: string
   requestedAt: number
-  // Conversation language captured from the original request, so the approval
-  // confirmation mirrors the user even when the reply is a terse '/approve'
-  // command that carries no language signal of its own.
   lang: ChannelLang
   cleanup: ReturnType<typeof setTimeout>
 }
@@ -306,9 +303,6 @@ function parseApprovalCommand(text: string): ChannelApprovalCommand | null {
   }
 }
 
-// Deterministic approval replies: exact short phrases advertised in the
-// channel prompt must work without depending on the LLM classifier. Longer or
-// ambiguous prose still falls through to classifyApprovalReplyWithLLM.
 const APPROVE_SYMBOL_RE = /^(?:👍|👍🏻|👍🏼|👍🏽|👍🏾|👍🏿|👌|👌🏻|👌🏼|👌🏽|👌🏾|👌🏿|✅)+$/u
 const DENY_SYMBOL_RE = /^(?:👎|👎🏻|👎🏼|👎🏽|👎🏾|👎🏿|❌|✖️|✖)+$/u
 const APPROVE_ONCE_TEXTS = new Set([
@@ -930,13 +924,6 @@ function imageGenAttachmentsFromText(text: string): ChannelAttachment[] {
   return attachments
 }
 
-// No recorded origin means the question was enqueued by a code path
-// that did not go through notifyQuestionRequest (e.g. a web UI run
-// or an in-memory state wipe). In that case we cannot attribute the
-// question to this channel sender, so we refuse the match rather
-// than letting any sender on the same bound session answer it.
-// Channel-originated questions always record an origin in
-// notifyQuestionRequest before delivery.
 export function matchesQuestionOrigin(
   origin: ChannelQuestionOrigin | undefined,
   normalized: ReturnType<ChannelMessageNormalizer['normalize']>,
@@ -1110,7 +1097,6 @@ export class ChannelMessagePipeline {
         },
       }])
     } catch {
-      // Observability is best-effort and must never affect channel traffic.
     }
   }
 
@@ -1295,10 +1281,6 @@ export class ChannelMessagePipeline {
         return
       }
 
-      // Memory slash commands (/memory, /memory_search, /memory_remember,
-      // /memory_forget, /memory_list, /memory_hot). Same scope guard as
-      // the rest of the channel pipeline: only memories owned by the
-      // calling user/channel are listed/searched/deletable.
       const lower = text.toLowerCase()
       if ((lower === '/memory' || lower.startsWith('/memory ') || lower.startsWith('/memory_'))
           && this.runtime.semanticIndex) {
@@ -1523,9 +1505,6 @@ export class ChannelMessagePipeline {
       return
     }
 
-    // Explicit `/parallel ...` (and /new /async /fork) command — parsed, not
-    // heuristically inferred. Natural-language follow-ups always go to the LLM
-    // classifier below; there is no regex prefilter for prose.
     const parallelCommand = explicitParallelCommand(message.text)
     if (parallelCommand.matched) {
       this.recordChannelEvent(normalized, 'channel.intent_classified', {
@@ -1555,8 +1534,6 @@ export class ChannelMessagePipeline {
         activeRuns: snapshots,
       })
     } catch (error) {
-      // Fail-safe: a thrown classifier must not spawn a mutating parallel run.
-      // Fall back to status (acknowledge, keep the active run) instead of forking.
       log.warn('Intent classifier threw unexpectedly', { error: errorName(error) })
       resolution = { intent: { category: 'status' }, source: 'fallback' }
     }
@@ -1635,9 +1612,6 @@ export class ChannelMessagePipeline {
     dedupeKey: string | undefined,
     activeRuns: ActiveChannelRun[],
   ): Promise<void> {
-    // The classifier judged this message to be the same request an active
-    // run is already handling (a verbatim re-send or a rephrase). Don't fork
-    // a duplicate run — just acknowledge so the user knows it landed.
     const target = activeRuns[0]
     this.recordChannelEvent(normalized, 'channel.duplicate_resend_ignored', {
       activeMessageId: target?.messageId,
@@ -1695,7 +1669,6 @@ export class ChannelMessagePipeline {
       try {
         run.controller.abort(new Error('user_cancel'))
       } catch {
-        // controller may already be aborted
       }
       this.recordChannelEvent(normalized, 'channel.run_aborted', {
         reason: 'user_cancel',
@@ -1739,7 +1712,6 @@ export class ChannelMessagePipeline {
       try {
         mainRun.controller.abort(new Error('correction'))
       } catch {
-        // already aborted
       }
       this.recordChannelEvent(normalized, 'channel.run_aborted', {
         reason: 'correction',
@@ -1786,11 +1758,6 @@ export class ChannelMessagePipeline {
       )
       return
     }
-    // Status / cancel / correction follow-ups all send an immediate ack.
-    // parallel_new used to start a fork silently, which made the user
-    // think their second message was dropped — the actual agent reply
-    // can take minutes when the main run is busy waiting on approvals
-    // or holding the LLM provider's request slot.
     try {
       await this.sendObserved(
         channel,
@@ -2086,9 +2053,6 @@ export class ChannelMessagePipeline {
       : ctx.model ?? ctx.provider
 
     if (ctx.sawModelOutput === false) {
-      // The run produced no tokens, no tool call — the LLM/provider request
-      // itself never came back. Point the user at provider health, not at
-      // their request being "too long" or a stuck tool.
       return [
         `모델이 ${elapsed} 동안 응답을 시작하지 않아 중단했습니다.`,
         modelLabel ? `대상: ${modelLabel}` : undefined,
@@ -2263,8 +2227,6 @@ export class ChannelMessagePipeline {
       sequence,
       toolName: record.toolName ?? 'tool',
       requestedAt: record.requestedAt,
-      // Persisted origins predate the language field; the resolution path falls
-      // back to detecting from the reply when the stored lang is unavailable.
       lang: detectChannelLang(undefined),
       cleanup,
     })
@@ -2436,9 +2398,6 @@ export class ChannelMessagePipeline {
     const matches = this.matchingApprovalRequests(normalized)
     if (matches.length === 0) return null
 
-    // 👍 / ✅ / 👎 / ❌ are unambiguous symbols — resolve them directly, the
-    // same way a /approve command resolves. Any natural-language reply goes to
-    // the LLM classifier; there is no regex that infers approve/deny from prose.
     const symbolIntent = parseApprovalSymbol(normalized.message.text)
     if (symbolIntent) {
       return this.resolveApprovalToLatestRequest(normalized, symbolIntent, matches)
@@ -2925,9 +2884,6 @@ export class ChannelMessagePipeline {
       this.forgetApprovalOrigin(command.requestId)
     }
 
-    // Mirror the conversation language: prefer this reply's own script when it
-    // has one, otherwise the language captured when the approval was requested,
-    // otherwise Korean for back-compat.
     const resolutionLang: ChannelLang =
       channelLangSignal(normalized.message.text) ?? origin?.lang ?? 'ko'
 
@@ -2979,11 +2935,6 @@ export class ChannelMessagePipeline {
       'processed',
     )
     if (result.resolved) {
-      // Reset waiting state for both approve and deny — after a denial
-      // the agent loop continues with the denial-as-tool-output, so the
-      // run is no longer "waiting for approval". Without this reset the
-      // busy reminder shown on subsequent messages would point at a
-      // waitingForId that has already been resolved.
       this.resumeActiveRunProgress(channel, normalized)
     }
   }
@@ -3429,7 +3380,6 @@ export class ChannelMessagePipeline {
   ): Promise<void> {
     const lines: string[] = ['🩺 sepilotd health']
 
-    // Daemon process.
     const uptimeMs = Math.floor(process.uptime() * 1000)
     const device = this.runtime.config?.device
     lines.push(
@@ -3438,7 +3388,6 @@ export class ChannelMessagePipeline {
       + (DAEMON_VERSION ? ` · v${DAEMON_VERSION}` : ''),
     )
 
-    // LLM provider — without one the agent cannot reply at all.
     const provider = this.runtime.providerRegistry?.getDefault?.()
     lines.push(
       provider
@@ -3446,7 +3395,6 @@ export class ChannelMessagePipeline {
         : '• provider: ⚠️ none configured — the agent cannot respond until one is added',
     )
 
-    // Scheduler.
     if (this.runtime.jobStore) {
       try {
         const jobs = this.runtime.jobStore.list()
@@ -3471,7 +3419,6 @@ export class ChannelMessagePipeline {
       lines.push('• scheduler: not available')
     }
 
-    // Memory subsystems.
     const memBits: string[] = []
     memBits.push(this.runtime.semanticIndex ? 'semantic ✓' : 'semantic ✗')
     memBits.push((this.runtime.fileMemory || this.runtime.fileMemoryRegistry) ? 'file ✓' : 'file ✗')
@@ -3486,7 +3433,6 @@ export class ChannelMessagePipeline {
     }
     lines.push(`• memory: ${memBits.join(' · ')}`)
 
-    // This chat: bound session + active runs.
     const chatKey = normalized.sessionKey
     const activeRuns = this.listActiveRuns(chatKey)
     const bound = await this.boundChannelSession(normalized).catch(() => null)
@@ -3496,7 +3442,6 @@ export class ChannelMessagePipeline {
       + (chatKey ? '' : ' · (channel has no persistent session key)'),
     )
 
-    // Channel pipeline counters.
     try {
       const stats = this.runtime.channelPipelineMonitor?.getStats?.()
       const here = stats?.byChannelType.find((c) => c.channelType === normalized.message.channelType)
@@ -3509,7 +3454,6 @@ export class ChannelMessagePipeline {
         )
       }
     } catch {
-      // Monitoring is best-effort; omit the line if it throws.
     }
 
     await this.completeCommand(
@@ -4399,22 +4343,6 @@ export class ChannelMessagePipeline {
   }
 }
 
-/**
- * Handle /memory or /memory_<verb> slash commands sent over a channel
- * (Telegram, Slack, etc.). Returns the user-facing reply text. The
- * command is fully scope-aware: list / search / hot / forget only see
- * memories that belong to the caller's scope tags. remember writes
- * with the caller's scope so the memory shows up in subsequent reads.
- *
- * Verbs (Telegram convention `/memory_X` and CLI convention
- * `/memory X` both supported):
- *   help             — usage
- *   search <query>   — top-N hits with snippets
- *   list [N]         — most-recent visible memories
- *   hot [N]          — top-N by access counter
- *   remember <text>  — append a new memory; scope tags auto-applied
- *   forget <id>      — delete a memory the caller owns
- */
 export async function handleMemoryCommand(args: {
   semanticIndex: {
     add(entry: { id?: string; content: string; source: 'user' | 'conversation' | 'document' | 'skill'; tags: string[] }): Promise<void>
@@ -4462,7 +4390,6 @@ export async function handleMemoryCommand(args: {
         const pinned = await args.semanticIndex.listPinned(500)
         pinnedCount = filterVisibleMemories(pinned, scopeTags).length
       } catch {
-        // best-effort
       }
     }
     const sourceLine = Array.from(bySource.entries())
@@ -4640,11 +4567,9 @@ export async function handleMemoryCommand(args: {
 }
 
 function parseMemoryCommand(text: string): { verb: string; rest: string } | null {
-  // Accepts both "/memory_<verb> <rest>" and "/memory <verb> <rest>".
   const lower = text.toLowerCase()
   if (!lower.startsWith('/memory')) return null
 
-  // Telegram convention: /memory_search react hooks → verb='search'
   const underscore = lower.match(/^\/memory_([a-z]+)(\s|$)/)
   if (underscore) {
     const verb = underscore[1]
@@ -4653,7 +4578,6 @@ function parseMemoryCommand(text: string): { verb: string; rest: string } | null
     return { verb, rest }
   }
 
-  // Bare /memory or /memory help → list-style help.
   if (lower === '/memory' || lower.startsWith('/memory ')) {
     const rest = text.slice('/memory'.length).trim()
     if (!rest) return { verb: 'help', rest: '' }

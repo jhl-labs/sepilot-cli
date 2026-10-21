@@ -8,16 +8,6 @@ import { extractPptxText, PptxExtractionError } from './pptx.js'
 
 const execFileAsync = promisify(execFile)
 
-/**
- * Minimal slice of `pdf-parse`'s `PDFParse` that this module uses.
- *
- * `pdf-parse` pulls in `pdfjs-dist`, whose top-level code references DOM globals
- * (`DOMMatrix`, …) and probes for `@napi-rs/canvas`. A static `import` of it at
- * module load would crash a `bun build --compile` binary at startup, so the real
- * parser is `await import('pdf-parse')`d lazily inside {@link defaultExtractionDeps}
- * — only when a PDF actually needs extracting. Tests pass their own
- * `createPdfParser` and never load `pdf-parse`.
- */
 export interface PdfParserLike {
   getText(): Promise<{ text: string }>
   destroy(): Promise<unknown>
@@ -40,19 +30,12 @@ export const TEXT_FILE_EXTENSIONS: readonly string[] = [
 
 const TEXT_EXT = new Set(TEXT_FILE_EXTENSIONS)
 
-const MAX_FILE_SIZE = 20 * 1024 * 1024 // 20MB
-// Pre-read size ceiling for the text-extraction path (PDF/OCR/text). Reuses the
-// same 20MB budget as inline media so a crafted large document cannot be read
-// wholesale into memory before any bound applies.
+const MAX_FILE_SIZE = 20 * 1024 * 1024
 const MAX_EXTRACTABLE_FILE_SIZE = MAX_FILE_SIZE
-// Sniff window used to reject binary payloads mislabeled with a text extension
-// (a NUL byte never occurs in valid UTF-8 text).
 const BINARY_SNIFF_BYTES = 8192
 export const MAX_CHAT_ATTACHMENTS = 16
 export const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 64 * 1024 * 1024
 const OCR_DEFAULT_LANGUAGES = ['eng']
-// Hard ceiling on PDF pages rasterized for OCR, independent of caller input, so
-// a huge scanned PDF cannot fan out an unbounded number of subprocesses.
 const OCR_MAX_PAGES_CEILING = 200
 export const OCR_DEFAULT_MAX_PAGES = 20
 const OCR_DEFAULT_CONCURRENCY = 2
@@ -188,12 +171,6 @@ function estimateDataUrlDecodedBytes(url: string): number | null {
   return Math.max(0, Math.floor((data.length * 3) / 4) - padding)
 }
 
-// A client-controlled `attachments[].path` is otherwise an arbitrary-file-read
-// (LFI): the daemon would `readFile` any path it can access (e.g. /etc/passwd,
-// source, logs) and stream it back inside the model context. Attachment paths
-// must be constrained to a fileId-registered upload or a path canonically
-// contained within an allow-listed root (uploads dir + the run workspace).
-
 export class AttachmentPathError extends Error {
   constructor(message: string) {
     super(message)
@@ -201,7 +178,6 @@ export class AttachmentPathError extends Error {
   }
 }
 
-// Legacy escape hatch: only when the operator explicitly opts in. Default off.
 export function attachmentPathLegacyAllowed(): boolean {
   return process.env.SEPILOTD_ALLOW_ATTACHMENT_PATH === '1'
 }
@@ -209,16 +185,9 @@ export function attachmentPathLegacyAllowed(): boolean {
 function isPathWithinRoot(candidate: string, root: string): boolean {
   if (!root) return false
   const rel = relative(resolve(root), resolve(candidate))
-  // Empty means candidate === root; a non-'..' relative that is not absolute
-  // means candidate sits inside root.
   return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
 }
 
-/**
- * Return the canonical attachment path only if it is a trusted upload path or
- * is contained within one of the allow-listed roots; otherwise throw. When the
- * operator has enabled the legacy escape hatch, any path resolves (unsafe).
- */
 export function assertAttachmentPathAllowed(
   candidatePath: string,
   options: { allowedRoots: readonly string[]; trusted?: boolean },
@@ -237,12 +206,6 @@ export function assertAttachmentPathAllowed(
   )
 }
 
-/**
- * Resolve a client-controlled attachment path only after both the lexical and
- * canonical filesystem boundaries agree. The lexical guard rejects obvious
- * escapes without touching outside paths; the realpath guard then rejects an
- * in-workspace symlink or junction whose target is outside the workspace.
- */
 async function resolveAttachmentPathAllowed(
   candidatePath: string,
   options: { allowedRoots: readonly string[]; trusted?: boolean },
@@ -265,8 +228,6 @@ async function resolveAttachmentPathAllowed(
       const canonicalRoot = await realpath(resolve(root))
       if (isPathWithinRoot(canonicalCandidate, canonicalRoot)) return canonicalCandidate
     } catch {
-      // A missing optional root (for example an upload directory that has not
-      // been created yet) cannot authorize the candidate. Check the next root.
     }
   }
 
@@ -329,7 +290,6 @@ export interface AttachmentContentInput {
   path?: string
   url?: string
   filename?: string
-  // Set for fileId-resolved uploads whose server-generated path is trusted.
   trusted?: boolean
 }
 
@@ -346,21 +306,9 @@ export interface BuiltAttachmentContentParts {
 
 export interface BuildAttachmentContentPartsOptions {
   allowedRoots: readonly string[]
-  /**
-   * Keep a presentation attachment as a lightweight reference instead of
-   * expanding every slide into the first model request. The presentation
-   * review skill then opens and reads exactly one slide through Office tools.
-   */
   deferPptxTextExtraction?: boolean
 }
 
-/**
- * Turn chat attachments into model ContentParts, enforcing the path-containment
- * guard for client-controlled paths (fileId uploads are trusted). Malformed,
- * oversized, wrong-type, or out-of-root attachments are collected in `skipped`
- * (with a reason) instead of being silently dropped, so callers can surface and
- * log them.
- */
 export async function buildAttachmentContentParts(
   attachments: readonly AttachmentContentInput[],
   options: BuildAttachmentContentPartsOptions,
@@ -511,16 +459,10 @@ function getOcrConcurrency(): number {
   return OCR_DEFAULT_CONCURRENCY
 }
 
-// Resolve a subprocess file argument to an absolute path so a model-controlled
-// leading-dash path (e.g. "-r99999.png", "--tessdata-dir=/x") can never be
-// parsed as a CLI flag by pdftoppm/tesseract. execFile already blocks shell
-// injection; this closes the remaining option-smuggling vector.
 function toSafeSubprocessPath(filePath: string): string {
   return isAbsolute(filePath) ? filePath : resolve(filePath)
 }
 
-// Run an async mapper over items with a bounded number of in-flight tasks so a
-// large PDF cannot spawn one OCR subprocess per page simultaneously (fork bomb).
 async function mapWithConcurrency<T, R>(
   items: readonly T[],
   limit: number,
@@ -545,7 +487,6 @@ async function assertExtractableFileSize(filePath: string): Promise<void> {
   try {
     info = await stat(filePath)
   } catch {
-    // Let the downstream read surface a proper ENOENT/permission error.
     return
   }
   if (info.isFile() && info.size > MAX_EXTRACTABLE_FILE_SIZE) {
@@ -638,8 +579,6 @@ async function extractPdfWithOcr(
       const cappedPages = Math.min(OCR_MAX_PAGES_CEILING, Math.max(1, Math.trunc(options.ocrMaxPages)))
       args.push('-f', '1', '-l', String(cappedPages))
     }
-    // `--` ends option parsing so a leading-dash file path cannot be smuggled as
-    // a flag; the path itself is also resolved to an absolute path.
     args.push('--', toSafeSubprocessPath(filePath), imagePrefix)
     try {
       await deps.execFile('pdftoppm', args, {

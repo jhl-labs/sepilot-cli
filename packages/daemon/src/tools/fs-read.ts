@@ -7,20 +7,16 @@ import { describeMissingPath } from './missing-path-hint.js'
 import { resolveToolPath } from './path-utils.js'
 import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
 
-// Keep implicit reads compact enough for the model to reason about without
-// flooding every later turn. Callers that genuinely need a larger contiguous
-// view can still opt in with `limit`.
 const DEFAULT_LIMIT = 200
 const MAX_FULL_READ_BYTES = 10 * 1024 * 1024
 const BINARY_SAMPLE_BYTES = 8192
 
-/**
- * Internal observation-ledger metadata. This is never part of the public
- * fs.read input schema and must never be forwarded to tool execution. It lets
- * the coverage layer distinguish "the requested page ended here because the
- * file ended" from "the page ended here because the read was truncated".
- */
 export const FS_READ_OBSERVATION_EOF_LINE = '__observationEofLine'
+
+export function fsReadHasUnreadTail(output: string): boolean {
+  return /call fs\.read again\b[^\][\n]{0,400}\bto continue\]/iu.test(output)
+    || /\[fs\.read:[^\][\n]{0,400}\bunread tail outside requested slice; optional next offset=\d+\]/iu.test(output)
+}
 
 export function createFsReadTool(): ToolDefinitionRuntime {
   return {
@@ -209,6 +205,8 @@ export function createFsReadTool(): ToolDefinitionRuntime {
       const encoding = (input.encoding as BufferEncoding) ?? 'utf-8'
       const offset = normalisePositiveInt(input.offset, 1)
       const limit = normalisePositiveInt(input.limit, DEFAULT_LIMIT)
+      const explicitSlice = typeof input.limit === 'number'
+        && Number.isFinite(input.limit) && input.limit >= 1
       const lineNumbers = Buffer.isEncoding(encoding)
         && isTextEncoding(encoding)
         && input.lineNumbers !== false
@@ -253,6 +251,7 @@ export function createFsReadTool(): ToolDefinitionRuntime {
           offset,
           limit,
           lineNumbers,
+          explicitSlice,
         })
         const cached = info.size <= MAX_FULL_READ_BYTES
           ? await context?.workspaceMutation?.lookupReadObservation?.(path, viewKey)
@@ -292,6 +291,7 @@ export function createFsReadTool(): ToolDefinitionRuntime {
             limit,
             info.size,
             lineNumbers,
+            explicitSlice,
             context?.signal,
           )
           await context?.workspaceMutation?.recordRead(path)
@@ -303,7 +303,7 @@ export function createFsReadTool(): ToolDefinitionRuntime {
         }
 
         const content = await readFile(path, { encoding })
-        const output = paginateOutput(content.toString(), offset, limit, lineNumbers)
+        const output = paginateOutput(content.toString(), offset, limit, lineNumbers, explicitSlice)
         const observation = context?.workspaceMutation?.recordReadObservation
           ? await context.workspaceMutation.recordReadObservation(path, viewKey, output)
           : null
@@ -340,9 +340,6 @@ export function createFsReadTool(): ToolDefinitionRuntime {
           }
         }
         const { message, code } = describeReadError(err, path)
-        // A missing path is the model's guess, not a filesystem fault. Return
-        // the surrounding evidence so the next call can be the right one
-        // instead of another guess.
         const hints = code === 'ENOENT_PERMANENT'
           ? await describeMissingPath(path, {
               root: context?.workspaceRoot ?? context?.cwd,
@@ -386,6 +383,7 @@ function paginateOutput(
   offset: number,
   limit: number,
   lineNumbers: boolean,
+  explicitSlice: boolean,
 ): string {
   const lines = content.split('\n')
   const totalLines = lines.length
@@ -407,16 +405,22 @@ function paginateOutput(
 
   const notes: string[] = []
   if (truncatedHead) {
-    notes.push(`[fs.read: skipped lines 1-${startIdx} (use offset=1 to read from the top)]`)
+    notes.push(`[fs.read: skipped lines 1-${startIdx} (${explicitSlice ? 'outside requested slice' : 'use offset=1 to read from the top'})]`)
   }
   if (truncatedTail) {
     const remaining = totalLines - endIdx
     notes.push(
-      `[fs.read: showing lines ${offset}-${endIdx} of ${totalLines}. ${remaining} more line${remaining === 1 ? '' : 's'} — call fs.read again with offset=${endIdx + 1} (and optional limit) to continue]`,
+      `[fs.read: showing lines ${offset}-${endIdx} of ${totalLines}. ${remaining} more line${remaining === 1 ? '' : 's'} — ${readTailNotice(endIdx + 1, explicitSlice)}]`,
     )
   }
 
   return `${slice}\n${notes.join('\n')}`
+}
+
+function readTailNotice(nextOffset: number, explicitSlice: boolean): string {
+  return explicitSlice
+    ? `unread tail outside requested slice; optional next offset=${nextOffset}`
+    : `call fs.read again with offset=${nextOffset} (and optional limit) to continue`
 }
 
 function isTextEncoding(encoding: BufferEncoding): boolean {
@@ -470,6 +474,7 @@ async function streamPaginatedTextFile(
   limit: number,
   fileSize: number,
   lineNumbers: boolean,
+  explicitSlice: boolean,
   signal?: AbortSignal,
 ): Promise<string> {
   const startLine = offset
@@ -518,12 +523,15 @@ async function streamPaginatedTextFile(
 
   const notes: string[] = []
   if (startLine > 1) {
-    notes.push(`[fs.read: skipped lines 1-${startLine - 1} (use offset=1 to read from the top)]`)
+    notes.push(`[fs.read: skipped lines 1-${startLine - 1} (${explicitSlice ? 'outside requested slice' : 'use offset=1 to read from the top'})]`)
   }
   if (truncatedTail) {
-    notes.push(
-      `[fs.read: ${path} is ${formatBytes(fileSize)}, so it was streamed instead of loaded fully and total line count was omitted. Call fs.read again with offset=${endLine + 1} (and optional limit) to continue]`,
-    )
+    const streamNote = `[fs.read: ${path} is ${formatBytes(fileSize)}, so it was streamed instead of loaded fully and total line count was omitted.`
+    if (explicitSlice) {
+      notes.push(`${streamNote}]`, `[fs.read: ${readTailNotice(endLine + 1, true)}]`)
+    } else {
+      notes.push(`${streamNote} Call fs.read again with offset=${endLine + 1} (and optional limit) to continue]`)
+    }
   }
 
   return notes.length > 0 ? `${selected.join('\n')}\n${notes.join('\n')}` : selected.join('\n')

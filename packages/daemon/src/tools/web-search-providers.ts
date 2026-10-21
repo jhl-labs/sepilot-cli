@@ -1,15 +1,3 @@
-/**
- * Keyed web-search backends.
- *
- * The keyless DuckDuckGo path is the default, but it answers automated queries
- * with an anti-bot challenge often enough that a personal assistant cannot rely
- * on it. Anyone who needs search to actually work configures a provider with an
- * API key here; DuckDuckGo stays as the no-configuration fallback.
- *
- * A configured provider never silently falls back to DuckDuckGo — a wrong key
- * or a spent quota has to look like a broken key, not like an empty web.
- */
-
 import { getDispatcherCompatibleFetch } from '../providers/http-timeout.js'
 import { raceWithAbort } from '../abort.js'
 
@@ -24,7 +12,6 @@ export type WebSearchProviderId =
 export interface WebSearchProviderSettings {
   provider: WebSearchProviderId
   apiKey?: string
-  /** Base URL of a self-hosted SearXNG or compatible AI Search instance. */
   endpoint?: string
 }
 
@@ -50,20 +37,13 @@ export interface SearchTimingEvidence {
 export interface SearchRetrievalEvidence {
   provider: Exclude<WebSearchProviderId, 'auto'>
   sourceKind: SearchSourceKind
-  /** Valid-URL hits accepted from the provider before trusted-domain filtering and deduplication. */
   providerResultCount: number
-  /** Provider-reported total matches, when the backend exposes one. */
   providerTotal?: number
-  /** Provider-reported end-to-end retrieval latency, distinct from tool durationMs. */
   backendDurationMs?: number
-  /** Bounded provider workflow evidence; arbitrary labels/details are intentionally omitted. */
   flow?: SearchFlowStageEvidence[]
-  /** Raw provider flow length, so truncation or invalid entries remain visible. */
   flowStageCount?: number
   flowTruncated?: boolean
-  /** Bounded numeric provider timing entries. Names retain any provider-declared unit suffix. */
   timings?: SearchTimingEvidence[]
-  /** Raw provider timing-key count, including entries rejected by normalization. */
   timingCount?: number
   timingsTruncated?: boolean
 }
@@ -73,7 +53,6 @@ export interface SearchProviderResult {
   evidence: SearchRetrievalEvidence
 }
 
-/** The backend a request will actually use, after env fallbacks and `auto`. */
 export type ResolvedSearchProvider =
   | { id: 'duckduckgo' }
   | { id: 'brave'; apiKey: string }
@@ -110,7 +89,6 @@ function discardSearchResponseBody(res: Response): void {
     const cancellation = res.body?.cancel()
     if (cancellation) void cancellation.catch(() => undefined)
   } catch {
-    // Best effort only. The request signal still owns transport cancellation.
   }
 }
 
@@ -120,7 +98,6 @@ function discardSearchResponseReader(
   try {
     void reader.cancel().catch(() => undefined)
   } catch {
-    // Best effort only. The request signal still owns transport cancellation.
   }
 }
 
@@ -197,11 +174,6 @@ const trimmed = (value: string | undefined): string | undefined => {
   return text ? text : undefined
 }
 
-/**
- * Config wins over the environment; the environment exists so a key can be kept
- * out of `config.yaml`. The provider-specific names are the ones each vendor's
- * own docs use, so an existing shell profile tends to just work.
- */
 export function resolveSearchProvider(
   settings: WebSearchProviderSettings,
   env: NodeJS.ProcessEnv = process.env,
@@ -232,8 +204,6 @@ export function resolveSearchProvider(
       return { id: 'duckduckgo' }
     case 'auto':
     default:
-      // Only a key that names its provider can select one under `auto`; a
-      // generic key would be ambiguous, so it needs an explicit provider.
       if (trimmed(env.BRAVE_SEARCH_API_KEY)) return { id: 'brave', apiKey: trimmed(env.BRAVE_SEARCH_API_KEY)! }
       if (trimmed(env.TAVILY_API_KEY)) return { id: 'tavily', apiKey: trimmed(env.TAVILY_API_KEY)! }
       if (trimmed(env.AI_SEARCH_URL)) {
@@ -294,14 +264,10 @@ function publicSearchResult(
 }
 
 async function readFailure(provider: string, res: Response): Promise<SearchProviderError> {
-  // Quota and rate limits recover on their own; a rejected key does not, and
-  // retrying it just burns the run's remaining iterations.
   const retriable = res.status === 429 || res.status >= 500
   const rejected = res.status === 401 || res.status === 403
   const detail = rejected
     ? provider === 'searxng'
-      // SearXNG has no key: a refusal means the instance is not serving the
-      // JSON API, which is off by default.
       ? ' — enable the json format in the instance settings.yml (search.formats)'
       : ' — check the API key'
     : res.status === 429

@@ -2,7 +2,9 @@ import { createHash, X509Certificate } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
 import { STATUS_CODES } from 'node:http'
 import { isAbsolute, resolve } from 'node:path'
+import { pipeline, type Readable, type Transform } from 'node:stream'
 import * as tls from 'node:tls'
+import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 import {
   Agent,
   EnvHttpProxyAgent,
@@ -48,8 +50,40 @@ function responseHeadersFromUndici(
   return headers
 }
 
+type ResponseBody = AsyncIterable<Uint8Array> & { destroy(error?: Error): void }
+
+function decodeResponseBody(body: Readable & AsyncIterable<Uint8Array>, headers: Headers): ResponseBody {
+  const contentEncoding = headers.get('content-encoding')
+  if (!contentEncoding) return body
+  const encodings = contentEncoding.split(',').map((encoding) => encoding.trim().toLowerCase())
+  if (encodings.length > 5) {
+    body.once('error', () => {})
+    body.destroy()
+    throw new TypeError('Too many response content encodings')
+  }
+  if (encodings.some((encoding) => !['gzip', 'x-gzip', 'deflate', 'br', 'identity'].includes(encoding))) {
+    return body
+  }
+  const decoders: Transform[] = []
+  for (const encoding of encodings.reverse()) {
+    if (encoding === 'gzip' || encoding === 'x-gzip') decoders.push(createGunzip())
+    else if (encoding === 'deflate') decoders.push(createInflate())
+    else if (encoding === 'br') decoders.push(createBrotliDecompress())
+  }
+  if (decoders.length === 0) return body
+  pipeline([body, ...decoders], () => {})
+  const decoded = decoders[decoders.length - 1]!
+  return {
+    [Symbol.asyncIterator]: () => decoded[Symbol.asyncIterator](),
+    destroy(error) {
+      body.destroy(error)
+      decoded.destroy(error)
+    },
+  }
+}
+
 function responseBodyFromUndici(
-  body: AsyncIterable<Uint8Array> & { destroy(error?: Error): void },
+  body: ResponseBody,
 ): ReadableStream<Uint8Array> {
   const iterator = body[Symbol.asyncIterator]()
   return new ReadableStream<Uint8Array>({
@@ -73,17 +107,6 @@ function responseBodyFromUndici(
   })
 }
 
-/**
- * Fetch adapter for provider SDKs running under Bun with the daemon's npm
- * Undici dispatcher policy.
- *
- * Bun can receive headers and bytes from `undici.fetch`, yet never deliver the
- * response-body EOF for Ollama's chunked `/api/chat` response. The SDK then
- * waits forever while health/model-list probes continue to look healthy.
- * `undici.request` does finish under Bun, so adapt its body iterator back into
- * a standards-shaped Response while retaining the configured dispatcher,
- * timeout, proxy, TLS, and cancellation policy.
- */
 export const fetchWithProviderDispatcher = (async (
   input: RequestInfo | URL,
   init?: RequestInit,
@@ -101,40 +124,30 @@ export const fetchWithProviderDispatcher = (async (
   })
   const hasResponseBody = method !== 'HEAD'
     && ![101, 204, 205, 304].includes(result.statusCode)
+  const headers = responseHeadersFromUndici(result.headers)
   const response = new Response(
     hasResponseBody
-      ? responseBodyFromUndici(result.body as typeof result.body & { destroy(error?: Error): void })
+      ? responseBodyFromUndici(decodeResponseBody(result.body, headers))
       : null,
     {
       status: result.statusCode,
       statusText: STATUS_CODES[result.statusCode] ?? '',
-      headers: responseHeadersFromUndici(result.headers),
+      headers,
     },
   )
   Object.defineProperty(response, 'url', { value: url })
   return response
 }) as typeof globalThis.fetch
 
-/**
- * HTTP fetch preserving the daemon dispatcher policy and Bun body
- * compatibility. Use this for daemon-owned HTTP clients that consume a
- * response body. Under Bun, the process-wide bridge must use `undici.fetch`
- * to enforce the dispatcher, but that transport can receive headers and then
- * never deliver body EOF. The request-based adapter above preserves the same
- * network policy while providing a standards-shaped, cancellable Response.
- */
 export function getDispatcherCompatibleFetch(): typeof globalThis.fetch {
   const bunRuntime = (globalThis as typeof globalThis & { Bun?: unknown }).Bun
   return bunRuntime ? fetchWithProviderDispatcher : globalThis.fetch
 }
 
-/** Backward-compatible provider SDK name for the same daemon HTTP contract. */
 export function getProviderSdkFetch(): typeof globalThis.fetch {
   return getDispatcherCompatibleFetch()
 }
 
-/** Bun's native fetch does not consistently honor undici.setGlobalDispatcher.
- * Bridge only under Bun, before any configured provider/plugin can fetch. */
 function ensureBunFetchDispatcherBridge(): void {
   const bunRuntime = (globalThis as typeof globalThis & { Bun?: unknown }).Bun
   if (!bunRuntime || fetchBeforeBunBridge) return
@@ -193,11 +206,6 @@ interface DefaultCaSource {
   getCACertificates?: (type: 'default') => string[]
 }
 
-/**
- * Node 22+ can include its effective system/default CA set in addition to the
- * bundled roots. Older runtimes expose only rootCertificates, so retain that
- * as a feature-detected fallback.
- */
 export function resolveDefaultCaCertificates(
   source: DefaultCaSource = tls,
 ): string[] {
@@ -206,7 +214,6 @@ export function resolveDefaultCaCertificates(
       const certificates = source.getCACertificates('default')
       if (certificates.length > 0) return [...new Set(certificates)]
     } catch {
-      // Fall through for early/partial Node implementations.
     }
   }
   return [...new Set(source.rootCertificates)]
@@ -247,11 +254,6 @@ function resolveEnvironmentCaSource(
   return null
 }
 
-/**
- * Return only the names of environment variables that override persisted
- * network settings. Values are deliberately omitted so diagnostics can never
- * expose proxy or filesystem secrets.
- */
 export function getProviderNetworkOverrideSources(
   config: NetworkConfig,
   env: NodeJS.ProcessEnv = process.env,
@@ -275,7 +277,6 @@ export function getProviderNetworkOverrideSources(
   return { tlsRejectUnauthorized, timeoutMs, customCaPath }
 }
 
-/** Environment inputs that were declared but rejected, without their values. */
 export function getProviderNetworkIgnoredOverrideSources(
   config: NetworkConfig,
   effectivePlan: ProviderDispatcherPlan,
@@ -341,8 +342,6 @@ function resolveEnvironmentProxy(
   httpsProxy?: string
   noProxy?: string
 } {
-  // undici 6's EnvHttpProxyAgent does not read ALL_PROXY itself. Normalize it
-  // here so existing daemon deployments keep the documented fallback.
   const allProxy = firstEnvironmentValue(env, 'all_proxy', 'ALL_PROXY')
   const rawHttpProxy = firstEnvironmentValue(env, 'http_proxy', 'HTTP_PROXY') ?? allProxy
   const rawHttpsProxy = firstEnvironmentValue(env, 'https_proxy', 'HTTPS_PROXY') ?? allProxy
@@ -353,8 +352,6 @@ function resolveEnvironmentProxy(
     ...(rawHttpProxy
       ? {
           httpProxy: validateProxyUrl(rawHttpProxy, 'HTTP_PROXY', {
-            // Environment variables are an operator-controlled compatibility
-            // surface. Manual API values remain credential-free.
             allowUserInfo: true,
           }),
         }
@@ -372,8 +369,6 @@ function resolveEnvironmentProxy(
 
 function resolveTimeoutMs(config: NetworkConfig, env: NodeJS.ProcessEnv): number {
   const override = resolveTimeoutEnvironmentOverride(env)
-  // Keep the established env-only escape hatch where 0 disables undici's
-  // headers/body timeout. The persisted UI contract stays bounded at >= 1s.
   return override?.value ?? config.timeoutMs
 }
 
@@ -410,9 +405,6 @@ const EMPTY_CUSTOM_CA: LoadedCustomCa = {
 }
 
 function isUncOrNetworkPath(path: string): boolean {
-  // Covers Windows UNC (\\server\share), slash-normalized UNC
-  // (//server/share), and device/extended namespaces (\\?\ / \\.\). These
-  // can make synchronous stat/read calls wait on a remote endpoint or driver.
   return /^(?:\\\\|\/\/)/.test(path)
 }
 
@@ -507,21 +499,10 @@ function loadCustomCa(
     return loadCustomCaStrict(configuredPath, configuredByApi)
   } catch (error) {
     if (configuredByApi) throw error
-    // Environment CA variables predate the settings contract and may point at
-    // a removed/rotated file. Preserve upgrade availability by falling back to
-    // Node's built-in roots. Persisted network.customCaPath stays strict so a
-    // new API write receives a clear 400 and startup can explicitly enter its
-    // fail-closed degraded state.
     return EMPTY_CUSTOM_CA
   }
 }
 
-/**
- * Resolve the process-wide undici dispatcher policy without changing global
- * state. The resulting dispatcher affects every daemon call made through
- * global `fetch`, including provider discovery/probes and non-LLM fetch users;
- * callers with an explicit dispatcher remain isolated from it.
- */
 export function planProviderDispatcher(
   input: Partial<NetworkConfig> = DEFAULT_NETWORK_CONFIG,
   env: NodeJS.ProcessEnv = process.env,
@@ -542,8 +523,6 @@ export function planProviderDispatcher(
     return [resolved.path, resolved.configuredByApi] as const
   })())
 
-  // Supplying `ca` to tls.connect replaces Node's default trust roots. Merge
-  // the custom bundle with the built-in roots so this remains an *extra* CA.
   const tlsOptions: ProviderTlsOptions | undefined =
     customCa.certificates.length > 0 || !rejectUnauthorized
       ? {
@@ -565,8 +544,6 @@ export function planProviderDispatcher(
     proxyUrl = validateProxyUrl(config.proxyUrl!, 'network.proxyUrl', {
       allowUserInfo: false,
     })
-    // EnvHttpProxyAgent also gives a manual proxy a real NO_PROXY bypass
-    // branch. A bare ProxyAgent cannot express per-target bypasses.
     environmentProxy = {
       httpProxy: proxyUrl,
       httpsProxy: proxyUrl,
@@ -655,29 +632,14 @@ export function createProviderDispatcher(plan: ProviderDispatcherPlan): Dispatch
     bodyTimeout: plan.timeoutMs,
     connections: plan.maxConcurrency,
   }
-  // Environment mode with no effective proxy is a direct connection. Using
-  // EnvHttpProxyAgent anyway is not only unnecessary: under Bun's global
-  // undici bridge it can leave streaming response bodies pending forever
-  // (notably Ollama /api/chat), even though ordinary non-streaming probes such
-  // as /api/tags still succeed. Keep EnvHttpProxyAgent only for plans that
-  // actually have a proxy route; the plain Agent enforces the same timeout,
-  // concurrency, and TLS policy for direct traffic.
   if (!plan.useProxy) {
     return new Agent({
       ...commonOptions,
       ...(plan.tlsOptions ? { connect: plan.tlsOptions } : {}),
     })
   }
-  // EnvHttpProxyAgent provides NO_PROXY routing for both environment and
-  // manual proxy modes. It forwards unknown agent options into its internal
-  // ProxyAgent at runtime. Supplying both `connect` (direct/no_proxy) and
-  // `requestTls`/`proxyTls` (proxied target/proxy) is required for custom CA
-  // and rejectUnauthorized to work in every environment branch.
   const environmentOptions = {
     ...commonOptions,
-    // Freeze the environment snapshot captured by planProviderDispatcher.
-    // Explicit empty values prevent a later process.env mutation from leaking
-    // into this dispatcher (and prevent manual mode from inheriting NO_PROXY).
     httpProxy: plan.httpProxy ?? '',
     httpsProxy: plan.httpsProxy ?? '',
     noProxy: plan.noProxy ?? '',
@@ -704,14 +666,6 @@ function retireDispatcher(dispatcher: Dispatcher): void {
   retiredDispatchers.add(closing)
 }
 
-/**
- * Atomically replace the daemon process-wide undici dispatcher. Existing
- * in-flight requests keep their old dispatcher while it drains; new global
- * fetch calls immediately use the new policy.
- *
- * Returns the applied timeout, or null when the effective policy is unchanged.
- * The legacy name is retained because startup/tests already import it.
- */
 export function configureProviderHttpTimeout(
   config: Partial<NetworkConfig> = DEFAULT_NETWORK_CONFIG,
 ): number | null {
@@ -723,7 +677,6 @@ export function configureProviderHttpTimeout(
 function activateProviderDispatcher(plan: ProviderDispatcherPlan): number | null {
   if (activePlan?.fingerprint === plan.fingerprint) return null
 
-  // Build first. A malformed proxy/CA must not displace a working dispatcher.
   const nextDispatcher = createProviderDispatcher(plan)
   const previousDispatcher = activeDispatcher
   setGlobalDispatcher(nextDispatcher)
@@ -735,11 +688,6 @@ function activateProviderDispatcher(plan: ProviderDispatcherPlan): number | null
   return plan.timeoutMs
 }
 
-/**
- * Install a fail-closed dispatcher while keeping the daemon control plane
- * reachable. No proxy/direct/environment path is consulted and every global
- * fetch dispatch fails locally until a valid network policy is saved.
- */
 export function configureProviderNetworkBlocked(
   input: Partial<NetworkConfig>,
   degradedReason: string,
@@ -791,7 +739,6 @@ export function getProviderDispatcherPlan(): ProviderDispatcherPlan | null {
   return activePlan
 }
 
-/** Restore the dispatcher that was present before daemon network setup. */
 export async function closeProviderHttpDispatcher(): Promise<void> {
   const current = activeDispatcher
   activeDispatcher = null

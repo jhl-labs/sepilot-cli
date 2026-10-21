@@ -19,6 +19,7 @@ import {
 } from '@sepilotd/api-client'
 import type { ApprovalRequest, MessageAttachment } from '../types.js'
 import { buildCliChatOptions } from '../../chat-options.js'
+import { isModelStreamWaitingNotice } from '@sepilotd/api-client'
 import type { DaemonClient } from '../../client/http.js'
 import type { DaemonWsClient } from '../../client/ws.js'
 import {
@@ -29,7 +30,7 @@ import {
 import { hydrateSession } from './useSession.js'
 import { prepareAttachmentUploads } from '../utils/attachments.js'
 import { buildRunProgressActivity, upsertRunProgressActivity } from '../utils/run-progress.js'
-import { chatReducer, initialState } from '../state/chat-reducer.js'
+import { chatReducer, initialState, requestedThinkingLevel } from '../state/chat-reducer.js'
 import {
   buildInitialLiveStreamMessages,
   createLiveStreamBindings,
@@ -45,6 +46,7 @@ import {
   buildStaleApprovalNotice,
 } from '../state/approval-helpers.js'
 import { formatJudgmentFeedLine } from '../state/judgment-feed.js'
+import { formatTurnSummary } from '../utils/run-notices.js'
 import { isTuiDebugLevel, logPreview, tuiLog, tuiLogError } from '../utils/debug-log.js'
 import { useActiveRunController } from './useActiveRunController.js'
 import { sanitizeTuiAgentResponse } from '../utils/agent-response-safety.js'
@@ -82,6 +84,17 @@ function attachmentMentionAliases(path: string): string[] {
   return basename && basename !== normalized ? [normalized, basename] : [normalized]
 }
 
+const SKILL_SOURCE_LABELS: Record<string, string> = {
+  selected: 'you selected',
+  router: 'matched this request',
+  bot: 'from the bot',
+  auto: 'auto-loaded',
+}
+
+export function formatLoadedSkills(skills: ReadonlyArray<{ id: string; source: string }>): string {
+  return skills.map((skill) => `${skill.id} (${SKILL_SOURCE_LABELS[skill.source] ?? skill.source})`).join(' · ')
+}
+
 export function parseAgentMention(
   content: string,
   options: { attachmentPaths?: Iterable<string> } = {},
@@ -107,11 +120,6 @@ export function parseSlashCommand(content: string): { commandId: string; args: s
 }
 
 export function normalizeError(error: unknown, opts: { sessionId?: string } = {}): string {
-  // Prefer the same friendly stream / http copy the cli surfaces use,
-  // so a `terminated` SSE drop or a 503 from the daemon shows up in the
-  // TUI as a multi-line guided message instead of a raw stack-trace
-  // snippet. Falls back to friendlyErrorMessage (json-unwrapped Error
-  // .message) for anything we don't classify.
   const message = (
     formatStreamError(error, { sessionId: opts.sessionId }) ??
     formatApiError(error) ??
@@ -132,7 +140,7 @@ export function formatDaemonEventError(message: string): string {
       if (typeof parsed.error.code === 'string') code = parsed.error.code
       if (typeof parsed.error.message === 'string') detail = parsed.error.message
     }
-  } catch { /* keep non-JSON daemon messages unchanged */ }
+  } catch {}
 
   if (code === 'UNAUTHORIZED' || /invalid token/i.test(detail)) {
     return [
@@ -217,12 +225,6 @@ async function uploadAttachments(
   }
 }
 
-// Narrow the http surface that useChat depends on so the hook can be
-// unit-tested with a hand-rolled stub instead of a full DaemonClient. The
-// type is derived via Pick<> so any signature drift in DaemonClient still
-// flows through here at compile time. The ws client must remain the full
-// type because it is forwarded to runDaemonWsClientChat() which expects
-// DaemonWsClient.connect() / .chat() in addition to .close().
 export type ChatHttpClient = Pick<
   DaemonClient,
   | 'chatStream'
@@ -235,10 +237,19 @@ export type ChatHttpClient = Pick<
   | 'resumeSessionStream'
   | 'undoSession'
   | 'uploadFiles'
-> & Partial<Pick<DaemonClient, 'listSessionInbox'>>
+> & Partial<Pick<DaemonClient, 'listSessionInbox' | 'bots'>>
 
 export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpClient) {
   const [state, dispatch] = useReducer(chatReducer, initialState)
+  const botNamesRef = useRef<Map<string, string>>(new Map())
+  useEffect(() => {
+    if (!httpClient.bots) return
+    let active = true
+    void httpClient.bots()
+      .then((bots) => { if (active) botNamesRef.current = new Map(bots.map((bot) => [bot.id, bot.name])) })
+      .catch(() => {})
+    return () => { active = false }
+  }, [httpClient])
   useEffect(() => {
     const sessionId = state.sessionId
     if (!sessionId || !httpClient.listSessionInbox) return
@@ -273,12 +284,20 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
     startedAt: number
   } | null>(null)
   const approvalRepeatCountsRef = useRef(new Map<string, number>())
+  const routedBotAnnouncedRef = useRef(false)
+  const turnWorkRef = useRef({ startedAt: 0, done: 0, failed: 0, completed: false })
+  const emitTurnSummary = useCallback(() => {
+    const work = turnWorkRef.current
+    if (!work.completed || work.startedAt === 0) return
+    work.completed = false
+    const summary = formatTurnSummary({
+      elapsedMs: Date.now() - work.startedAt,
+      tools: work,
+      locale: detectCliLocale(),
+    })
+    if (summary) dispatch({ type: 'SYSTEM_MESSAGE', content: summary })
+  }, [])
   const alreadyHandledNoticeRef = useRef(new Set<string>())
-  // Guards against double-submitting one approval: a single keypress can
-  // reach resolveApproval from both the global keybinding and the modal's
-  // onResolve in the same tick (pendingApproval clears asynchronously), which
-  // used to fire two POSTs — one 404, one 200 — and the loser's error path
-  // tore down the live stream mid-run.
   const approvalRespondInFlightRef = useRef(new Set<string>())
   const currentRunPhaseRef = useRef<string | null>(null)
   const currentRunSessionIdRef = useRef<string | null>(null)
@@ -358,16 +377,19 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
   const clearRunController = runController.clear
 
   const openStreamResponse = useCallback(
-    (responsePromise: Promise<Response>, controller: DaemonChatRunController) => {
+    (responsePromise: Promise<Response>, controller: DaemonChatRunController, sessionId?: string | null) => {
       const timeoutMs = resolveCliStreamConnectMs()
       const timeoutError = createTimedOutChatRunError(timeoutMs)
       return openChatStreamWithConnectTimeout(responsePromise, {
         timeoutMs,
         timeoutError,
-        abort: () => controller.cancel(timeoutError),
+        abort: () => {
+          controller.cancel(timeoutError)
+          if (sessionId) void httpClient.cancelActiveRun(sessionId).catch(() => {})
+        },
       })
     },
-    [],
+    [httpClient],
   )
 
   const beginTokenSpeedRun = useCallback(() => {
@@ -468,6 +490,16 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
         return
       }
 
+      const stopReason = payload.type === 'error' ? payload.error?.stopReason
+        : payload.type === 'done' ? payload.stopReason : undefined
+      const parkedApprovalId = stopReason?.code === 'approval_timeout'
+        && stopReason.resumable && stopReason.detail?.layer === 'approval'
+        && typeof stopReason.detail.requestId === 'string'
+        ? stopReason.detail.requestId : undefined
+      if (parkedApprovalId) {
+        dispatch({ type: 'PARK_APPROVAL', requestId: parkedApprovalId })
+      }
+
       const payloadSessionId =
         typeof (payload as { sessionId?: unknown }).sessionId === 'string'
           ? (payload as { sessionId: string }).sessionId
@@ -477,9 +509,6 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
         dispatch({ type: 'SESSION_SET', sessionId: payloadSessionId })
       }
 
-      // With SEPILOT_DEBUG=1, trace key transitions and, at
-      // SEPILOT_CLI_LOG_LEVEL=debug, every payload type. This reconstructs a
-      // "why did the TUI do that?" report from ~/.sepilotd/logs.
       if (
         isTuiDebugLevel() ||
         payload.type === 'state_change' ||
@@ -546,10 +575,6 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
           nextEdge: payload.nextEdge,
         })
       } else if (payload.type === 'phase_change') {
-        // Surface phase transitions on the status line so operators can
-        // see which named stage the run is in (implementation /
-        // validation / review / finalize) and how many tokens the
-        // previous phase ended up burning.
         const entered = payload.enteredPhase ?? 'finalize'
         currentRunPhaseRef.current = entered
         dispatch({ type: 'SET_PHASE', phase: entered })
@@ -573,9 +598,6 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
             iteration: payload.iteration,
           })
         }
-        // Counts-only progress snapshot from the agent state board (Task 6
-        // frame). StatusBar renders these structured numbers directly — no
-        // text parsing, no dataset-specific inference.
         dispatch({
           type: 'SET_STATE_BOARD_COUNTS',
           counts: {
@@ -589,10 +611,6 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
           },
         })
       } else if (payload.type === 'post_edit_findings') {
-        // Status surfaces blast radius from the post-edit pass —
-        // broken callers in particular are a near-failure signal the
-        // user should see immediately rather than waiting for the
-        // next reasoning turn to mention them.
         const broken = payload.diagnostics.filter((d) => d.summary.startsWith('[caller]'))
         const editedSummary = payload.editedFiles.slice(0, 2).join(', ')
         const status =
@@ -606,11 +624,28 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
         })
       }
 
-      // Judgment feed: surface the daemon's decision events (reasoning
-      // steps, routing choices, quality-gate verdicts, backtracks) as dim
-      // one-line transcript entries so the operator can see *why* the run
-      // is doing what it does instead of a silent spinner.
-      const judgmentLine = formatJudgmentFeedLine(
+      if (payload.type === 'router_decision') {
+        const decision = (payload as { decision?: { persona?: string; skipped?: boolean; mode?: string } }).decision
+        const botName = decision?.persona && !decision.skipped ? botNamesRef.current.get(decision.persona) : undefined
+        dispatch({ type: 'SET_ROUTED_BOT', bot: botName ? decision!.persona! : null })
+        routedBotAnnouncedRef.current = Boolean(botName)
+        if (botName) {
+          const engine = decision?.mode ? ` · ${decision.mode}` : ''
+          dispatch({ type: 'SYSTEM_MESSAGE', content: `Bot: ${botName} (${decision!.persona})${engine}` })
+        }
+      }
+
+      if (payload.type === 'skills_loaded') {
+        const skills = (payload as { skills?: Array<{ id: string; source: string }> }).skills ?? []
+        if (skills.length > 0) {
+          dispatch({ type: 'SYSTEM_MESSAGE', content: `Skills: ${formatLoadedSkills(skills)}` })
+        }
+      }
+
+      const modeAlreadyAnnounced = payload.type === 'mode_route_decision'
+        && routedBotAnnouncedRef.current
+        && (payload as { fallback?: boolean }).fallback !== true
+      const judgmentLine = modeAlreadyAnnounced ? null : formatJudgmentFeedLine(
         payload as { type: string } & Record<string, unknown>,
       )
       if (judgmentLine) {
@@ -671,7 +706,21 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
         dispatch({ type: 'SET_PENDING_APPROVAL', approval: null })
       }
 
+      if (payload.type === 'tool_result') {
+        turnWorkRef.current.done += 1
+        if ((payload as { status?: string }).status !== 'success') turnWorkRef.current.failed += 1
+      }
+
       const liveStream = liveStreamRef.current
+      if (parkedApprovalId) {
+        if (liveStream && !liveStream.controller.getAssistantContent()) {
+          liveStream.controller.updateAssistant('Waiting for your approval.')
+        }
+        liveStreamRef.current = null
+        dispatch({ type: 'STREAM_FINALIZED' })
+        dispatch({ type: 'SYSTEM_MESSAGE', content: 'Approval is still waiting. Choose an option above to continue the saved run.' })
+        return
+      }
       if (liveStream) {
         const safePayload =
           payload.type === 'message'
@@ -680,14 +729,14 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
         liveStream.controller.handleEvent(safePayload)
         if (payload.type === 'done' || payload.type === 'error') {
           liveStreamRef.current = null
-          // Structured stop cause wins over any prose the model left: render
-          // the compact stop card right below the assistant reply.
           const stopReason = liveStream.controller.getStopReason()
           if (shouldRenderStopCard(stopReason)) {
             dispatch({
               type: 'SYSTEM_MESSAGE',
               content: formatRunStopCard(stopReason, { locale: detectCliLocale() }),
             })
+          } else if (payload.type === 'done') {
+            turnWorkRef.current.completed = true
           }
         }
         return
@@ -695,6 +744,7 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
 
       switch (payload.type) {
         case 'thinking':
+          if (isModelStreamWaitingNotice(payload.content)) break
           if (payload.content) {
             dispatch({ type: 'SET_THINKING', content: payload.content })
           }
@@ -703,10 +753,6 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
             status: 'Reasoning…',
           })
           break
-        // The live-stream binding can be torn down before the terminal event
-        // arrives (approval-response races null liveStreamRef). Without this
-        // fallback the done event is dropped and isStreaming stays true
-        // forever — the "in progress • thinking • 23m" stuck-timer bug.
         case 'done':
           dispatch({ type: 'STREAM_FINALIZED' })
           break
@@ -761,7 +807,8 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
         model: state.model,
         provider: state.provider,
         mode: state.mode,
-        thinkingLevel: state.thinkingLevel,
+        bot: state.bot ?? undefined,
+        thinkingLevel: requestedThinkingLevel(state),
         autonomy: state.autonomy,
         maxTokens: state.maxTokens,
         projectId: state.projectId,
@@ -794,10 +841,12 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
       state.autonomy,
       state.maxTokens,
       state.mode,
+      state.bot,
       state.model,
       state.projectId,
       state.provider,
       state.thinkingLevel,
+      state.thinkingLevelChosen,
       wsClient,
     ],
   )
@@ -814,10 +863,6 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
         targetSessionId?: string
       },
     ): Promise<boolean> => {
-      // Local transport abort is immediate, while daemon-side provider and
-      // lease cleanup is asynchronous. Serialize the next turn behind the
-      // remote cancellation acknowledgment so users can cancel and retype
-      // without racing the previous run's session lease.
       await cancellationBarrierRef.current
       const streamSessionId = options?.targetSessionId ?? state.sessionId ?? undefined
       const prefix = await applySlashCommandPrefix({
@@ -841,17 +886,22 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
       const effectiveDisplayContent = options?.displayContent
         ? (displayMention?.rest ?? workingDisplayContent)
         : effectiveContent
-      const effectiveMode = mention?.agentId ?? resolvedAgent ?? state.mode
+      const mentionBot = mention && botNamesRef.current.has(mention.agentId) ? mention.agentId : undefined
+      const turnBot = mentionBot ?? state.bot ?? undefined
+      const effectiveMode = (mentionBot ? undefined : mention?.agentId) ?? resolvedAgent ?? state.mode
       const userMessageId = recordUserMessage ? crypto.randomUUID() : undefined
       const runController = beginRunController()
       const tokenSpeedStartedAt = beginTokenSpeedRun()
       approvalRepeatCountsRef.current.clear()
+      routedBotAnnouncedRef.current = false
+      turnWorkRef.current = { startedAt: Date.now(), done: 0, failed: 0, completed: false }
       currentRunPhaseRef.current = null
       currentRunSessionIdRef.current = streamSessionId ?? null
 
       tuiLog('run.start', {
         sessionId: streamSessionId,
         mode: effectiveMode,
+        bot: turnBot,
         recordUserMessage,
         content: logPreview(effectiveContent),
       })
@@ -899,7 +949,8 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
             model: state.model,
             provider: state.provider,
             mode: effectiveMode as typeof state.mode,
-            thinkingLevel: state.thinkingLevel,
+            bot: turnBot,
+            thinkingLevel: requestedThinkingLevel(state),
             autonomy: state.autonomy,
             maxTokens: state.maxTokens,
             projectId: state.projectId,
@@ -914,16 +965,13 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
               { signal: runController.signal },
             ),
             runController,
+            streamSessionId,
           )
           clearPreflightStatusTimers()
           dispatch({ type: 'SET_STREAM_STATUS', status: 'Daemon connected; starting agent…' })
           await consumeSseResponse(response, runController.signal, runController.markActivity)
-          // A successfully consumed transport is itself a terminal boundary.
-          // The done/error handler normally finalizes the reducer, but keep a
-          // second idempotent transition here so a detached live binding or a
-          // provider-specific event ordering cannot leave the TUI spinner and
-          // elapsed timer alive after the connection has ended.
           dispatch({ type: 'STREAM_FINALIZED' })
+          emitTurnSummary()
           return true
         } catch (streamError) {
           const abortReason = resolveDaemonChatRunAbortReason(runController.signal, streamError)
@@ -953,6 +1001,7 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
           streamSessionId,
         )
         dispatch({ type: 'STREAM_FINALIZED' })
+        emitTurnSummary()
         return true
       } catch (error) {
         if (handleAbortOutcome(error)) {
@@ -962,8 +1011,6 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
 
         tuiLogError('run.failed', error, { sessionId: streamSessionId })
         const message = normalizeError(error, { sessionId: streamSessionId })
-        // Keep a persistent error transcript line under the failed user turn;
-        // the transient error slot alone disappears on later state changes.
         dispatch({
           type: 'SYSTEM_MESSAGE',
           content: buildPersistentErrorLine(message),
@@ -994,17 +1041,20 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
       clearTokenSpeedRun,
       consumeSseResponse,
       consumeWsResponse,
+      emitTurnSummary,
       handleAbortOutcome,
       httpClient,
       openStreamResponse,
       state.autonomy,
       state.maxTokens,
       state.mode,
+      state.bot,
       state.model,
       state.projectId,
       state.provider,
       state.sessionId,
       state.thinkingLevel,
+      state.thinkingLevelChosen,
       wsClient,
     ],
   )
@@ -1081,14 +1131,11 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
         hasNote: Boolean(note?.trim()),
         approvalState: approval.state,
       })
-      // A trimmed note means "change course": send the feedback decision so
-      // the agent receives [approval:needs-changes] + the user's instruction
-      // instead of a bare denial.
       const trimmedNote = note?.trim() || undefined
       const decision: boolean | 'feedback' = !approved && trimmedNote ? 'feedback' : approved
 
       try {
-        if (approval.state === 'stale' && approval.resumeAvailable) {
+        if ((approval.state === 'stale' || approval.state === 'parked') && approval.resumeAvailable) {
           const runController = beginRunController()
           const tokenSpeedStartedAt = beginTokenSpeedRun()
           approvalRepeatCountsRef.current.clear()
@@ -1113,9 +1160,10 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
                 decision,
                 approvalSessionId,
                 trimmedNote,
-                { signal: runController.signal },
+                { signal: runController.signal, scope },
               ),
               runController,
+              approvalSessionId,
             )
             await consumeSseResponse(response, runController.signal, runController.markActivity)
           } finally {
@@ -1173,11 +1221,14 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
           sessionId: approvalSessionId,
           requestId: approval.requestId,
         })
+        if (approval.state === 'parked' && !isAlreadyHandledApprovalError(error)) {
+          dispatch({ type: 'SET_PENDING_APPROVAL', approval })
+          dispatch({ type: 'ERROR', message: normalizeError(error, { sessionId: approvalSessionId }) })
+          liveStreamRef.current = null
+          return
+        }
         dispatch({ type: 'SET_PENDING_APPROVAL', approval: null })
         if (isAlreadyHandledApprovalError(error)) {
-          // Only notice once per request — reconnect races can surface the
-          // same already-handled error several times and repeating the same
-          // system line reads as the TUI being stuck.
           if (!alreadyHandledNoticeRef.current.has(approval.requestId)) {
             alreadyHandledNoticeRef.current.add(approval.requestId)
             dispatch({
@@ -1249,6 +1300,7 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
             { signal: runController.signal },
           ),
           runController,
+          state.sessionId,
         )
         await consumeSseResponse(response, runController.signal, runController.markActivity)
         tuiLog('resume.done', { sessionId: state.sessionId })
@@ -1321,10 +1373,6 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
 
   const cancelStream = useCallback(() => {
     const cancelledController = runController.cancel()
-    // Normally isStreaming and the active controller move together. If a
-    // terminal-event race cleared the controller first, retain an escape hatch:
-    // Ctrl+C still repairs local state and asks the daemon to cancel any run it
-    // may still know about. When both are idle this remains a true no-op.
     if (!cancelledController && !state.isStreaming) return
     const sessionId = currentRunSessionIdRef.current ?? state.sessionId ?? undefined
     tuiLog(cancelledController ? 'run.cancel' : 'run.cancel-stale-ui', { sessionId })
@@ -1339,9 +1387,6 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
     } else {
       dispatch({ type: 'STREAM_FINALIZED' })
     }
-    // Finalize any in-flight tool activities so the Activity panel doesn't keep
-    // showing "running <tool> · waiting for the next stream event" forever after
-    // the server run has already stopped (CLI_BACKLOG.md B8).
     dispatch({
       type: 'SET_ACTIVITIES',
       activities: (prev) =>

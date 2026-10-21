@@ -53,6 +53,7 @@ import type {
   DaemonMemorySemanticStatus,
   DaemonMemoryUpdateInput,
   DaemonPersona,
+  DaemonRoleBot,
   DaemonProviderInfo,
   DaemonProject,
   DaemonSessionCompactResult,
@@ -75,18 +76,9 @@ import type { PaginatedResult, Ticket } from '@sepilotd/core'
 export type DesktopShellKind = 'local' | 'ssh'
 
 export interface DesktopShellStartInput {
-  /**
-   * Optional UUID reserved by the caller before startup so data/exit IPC
-   * listeners can be attached before a short-lived process is spawned.
-   */
   id?: string
   kind?: DesktopShellKind
   cwd?: string
-  /**
-   * Optional local command to run as the PTY process instead of the default
-   * shell. Used by desktop-only integrations that need a real TTY-backed
-   * process while rendering output somewhere other than the terminal pane.
-   */
   command?: string[]
   title?: string
   env?: Record<string, string>
@@ -973,7 +965,6 @@ export interface SepilotDesktopApi {
     input?: DesktopDiagnosticsExportInput,
   ): Promise<DesktopDiagnosticsExportResult | null>
   selectDirectory(defaultPath?: string): Promise<string | null>
-  /** Optional so a renderer hot-reloaded before its Electron preload can fail closed. */
   wikiFiles?: SepilotDesktopWikiFilesApi
   computerObservationImage(path: string): Promise<string | null>
   shell: SepilotDesktopShellApi
@@ -1029,6 +1020,7 @@ export interface SepilotDesktopApi {
   config(): Promise<DaemonConfig>
   providers(): Promise<DaemonProviderInfo[]>
   personas(): Promise<DaemonPersona[]>
+  bots(): Promise<DaemonRoleBot[]>
   skills(): Promise<DaemonSkill[]>
   skillSearch(query: string): Promise<DaemonSkill[]>
   skillMarketplaceSearch(

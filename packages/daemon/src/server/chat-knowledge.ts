@@ -44,7 +44,6 @@ export interface ChatKnowledgeItem {
   content: string
   tags?: string[]
   score?: number
-  /** Safety/provenance metadata kept ahead of the independently truncated body. */
   contextNotes?: string[]
 }
 
@@ -94,12 +93,6 @@ function truncate(value: string, limit: number): string {
   return `${trimmed.slice(0, Math.max(0, limit - 1)).trimEnd()}…`
 }
 
-/**
- * Rank small local knowledge collections without requiring an embedding model.
- * Korean particles are removed so queries such as "이름이" still match
- * documents containing "이름은". Providers can use this as a deterministic
- * fallback even when their FTS tokenization is too strict for natural questions.
- */
 export function rankChatKnowledgeItems(
   query: string,
   items: readonly ChatKnowledgeItem[],
@@ -167,7 +160,6 @@ export class ChatKnowledgeProviderRegistry {
         try {
           return await provider.search(normalizedQuery, providerLimit)
         } catch {
-          // A broken optional knowledge source must not break the chat turn.
           return []
         }
       }),

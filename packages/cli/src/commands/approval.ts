@@ -67,10 +67,6 @@ async function respond(
 ): Promise<void> {
   const copy = APPROVAL_COPY[detectCliLocale()] ?? APPROVAL_COPY.en
   const scope = parseScope(options.scope)
-  // Persistent denials are a heavier policy decision than a one-off "no"
-  // — mirror the chat shell's `/deny` rule and refuse session/always
-  // here so users land on `approve --scope session` (or the policy
-  // file) for the explicit case.
   if (!approved && scope !== 'once') {
     console.error(chalk.red(copy.persistentDenialsUnsupported))
     process.exit(1)
@@ -88,13 +84,6 @@ async function respond(
       const scopeLabel = scope !== 'once' ? copy.scopeLabel(scope) : ''
       const noteLabel = options.reason ? ` — ${options.reason}` : ''
       const lines = [chalk.green(`${verbCap} ${requestId}${scopeLabel}${noteLabel}`)]
-      // Surface the derived rule pattern when the daemon persisted a
-      // session/always decision. The pattern is the *exact* shape
-      // future invocations must match to short-circuit (e.g.
-      // `ls /tmp/foo *`); without seeing it the operator might
-      // assume a different command would also auto-approve and be
-      // surprised by a re-prompt. This closes the round-trip ux gap
-      // discovered while live-testing --scope session.
       if (data?.rule?.pattern) {
         lines.push(chalk.gray(copy.patternPrefix(data.rule.tool, data.rule.pattern)))
       }

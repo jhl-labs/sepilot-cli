@@ -85,7 +85,6 @@ export class UsageTracker {
         metadata TEXT
       )
     `)
-    // Additive migration for databases created before cost_known existed.
     this.ensureColumn('usage_records', 'cost_known', 'INTEGER DEFAULT 0')
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS daily_summary (
@@ -115,10 +114,6 @@ export class UsageTracker {
   }
 
   record(usage: UsageRecord): void {
-    // Compute cost from the maintained price table when the caller did not
-    // supply an explicit cost. Unknown models stay honest: cost 0 with
-    // cost_known=0 (never a fabricated known $0). Pure tool-call rows (no
-    // tokens) are not billable and stay cost_known=0.
     let costUsd = usage.costUsd
     let costKnown = usage.costKnown ?? false
     if (costUsd === undefined) {
@@ -151,20 +146,11 @@ export class UsageTracker {
     )
   }
 
-  /**
-   * Delete all usage rows for a session. Used by complete session deletion so a
-   * deleted session leaves no usage/cost residue behind (GDPR). Returns the
-   * number of rows removed.
-   */
   deleteBySession(sessionId: string): number {
     const result = this.db.prepare(`DELETE FROM usage_records WHERE session_id = ?`).run(sessionId)
     return Number(result.changes ?? 0)
   }
 
-  /**
-   * Delete usage rows older than an ISO cutoff. Used by the retention sweeper.
-   * Returns the number of rows removed.
-   */
   deleteOlderThan(cutoffIso: string): number {
     const result = this.db.prepare(`DELETE FROM usage_records WHERE timestamp < ?`).run(cutoffIso)
     return Number(result.changes ?? 0)
@@ -257,16 +243,6 @@ export class UsageTracker {
   }
 
   getSnapshot(): { totalSessions: number; totalMessages: number; totalToolCalls: number } {
-    // 이전 구현은 usage.db 의 'sessions' / 'messages' / 'tool_calls' 테이블을
-    // COUNT 했는데, 이 DB 의 스키마에는 그 테이블이 존재하지 않아 (initSchema는
-    // usage_records 와 daily_summary 만 만든다) Settings → Agent Stats 의
-    // Sessions / Messages / Tool calls 가 항상 0 으로 나오는 버그가 있었음.
-    // 실제 데이터인 usage_records 에서 직접 집계:
-    //   - totalSessions  = distinct session_id 수
-    //   - totalToolCalls = tool_name 이 채워진 record (도구 실행 트레이스)
-    //   - totalMessages  = tool_name 이 NULL 인 record (LLM 호출 = 1 turn).
-    //     사용자 메시지는 별도 JSONL 세션 저널에 있어서 어시스턴트 측
-    //     turn 수가 가장 가까운 의미.
     try {
       const sessions = (this.db
         .prepare(
@@ -294,13 +270,9 @@ export class UsageTracker {
   }
 
   close(): void {
-    // Truncate the WAL back into the main db before closing so the -wal file
-    // does not keep growing across restarts and the next boot has no replay
-    // cost. Best-effort: a checkpoint failure must not block close.
     try {
       this.db.pragma('wal_checkpoint(TRUNCATE)')
     } catch {
-      /* ignore checkpoint failure */
     }
     this.db.close()
   }

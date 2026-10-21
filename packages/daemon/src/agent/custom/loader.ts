@@ -57,18 +57,11 @@ async function projectConfigRoots(
 
 export async function discoverCustomDefs(
   kind: CustomKind,
-  /**
-   * `cwd: null` skips the project-level roots entirely (request without a
-   * cwd on a shared daemon); `undefined` keeps the legacy process.cwd()
-   * default for direct callers.
-   */
   opts: { home?: string; cwd?: string | null; boundaryRoot?: string } = {},
 ): Promise<CustomDef[]> {
   const home = opts.home ?? homedir()
   const cwd = opts.cwd === null ? null : (opts.cwd ?? process.cwd())
   const projectRoots = await projectConfigRoots(kind, cwd, home, opts.boundaryRoot)
-  // User-level custom definitions are agent control-plane configuration. They
-  // remain available inside a strict workspace but do not widen tool access.
   const roots: Array<{ path: string; enforceBoundary: boolean }> = [
     ...projectRoots.map((path) => ({ path, enforceBoundary: true })),
     ...GLOBAL_CONFIG_DIRS.map((configDir) => ({
@@ -90,9 +83,6 @@ export async function discoverCustomDefs(
       continue
     }
     for (const entry of entries) {
-      // Custom definitions are single regular Markdown files. Refusing
-      // symlinks avoids silently importing prompts from outside the selected
-      // workspace (or from mutable credential/config locations).
       if (!entry.isFile() || entry.isSymbolicLink() || extname(entry.name) !== '.md') continue
       const source = join(root.path, entry.name)
       if (root.enforceBoundary && opts.boundaryRoot && strictWorkspacePathViolation(source, opts.boundaryRoot)) {
@@ -105,8 +95,6 @@ export async function discoverCustomDefs(
         const fm = parseFrontmatter(raw)
         byId.set(id, { id, data: fm.data, body: fm.body, source })
       } catch {
-        // Keep the id occupied: never fall back to a less restrictive same-name
-        // global definition when a project's policy file cannot be parsed.
         byId.set(id, { id, source, body: '', data: {}, error: 'Unable to read or parse definition; check YAML frontmatter' })
       }
     }

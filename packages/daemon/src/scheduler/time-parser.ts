@@ -1,4 +1,3 @@
-// packages/daemon/src/scheduler/time-parser.ts
 import * as chrono from 'chrono-node'
 import cronParser from 'cron-parser'
 import { parseReminderTime } from '../memory/reminders.js'
@@ -16,7 +15,6 @@ export type ParsedSchedule =
 
 export interface ParseWhenOptions {
   now?: number
-  /** IANA timezone for interpreting cron expressions; undefined = host local time. */
   timezone?: string
 }
 
@@ -45,7 +43,6 @@ const DAY_OF_WEEK: Record<string, number> = {
   일: 0, 월: 1, 화: 2, 수: 3, 목: 4, 금: 5, 토: 6,
 }
 
-// Korean interval suffix pattern: "2분 후", "5시간 후", "30초 후"
 const KO_INTERVAL_RE = /^(\d+)\s*(초|분|시간|일)\s*후$/
 
 function intervalUnitCode(unit: string): 's' | 'm' | 'h' | 'd' {
@@ -70,9 +67,6 @@ function intervalUnitCode(unit: string): 's' | 'm' | 'h' | 'd' {
   }
 }
 
-// 5 years. Past this the resulting nextRunAt approaches the JS Date valid range
-// (8.64e15 ms) and the schedule silently fails to fire downstream, so reject
-// up front rather than register a non-firing recurring job.
 const MAX_RECURRING_INTERVAL_MS = 5 * 365 * 86_400_000
 
 function recurringInterval(value: number, unit: string, now: number): ParsedSchedule {
@@ -90,27 +84,12 @@ function recurringInterval(value: number, unit: string, now: number): ParsedSche
   return { kind: 'recurring', cron: `@every ${value}${code}`, nextRunAt: now + intervalMs }
 }
 
-/** Parse the interval (ms) encoded in an `@every Ns` recurring expression, or null. */
 export function parseEveryInterval(cron: string): number | null {
   const m = cron.match(EVERY_RE)
   if (!m) return null
   return parseInt(m[1], 10) * (INTERVAL_UNIT_MS[m[2].toLowerCase()] ?? 60_000)
 }
 
-/**
- * cron-parser only understands nicknames with the `@` prefix — a bare `daily`
- * is parsed as a field alias and rejected. Accept the unprefixed spelling and
- * normalise it, so a job persisted with `daily` (older releases, hand-edited
- * state, an import) still resolves instead of failing to re-arm forever: the
- * engine only retries recurring jobs already marked failed, so an unparseable
- * expression means that job never fires again and only logs a warning.
- */
-/**
- * cron-parser knows @daily/@hourly/@weekly/@monthly/@yearly but not @midnight
- * or @annually, even though both are standard crontab spellings and both are
- * advertised by CRON_NICKNAMES and the schedule tool. Map them onto the
- * equivalent it does accept rather than letting an advertised expression fail.
- */
 const CRON_NICKNAME_ALIASES: Readonly<Record<string, string>> = {
   '@midnight': '@daily',
   '@annually': '@yearly',
@@ -123,15 +102,10 @@ function normalizeCronNickname(cron: string): string {
   return CRON_NICKNAME_ALIASES[prefixed] ?? prefixed
 }
 
-/** True when the cron string is a standard cron / nickname understood by cron-parser. */
 function isCronParserExpression(cron: string): boolean {
   return CRON_RE.test(cron) || CRON_NICKNAMES.has(normalizeCronNickname(cron))
 }
 
-/**
- * Compute the next fire time (epoch ms) strictly after `after` for a recurring schedule.
- * Supports 5-field cron, cron nicknames (`@daily` …) and the interval form `@every 30s`.
- */
 export function nextRecurringRun(cron: string, after: number, timezone?: string): number {
   const everyMs = parseEveryInterval(cron)
   if (everyMs != null) return after + everyMs
@@ -145,24 +119,32 @@ export function nextRecurringRun(cron: string, after: number, timezone?: string)
   throw new SchedulerParseError(`invalid recurring expression: ${cron}`)
 }
 
+export function nextScheduledRun(cron: string, completedAt: number, timezone: string | undefined, metadata: Record<string, unknown> | null | undefined): number {
+  const cadence = metadata?.schedulerInterval as { version?: unknown; mode?: unknown; anchor?: unknown } | undefined
+  if (cadence && (cadence.version !== 1 || !['fixed-rate', 'fixed-delay'].includes(String(cadence.mode)))) {
+    throw new SchedulerParseError('invalid scheduler interval policy')
+  }
+  if (cadence?.mode !== 'fixed-rate') return nextRecurringRun(cron, completedAt, timezone)
+  const interval = parseEveryInterval(cron)
+  if (!interval || typeof cadence.anchor !== 'number' || !Number.isFinite(cadence.anchor)) {
+    throw new SchedulerParseError('fixed-rate requires an @every interval and a finite anchor')
+  }
+  return cadence.anchor + Math.max(1, Math.floor((completedAt - cadence.anchor) / interval) + 1) * interval
+}
+
 export function parseWhen(text: string, opts: ParseWhenOptions = {}): ParsedSchedule {
   const now = opts.now ?? Date.now()
   const timezone = opts.timezone
   const trimmed = text.trim()
 
-  // Canonical immediate one-shot token, shared by tools and HTTP surfaces.
-  // Admission remains owned by the durable scheduler (including concurrency).
   if (trimmed.toLowerCase() === '@now') return { kind: 'oneshot', runAt: now }
 
-  // @every 30s | @every 5m | @every 1h | @every 2d  → interval-based recurring
   const everyMatch = trimmed.match(EVERY_RE)
   if (everyMatch) {
     const value = parseInt(everyMatch[1], 10)
     return recurringInterval(value, everyMatch[2].toLowerCase(), now)
   }
 
-  // Cron nicknames: @daily @hourly @weekly @monthly @yearly @midnight @annually
-  // The `@` may be omitted; normalise so creation and re-arm accept the same set.
   if (CRON_NICKNAMES.has(normalizeCronNickname(trimmed))) {
     const nick = normalizeCronNickname(trimmed)
     try {
@@ -176,7 +158,6 @@ export function parseWhen(text: string, opts: ParseWhenOptions = {}): ParsedSche
     }
   }
 
-  // Standard 5-field cron
   if (CRON_RE.test(trimmed)) {
     try {
       const interval = cronParser.parseExpression(trimmed, {
@@ -196,7 +177,6 @@ export function parseWhen(text: string, opts: ParseWhenOptions = {}): ParsedSche
     return { kind: 'oneshot', runAt: now + value * unitMs }
   }
 
-  // Korean interval with 후 suffix: "2분 후", "5시간 후"
   const koIntervalMatch = trimmed.match(KO_INTERVAL_RE)
   if (koIntervalMatch) {
     const value = parseInt(koIntervalMatch[1], 10)
@@ -254,13 +234,6 @@ export function parseWhen(text: string, opts: ParseWhenOptions = {}): ParsedSche
     }
   }
 
-  // chrono ships no Korean locale, and it resolves wall-clock phrases in the
-  // host timezone rather than the caller's. The reminder parser already covers
-  // both languages and honours an IANA zone, so a one-shot phrase goes there
-  // first; chrono stays as the fallback for the English forms it does not
-  // cover. Without this, "내일 오전 9시" failed permanently while its English
-  // spelling succeeded, and a container running in UTC scheduled every
-  // wall-clock request at the wrong hour.
   const zoned = parseReminderTime(trimmed, new Date(now), timezone)
   if (zoned) {
     const zonedTs = zoned.getTime()

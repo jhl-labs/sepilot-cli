@@ -1,8 +1,3 @@
-// Terminal input offsets are UTF-16 string offsets because callers edit with
-// String#slice. User-visible cursor movement must nevertheless operate on
-// extended grapheme clusters: one Korean syllable, an NFD syllable, or a ZWJ
-// emoji is one editable character even when it spans several code units.
-
 const segmenter = typeof Intl.Segmenter === 'function'
   ? new Intl.Segmenter('ko', { granularity: 'grapheme' })
   : null
@@ -73,7 +68,6 @@ export function graphemeBoundaries(value: string): number[] {
   return boundaries
 }
 
-/** Clamp to the grapheme boundary at or before the requested UTF-16 offset. */
 export function clampGraphemeOffset(value: string, offset: number): number {
   const requested = Math.max(0, Math.min(value.length, Math.trunc(offset)))
   let result = 0

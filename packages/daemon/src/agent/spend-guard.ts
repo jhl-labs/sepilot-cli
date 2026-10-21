@@ -1,8 +1,3 @@
-// Spend-cap gate. Checked BEFORE every LLM dispatch so a runaway loop, a
-// misconfigured schedule, or an abusive client cannot burn unbounded provider
-// dollars. Only priced (costKnown) spend is recorded in usage.db, so local
-// models — which have no API billing — never trip the cap.
-
 export interface SpendBudgetConfig {
   dailyUsdBudget?: number
   sessionUsdBudget?: number
@@ -12,7 +7,6 @@ export interface SpendScope {
   sessionId: string
 }
 
-// Minimal surface of UsageTracker the guard needs, so tests can mock it.
 export interface SpendUsageSource {
   getDailySummaries: (days?: number) => Array<{ totalCostUsd: number }>
   getSessionUsage: (sessionId: string) => { costUsd: number }
@@ -30,11 +24,6 @@ function envBudget(name: string): number | undefined {
   return Number.isFinite(value) && value > 0 ? value : undefined
 }
 
-/**
- * Resolve effective budgets from config with env override. env
- * SEPILOTD_DAILY_USD_BUDGET / SEPILOTD_SESSION_USD_BUDGET take precedence so an
- * operator can cap a shared daemon without editing config.yaml.
- */
 export function resolveSpendBudgets(config: SpendBudgetConfig | undefined): SpendBudgetConfig {
   return {
     dailyUsdBudget: envBudget('SEPILOTD_DAILY_USD_BUDGET') ?? config?.dailyUsdBudget,
@@ -42,12 +31,6 @@ export function resolveSpendBudgets(config: SpendBudgetConfig | undefined): Spen
   }
 }
 
-/**
- * Return whether an LLM dispatch is allowed under the configured spend caps.
- * Unlimited when no budget is set. The check is a pre-dispatch gate: crossing a
- * budget blocks the next call rather than mid-call, so the overshoot is at most
- * one turn.
- */
 export function checkSpendBudget(
   usage: SpendUsageSource,
   config: SpendBudgetConfig | undefined,

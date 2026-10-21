@@ -40,7 +40,7 @@ export class SwarmRun extends EventEmitter {
 
   constructor(opts: SwarmRunOpts) {
     super()
-    this.setMaxListeners(0) // 0 = uncapped; SSE fan-out can exceed Node's default of 10
+    this.setMaxListeners(0)
     this.id = opts.id
     this.goal = opts.goal
     this.worktree = opts.worktree
@@ -229,7 +229,6 @@ export class SwarmRun extends EventEmitter {
     return lease ? { ...lease } : undefined
   }
 
-  /** Silent no-op when the handle is missing — supervisor + lifecycle paths can race during teardown. */
   removeAgent(handleId: string): void {
     if (!this.agents.delete(handleId)) return
     if (this.activeHandle === handleId) this.activeHandle = undefined
@@ -237,7 +236,6 @@ export class SwarmRun extends EventEmitter {
     this.emitEvent({ type: 'agent.killed', runId: this.id, handle: handleId, ts: Date.now() })
   }
 
-  /** Silent no-op when the handle is missing — same teardown-race rationale as removeAgent. */
   setStatus(handleId: string, status: SwarmAgentHandle['status']): void {
     const a = this.agents.get(handleId)
     if (!a) return
@@ -245,7 +243,6 @@ export class SwarmRun extends EventEmitter {
     this.emitEvent({ type: 'agent.status', runId: this.id, handle: handleId, status, ts: Date.now() })
   }
 
-  /** Throws on unknown handle — promoting a non-existent agent is a programmer error. */
   setActive(handleId: string): void {
     if (!this.agents.has(handleId)) throw new Error(`unknown handle: ${handleId}`)
     this.activeHandle = handleId

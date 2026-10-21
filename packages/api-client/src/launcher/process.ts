@@ -6,12 +6,6 @@ export function launchDaemon(
   invocation: DaemonInvocation,
   options: DaemonLaunchOptions = {},
 ): DaemonProcess {
-  // Next.js globally augments NodeJS.ProcessEnv with a required NODE_ENV even
-  // though Node's child-process API accepts an environment without that key.
-  // A least-privilege launcher must not synthesize NODE_ENV (or any ambient
-  // value) into an `inheritEnv: false` snapshot merely to satisfy that UI-only
-  // type declaration. Keep runtime behavior exact and narrow only at the Node
-  // process boundary.
   const childEnv = (options.inheritEnv === false
     ? { ...options.env }
     : { ...process.env, ...options.env }) as NodeJS.ProcessEnv
@@ -69,7 +63,6 @@ export function launchDaemon(
       try {
         child.kill(process.platform === 'win32' ? undefined : 'SIGTERM')
       } catch {
-        // Process may already be gone.
       }
     },
   }
@@ -93,7 +86,6 @@ export async function waitForDaemonReady(
       })
       if (response.ok) return true
     } catch {
-      // Not ready yet.
     }
   }
 

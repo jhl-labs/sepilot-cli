@@ -278,7 +278,6 @@ export interface SessionEvidenceArtifact {
   tool?: string
   path?: string
   hash?: string
-  /** Validation result belongs to the latest validation-relevant workspace revision. */
   currentRevision?: boolean
   relatedAcceptanceCriteriaIds?: string[]
 }
@@ -1082,11 +1081,6 @@ function validationArtifactStatus(
   call: Extract<SessionEvent, { type: 'tool_call' }>,
   result: Extract<SessionEvent, { type: 'tool_result' }>,
 ): SessionEvidenceArtifactStatus {
-  // A schema/policy/preflight rejection is still useful audit evidence, but
-  // it says nothing about the workspace's mechanical validity because the
-  // validator never ran. Preserve it as a warning instead of letting it
-  // override a later executed validation for the same revision. Missing
-  // metadata remains conservative for historical events.
   if (result.metadata?.[TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY] === false) {
     return 'warning'
   }
@@ -1143,13 +1137,6 @@ function latestRunContractEvent(
   const latest = contractEvents.at(-1)
   if (!latest) return undefined
 
-  // Graph checkpoints and phase handoffs can re-emit the unchanged active
-  // contract. The evidence window begins when that semantic contract became
-  // active, not at its latest transport copy; otherwise a late duplicate can
-  // make earlier edits and validations appear to predate the contract. Walk
-  // back only through the trailing run of semantically identical contracts.
-  // A genuinely revised contract therefore still starts a new evidence
-  // window, including the case where a later revision returns to old text.
   const latestFingerprint = stableFingerprint(latest.contract)
   let active = latest
   for (let index = contractEvents.length - 2; index >= 0; index -= 1) {
@@ -1231,11 +1218,6 @@ export function buildSessionTraceMetrics(
   let approvalApproved = 0
   let approvalFeedback = 0
   let approvalDenied = 0
-  // Auto-approval counters track tool calls that ran via remembered
-  // session/always rules — operators auditing a long session need to
-  // tell the difference between "agent ran 12 tools, 4 with explicit
-  // consent, 8 short-circuited by the rule registered at turn 13" vs
-  // "agent ran 12 tools with 4 explicit prompts" (current totals).
   let autoApprovalsApproved = 0
   let autoApprovalsDenied = 0
   let contextCompactions = 0
@@ -1814,11 +1796,6 @@ export function buildSessionWorkingMemory(
         }
       }
       if (event.type === 'auto_approval') {
-        // Surfaces the matched scope/pattern so working-memory
-        // consumers (web/desktop overlay, /sessions show working
-        // memory) can show *why* a tool ran without an explicit
-        // prompt. Categorised under 'approval' so existing UIs that
-        // group by decision type still see it.
         return {
           type: 'approval' as const,
           summary: truncateText(
@@ -1901,10 +1878,6 @@ export function buildSessionEditRollbacks(events: SessionEvent[]): SessionEditRo
     }))
 }
 
-/** Same source events as buildSessionEditRollbacks, but returns the raw
- * EditCheckpointSummary the live SSE onEditCheckpointResolved callback
- * already sends per-turn — lets session-history replay feed the exact
- * same client-side store action (appendEditRollback) without an adapter. */
 export function buildSessionRawEditCheckpoints(events: SessionEvent[]): EditCheckpointSummary[] {
   return events
     .filter(
@@ -2456,11 +2429,6 @@ function detectContractLedgerBlockers(events: SessionEvent[]): SessionContractLe
   ]
 
   for (const event of userEvents) {
-    // Authority blockers describe actions the user affirmatively authorized,
-    // not every dangerous noun that appears in the request. Reuse the same
-    // bounded negative-capability scope as execution contracts so a leading
-    // or trailing prohibition applies across coordinated action lists, while
-    // an explicit later contrast/sequence remains actionable.
     const text = inputPositiveCapabilityScope(event.content)
     for (const spec of specs) {
       if (!hasActionableAuthorityMatch(text, spec.pattern)) continue
@@ -2953,11 +2921,6 @@ export function buildSessionEvidenceManifest(
     artifacts.push(completionVerdictArtifact)
   }
 
-  // Mechanical evidence belongs to a concrete workspace revision. A failed
-  // check followed by a source edit is stale, while a check from before the
-  // latest source/config/test edit cannot validate the current revision. Keep
-  // all artifacts for audit, but scope pass/fail semantics to results after
-  // the latest validation-relevant successful change.
   let validationBaselineIndex = contractIndex
   for (const call of toolCalls.values()) {
     const hasWorkspaceMutation = extractToolCallPaths(call).length > 0
@@ -3849,10 +3812,6 @@ function extractPathTokens(text: string): string[] {
   }
   for (const match of text.matchAll(pattern)) {
     const normalized = normalizeAssertionPath(match[1] ?? '')
-    // A bare dotted token such as a runtime, framework, or protocol name is
-    // syntactically indistinguishable from a basename-only source file.
-    // Require explicit path syntax for unquoted prose; backticks above remain
-    // the unambiguous way to assert a basename-only artifact like package.json.
     if (normalized?.includes('/') && isSourceLikePath(normalized)) {
       paths.add(normalized)
     }

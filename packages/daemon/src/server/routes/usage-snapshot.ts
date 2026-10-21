@@ -17,9 +17,6 @@ function openUsageDb(): SqliteDatabase {
   return openDatabase(join(dir, 'usage.db'))
 }
 
-// usage.db 가 비어 있거나 usage_records 테이블이 아직 안 만들어진 경우를
-// 안전하게 다루기 위한 헬퍼. runtime.usageTracker 가 붙어 있지 않은 fallback
-// 경로에서만 사용한다.
 function snapshotFromUsageRecords(db: SqliteDatabase): UsageSnapshot {
   try {
     const exists = db

@@ -1,15 +1,7 @@
 import type { AgentState, GraphExecutionContext } from './types.js'
+import { AutonomyLevel } from '@sepilotd/core'
 import { isAbortError, raceWithAbort, throwIfAborted } from '../../abort.js'
 
-/**
- * Doom-loop questions (plan P2-4): when the stuck-repeat repair budget or the
- * consecutive no-progress limit is exhausted in an interactive run, ask the
- * human one structured question instead of forcing the final synthesis. The
- * question is a fixed, code-driven template (no model prose), the answer is a
- * closed choice set, and the number of questions per run is bounded so the
- * loop can never turn into an endless prompt cycle. Headless runs (no HITL
- * `requestQuestion` channel) keep the forced-final behaviour unchanged.
- */
 export const MAX_LOOP_CONTROL_QUESTIONS = 2
 
 export type LoopControlDecision = 'continue' | 'different_approach' | 'stop'
@@ -21,15 +13,12 @@ export const LOOP_CONTROL_CHOICES: readonly LoopControlDecision[] = [
 
 export interface LoopControlQuestionInput {
   kind: 'stuck_repeat' | 'no_progress'
-  /** Repeated tool name (stuck-repeat) — rendered inside backticks. */
   tool?: string
-  /** Repeat count (stuck-repeat) or consecutive no-progress iterations. */
   count: number
 }
 
 export interface LoopControlAnswer {
   decision: LoopControlDecision
-  /** Free-text guidance the user typed instead of a fixed choice. */
   guidance?: string
 }
 
@@ -53,12 +42,6 @@ export function buildLoopControlQuestionPrompt(
     : `The agent spent ${input.count} consecutive iterations without a tool call or a final answer. Continue, try a different approach, or stop? (continue / different_approach / stop)`
 }
 
-/**
- * Map a raw answer to a decision. Exact choice ids (case-insensitive) win.
- * Any other non-empty text is treated as the user's own guidance for a
- * different approach — explicit user intent is honoured, not discarded. An
- * empty answer is `stop` (fail-safe).
- */
 export function parseLoopControlAnswer(raw: string | undefined): LoopControlAnswer {
   const answer = (raw ?? '').trim()
   if (!answer) return { decision: 'stop' }
@@ -71,22 +54,16 @@ export function parseLoopControlAnswer(raw: string | undefined): LoopControlAnsw
 
 export function canAskLoopControlQuestion(
   state: Pick<AgentState, 'loopControlQuestionCount'>,
-  context: Pick<GraphExecutionContext, 'requestQuestion'> | undefined,
+  context: (Pick<GraphExecutionContext, 'requestQuestion'> & Partial<Pick<GraphExecutionContext, 'autonomy'>>) | undefined,
 ): boolean {
   return Boolean(context?.requestQuestion)
+    && context?.autonomy !== AutonomyLevel.Autonomous
     && (state.loopControlQuestionCount ?? 0) < MAX_LOOP_CONTROL_QUESTIONS
 }
 
-/**
- * Ask the bounded loop-control question. Returns undefined when the run is
- * headless or the per-run question bound is spent, so the caller falls back to
- * the existing forced-final path. A question that fails (transport error or a
- * non-parked timeout) resolves to `stop`; a parked-question timeout raised by
- * the transport propagates so the shared parked-decision semantics apply.
- */
 export async function askLoopControlQuestion(
   state: Pick<AgentState, 'loopControlQuestionCount' | 'input'>,
-  context: Pick<GraphExecutionContext, 'requestQuestion' | 'signal'> & { sessionId: string },
+  context: Pick<GraphExecutionContext, 'requestQuestion' | 'signal'> & Partial<Pick<GraphExecutionContext, 'autonomy'>> & { sessionId: string },
   input: LoopControlQuestionInput,
 ): Promise<LoopControlAnswer | undefined> {
   if (!canAskLoopControlQuestion(state, context) || !context.requestQuestion) return undefined
@@ -106,17 +83,11 @@ export async function askLoopControlQuestion(
   return parseLoopControlAnswer(raw)
 }
 
-/**
- * Transport-level parked decision (approval/question timeout that keeps the
- * pending decision alive). Recognised structurally by a `code` field so no
- * error class import from the server layer is needed here.
- */
 function isParkedDecisionError(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code
   return code === 'QUESTION_TIMEOUT' || code === 'APPROVAL_TIMEOUT'
 }
 
-/** System message injected after a `different_approach` answer. */
 export function buildDifferentApproachMessage(
   input: LoopControlQuestionInput & { signature?: string; guidance?: string },
 ): string {

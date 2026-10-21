@@ -3,18 +3,6 @@ import { join } from 'node:path'
 import type { TodoItem } from '@sepilotd/core'
 import { createLogger } from '../logger.js'
 
-/**
- * Cross-session project task board (the durable half of the P022 task layer,
- * ~ Claude Code's `~/.claude/tasks/`).
- *
- * TodoWrite is in-session scratch state; this store is the durable spine: it
- * persists project-scoped tasks to `<stateDir>/<projectHash>.tasks.jsonl`
- * (projectHash from `memory/scope.ts#hashProjectPath` — never a raw cwd, which
- * embeds the OS username) so a new session can reload the still-open tasks
- * into its board. Records are append-only; the latest record per task id is
- * the current state, so history is preserved and writes never race-clobber.
- */
-
 const log = createLogger('task-board')
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'cancelled'
@@ -23,14 +11,12 @@ export interface ProjectTask {
   id: string
   content: string
   status: TaskStatus
-  /** ISO timestamp of this record. */
   updatedAt: string
 }
 
 export interface TaskBoardWriteEvent {
   projectHash: string
   path: string
-  /** Tasks whose state changed in this write. */
   changed: ProjectTask[]
 }
 
@@ -38,7 +24,6 @@ export type TaskBoardBroadcaster = (event: TaskBoardWriteEvent) => void
 
 const OPEN_STATUSES = new Set<TaskStatus>(['pending', 'in_progress', 'blocked'])
 
-/** projectHash is used directly as a filename segment — must be a bare token. */
 const SAFE_PROJECT_HASH = /^[a-z0-9_-]+$/
 
 function assertSafeProjectHash(projectHash: string): void {
@@ -68,7 +53,6 @@ export class TaskBoardStore {
     return join(this.stateDir, `${projectHash}.tasks.jsonl`)
   }
 
-  /** Latest state of every task (append-only log reduced by id). */
   async loadTasks(projectHash: string): Promise<ProjectTask[]> {
     const raw = await this.readRaw(projectHash)
     if (!raw) return []
@@ -88,17 +72,10 @@ export class TaskBoardStore {
     return [...latest.values()]
   }
 
-  /** Tasks a new session should resume: pending or in_progress. */
   async loadOpenTasks(projectHash: string): Promise<ProjectTask[]> {
     return (await this.loadTasks(projectHash)).filter((task) => OPEN_STATUSES.has(task.status))
   }
 
-  /**
-   * Upsert the given items into the durable store. Only tasks whose content or
-   * status actually differs from the current latest record are appended (so a
-   * no-op todowrite does not grow the log), and only those are broadcast.
-   * Returns the tasks that changed.
-   */
   async upsertTasks(
     projectHash: string,
     items: Array<Pick<ProjectTask, 'id' | 'content' | 'status'>>,
@@ -147,7 +124,6 @@ export class TaskBoardStore {
   }
 }
 
-/** Convert durable tasks back into in-session TodoItem shape for board load. */
 export function projectTasksToTodoItems(tasks: ProjectTask[]): TodoItem[] {
   return tasks
     .filter((task) => task.status !== 'cancelled')

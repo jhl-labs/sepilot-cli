@@ -164,8 +164,6 @@ export async function buildDoctorReport(
     const runtimeCheck = checkSandboxRuntime(effectiveConfig.security)
     if (runtimeCheck) results.push(runtimeCheck)
   } else {
-    // Preserve the installation hint when the config is absent or invalid and
-    // there is no selected runtime whose availability can be checked.
     results.push(checkDocker())
   }
   results.push(await checkFileExists(join(securityDir, 'audit.log'), 'audit_log_file', 'audit.log'))
@@ -199,10 +197,6 @@ async function readDoctorConfig(path: string): Promise<SepilotdConfig | undefine
   }
 }
 
-/**
- * Explain the effective sandbox boundary without claiming that a configured
- * backend covers tools which still execute in the daemon process.
- */
 export function checkSandboxConfiguration(config: {
   security?: SandboxSecurityConfig
 }): DoctorCheckResult[] {

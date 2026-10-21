@@ -160,10 +160,6 @@ const PROVIDER_DEFAULTS: Record<string, ProviderModelDefaults> = {
     },
   },
   openrouter: {
-    // OpenRouter fronts 200+ models with wildly different limits. These
-    // are broad fallbacks; per-model context/maxTokens/capabilities should
-    // be set via provider config modelOverrides when it matters
-    // (e.g. a 1M-context Gemini route, or a vision-capable model).
     contextWindow: 128_000,
     maxOutputTokens: 128_000,
     capabilities: {
@@ -183,21 +179,11 @@ const PROVIDER_BASE_URLS: Record<string, string> = {
   openrouter: 'https://openrouter.ai/api/v1',
 }
 
-/**
- * OpenRouter uses optional ranking headers (`HTTP-Referer`, `X-Title`)
- * to attribute traffic. We set neutral defaults that carry no host /
- * user / IP information; an operator can override them via the provider
- * config's `headers` map if they want their own attribution.
- */
 const OPENROUTER_DEFAULT_HEADERS: Record<string, string> = {
   'HTTP-Referer': 'https://github.com/jhl-labs/sepilot-cli',
   'X-Title': 'sepilotd',
 }
 
-/**
- * Provider for OpenAI-compatible APIs (Groq, Together AI, DeepSeek, etc.)
- * Reuses the OpenAI SDK with a different baseURL.
- */
 export class OpenAICompatibleProvider implements ILLMProvider {
   readonly id: string
   readonly name: string
@@ -216,14 +202,7 @@ export class OpenAICompatibleProvider implements ILLMProvider {
       apiKey: config.apiKey,
       baseURL: baseUrl,
       defaultHeaders: config.headers,
-      // Compiled Bun must consume provider bodies through the daemon's
-      // undici.request adapter; its native/undici fetch bridges can receive
-      // all bytes yet fail to deliver body EOF to the OpenAI SDK.
       fetch: getProviderSdkFetch(),
-      // Retry ownership lives in guardedProviderChat/guardedProviderStream.
-      // Leaving the SDK's independent retry loop enabled multiplies attempts
-      // (and honours long Retry-After values) underneath a single silent graph
-      // node, so a local 429 can look like a frozen agent with an idle GPU.
       maxRetries: 0,
     })
 
@@ -247,26 +226,9 @@ export class OpenAICompatibleProvider implements ILLMProvider {
           ...(defaults?.capabilities ?? {
             vision: false,
             toolUse: true,
-            // Streaming is part of the OpenAI-compatible chat-completions
-            // contract and preserves incremental progress for long local
-            // reasoning/tool responses. The guarded stream layer treats the
-            // protocol's `done` chunk as terminal, so a runtime no longer has
-            // to wait for a second iterator EOF. Operators can still declare
-            // `streaming: false` for endpoints that only implement chat().
             streaming: true,
             embedding: true,
-            // A custom OpenAI-compatible endpoint does not expose a reliable
-            // capability catalog. Treat hidden reasoning as supported until
-            // the operator says otherwise so short orchestration calls leave
-            // enough output headroom for reasoning + the requested JSON.
-            // This only raises a max-token ceiling; ordinary models still stop
-            // as soon as their short answer is complete.
             thinking: true,
-            // OpenAI-compatible is a wire protocol, not evidence that native
-            // tools are broken. Tool-only assistant turns with empty visible
-            // prose are valid and common, so automatic adaptive switching is
-            // opt-in through the model compatibility profile/capability. Real
-            // transport rejection still has its separate guarded recovery.
             adaptivePromptReact: false,
           }),
           ...config.capabilities,
@@ -348,7 +310,6 @@ export class OpenAICompatibleProvider implements ILLMProvider {
     return { modelIds, added, removed }
   }
 
-  /** Create a Groq provider */
   static groq(
     apiKey: string,
     models: string[],
@@ -364,7 +325,6 @@ export class OpenAICompatibleProvider implements ILLMProvider {
     })
   }
 
-  /** Create a Together AI provider */
   static together(
     apiKey: string,
     models: string[],
@@ -380,7 +340,6 @@ export class OpenAICompatibleProvider implements ILLMProvider {
     })
   }
 
-  /** Create a DeepSeek provider */
   static deepseek(
     apiKey: string,
     models: string[],
@@ -396,12 +355,6 @@ export class OpenAICompatibleProvider implements ILLMProvider {
     })
   }
 
-  /**
-   * Create an OpenRouter provider — a single OpenAI-compatible endpoint
-   * that fronts 200+ models from Anthropic, OpenAI, Google, Meta, Mistral,
-   * DeepSeek, Qwen and many more. Model ids are namespaced
-   * (`anthropic/claude-3.7-sonnet`, `openai/gpt-4o`, …).
-   */
   static openrouter(
     apiKey: string,
     models: string[],
@@ -427,10 +380,12 @@ export class OpenAICompatibleProvider implements ILLMProvider {
   }
 
   async chat(request: ChatRequest, options?: LLMRequestOptions): Promise<ChatResponse> {
+    const model = this.models.find((candidate) => candidate.id === request.model)
     return createOpenAIChatResponse(this.client, request, options, {
       filterThinkTags: true,
-      thinkingControl: this.models.find((model) => model.id === request.model)
-        ?.capabilities.thinkingControl,
+      thinkingControl: model?.capabilities.thinkingControl,
+      reasoningEffortOffValue: model?.compatibility?.reasoningEffortOffValue,
+      reasoningEffortAliases: model?.compatibility?.reasoningEffortAliases,
     })
   }
 
@@ -473,6 +428,8 @@ export class OpenAICompatibleProvider implements ILLMProvider {
     yield* streamOpenAIChatResponse(this.client, request, options, {
       filterThinkTags: true,
       thinkingControl: model?.capabilities.thinkingControl,
+      reasoningEffortOffValue: model?.compatibility?.reasoningEffortOffValue,
+      reasoningEffortAliases: model?.compatibility?.reasoningEffortAliases,
     })
   }
 }

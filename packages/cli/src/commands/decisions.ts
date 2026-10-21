@@ -100,35 +100,9 @@ function decisionsCopy(): DecisionsCopy {
 
 export interface DecisionsListOptions {
   url?: string
-  /**
-   * When set, narrow output to rules that look stale: zero hits AND
-   * createdAt older than STALE_RULE_THRESHOLD_DAYS. Lets automation
-   * pipe `decisions list --stale --json | jq '.decisions[].pattern'`
-   * into a cleanup script without re-implementing the staleness rule
-   * client-side.
-   */
   stale?: boolean
-  /**
-   * Cap the rendered rows. Default 20 mirrors `sessions list`; '0'
-   * (or any non-positive integer) means "show all" — useful when
-   * piping to grep/jq. Filter happens client-side after sort, so the
-   * row order (most-recently-matched first) is preserved.
-   */
   limit?: string
-  /**
-   * Narrow by rule scope. session|always (omit for all). Pairs with
-   * `decisions clear --scope` so the operator can preview-then-prune
-   * with the same flag spelled the same way.
-   */
   scope?: string
-  /**
-   * Narrow by exact tool name (e.g. `terminal.run`, `fs.write`).
-   * Useful for "show me every rule that lets the agent touch <tool>"
-   * audits — without this, an operator on a daemon with rules for a
-   * dozen tools would have to grep stdout. Exact match (not glob)
-   * because tool names are well-known constants and partial matches
-   * would silently include unrelated tools.
-   */
   tool?: string
 }
 
@@ -136,22 +110,7 @@ export interface DecisionsClearOptions {
   url?: string
   scope?: string
   session?: string
-  /**
-   * When set, ask the daemon to remove only rules that match
-   * isStaleRememberedDecision. Pairs naturally with `decisions list
-   * --stale` — see what would be pruned, then prune it. Combinable
-   * with --scope so an operator can narrow ("clear stale always
-   * rules only"); --session is intentionally ignored under --stale
-   * because session-scoped staleness rarely makes sense (sessions
-   * are short-lived already).
-   */
   stale?: boolean
-  /**
-   * Exact tool name. Pairs with `decisions list --tool` for
-   * preview-then-prune by tool. Combinable with --scope/--stale —
-   * filters compose, so `clear --tool fs.write --stale` removes
-   * only stale fs.write rules.
-   */
   tool?: string
 }
 
@@ -185,13 +144,6 @@ export function formatPastTime(iso: string | undefined, now: number): string | u
   return copy.monthsAgo(months)
 }
 
-/**
- * Thin wrapper over the core `isStaleRememberedDecision` helper so
- * callers in chat-stream-printer / chat shell keep their existing
- * import path. The actual predicate lives in core (single source of
- * truth shared with the daemon's clear({stale}) — without that, the
- * cli could flag a rule the daemon refuses to delete).
- */
 export function isStaleRule(
   decision: DaemonRememberedApproval,
   now: number,
@@ -199,14 +151,6 @@ export function isStaleRule(
   return isStaleRememberedDecision(decision, now)
 }
 
-/**
- * Sort order: most-recently-matched first, then never-matched (those
- * fall to the bottom, ordered by createdAt asc so the *oldest* unused
- * rule is at the very bottom — the natural cleanup target). Without
- * this, decisions list shows insertion order, so a rule registered
- * yesterday and used 100 times sits below a forgotten rule from
- * months ago.
- */
 export function compareDecisions(
   a: DaemonRememberedApproval,
   b: DaemonRememberedApproval,
@@ -216,8 +160,6 @@ export function compareDecisions(
   if (aLast !== null && bLast !== null) return bLast - aLast
   if (aLast !== null) return -1
   if (bLast !== null) return 1
-  // Both never matched — oldest first (oldest is the most likely
-  // cleanup candidate).
   const aCreated = a.createdAt ? new Date(a.createdAt).getTime() : 0
   const bCreated = b.createdAt ? new Date(b.createdAt).getTime() : 0
   return aCreated - bCreated
@@ -237,19 +179,12 @@ export async function decisionsListCommand(
   const copy = decisionsCopy()
   const scopeFilter = parseListScope(options.scope)
   const toolFilter = options.tool?.trim() || undefined
-  // --limit '0' (or any non-positive integer) means "show all" so an
-  // operator piping to grep/jq doesn't have to remember a giant
-  // number. NaN / missing falls back to the default 20 — same
-  // contract as `sessions list --limit`.
   const limitArg = options.limit ? Number.parseInt(options.limit, 10) : 20
   const limit = Number.isFinite(limitArg) && limitArg >= 0 ? limitArg : 20
   const client = new DaemonClient(options.url)
   try {
     const result = await client.listRememberedApprovals()
     const allDecisions = result.decisions ?? []
-    // Filters compose: tool/scope first (cheap), stale second (date
-    // math). Order doesn't change semantics but keeps the predicate
-    // cost ordering rational.
     const toolFiltered = toolFilter
       ? allDecisions.filter((d) => d.tool === toolFilter)
       : allDecisions
@@ -265,8 +200,6 @@ export async function decisionsListCommand(
     output(filtered, (data) => {
       const items = data.decisions ?? []
       if (items.length === 0) {
-        // Status-aware empty copy so operators can tell "filter
-        // matched nothing" from "list view broke".
         const filterParts = [
           options.stale ? 'stale' : null,
           scopeFilter ? `scope=${scopeFilter}` : null,
@@ -278,9 +211,6 @@ export async function decisionsListCommand(
         return chalk.gray(copy.noDecisions)
       }
       const now = Date.now()
-      // Sorting + stale-flagging happen client-side so the daemon
-      // contract stays simple (returns a flat list); the cli is
-      // already the place that owns presentation.
       const sortedItems = [...items].sort(compareDecisions)
       const visibleItems = limit === 0 ? sortedItems : sortedItems.slice(0, limit)
       const staleCount = sortedItems.filter((d) => isStaleRule(d, now)).length
@@ -294,21 +224,10 @@ export async function decisionsListCommand(
       const headlinePrefix = options.stale
         ? copy.headlineStale
         : copy.headline
-      // Headline mirrors `sessions list` shape: total + filter +
-      // showing. When everything fits, "showing N" matches "N total"
-      // — kept verbose so a future paginated list reads consistently.
       lines.push(chalk.cyan(
         `${headlinePrefix} ${copy.headlineSuffix(sortedItems.length, headlineFilter, visibleItems.length)}`,
       ))
       for (const decision of visibleItems) {
-        // Showing tool + scope + approved/denied is the minimum an
-        // operator needs to recognise a leftover rule. createdAt
-        // helps spot stale decisions a session ran into months ago.
-        // hits surfaces the runtime usage signal — a hits=0 rule
-        // weeks after registration is a cleanup candidate, while a
-        // hot rule warrants a re-check of whether short-circuiting
-        // is still appropriate. lastHit shows recency without
-        // forcing the operator to compute "how old is this iso?".
         const verb = decision.approved ? chalk.green(copy.approved) : chalk.red(copy.denied)
         const sessionLabel = decision.sessionId ? copy.sessionLabelPrefix(decision.sessionId) : ''
         const created = decision.createdAt ? chalk.gray(` · ${decision.createdAt}`) : ''
@@ -325,19 +244,12 @@ export async function decisionsListCommand(
         )
       }
       if (staleCount > 0 && !options.stale) {
-        // Trailing hint only fires when there's actually something
-        // to clean up AND the operator hasn't already filtered to
-        // stale-only — otherwise it's redundant noise. Mention the
-        // cli verb so the operator can act in one step.
         lines.push('')
         lines.push(
           chalk.gray(copy.staleHint(staleCount, STALE_RULE_THRESHOLD_DAYS)),
         )
       }
       if (visibleItems.length < sortedItems.length) {
-        // Mirror the sessions-list "…N more" hint so operators
-        // hitting the default 20-row cap can immediately see the
-        // escape hatch (`--limit 0`).
         lines.push(
           chalk.gray(copy.moreHint(sortedItems.length - visibleItems.length)),
         )
@@ -357,14 +269,6 @@ export interface DecisionsShowOptions {
   url?: string
 }
 
-/**
- * Verbose detail view for every rule that matches a tool name.
- * `decisions list --tool <name>` already narrows the list, but stays
- * one-row-per-rule for at-a-glance scanning. `show` is the
- * complement: 1 block per rule with full ISO timestamps + relative
- * ages + the staleness verdict — the view an operator opens when
- * deciding whether to keep / extend / prune a specific rule.
- */
 export async function decisionsShowCommand(
   tool: string,
   options: DecisionsShowOptions = {},
@@ -391,10 +295,6 @@ export async function decisionsShowCommand(
       const lines: string[] = []
       lines.push(chalk.cyan(copy.headlineForTool(trimmedTool, items.length)))
       for (const decision of sortedItems) {
-        // 1 block per rule. Field-per-line layout makes long
-        // sessionId / pattern values readable; relative ages sit
-        // alongside the iso timestamp so an operator can grok
-        // "5d ago (2026-04-28T...)" without computing the delta.
         const verb = decision.approved ? chalk.green(copy.approved) : chalk.red(copy.denied)
         const stale = isStaleRule(decision, now)
         lines.push('')
@@ -418,9 +318,6 @@ export async function decisionsShowCommand(
             `    ${copy.lastHitAtLabel} ${decision.lastHitAt}${lastAge ? ` (${lastAge})` : ''}`,
           ))
         } else {
-          // Surfacing "lastHitAt: never matched" up front saves the
-          // operator from interpreting the absence of a field as
-          // "the daemon forgot to record it".
           lines.push(chalk.gray(`    ${copy.lastHitAtLabel} ${copy.neverMatched}`))
         }
       }

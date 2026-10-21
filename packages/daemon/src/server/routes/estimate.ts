@@ -11,7 +11,6 @@ import {
 import { zodRequestValidation } from './utils.js'
 import { getRatePer1k } from '../../providers/pricing.js'
 
-// Fallback per-1K rate for models not in the maintained price table.
 const FALLBACK_RATE = { input: 0.001, output: 0.002 }
 
 const estimateRequestSchema = z.object({
@@ -87,7 +86,6 @@ export async function estimateRoutes(app: FastifyInstance) {
     const body = request.body
     const { message, model, sessionId } = body
 
-    // Estimate input tokens
     let inputChars = message.length
     if (sessionId) {
       try {
@@ -95,7 +93,7 @@ export async function estimateRoutes(app: FastifyInstance) {
         for (const event of events) {
           inputChars += getEventContentLength(event)
         }
-      } catch { /* session not found */ }
+      } catch {}
     }
 
     const estimatedInputTokens = Math.ceil(inputChars / 4)

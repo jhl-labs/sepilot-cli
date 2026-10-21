@@ -28,9 +28,7 @@ export interface NotificationRelayOutboxSummary {
   failed: number
   delivered: number
   dead: number
-  /** Earliest due time across pending and failed rows. */
   nextAttemptAt: number | null
-  /** Earliest retry time across failed rows only. */
   nextRetryAt: number | null
 }
 

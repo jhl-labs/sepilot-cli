@@ -304,8 +304,6 @@ export function createJpadTools(options: JpadToolOptions = {}): ToolDefinitionRu
         const headers = new Headers({
           accept: 'application/json',
           authorization: `Bearer ${token}`,
-          // JPAD's front door permits its documented Agent API clients while
-          // rejecting generic automation user agents.
           'user-agent': 'curl/8.5.0 sepilotd-jpad-agent-api-v1',
         })
         let body: string | undefined
@@ -343,10 +341,6 @@ export function createJpadTools(options: JpadToolOptions = {}): ToolDefinitionRu
           data,
         }
       })()
-      // Some compiled fetch runtimes can resolve headers and then leave
-      // response.text() pending even after their AbortSignal fires. Race the
-      // whole request/body operation against the controller so the tool's
-      // advertised timeout remains authoritative at the runtime boundary.
       const abortPromise = new Promise<never>((_resolve, reject) => {
         const onAbort = () => {
           reject(timedOut

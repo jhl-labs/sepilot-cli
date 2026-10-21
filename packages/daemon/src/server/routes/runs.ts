@@ -70,19 +70,11 @@ export async function runsRoutes(app: FastifyInstance) {
       if (!cancelled && activeRuns.get(sessionId)) {
         return reply.status(409).send({ error: { code: 'RUN_CANCEL_UNAVAILABLE', message: 'This active run has no registered cancellation owner. No cancellation was performed; use its originating task controls.' } })
       }
-      // A cancellation acknowledgment is a completion boundary, not merely a
-      // signal-delivery receipt. Waiting for the session lease prevents a
-      // client that immediately submits its next turn from racing cleanup and
-      // receiving BUSY for the run it just cancelled.
       await runtime.sessionBusy?.waitUntilIdle(sessionId)
       return { data: { cancelled } }
     },
   )
 
-  // Canonical state-board inspection endpoint (PLAN_023 D4). Returns the
-  // structured board, not rendered text, so each surface renders it itself.
-  // The durable journal is the source of truth; `source` reports whether a run
-  // is currently active ('live') or only persisted ('journal').
   app.get<{ Params: { sessionId: string } }>(
     '/runs/:sessionId/state',
     async (request, reply) => {
@@ -105,8 +97,6 @@ export async function runsRoutes(app: FastifyInstance) {
           },
         }
       }
-      // Active run that has not journaled a board yet — rebuild from the latest
-      // node-boundary checkpoint so a fresh run still surfaces its board.
       if (active) {
         const inspection = await runtime.runCheckpoints?.inspect(sessionId)
         if (inspection?.status === 'available' && inspection.checkpoint.graphState) {

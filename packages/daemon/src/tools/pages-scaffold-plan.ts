@@ -47,11 +47,6 @@ const BLOCKED_SCAFFOLD_PARTS = new Set([
   'release-assets',
 ])
 
-/**
- * Resolves every filesystem target that pages.scaffold can create. Both the
- * policy engine and the executor use this plan so a newly added template file
- * cannot silently bypass strict-workspace validation.
- */
 export function resolvePagesScaffoldPathPlan(
   input: Record<string, unknown>,
   cwd?: string,
@@ -112,11 +107,6 @@ export function resolvePagesScaffoldPolicyTargets(
   return [plan.repoRoot, plan.siteRoot, ...plan.targets.map((target) => target.absolutePath)]
 }
 
-/**
- * Revalidates the immutable workspace root and a concrete output immediately
- * before filesystem mutation. Existing symlinks/junctions are resolved, while
- * missing suffixes are appended to the nearest canonical existing ancestor.
- */
 export async function assertPagesScaffoldExecutionBoundary(
   workspaceRoot: string,
   targetPath: string,

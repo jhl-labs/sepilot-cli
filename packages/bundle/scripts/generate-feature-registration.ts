@@ -2,15 +2,6 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 import { validateFeatureSelection } from '../../daemon/src/features/feature-catalog.js'
 
-/**
- * Loads `build.features.yaml` (or an override path) and flattens it into the
- * set of disabled feature ids. A missing file means "all features enabled".
- * `channels:` is a nested map; each `false` entry under it becomes
- * `channels.<name>`. The nested `desktop:` map is a Desktop compile-time
- * contract consumed by Next/Electron builds and is deliberately ignored by
- * daemon binary generation. Other unknown keys are passed through as-is so
- * `validateFeatureSelection` can reject them with a proper error.
- */
 export function loadBuildFeatures(path?: string): { disabled: Set<string> } {
   const filePath = path ?? process.env.SEPILOT_BUILD_FEATURES_FILE ?? 'build.features.yaml'
   let raw: string
@@ -57,8 +48,6 @@ interface RouteEntry {
   funcName: string
 }
 
-// Order matches the committed stub exactly — see
-// packages/daemon/src/generated/feature-registration.ts.
 const TOOL_ENTRIES: ToolEntry[] = [
   { featureId: 'lsp', alias: 'lsp', importPath: '../features/entries/lsp.js', section: 'tools' },
   {
@@ -237,12 +226,14 @@ const ROUTE_ENTRIES: RouteEntry[] = [
     importPath: '../features/entries/routes-swarm.js',
     funcName: 'registerSwarmFeatureRoutes',
   },
+  {
+    featureId: 'event-routing',
+    alias: 'routesEventRouting',
+    importPath: '../features/entries/routes-event-routing.js',
+    funcName: 'registerEventRoutingFeatureRoutes',
+  },
 ]
 
-// Extra entry modules imported only for the second-pass runtime/capability
-// wiring below (a2a/acp runtime services, plugin loader, wiki/extensions
-// capability routes). delegation + micro-apps reuse the aliases already
-// imported by TOOL_ENTRIES.
 interface RuntimeEntry {
   featureId: string
   alias: string
@@ -275,13 +266,13 @@ const RUNTIME_ENTRIES: RuntimeEntry[] = [
     alias: 'extensions',
     importPath: '../features/entries/extensions.js',
   },
+  {
+    featureId: 'event-routing',
+    alias: 'eventRoutingRuntime',
+    importPath: '../features/entries/event-routing-runtime.js',
+  },
 ]
 
-/**
- * Renders the full content of `packages/daemon/src/generated/feature-registration.ts`
- * for the given disabled-feature set. With an empty set, the output is
- * byte-identical to the committed stub (guarded by a regression test).
- */
 export function renderFeatureRegistration(disabled: Set<string>): string {
   const errors = validateFeatureSelection(disabled)
   if (errors.length > 0) {
@@ -300,11 +291,14 @@ export function renderFeatureRegistration(disabled: Set<string>): string {
   lines.push('  FeatureToolDeps,')
   lines.push('  FeatureRouteDeps,')
   lines.push('  FeatureRuntimeToolDeps,')
+  lines.push('  FeatureEventRoutingHooks,')
+  lines.push('  FeatureEventRoutingRuntime,')
+  lines.push('  FeatureEventRoutingStopRuntime,')
   lines.push("} from '../features/types.js'")
   lines.push("import type { ChannelFactoryRegistry } from '../server/runtime/channels.js'")
   lines.push("import type { SepilotdConfig } from '../config/schema.js'")
   lines.push("import type { A2ATaskStore } from '../a2a/server.js'")
-  lines.push("import type { ExternalAcpAgentDispatcher } from '../acp/external-agent.js'")
+  lines.push("import type { ExternalAgentRuntime } from '../acp/external-agent.js'")
   lines.push("import type { PluginLoader } from '../plugins/loader.js'")
   lines.push(
     "import type { OpenApiComponentOverrides, OpenApiOverrideMap } from '../server/openapi.js'",
@@ -363,8 +357,6 @@ export function renderFeatureRegistration(disabled: Set<string>): string {
   lines.push('}')
   lines.push('')
 
-  // Second-pass runtime registrations (called from buildRuntime after the
-  // storage layer exists). Each is a no-op / null when its feature is off.
   lines.push('export function registerDelegationRuntimeTool(')
   lines.push('  registry: ToolRegistry,')
   lines.push('  deps: FeatureRuntimeToolDeps,')
@@ -405,7 +397,7 @@ export function renderFeatureRegistration(disabled: Set<string>): string {
   lines.push('export function createAcpRuntime(')
   lines.push('  registry: ToolRegistry,')
   lines.push('  deps: FeatureRuntimeToolDeps,')
-  lines.push('): ExternalAcpAgentDispatcher | null {')
+  lines.push('): ExternalAgentRuntime | null {')
   if (isOn('acp')) {
     lines.push('  return acpRuntime.createAcpRuntime(registry, deps)')
   } else {
@@ -427,9 +419,6 @@ export function renderFeatureRegistration(disabled: Set<string>): string {
   lines.push('}')
   lines.push('')
 
-  // Plugin OpenAPI docs — routed through the manifest so server/app.ts does not
-  // statically import the plugin route module (which carries the `List plugins`
-  // marker). Empty when plugins are disabled.
   lines.push('export function getPluginsOpenApiComponents(): OpenApiComponentOverrides {')
   if (isOn('plugins')) {
     lines.push('  return plugins.pluginOpenApiComponents')
@@ -475,9 +464,6 @@ export function renderFeatureRegistration(disabled: Set<string>): string {
     lines.push('')
   }
 
-  // Capability routes registered directly (no prefix) from
-  // server/capability-routes.ts. Gated here so wiki/extensions code drops from
-  // the bundle when disabled.
   lines.push(
     'export async function registerWikiFeatureRoutes(app: FastifyInstance): Promise<void> {',
   )
@@ -500,17 +486,38 @@ export function renderFeatureRegistration(disabled: Set<string>): string {
   lines.push('}')
   lines.push('')
 
-  // Drop the trailing blank line after the last function; the file ends with one newline.
+  const eventRoutingOn = isOn('event-routing')
+  const eventRoutingOff = '  // event-routing feature disabled in this build'
+  lines.push(
+    'export function startEventRoutingFeature(runtime: FeatureEventRoutingRuntime): FeatureEventRoutingHooks {',
+  )
+  if (eventRoutingOn) {
+    lines.push('  return eventRoutingRuntime.startEventRouting(runtime)')
+  } else {
+    lines.push(eventRoutingOff)
+    lines.push('  return {}')
+  }
+  lines.push('}')
+  lines.push('')
+
+  lines.push(
+    'export async function stopEventRoutingFeature(runtime: FeatureEventRoutingStopRuntime): Promise<void> {',
+  )
+  lines.push(eventRoutingOn ? '  await eventRoutingRuntime.stopEventRouting(runtime)' : eventRoutingOff)
+  lines.push('}')
+  lines.push('')
+
+  lines.push('export function installEventRoutingLlmRunner(app: FastifyInstance): void {')
+  lines.push(eventRoutingOn ? '  eventRoutingRuntime.installLlmRunner(app)' : eventRoutingOff)
+  lines.push('}')
+  lines.push('')
+
   if (lines[lines.length - 1] === '') lines.pop()
   lines.push('')
 
   return lines.join('\n')
 }
 
-/**
- * Loads build.features.yaml (or the given path), renders the generated
- * source, and writes it to `outFile`.
- */
 export function generateFeatureRegistration(options: { featuresFile?: string; outFile: string }): {
   disabled: string[]
 } {

@@ -49,9 +49,16 @@ import { FilePicker, type FilePickerItem } from '../components/FilePicker.js'
 import { SwarmAttachView, type SwarmAttachTarget } from '../components/SwarmAttachView.js'
 import { ProviderSetupModal, type ProviderSetupStep } from '../components/ProviderSetupModal.js'
 import { ProviderDeleteModal } from '../components/ProviderDeleteModal.js'
+import { ProviderManager, buildProviderManagerRows } from '../components/ProviderManager.js'
+import {
+  firstProviderSetupStep,
+  previousProviderSetupStep,
+  validateProviderConnection,
+  type ProviderConnectionFieldKey,
+} from '../utils/provider-wizard.js'
 import { ModelPicker } from '../components/ModelPicker.js'
 import {
-  buildProviderModelPickerList,
+  buildProviderPickerList,
   type ProviderModelPickerItem,
 } from '../utils/provider-models.js'
 import { ModePicker } from '../components/ModePicker.js'
@@ -123,8 +130,6 @@ import {
   buildProviderSecretEnvUpdate,
   buildProviderSetupDraft,
   findBuiltinProviderPreset,
-  isValidProviderEnvVarName,
-  managedProviderApiKeyEnvVar,
   reconcileProviderModelDiscovery,
   type ConfiguredProviderRecord,
   type ProviderSetupDraft,
@@ -152,10 +157,12 @@ import {
   primaryCommands,
   type CommandDef,
 } from './commands/registry.js'
-import { runModeCommand, runModelCommand } from './commands/runtime-selection.js'
+import { PRIVILEGE_DESCRIPTIONS, nextPrivilege } from './privilege.js'
+import { AUTO_BOT_ENTRY, ENGINE_OVERRIDE_ENTRY, runBotCommand, runModeCommand, runModelCommand } from './commands/runtime-selection.js'
 import { runProjectCommand, runUsageCommand } from './commands/workspace.js'
 import { runSessionCommand } from './commands/session.js'
 import { ChoiceDialog } from './dialogs/ChoiceDialog.js'
+import { ActivityDialog } from './dialogs/ActivityDialog.js'
 import { TasksDialog } from './dialogs/TasksDialog.js'
 import { runTasksCommand } from '../../commands/tasks.js'
 import { runRewind } from '../../commands/rewind.js'
@@ -192,6 +199,8 @@ import {
   replayInlineInputControls,
   stripBracketedPasteDelimiters,
 } from '../utils/hangul.js'
+import { currentTurnToolCounts, formatRunWatchLabel, presentReasoningPreview } from '../utils/run-notices.js'
+import { detectCliLocale } from '../../utils/locale.js'
 import {
   clampGraphemeOffset,
   nextGraphemeOffset,
@@ -208,6 +217,8 @@ import {
   estimateConversationTokens,
 } from '../utils/context-token-estimate.js'
 
+const cliLocale = detectCliLocale()
+
 const MODE_FALLBACKS = [
   { id: 'auto', name: 'Auto', description: 'Choose the best agent automatically' },
   { id: 'build', name: 'Build', description: 'Implement and validate changes' },
@@ -218,13 +229,8 @@ const THINKING_OPTIONS = ['auto', 'off', 'low', 'medium', 'high', 'max'].map((va
   value,
   label: value,
 }))
-const AUTONOMY_OPTIONS = [
-  'readonly',
-  'accept-edits',
-  'workspace-write',
-  'supervised',
-  'autonomous',
-].map((value) => ({ value, label: value }))
+const AUTONOMY_OPTIONS = (['readonly', 'supervised', 'accept-edits', 'workspace-write', 'autonomous'] as const)
+  .map((value) => ({ value, label: `${value} — ${PRIVILEGE_DESCRIPTIONS[value]}` }))
 const MAX_TOKEN_OPTIONS = [
   { value: 'default', label: 'Provider default' },
   { value: '4096', label: '4,096' },
@@ -277,6 +283,7 @@ interface InlineProviderSetupState {
   validating: boolean
   saving: boolean
   error: string | null
+  errorField: ProviderConnectionFieldKey | null
 }
 
 interface InlineProviderDeleteState {
@@ -310,23 +317,14 @@ function preferredModelPickerIndex(options: {
   const preferredProvider = options.target === 'default'
     ? options.defaultProvider
     : options.currentProvider
-  const preferredModel = options.target === 'default'
-    ? options.defaultModel
-    : options.currentModel
-  const ordered = buildProviderModelPickerList(
+  const ordered = buildProviderPickerList(
     options.providers,
     options.currentProvider,
-    options.currentModel,
-    '',
-    {
-      defaultProviderId: options.defaultProvider,
-      defaultModelId: options.defaultModel,
-    },
+    options.defaultProvider,
+    options.defaultModel,
   ).ordered
   const index = ordered.findIndex((item) => (
-    item.kind === 'model'
-    && item.providerId === preferredProvider
-    && item.modelId === preferredModel
+    item.kind === 'provider' && item.providerId === preferredProvider
   ))
   return index >= 0 ? index : 0
 }
@@ -337,7 +335,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const { stdout } = useStdout()
   const { rows, columns: width } = useTerminalSize(stdout)
   const [client] = useState(() => runtime?.client ?? new DaemonClient(config.url))
-  const [swarmClient] = useState(() => runtime?.swarmClient ?? createSwarmClient({ baseUrl: config.url, token: loadDaemonToken() }))
+  const [swarmClient] = useState(() => runtime?.swarmClient ?? createSwarmClient({ baseUrl: config.url, token: loadDaemonToken(config.url) }))
   const {
     state,
     dispatch,
@@ -399,6 +397,15 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const [modeIndex, setModeIndex] = useState(0)
   const [modeLoading, setModeLoading] = useState(false)
   const [modeError, setModeError] = useState<string | null>(null)
+  const [bots, setBots] = useState<DaemonAgentDescriptor[]>([AUTO_BOT_ENTRY])
+  const [botQuery, setBotQuery] = useState('')
+  const [botIndex, setBotIndex] = useState(0)
+  const [botLoading, setBotLoading] = useState(false)
+  const [botError, setBotError] = useState<string | null>(null)
+  const fetchBotEntries = useCallback(async (): Promise<DaemonAgentDescriptor[]> => {
+    const list = await client.bots()
+    return [AUTO_BOT_ENTRY, ...list.map((bot) => ({ id: bot.id, name: bot.name, description: `${bot.description} [${bot.engine}]` })), ENGINE_OVERRIDE_ENTRY]
+  }, [client])
   const [sessions, setSessions] = useState<DaemonSessionMeta[]>([])
   const [sessionQuery, setSessionQuery] = useState('')
   const [sessionIndex, setSessionIndex] = useState(0)
@@ -441,6 +448,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const [themeId, setThemeId] = useState<ThemeId>(() => getActiveThemeId())
   const [autonomyPurpose, setAutonomyPurpose] = useState<'session' | 'default'>('session')
   const [defaultAutonomy, setDefaultAutonomy] = useState<typeof state.autonomy | null>(null)
+  const [configuredPrivilege, setConfiguredPrivilege] = useState<string | null>(null)
   const [recapEnabled, setRecapEnabled] = useState(true)
   const [lastTurnRecap, setLastTurnRecap] = useState<string | null>(null)
   const [showToolDetails, setShowToolDetails] = useState(false)
@@ -463,6 +471,10 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const [swarmAttachTarget, setSwarmAttachTarget] = useState<SwarmAttachTarget | null>(null)
   const [providerSetup, setProviderSetup] = useState<InlineProviderSetupState | null>(null)
   const [providerDelete, setProviderDelete] = useState<InlineProviderDeleteState | null>(null)
+  const [providerManagerIndex, setProviderManagerIndex] = useState(0)
+  const [providerManagerLoading, setProviderManagerLoading] = useState(false)
+  const [providerManagerError, setProviderManagerError] = useState<string | null>(null)
+  const [configuredProviderTypes, setConfiguredProviderTypes] = useState<Record<string, string>>({})
 
   const keybindings = useMemo(
     () => runtime?.keybindings ?? loadKeybindings((path) => readFileSync(path, 'utf8'), homedir()),
@@ -570,9 +582,6 @@ export function NextApp({ config, runtime }: NextAppProps) {
     recapToolCallsRef.current = new Map()
     idleToolIdsRef.current = new Set(state.toolCalls.map((call) => call.id))
     if (!snapshot || !recapEnabled) return
-    // Tool rows can be transient: some daemon surfaces omit them from the
-    // finalized assistant message. Use the calls observed during the run so
-    // the recap does not silently disappear at completion.
     const recap = buildTurnRecap(snapshot, turnToolCalls, state.usage, Date.now())
     setLastTurnRecap(recap)
   }, [recapEnabled, state.isStreaming, state.toolCalls, state.usage])
@@ -592,12 +601,13 @@ export function NextApp({ config, runtime }: NextAppProps) {
         setProviderDefaults({ provider: defaultProvider, model: defaultModel })
         if (!config.provider && defaultProvider) dispatch({ type: 'SET_PROVIDER', provider: defaultProvider })
         if (!config.model && defaultModel) dispatch({ type: 'SET_MODEL', model: defaultModel })
-        if (daemonConfig.agent?.autonomy) dispatch({ type: 'SET_AUTONOMY', autonomy: daemonConfig.agent.autonomy })
-        if (daemonConfig.agent?.thinkingLevel) dispatch({ type: 'SET_THINKING_LEVEL', thinkingLevel: daemonConfig.agent.thinkingLevel })
+        if (daemonConfig.agent?.autonomy) {
+          dispatch({ type: 'SET_AUTONOMY', autonomy: daemonConfig.agent.autonomy })
+          setConfiguredPrivilege(daemonConfig.agent.autonomy)
+        }
+        if (daemonConfig.agent?.thinkingLevel) dispatch({ type: 'SET_THINKING_LEVEL', thinkingLevel: daemonConfig.agent.thinkingLevel, source: 'default' })
       })
       .catch(() => {
-        // Startup remains usable when metadata is temporarily unavailable;
-        // the model picker exposes retryable errors when opened explicitly.
       })
       .finally(() => {
         if (active) setProviderMetadataLoading(false)
@@ -609,7 +619,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
     let active = true
     void client.userCommands()
       .then((commands) => { if (active) setUserCommands(commands) })
-      .catch(() => { /* Custom command discovery is optional while the daemon is unavailable. */ })
+      .catch(() => {})
     return () => { active = false }
   }, [client])
 
@@ -682,6 +692,41 @@ export function NextApp({ config, runtime }: NextAppProps) {
       .finally(() => active && setModelLoading(false))
     return () => { active = false }
   }, [client, dialogs, modelPickerPurpose, state.model, state.provider])
+
+  useEffect(() => {
+    if (dialogs.at(-1) !== 'providers') return
+    let active = true
+    setProviderManagerLoading(true)
+    setProviderManagerError(null)
+    void Promise.all([client.providers(), client.config()])
+      .then(([nextProviders, daemonConfig]) => {
+        if (!active) return
+        setProviders(nextProviders)
+        setProviderDefaults({
+          provider: daemonConfig.agent?.defaultProvider ?? '',
+          model: daemonConfig.agent?.defaultModel ?? '',
+        })
+        setConfiguredProviderTypes(Object.fromEntries(
+          ((daemonConfig.providers ?? []) as ConfiguredProviderRecord[])
+            .map((provider) => [String(provider.id), String(provider.type)] as const),
+        ))
+      })
+      .catch((error) => active && setProviderManagerError(errorMessage(error)))
+      .finally(() => active && setProviderManagerLoading(false))
+    return () => { active = false }
+  }, [client, dialogs])
+
+  useEffect(() => {
+    if (dialogs.at(-1) !== 'bot') return
+    let active = true
+    setBotLoading(true)
+    setBotError(null)
+    void fetchBotEntries()
+      .then((entries) => active && setBots(entries))
+      .catch((error) => active && setBotError(errorMessage(error)))
+      .finally(() => active && setBotLoading(false))
+    return () => { active = false }
+  }, [fetchBotEntries, dialogs])
 
   useEffect(() => {
     if (dialogs.at(-1) !== 'mode') return
@@ -901,10 +946,11 @@ export function NextApp({ config, runtime }: NextAppProps) {
       const preset = requestedPreset ?? findBuiltinProviderPreset(existing?.type) ?? PROVIDER_WIZARD_PRESETS[0] ?? null
       if (!preset) throw new Error('No provider presets are available.')
       const draft = buildProviderSetupDraft({ provider: existing, preset, currentProvider: state.provider, currentModel: state.model })
+      const allowPresetSelection = !providerId && !requestedPreset
       setProviderSetup({
         mode: existing ? 'edit' : 'new',
-        step: providerId || requestedPreset ? 'providerId' : 'preset',
-        allowPresetSelection: !providerId && !requestedPreset,
+        step: firstProviderSetupStep(allowPresetSelection),
+        allowPresetSelection,
         applyToCurrentSession: false,
         preset,
         selectedPresetIndex: Math.max(0, PROVIDER_WIZARD_PRESETS.findIndex((entry) => entry.type === preset.type)),
@@ -923,6 +969,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         validating: false,
         saving: false,
         error: null,
+        errorField: null,
       })
       openDialog('providerSetup')
     } catch (error) { setStatusError(errorMessage(error)) }
@@ -934,7 +981,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
     setProviderSetup((current) => {
       if (!current) return current
       const draft = buildProviderSetupDraft({ preset, currentProvider: state.provider, currentModel: state.model })
-      return { ...current, preset, selectedPresetIndex: index, sourceProviderId: null, providerId: draft.providerId, baseUrl: draft.baseUrl, apiKeyEnvVar: draft.apiKeyEnvVar, apiKeyValue: '', headersText: formatProviderHeadersInput(draft.headers), model: draft.model, modelSuggestions: preset.type === 'ollama' ? [] : buildProviderModelSuggestions(draft), modelSuggestionIndex: 0, modelAliasSource: undefined, step: 'providerId', error: null }
+      return { ...current, preset, selectedPresetIndex: index, sourceProviderId: null, providerId: draft.providerId, baseUrl: draft.baseUrl, apiKeyEnvVar: draft.apiKeyEnvVar, apiKeyValue: '', headersText: formatProviderHeadersInput(draft.headers), model: draft.model, modelSuggestions: preset.type === 'ollama' ? [] : buildProviderModelSuggestions(draft), modelSuggestionIndex: 0, modelAliasSource: undefined, step: 'connection', error: null, errorField: null }
     })
   }, [state.model, state.provider])
 
@@ -978,126 +1025,71 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const advanceProviderSetup = useCallback(async () => {
     const current = providerSetup
     if (!current || !current.preset || current.loading || current.validating || current.saving) return
-    const required = (message: string) => setProviderSetup((value) => value ? { ...value, error: message } : value)
+    const preset = current.preset
     if (current.step === 'preset') { selectProviderPreset(current.selectedPresetIndex); return }
-    if (current.step === 'providerId') {
-      if (!current.providerId.trim()) { required('Provider id is required.'); return }
-      setProviderSetup({ ...current, providerId: current.providerId.trim(), step: current.preset.type === 'ollama' || current.preset.type === 'custom' ? 'baseUrl' : 'apiKeyValue', error: null })
-      return
-    }
-    if (current.step === 'baseUrl') {
-      const raw = current.baseUrl.trim().replace(/\/+$/, '')
-      if (!raw) { required('Base URL is required.'); return }
-      const baseUrl = current.preset.type === 'custom' && !raw.endsWith('/v1') ? `${raw}/v1` : raw
-      if (current.preset.type === 'custom') {
-        setProviderSetup({ ...current, baseUrl, step: 'apiKeyValue', error: null })
-        return
-      }
-      setProviderSetup({ ...current, baseUrl, loading: true, error: null })
-      const discovered = await detectOllamaModels(baseUrl).catch(() => [])
-      setProviderSetup((value) => {
-        if (!value) return value
-        const selection = reconcileProviderModelDiscovery({
-          currentModel: value.model,
-          discoveredModels: discovered,
-          fallbackModels: value.modelSuggestions.length > 0
-            ? value.modelSuggestions
-            : current.preset?.suggestedModels,
-          defaultModel: current.preset?.type === 'ollama' ? 'llama3.3' : undefined,
-        })
-        return {
-          ...value,
-          baseUrl,
-          loading: false,
-          ...selection,
-          step: 'model',
-          error: null,
-        }
-      })
-      return
-    }
-    if (current.step === 'apiKeyEnv') {
-      const apiKeyEnvVar = current.apiKeyEnvVar.trim()
-      if (!apiKeyEnvVar && current.preset.type !== 'custom') { required('API key env var is required.'); return }
-      if (apiKeyEnvVar && !isValidProviderEnvVarName(apiKeyEnvVar)) { required('API key env var must match [A-Za-z_][A-Za-z0-9_]*.'); return }
-      setProviderSetup({ ...current, apiKeyEnvVar, step: current.preset.type === 'custom' ? 'headers' : 'model', error: null })
-      return
-    }
-    if (current.step === 'apiKeyValue') {
-      if (!current.apiKeyValue.length) {
-        setProviderSetup({ ...current, apiKeyValue: '', step: 'apiKeyEnv', error: null })
-        return
-      }
-      setProviderSetup({
-        ...current,
-        apiKeyEnvVar: managedProviderApiKeyEnvVar({
-          providerId: current.providerId,
-          preset: current.preset,
-          currentEnvVar: current.apiKeyEnvVar,
-        }),
-        step: current.preset.type === 'custom' ? 'headers' : 'model',
-        error: null,
-      })
-      return
-    }
-    if (current.step === 'headers') {
-      let headers: Record<string, string>
-      try {
-        headers = parseProviderHeadersInput(current.headersText ?? '')
-      } catch (error) {
-        required(errorMessage(error))
-        return
-      }
-      setProviderSetup({ ...current, headersText: (current.headersText ?? '').trim(), loading: true, error: null })
-      const discovered = await client.discoverProviderModels({
-        type: current.preset.type,
+    if (current.step === 'connection') {
+      const validation = validateProviderConnection({
+        providerId: current.providerId,
         baseUrl: current.baseUrl,
-        apiKey: current.apiKeyValue.length > 0
-          ? current.apiKeyValue
-          : (current.apiKeyEnvVar ? `\${${current.apiKeyEnvVar}}` : undefined),
-        headers,
-      }).then((result) => result.models).catch(() => [])
+        apiKeyEnvVar: current.apiKeyEnvVar,
+        apiKeyValue: current.apiKeyValue,
+        headersText: current.headersText ?? '',
+      }, preset)
+      if (!validation.ok) {
+        setProviderSetup({ ...current, error: validation.error, errorField: validation.field })
+        return
+      }
+      const normalized = { ...current, ...validation.values, error: null, errorField: null }
+      if (!validation.discovery) {
+        const draft: ProviderSetupDraft = {
+          sourceProviderId: current.sourceProviderId,
+          preset,
+          providerId: normalized.providerId,
+          baseUrl: normalized.baseUrl,
+          apiKeyEnvVar: normalized.apiKeyEnvVar,
+          model: normalized.model,
+          models: current.modelSuggestions,
+        }
+        setProviderSetup({
+          ...normalized,
+          modelSuggestions: buildProviderModelSuggestions(draft),
+          modelSuggestionIndex: 0,
+          step: 'model',
+        })
+        return
+      }
+      setProviderSetup({ ...normalized, loading: true })
+      const discovered = validation.discovery.kind === 'ollama'
+        ? await detectOllamaModels(validation.discovery.baseUrl).catch(() => [])
+        : await client.discoverProviderModels({
+            type: validation.discovery.type,
+            baseUrl: validation.discovery.baseUrl,
+            apiKey: validation.discovery.apiKey,
+            headers: validation.discovery.headers,
+          }).then((result) => result.models).catch(() => [])
       const selection = reconcileProviderModelDiscovery({
-        currentModel: current.model,
+        currentModel: normalized.model,
         discoveredModels: discovered,
-        fallbackModels: current.modelSuggestions,
+        fallbackModels: current.modelSuggestions.length > 0
+          ? current.modelSuggestions
+          : preset.suggestedModels,
+        defaultModel: preset.type === 'ollama' ? 'llama3.3' : undefined,
       })
-      setProviderSetup({
-        ...current,
-        headersText: (current.headersText ?? '').trim(),
-        loading: false,
-        ...selection,
-        step: 'model',
-        error: null,
-      })
+      setProviderSetup((value) => value ? { ...value, ...selection, loading: false, step: 'model' } : value)
       return
     }
     if (current.step === 'model') {
-      if (!current.model.trim()) { required('Model name is required.'); return }
+      if (!current.model.trim()) { setProviderSetup({ ...current, error: 'Model name is required.' }); return }
       setProviderSetup({ ...current, model: current.model.trim(), step: 'confirm', error: null })
       return
     }
     await saveProviderSetup(current)
-  }, [providerSetup, saveProviderSetup, selectProviderPreset])
+  }, [client, providerSetup, saveProviderSetup, selectProviderPreset])
 
   const backProviderSetup = useCallback(() => setProviderSetup((current) => {
     if (!current || current.loading || current.validating || current.saving) return current
-    const previous: Partial<Record<ProviderSetupStep, ProviderSetupStep>> = {
-      confirm: 'model',
-      model: current.preset?.type === 'ollama'
-        ? 'baseUrl'
-        : current.preset?.type === 'custom'
-          ? 'headers'
-          : 'apiKeyValue',
-      headers: current.apiKeyValue.length > 0 ? 'apiKeyValue' : 'apiKeyEnv',
-      apiKeyValue: current.preset?.type === 'custom' ? 'baseUrl' : 'providerId',
-      baseUrl: 'providerId',
-      apiKeyEnv: 'apiKeyValue',
-      providerId: 'preset',
-    }
-    const step = previous[current.step]
-    if (!step || (current.step === 'providerId' && !current.allowPresetSelection)) return null
-    return { ...current, step, error: null }
+    const step = previousProviderSetupStep(current.step, current.allowPresetSelection)
+    return step ? { ...current, step, error: null, errorField: null } : current
   }), [])
 
   const confirmProviderDelete = useCallback(async () => {
@@ -1171,7 +1163,36 @@ export function NextApp({ config, runtime }: NextAppProps) {
     }
   }, [client, closeTopDialog, showNotice])
 
-  const openProviderDeleteFromPicker = useCallback(async (providerId: string) => {
+  const providerManagerRows = useMemo(() => buildProviderManagerRows({
+    providers,
+    configuredTypes: configuredProviderTypes,
+    currentProvider: state.provider,
+    defaultProvider: providerDefaults.provider,
+    defaultModel: providerDefaults.model,
+  }), [configuredProviderTypes, providerDefaults.model, providerDefaults.provider, providers, state.provider])
+
+  const setProviderDefaultFromManager = useCallback(async (providerId: string) => {
+    setProviderManagerError(null)
+    try {
+      const snapshot = await client.config()
+      const updates = buildProviderDefaultUpdate({
+        config: { providers: snapshot.providers ?? [], agent: snapshot.agent },
+        providerId,
+      })
+      await client.updateConfig(updates)
+      const nextProvider = String(updates['agent.defaultProvider'])
+      const nextModel = String(updates['agent.defaultModel'])
+      setProviderDefaults({ provider: nextProvider, model: nextModel })
+      showNotice(`Daemon default set to ${nextProvider}/${nextModel}.`)
+    } catch (error) {
+      setProviderManagerError(errorMessage(error))
+    }
+  }, [client, showNotice])
+
+  const openProviderDeleteFromPicker = useCallback(async (
+    providerId: string,
+    reportError: (message: string) => void = setModelError,
+  ) => {
     setModelError(null)
     try {
       const snapshot = await client.config()
@@ -1195,7 +1216,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       })
       openDialog('providerDelete')
     } catch (error) {
-      setModelError(errorMessage(error))
+      reportError(errorMessage(error))
     }
   }, [client, openDialog, providers])
 
@@ -1227,7 +1248,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         showNotice(`Model set to daemon default ${selection.providerId}/${selection.modelId}.`)
         return
       case 'setup':
-        void openProviderSetup()
+        openDialog('providers')
         return
       case 'setup-preset':
         void openProviderSetup(undefined, selection.presetType)
@@ -1257,6 +1278,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
     closeTopDialog,
     dispatch,
     modelPickerPurpose,
+    openDialog,
     openProviderDeleteFromPicker,
     openProviderSetup,
     setProviderDefaultFromPicker,
@@ -1271,6 +1293,19 @@ export function NextApp({ config, runtime }: NextAppProps) {
     setStatusError(result.ok ? null : (result.error ?? 'clipboard failed'))
     return result.ok
   }, [runtime, stdout])
+
+  const changePrivilege = useCallback((level: typeof state.autonomy) => {
+    dispatch({ type: 'SET_AUTONOMY', autonomy: level })
+    if (!state.isStreaming || !state.sessionId) {
+      showNotice(`Privilege: ${level}`)
+      return
+    }
+    void client.setSessionPrivilege(state.sessionId, level)
+      .then((result) => showNotice(result.applied
+        ? `Privilege: ${result.level} (applied to the running turn)`
+        : `Privilege: ${result.level} (from the next turn)`))
+      .catch((error) => setStatusError(`Privilege change not applied to the running turn: ${errorMessage(error)}`))
+  }, [client, dispatch, showNotice, state.isStreaming, state.sessionId])
 
   const runCommand = useCallback(async (command: CommandDef, args = '') => {
     setStatusError(null)
@@ -1289,7 +1324,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       case 'shell.help':
         setInfo({
           title: 'Help',
-          body: 'Enter send · Ctrl+J newline · Ctrl+C cancel/clear; twice exit · Ctrl+D exit · Ctrl+X leader\nF11 plan/todo · F12 agent loop · Ctrl+O latest file · Esc return\n/new fresh session · /clear local transcript · /compact context · /doctor health',
+          body: 'Enter send · Ctrl+J newline · Ctrl+C cancel/clear; twice exit · Ctrl+D exit · Ctrl+X leader\n→ tasks (empty input) · F11 plan/todo · F12 agent loop · Ctrl+O expand activity · /preview latest file · Esc return\n/new fresh session · /clear local transcript · /compact context · /doctor health',
         })
         openDialog('info')
         return
@@ -1306,7 +1341,17 @@ export function NextApp({ config, runtime }: NextAppProps) {
           showNotice,
         })
         return
+      case 'bot.pick':
+        await runBotCommand(args, {
+          bots, currentBot: state.bot ?? null, fetchBots: fetchBotEntries, openPicker: () => openDialog('bot'),
+          select: (bot) => { dispatch({ type: 'SET_BOT', bot }); showNotice(bot ? `Pinned bot: ${bot}` : 'Auto: the router picks a bot per turn.') },
+          setError: setStatusError, showNotice,
+        })
+        return
       case 'mode.pick':
+        if (state.bot && args.trim() && args.trim() !== 'current' && args.trim() !== 'info') {
+          showNotice(`Engine override: this replaces the engine bot ${state.bot} would use. /mode auto lets the bot choose again.`)
+        }
         await runModeCommand(args, {
           agents, fallbacks: MODE_FALLBACKS, currentMode: state.mode,
           fetchAgents: () => client.agents(), openPicker: () => openDialog('mode'),
@@ -1632,7 +1677,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
             `Tokens   ${(state.usage.input + state.usage.output).toLocaleString()}`,
             `Model    ${state.provider}/${state.model}`,
             `Mode     ${state.mode}`,
-            `Autonomy ${state.autonomy}`,
+            `Privilege ${state.autonomy}`,
           ].join('\n'))
         } catch (error) { setStatusError(errorMessage(error)) }
         return
@@ -1845,7 +1890,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         if (!['on', 'off'].includes(action)) { setStatusError('Usage: /recap <on|off|status>'); return }
         const enabled = action === 'on'
         setRecapEnabled(enabled)
-        try { await recordRecapPreference(enabled) } catch { /* session setting still applies */ }
+        try { await recordRecapPreference(enabled) } catch {}
         showNotice(`Recap ${enabled ? 'enabled' : 'disabled'}.`)
         return
       }
@@ -2115,11 +2160,10 @@ export function NextApp({ config, runtime }: NextAppProps) {
         return
       case 'shell.exit': exit(); return
       case 'autonomy.pick':
-        if (args === 'current' || args === 'info') { showNotice(`Current autonomy: ${state.autonomy}`); return }
+        if (args === 'current' || args === 'info') { showNotice(`Current privilege: ${state.autonomy}`); return }
         if (args) {
-          if (!AUTONOMY_OPTIONS.some(({ value }) => value === args)) { setStatusError('Usage: /autonomy <readonly|accept-edits|workspace-write|supervised|autonomous>'); return }
-          dispatch({ type: 'SET_AUTONOMY', autonomy: args as typeof state.autonomy })
-          showNotice(`Autonomy: ${args}`)
+          if (!AUTONOMY_OPTIONS.some(({ value }) => value === args)) { setStatusError('Usage: /privilege <supervised|accept-edits|workspace-write|readonly|autonomous>'); return }
+          changePrivilege(args as typeof state.autonomy)
           return
         }
         setAutonomyPurpose('session'); openDialog('autonomy'); return
@@ -2135,7 +2179,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       }
       case 'providers.open': {
         const [action, value] = args.split(/\s+/).filter(Boolean)
-        if (!action) { openModelPicker('session'); return }
+        if (!action || action === 'list' || action === 'manage') { openDialog('providers'); return }
         if (action === 'setup' || action === 'add' || action === 'config') { await openProviderSetup(undefined, value); return }
         if (action === 'edit') {
           if (!value) { setStatusError('Usage: /provider edit <id>'); return }
@@ -2199,6 +2243,12 @@ export function NextApp({ config, runtime }: NextAppProps) {
         } catch (error) { setStatusError(errorMessage(error)) }
         return
       }
+      case 'files.preview':
+        await openLatestFilePreview()
+        return
+      case 'agent.activity':
+        openDialog('activity')
+        return
       case 'agent.planner':
         openDialog('planTodo')
         return
@@ -2216,7 +2266,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       default:
         setStatusError(`No inline handler is registered for ${command.id}.`)
     }
-  }, [answerQuestion, cancelQueuedFollowUps, client, copyText, dispatch, exit, fileRoot, getTokenSpeedStats, inputValue, loadSession, openDialog, openModelPicker, recapEnabled, rememberQueuedFollowUp, replaceComposerValue, resetTokenSpeedStats, runtime, sendMessage, showNotice, state.autonomy, state.debateRounds, state.editRollbacks, state.isStreaming, state.messages, state.mode, state.model, state.pendingApproval, state.pendingQuestions, state.plannerWorkingMemory, state.provider, state.sessionId, state.thinkingLevel, state.usage.input, state.usage.output, themeId])
+  }, [answerQuestion, cancelQueuedFollowUps, client, copyText, dispatch, exit, fileRoot, getTokenSpeedStats, inputValue, loadSession, openDialog, openLatestFilePreview, openModelPicker, recapEnabled, rememberQueuedFollowUp, replaceComposerValue, resetTokenSpeedStats, runtime, sendMessage, showNotice, state.autonomy, state.debateRounds, state.editRollbacks, state.isStreaming, state.messages, state.mode, state.model, state.pendingApproval, state.pendingQuestions, state.plannerWorkingMemory, state.provider, state.sessionId, state.thinkingLevel, state.usage.input, state.usage.output, themeId])
 
   const submitInput = useCallback(async () => {
     const text = composeHangul(replayInlineInputControls(inputValueRef.current)).normalize('NFC').trim()
@@ -2238,7 +2288,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       }
       const gate = resolveLocalShellGate({ autonomy: state.autonomy })
       if (gate === 'block') {
-        setStatusError("Local shell is disabled under autonomy 'readonly'.")
+        setStatusError("Local shell is disabled under privilege 'readonly'.")
         return
       }
       lastShellCommand.current = shellCommand
@@ -2410,7 +2460,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
     let active = true
     void client.skills({ includeDisabled: true, cwd: fileRoot, workspaceRoot: fileRoot })
       .then((items) => { if (active) setSkills(items) })
-      .catch(() => { /* The explicit skill manager exposes retryable errors. */ })
+      .catch(() => {})
     return () => { active = false }
   }, [activeSkillReference, client, fileRoot, skills.length])
 
@@ -2419,6 +2469,13 @@ export function NextApp({ config, runtime }: NextAppProps) {
   useEffect(() => { setSkillSuggestionIndex(0) }, [activeSkillReference?.query])
 
   useInput((input, key) => {
+    if (key.escape && !dialogOpen && state.isStreaming) {
+      if (queuedFollowUpsRef.current.some((queued) => queued.sessionId === state.sessionId)) {
+        void cancelQueuedFollowUps({ selector: 'all' })
+      }
+      cancelStream()
+      return
+    }
     if (key.escape && !dialogOpen && inputValueRef.current.startsWith('!')) {
       historyIndexRef.current = null
       setHistoryDraft('')
@@ -2427,13 +2484,6 @@ export function NextApp({ config, runtime }: NextAppProps) {
       return
     }
     if (key.escape && !dialogOpen && !inputValue) {
-      const queued = [...queuedFollowUpsRef.current].reverse().find(
-        (candidate) => candidate.sessionId === state.sessionId,
-      )
-      if (state.isStreaming && queued) {
-        void cancelQueuedFollowUps({ noteId: queued.noteId })
-        return
-      }
       const now = Date.now()
       if (now - lastEmptyEscapeAt.current <= 700) {
         lastEmptyEscapeAt.current = 0
@@ -2490,7 +2540,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       return
     }
     if (key.ctrl && input.toLowerCase() === 'o') {
-      void openLatestFilePreview()
+      openDialog('activity')
       return
     }
     if (key.ctrl && input.toLowerCase() === 'p') {
@@ -2517,6 +2567,10 @@ export function NextApp({ config, runtime }: NextAppProps) {
       const cursor = cursorOffsetRef.current
       const next = `${current.slice(0, cursor)}${leaderResult.text}${current.slice(cursor)}`
       applyComposerValue(next, cursor + leaderResult.text.length)
+      return
+    }
+    if ((key.tab && key.shift) || input === '\u001b[Z') {
+      changePrivilege(nextPrivilege(state.autonomy, configuredPrivilege) as typeof state.autonomy)
       return
     }
     if (suggestions.length > 0 && key.upArrow) {
@@ -2586,6 +2640,10 @@ export function NextApp({ config, runtime }: NextAppProps) {
       )
       return
     }
+    if (key.rightArrow && !key.ctrl && !key.meta && !key.shift && !inputValueRef.current) {
+      openDialog('planTodo')
+      return
+    }
     if (key.rightArrow) {
       const current = inputValueRef.current
       applyComposerValue(
@@ -2621,8 +2679,6 @@ export function NextApp({ config, runtime }: NextAppProps) {
       void submitInput()
       return
     }
-    // Ink 5 names the DEL byte (0x7f) `delete`, although most terminals emit
-    // it for Backspace. Preserve terminal Backspace semantics for both flags.
     if (key.backspace || key.delete) {
       const current = inputValueRef.current
       const cursor = cursorOffsetRef.current
@@ -2639,16 +2695,10 @@ export function NextApp({ config, runtime }: NextAppProps) {
     if (input && !key.ctrl && !key.meta) {
       setExitArmed(false)
       historyIndexRef.current = null
-      // Ink forwards a paste as one input string. PTYs and automation can also
-      // coalesce the following Enter byte into that same string, so parse the
-      // trailing submit delimiter instead of inserting a literal carriage
-      // return into the prompt. Bracketed paste newlines remain prompt text.
       const bracketedPaste = input.includes('\x1b[200~')
         || input.includes('\x1b[201~')
         || input.includes('[200~')
         || input.includes('[201~')
-      // This composer intentionally treats LF as a multiline insertion
-      // (Ctrl+J) and CR as submit (Enter).
       const submitAfterInsertion = !bracketedPaste && /(?:\r\n|\r)$/u.test(input)
       const insertionInput = submitAfterInsertion
         ? input.replace(/(?:\r\n|\r)+$/u, '')
@@ -2676,12 +2726,15 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const visibleMessages = useMemo(() => {
     const start = Math.min(clearedMessageCount, state.messages.length)
     const result: Message[] = state.messages.slice(start)
-    if (showThinking && state.thinkingText) {
+    const reasoningPreview = showThinking && state.thinkingText
+      ? presentReasoningPreview(state.thinkingText, { details: showToolDetails, locale: cliLocale })
+      : null
+    if (reasoningPreview) {
       const reasoningMessage: Message = {
         id: '__active-reasoning__',
         role: 'system',
         variant: 'thinking',
-        content: state.thinkingText,
+        content: reasoningPreview,
         timestamp: Date.now(),
       }
       if (state.currentMessage) {
@@ -2701,7 +2754,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       })
     }
     return result
-  }, [clearedMessageCount, showThinking, state.currentMessage, state.messages, state.thinkingText, state.toolCalls])
+  }, [clearedMessageCount, showThinking, showToolDetails, state.currentMessage, state.messages, state.thinkingText, state.toolCalls])
   const currentModel = useMemo(() => {
     const model = providers
       .find(({ id }) => id === state.provider)
@@ -2733,8 +2786,25 @@ export function NextApp({ config, runtime }: NextAppProps) {
     streamStatus: state.streamStatus,
     counts: state.stateBoardCounts,
   })
+  const providerWaitLabel = state.isStreaming && state.providerWait
+    ? `${state.providerWait.auxiliary ? 'reviewing' : 'waiting for model'} ${Math.max(0, Math.floor((Date.now() - state.providerWait.startedAt) / 1000))}s`
+    : null
+  const turnToolCounts = useMemo(() => currentTurnToolCounts(state.messages), [state.messages])
+  const runWatchLabel = state.isStreaming && state.streamStartedAt
+    ? formatRunWatchLabel({
+        elapsedMs: Date.now() - state.streamStartedAt,
+        tools: turnToolCounts,
+        modelWaitMs: state.providerWait && !state.providerWait.auxiliary
+          ? Date.now() - state.providerWait.startedAt
+          : null,
+        locale: cliLocale,
+        showElapsed: false,
+      })
+    : null
   const interactiveProgressLabel = humanInputLabel
-    ?? (state.isStreaming ? progressLabel ?? 'waiting for model events' : progressLabel)
+    ?? (state.isStreaming
+      ? [progressLabel, providerWaitLabel, runWatchLabel].filter(Boolean).join(' · ') || 'waiting for model events'
+      : progressLabel)
 
   const settingsSelect = useCallback((itemId: string) => {
     if (itemId.startsWith('command:')) {
@@ -2846,14 +2916,16 @@ export function NextApp({ config, runtime }: NextAppProps) {
         validating={providerSetup.validating}
         saving={providerSetup.saving}
         error={providerSetup.error}
+        errorField={providerSetup.errorField}
+        allowPresetSelection={providerSetup.allowPresetSelection}
         maxVisibleItems={Math.max(4, Math.min(8, rows - 10))}
         onSelectPresetIndex={(index) => setProviderSetup((current) => current ? { ...current, selectedPresetIndex: index } : current)}
         onSelectPreset={selectProviderPreset}
-        onProviderIdChange={(providerId) => setProviderSetup((current) => current ? { ...current, providerId, error: null } : current)}
-        onBaseUrlChange={(baseUrl) => setProviderSetup((current) => current ? { ...current, baseUrl, error: null } : current)}
-        onApiKeyEnvVarChange={(apiKeyEnvVar) => setProviderSetup((current) => current ? { ...current, apiKeyEnvVar, error: null } : current)}
-        onApiKeyValueChange={(apiKeyValue) => setProviderSetup((current) => current ? { ...current, apiKeyValue, error: null } : current)}
-        onHeadersTextChange={(headersText) => setProviderSetup((current) => current ? { ...current, headersText, error: null } : current)}
+        onProviderIdChange={(providerId) => setProviderSetup((current) => current ? { ...current, providerId, error: null, errorField: null } : current)}
+        onBaseUrlChange={(baseUrl) => setProviderSetup((current) => current ? { ...current, baseUrl, error: null, errorField: null } : current)}
+        onApiKeyEnvVarChange={(apiKeyEnvVar) => setProviderSetup((current) => current ? { ...current, apiKeyEnvVar, error: null, errorField: null } : current)}
+        onApiKeyValueChange={(apiKeyValue) => setProviderSetup((current) => current ? { ...current, apiKeyValue, error: null, errorField: null } : current)}
+        onHeadersTextChange={(headersText) => setProviderSetup((current) => current ? { ...current, headersText, error: null, errorField: null } : current)}
         onModelChange={(model) => setProviderSetup((current) => current ? { ...current, model, modelAliasSource: undefined, error: null } : current)}
         onSelectModelSuggestionIndex={(modelSuggestionIndex) => setProviderSetup((current) => current ? { ...current, modelSuggestionIndex } : current)}
         onApplyModelSuggestion={(index) => setProviderSetup((current) => {
@@ -2871,6 +2943,21 @@ export function NextApp({ config, runtime }: NextAppProps) {
         onNext={() => { void advanceProviderSetup() }}
         onBack={backProviderSetup}
         onClose={() => { setProviderSetup(null); closeTopDialog() }}
+      />
+    ) : id === 'providers' ? (
+      <ProviderManager
+        key={id}
+        rows={providerManagerRows}
+        selectedIndex={providerManagerIndex}
+        loading={providerManagerLoading}
+        error={providerManagerError}
+        maxVisibleItems={Math.max(4, Math.min(10, rows - 8))}
+        onSelectIndex={setProviderManagerIndex}
+        onAdd={() => { void openProviderSetup() }}
+        onEdit={(providerId) => { void openProviderSetup(providerId) }}
+        onSetDefault={(providerId) => { void setProviderDefaultFromManager(providerId) }}
+        onDelete={(providerId) => { void openProviderDeleteFromPicker(providerId, setProviderManagerError) }}
+        onClose={closeTopDialog}
       />
     ) : id === 'providerDelete' && providerDelete ? (
       <ProviderDeleteModal
@@ -2919,6 +3006,16 @@ export function NextApp({ config, runtime }: NextAppProps) {
         currentPhase={state.currentPhase}
         isStreaming={state.isStreaming}
         streamStatus={state.streamStatus}
+        width={width}
+        height={Math.max(8, rows - 2)}
+        onClose={closeTopDialog}
+      />
+    ) : id === 'activity' ? (
+      <ActivityDialog
+        key={id}
+        reasoning={state.thinkingText}
+        messages={state.messages}
+        isStreaming={state.isStreaming}
         width={width}
         height={Math.max(8, rows - 2)}
         onClose={closeTopDialog}
@@ -2975,6 +3072,8 @@ export function NextApp({ config, runtime }: NextAppProps) {
         currentModel={state.model}
         defaultProvider={providerDefaults.provider}
         defaultModel={providerDefaults.model}
+        preferredProvider={modelPickerPurpose === 'default' ? providerDefaults.provider : state.provider}
+        preferredModel={modelPickerPurpose === 'default' ? providerDefaults.model : state.model}
         selectedIndex={modelIndex}
         loading={modelLoading}
         error={modelError}
@@ -2982,6 +3081,27 @@ export function NextApp({ config, runtime }: NextAppProps) {
         onSelectIndex={setModelIndex}
         onConfirm={handleModelPickerSelection}
         onAddProvider={() => { void openProviderSetup() }}
+        onClose={closeTopDialog}
+      />
+    ) : id === 'bot' ? (
+      <ModePicker
+        key={id}
+        title="Bot Picker"
+        loadingLabel="Loading role bots..."
+        emptyLabel="No bots matched."
+        query={botQuery}
+        agents={bots}
+        currentMode={state.bot ?? 'auto'}
+        selectedIndex={botIndex}
+        loading={botLoading}
+        error={botError}
+        onQueryChange={setBotQuery}
+        onSelectIndex={setBotIndex}
+        onConfirm={(bot) => {
+          closeTopDialog()
+          if (bot.id === ENGINE_OVERRIDE_ENTRY.id) { openDialog('mode'); return }
+          dispatch({ type: 'SET_BOT', bot: bot.id === 'auto' ? null : bot.id })
+        }}
         onClose={closeTopDialog}
       />
     ) : id === 'mode' ? (
@@ -3166,13 +3286,13 @@ export function NextApp({ config, runtime }: NextAppProps) {
     ) : id === 'thinking' ? (
       <ChoiceDialog key={id} title="Thinking level" options={THINKING_OPTIONS} current={state.thinkingLevel} width={width} onSelect={(value) => { dispatch({ type: 'SET_THINKING_LEVEL', thinkingLevel: value as typeof state.thinkingLevel }); closeTopDialog() }} onClose={closeTopDialog} />
     ) : id === 'autonomy' ? (
-      <ChoiceDialog key={id} title={autonomyPurpose === 'default' ? 'Default autonomy' : 'Autonomy'} options={AUTONOMY_OPTIONS} current={autonomyPurpose === 'default' ? (defaultAutonomy ?? state.autonomy) : state.autonomy} width={width} onSelect={(value) => {
+      <ChoiceDialog key={id} title={autonomyPurpose === 'default' ? 'Default privilege' : 'Privilege'} options={AUTONOMY_OPTIONS} current={autonomyPurpose === 'default' ? (defaultAutonomy ?? state.autonomy) : state.autonomy} width={width} onSelect={(value) => {
         if (autonomyPurpose === 'default') {
           void client.updateConfig({ 'agent.autonomy': value as typeof state.autonomy })
-            .then(() => { setDefaultAutonomy(value as typeof state.autonomy); closeTopDialog() })
+            .then(() => { setDefaultAutonomy(value as typeof state.autonomy); setConfiguredPrivilege(value); closeTopDialog() })
             .catch((error) => setStatusError(errorMessage(error)))
         } else {
-          dispatch({ type: 'SET_AUTONOMY', autonomy: value as typeof state.autonomy })
+          changePrivilege(value as typeof state.autonomy)
           closeTopDialog()
         }
       }} onClose={closeTopDialog} />
@@ -3190,13 +3310,17 @@ export function NextApp({ config, runtime }: NextAppProps) {
         isStreaming={state.isStreaming}
         width={width}
         runningTools={state.toolCalls}
+        activities={state.activities}
         compactTools={!showToolDetails}
         showBrandMark={!dialogOpen}
         activityFrame={activityAnimation.frame}
         suspended={dialogOpen}
       />
       {state.pendingApproval ? (
-        <ApprovalModal compact approval={state.pendingApproval} onResolve={(approved, scope, note) => { void resolveApproval(approved, scope, note) }} />
+        <ApprovalModal compact approval={state.pendingApproval} onResolve={(approved, scope, note, interrupt) => {
+          void resolveApproval(approved, scope, note)
+          if (interrupt) cancelStream()
+        }} onShowFull={(text) => dispatch({ type: 'SYSTEM_MESSAGE', content: `Full ${state.pendingApproval?.toolName ?? 'tool'} request for review:\n${text}` })} />
       ) : pendingQuestion ? (
         <QuestionDialog
           question={pendingQuestion}
@@ -3238,6 +3362,9 @@ export function NextApp({ config, runtime }: NextAppProps) {
           <Text color={colors.dimText}>↑/↓ move  Enter/Tab select</Text>
         </Box>
       ) : null}
+      {!dialogOpen && state.isStreaming && state.plannerWorkingMemory?.currentStepRationale ? (
+        <Text color={colors.info} wrap="truncate-end">Why now · {state.plannerWorkingMemory.currentStepRationale.replace(/\s+/g, ' ')} · /planner details</Text>
+      ) : null}
       {!dialogOpen ? <Composer value={inputValue} cursorOffset={cursorOffset} leaderArmed={leaderState.armed} leaderHintText={leaderHint(keybindings.bindings, titles)} busy={state.isStreaming} busyLabel={interactiveProgressLabel} activityFrame={activityAnimation.frame} activityColor={activityAnimation.color} width={width} hardwareCursor={runtime?.hardwareCursor} /> : null}
       {!dialogOpen && lastTurnRecap ? (
         <Text color={colors.dimText}>{lastTurnRecap}</Text>
@@ -3247,6 +3374,9 @@ export function NextApp({ config, runtime }: NextAppProps) {
           ? 'Connecting to daemon…'
           : `${state.provider}/${state.model}`}
         mode={state.mode}
+        bot={state.bot ?? (state.routedBot ? `${state.routedBot} (auto)` : 'auto')}
+        engineOverride={state.mode !== 'auto'}
+        tokensPerSecond={state.tokensPerSecond ?? null}
         autonomy={state.autonomy}
         contextPercent={contextPercent}
         contextTokens={contextTokens}

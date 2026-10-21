@@ -33,12 +33,6 @@ export function isExplicitWebSearchRequest(input: string): boolean {
     || EXPLICIT_WEB_SEARCH_EN_RE.test(actionable)
 }
 
-/**
- * Resolve the smallest live-information tool surface that can satisfy an
- * explicit request. This intentionally does not match generic factual
- * questions: instant mode remains tool-free unless the user names web access
- * or asks for time-sensitive market data.
- */
 export function resolveExplicitLiveInformationToolNames(
   input: string,
 ): readonly string[] | null {

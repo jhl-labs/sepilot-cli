@@ -12,9 +12,6 @@ import type {
 import type { JobExecutionResult } from './engine.js'
 
 const MAX_INCOMPLETE_REASON_LENGTH = 500
-// Text fallback for rows with no recorded stop kind: the pre-stop-reason
-// wording, plus the structured wording emitted when the kind was observed but
-// (older daemon, failed column write) not persisted alongside it.
 const SCHEDULED_INCOMPLETE_ERROR =
   /^Scheduled agent (?:reported an incomplete result|stopped: (?:incomplete|blocked)\/)(?:[.:/]|$)?/iu
 
@@ -22,10 +19,6 @@ export function projectStoredJobRunOutcome(input: {
   status: JobRunStatus
   error: string | null
   outputExcerpt: string | null
-  /**
-   * Structured termination cause recorded by current daemons. Older rows have
-   * none, so the text probes below remain the compatibility fallback.
-   */
   stopKind?: RunStopKind | null
 }): {
   taskOutcome: JobRunTaskOutcome
@@ -35,8 +28,6 @@ export function projectStoredJobRunOutcome(input: {
     return { taskOutcome: 'running', statusIntegrity: 'consistent' }
   }
 
-  // Prefer the recorded stop kind: it states the cause outright instead of
-  // inferring it from how the final answer happened to be worded.
   const incomplete = input.stopKind != null
     ? input.stopKind === 'incomplete' || input.stopKind === 'blocked'
     : SCHEDULED_INCOMPLETE_ERROR.test(input.error?.trim() ?? '')
@@ -62,14 +53,10 @@ function compactReason(value: string): string {
 }
 
 export function scheduledAgentExecutionResult(input: {
-  /** Raw agent protocol output, before a channel strips ANSWER:/INCOMPLETE:. */
   rawOutput: string
-  /** Optional surface-safe output persisted in run history instead of raw protocol text. */
   output?: string
   usage?: JobExecutionResult['usage']
-  /** Internal fallback responses are incomplete even when they have no literal stem. */
   forceIncomplete?: boolean
-  /** Structured termination cause from the agent's done event, when observed. */
   stopReason?: RunStopReason
 }): JobExecutionResult {
   const output = input.output ?? input.rawOutput
@@ -77,6 +64,8 @@ export function scheduledAgentExecutionResult(input: {
     || hasIncompleteAnswerStem(input.rawOutput)
     || input.stopReason?.kind === 'incomplete'
     || input.stopReason?.kind === 'blocked'
+    || input.stopReason?.kind === 'error'
+    || input.stopReason?.kind === 'cancelled'
   if (!incomplete) {
     return {
       ...(output ? { output } : {}),
@@ -95,12 +84,6 @@ export function scheduledAgentExecutionResult(input: {
   }
 }
 
-/**
- * Lead with the machine-readable cause. The retained tool output that follows
- * can run to hundreds of characters, so a reader (or an operator scanning
- * last_error) previously had to guess whether the run crashed, was blocked, or
- * simply ran out of a deliberate budget with its state still resumable.
- */
 export function formatScheduledIncompleteReason(
   blocker: string,
   stopReason?: RunStopReason,

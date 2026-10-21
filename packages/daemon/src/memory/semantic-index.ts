@@ -104,10 +104,6 @@ export interface MemoryEmbedder {
   embed(texts: string[], model?: string): Promise<number[][]>
 }
 
-// Bounded retry for transient embedding failures. Without it, a single
-// transient provider error permanently parks a memory outside semantic search
-// (the backfill selector excluded all 'failed' rows forever). A failed row is
-// retried up to MAX attempts, each after a cooldown window, then parked.
 function resolveEmbedMaxAttempts(): number {
   const raw = Number(process.env.SEPILOTD_EMBED_MAX_ATTEMPTS)
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 5
@@ -115,7 +111,6 @@ function resolveEmbedMaxAttempts(): number {
 
 function resolveEmbedRetryMinutes(): number {
   const raw = Number(process.env.SEPILOTD_EMBED_RETRY_MINUTES)
-  // 0 is valid (retry on the very next pass); only fall back on unset/invalid.
   return Number.isFinite(raw) && raw >= 0 ? raw : 5
 }
 
@@ -240,11 +235,8 @@ const MEMORY_MAINTENANCE_ID = '__memory_maintenance__'
 const GRAPH_LOW_CONFIDENCE_THRESHOLD = 0.45
 const GRAPH_STALE_AFTER_DAYS = 180
 const DOCUMENT_EMBEDDING_BATCH_SIZE = 32
-// Ceiling on chunks produced by a single document ingest, so a pathologically
-// large document cannot flood the memories table + embedding queue.
 const MAX_DOCUMENT_CHUNKS = 2_000
 
-/** Run each attempt in order and take the first that returns any rows. */
 function firstNonEmpty<T>(...attempts: Array<() => T[]>): T[] {
   for (const attempt of attempts) {
     const rows = attempt()
@@ -442,7 +434,7 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
       try {
         const parsed = memoryEvidenceSchema.safeParse(JSON.parse(row.metadata ?? '{}').memory)
         if (parsed.success) evidence = parsed.data
-      } catch { /* Legacy document metadata has no memory evidence. */ }
+      } catch {}
       return { ...entry, ...(evidence ? { evidence } : {}), createdAt: row.created_at, updatedAt: row.updated_at }
     })
   }
@@ -454,9 +446,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     if (!content) throw new Error('Document content is required')
 
     const tags = JSON.stringify(input.tags ?? [])
-    // Content-hash dedup: re-ingesting the same title/tags/content must not
-    // multiply rows. When the caller does not pin an explicit id, reuse the id
-    // of an identical existing document so the upsert updates it in place.
     const contentHash = createHash('sha256')
       .update(`${title}\n${tags}\n${content}`)
       .digest('hex')
@@ -740,7 +729,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     sets.push("updated_at = datetime('now')")
 
     if (sets.length === 1) {
-      // only updated_at — nothing changed, treat as no-op.
       return existing
     }
 
@@ -750,9 +738,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
       WHERE id = @id
     `).run(params)
 
-    // Propagate the new tags / title into the chunk-level memories rows so
-    // memory.documents.search and memory.search keep returning consistent
-    // metadata.
     if (input.tags !== undefined) {
       this.db.prepare(`
         UPDATE memories
@@ -801,10 +786,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     const limit = options?.limit ?? 10
     const type = options?.type ?? (this.isSemanticQueryable() ? 'hybrid' : 'keyword')
 
-    // When a tag filter is active it is applied in JS after the backend LIMIT,
-    // so fetching exactly `limit` candidates under-returns whenever any are
-    // filtered out. Over-fetch a wider candidate window, filter, then trim to
-    // the requested limit.
     const tagFilterActive = Boolean(options?.tags?.length || options?.excludeTags?.length)
     const fetchLimit = tagFilterActive ? Math.min(Math.max(limit * 4, limit), 500) : limit
 
@@ -821,21 +802,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
       raw = this.applyTagFilter(this.mergeHybridResults(semantic, keyword, fetchLimit), options)
     }
 
-    // Nothing matched at all. Rather than answer "no memories" for something
-    // that is stored, retry the keyword pass with its looser forms.
-    //
-    // Korean glues particles onto the stem, so a memory saved as `주 개발 언어는
-    // TypeScript` indexes the token `언어는` and a search for `언어` matched
-    // nothing — a memory the user had saved a moment earlier came back as zero
-    // hits. Recall is also asked in whole sentences ("주력 언어 프로그래밍",
-    // "내 노트북 OS") that no single memory contains every word of. Against real
-    // stored data those queries go from 0 hits to 8 and 9 this way.
-    //
-    // Only on an empty result, so every query that already returned something
-    // keeps returning exactly what it did: the widened forms trade precision
-    // for recall, and that trade is only worth making against nothing.
-    // Not for `type: 'semantic'`, which promises vector results only and must
-    // stay empty rather than fall back to keyword matching.
     if (raw.length === 0 && type !== 'semantic') {
       raw = this.applyTagFilter(
         this.keywordSearch(trimmedQuery, fetchLimit, { ...options, widenWhenEmpty: true }),
@@ -843,10 +809,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
       )
     }
 
-    // Optional chronological re-sort: relevance backends rank by score, but
-    // operators sometimes want newest-first / oldest-first (e.g. "지난주에
-    // 결정한 것"). Pull created_at / updated_at for the candidate ids in
-    // one batch so we don't N+1 the SQLite layer.
     if (options?.sortBy === 'createdAt' || options?.sortBy === 'updatedAt') {
       const column = options.sortBy === 'updatedAt' ? 'updated_at' : 'created_at'
       const ids = raw.map((entry) => entry.id)
@@ -885,8 +847,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
       const entryOwner = memoryResetOwner(tags)
       return !tags.some((tag) => tag.toLowerCase() === 'scope:public') && (entryOwner === owner || (owner === 'global' && entryOwner.startsWith('scope:session:')))
     }
-    // Enumerate authoritative storage without a search/list top-k ceiling. Fail
-    // before deleting anything when ownership metadata cannot be interpreted.
     const rows = (this.db.prepare('SELECT id, rowid, tags FROM memories').all() as Array<{ id: string; rowid: number; tags: string }>).filter((row) => owns(row.tags))
     const documents = (this.db.prepare('SELECT id, tags FROM memory_documents').all() as Array<{ id: string; tags: string }>).filter((row) => owns(row.tags))
     return { owner, rows, documents }
@@ -899,8 +859,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
 
   async forgetOwnedMemory(scopeTags: string[]): Promise<{ memories: number; documents: number; resetAt: string }> {
     const { owner, rows, documents } = this.ownedMemoryRows(scopeTags)
-    // External deletion must succeed before authoritative rows disappear, so a
-    // failed backend cleanup remains retryable and cannot be reported as success.
     await this.vectorBackend.delete(rows.map((row) => row.rowid))
     const resetAt = new Date().toISOString()
     this.db.transaction(() => {
@@ -957,11 +915,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
 
   async mergeMemories(input: MergeMemoriesInput): Promise<MergeMemoriesResult> {
     const embeddingState = this.isSemanticConfigured() ? 'pending' : 'disabled'
-    // The content update + duplicate deletes run inside one better-sqlite3
-    // transaction so a crash cannot leave the kept memory deleted with the
-    // merged row unwritten. Vector rows are cleaned up after the transaction
-    // commits (mirrors delete()/deleteDocument()), which is best-effort by
-    // design — the durable metadata is already consistent.
     const tx = this.db.transaction(() => {
       const kept = this.db.prepare(
         'SELECT rowid FROM memories WHERE id = ?',
@@ -979,7 +932,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
           'SELECT rowid, pinned FROM memories WHERE id = ?',
         ).get(removeId) as { rowid: number; pinned: number | null } | undefined
         if (!row) continue
-        // Never hard-delete a pinned duplicate — the user asked to keep it.
         if (row.pinned) {
           skippedPinned.push(removeId)
           continue
@@ -989,10 +941,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
         staleRowids.push(row.rowid)
       }
 
-      // Update ONLY content/tags/updated_at and invalidate the stale embedding.
-      // importance, base_importance, access_count, pinned, and created_at are
-      // deliberately left untouched so the merge preserves the kept memory's
-      // accumulated signal (the old delete+re-add reset all of these).
       if (input.tags !== undefined) {
         this.db.prepare(`
           UPDATE memories SET
@@ -1029,8 +977,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     })
 
     const outcome = tx()
-    // Drop vector rows for both the deleted duplicates and the kept memory
-    // (its embedding no longer matches the merged content; backfill re-embeds).
     await this.deleteVectorRows(outcome.staleRowids)
     this.persistDerivedStatus()
     return {
@@ -1074,9 +1020,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     })))
   }
 
-  /** Like listRecent but each row also carries created_at / updated_at so
-   *  callers (memory.export) can filter by time without a second query.
-   *  Optional createdAfter / createdBefore are applied at the SQL layer. */
   async listRecentWithTimestamps(
     limit: number,
     options: { createdAfter?: string; createdBefore?: string } = {},
@@ -1116,13 +1059,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     })))
   }
 
-  /**
-   * Bump access_count + last_accessed_at for the given ids. Best-effort:
-   * unknown ids are silently ignored, no throw, no audit (counter
-   * mutations are far too high-volume to log every hit). Duplicate ids
-   * within a single call each count — surfacing the same memory twice
-   * IS two accesses.
-   */
   async recordAccess(ids: string[]): Promise<void> {
     const counts = new Map<string, number>()
     for (const raw of ids) {
@@ -1184,14 +1120,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     }))
   }
 
-  /**
-   * Mark a memory as pin so the dreaming prune phase skips it. The
-   * column doubles as a recency timestamp (`last_accessed_at` is bumped
-   * on pin so a freshly-pinned item is also "warm" for ranking). Pin
-   * is idempotent — re-pinning is a no-op except for the timestamp
-   * refresh, which lets users revive a memory's freshness without
-   * actually accessing it.
-   */
   async pin(id: string): Promise<void> {
     const trimmed = id?.trim()
     if (!trimmed) return
@@ -1361,15 +1289,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
   }
 
   async recalculateImportanceScores(): Promise<number> {
-    // Deterministic recompute from a stable base, NOT a running ratchet. The
-    // old form did `importance = importance + age + access` every run, so a
-    // 6h+1d schedule drove almost everything to 1.0 within days and importance
-    // stopped discriminating (prune became a no-op). Here importance is
-    // re-derived each run as clamp(base_importance + recency + access): the
-    // base is fixed, created_at is fixed, and access_count only grows, so two
-    // consecutive runs with the same access_count produce the same score (no
-    // saturation, idempotent). base_importance is seeded from the current
-    // importance the first time a row is recomputed.
     const result = this.db.prepare(`
       UPDATE memories SET
         base_importance = COALESCE(base_importance, importance, 0.5),
@@ -1414,11 +1333,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     const maxImportance = options?.maxImportance ?? 0.1
     const actor = options?.actor ?? 'memory-maintenance'
     const reason = options?.reason ?? 'Pruned stale low-importance conversation memory'
-    // Two layers of prune protection:
-    //   1. Hot-memory: access_count > 0 AND last_accessed_at within 30d
-    //      → the agent keeps using it, retain.
-    //   2. Pinned: row.pinned = 1 → user explicitly marked it
-    //      indispensable, retain regardless of age/importance.
     const tx = this.db.transaction((ageDays: number, importance: number) => {
       const rows = this.db.prepare(`
         SELECT rowid, id, content, source, tags
@@ -1500,7 +1414,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     }
 
     void this.backfill(batchSize).catch(() => {
-      // Backfill is best-effort.
     })
   }
 
@@ -2375,7 +2288,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
           },
         })
       } catch {
-        // Repair should not become half-applied because the audit sink failed.
       }
     }
 
@@ -2387,12 +2299,9 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
 
   close(): void {
     this.closed = true
-    // Fold the WAL back into the main db so the -wal file does not accrue
-    // across restarts. Best-effort; never block close on a checkpoint error.
     try {
       this.db.pragma('wal_checkpoint(TRUNCATE)')
     } catch {
-      /* ignore checkpoint failure */
     }
     this.db.close()
   }
@@ -2559,11 +2468,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
       throw new Error('Embedding provider unavailable or does not support embeddings')
     }
 
-    // Atomic-swap-lite: probe the embedder BEFORE destroying the existing
-    // index. If the provider is actually down (not just object-present), this
-    // throws here and the old vectors/blobs stay queryable, instead of clearing
-    // first and then discovering the provider cannot rebuild — which would kill
-    // search until the provider recovers.
     const probe = await this.embedTexts(['reindex readiness probe'])
     this.validateEmbeddings(probe)
 
@@ -2663,9 +2567,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
   }
 
   private getNeedsEmbeddingWhereClause(): string {
-    // A row needs (re)embedding when it is missing/stale, OR when a prior
-    // embedding failed but is still within the bounded-retry budget and past
-    // its cooldown window (transient errors recover instead of parking forever).
     const maxAttempts = resolveEmbedMaxAttempts()
     return `
       content IS NOT NULL
@@ -2737,8 +2638,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
       const processed = await this.embedAndWriteWithSplitRetry(rows)
       total += processed
       if (processed === 0) {
-        // The whole batch failed and every row was marked for a later retry
-        // (cooldown); stop this pass instead of re-selecting the same rows.
         return total
       }
     }
@@ -2746,9 +2645,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     return total
   }
 
-  // Embed and persist a batch, bisecting on failure so a single bad row does
-  // not fail its whole batch. On singleton failure the row is marked failed
-  // (bounded retry). Returns the number of rows successfully embedded.
   private async embedAndWriteWithSplitRetry(rows: MemoryRow[]): Promise<number> {
     if (rows.length === 0) return 0
 
@@ -2901,9 +2797,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
   private markRowsFailed(ids: string[], error: string): void {
     if (ids.length === 0) return
 
-    // Increment the attempt counter and schedule the next retry a cooldown
-    // window out, so a transient failure is retried by a later backfill pass
-    // (bounded by SEPILOTD_EMBED_MAX_ATTEMPTS) rather than parked permanently.
     const retryMinutes = resolveEmbedRetryMinutes()
     const updateFailure = this.db.prepare(`
       UPDATE memories
@@ -2923,24 +2816,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     tx(ids, error)
   }
 
-  /**
-   * Build the FTS5 MATCH expression, matching each term as a prefix.
-   *
-   * FTS5's default tokenizer splits on whitespace and punctuation, which suits
-   * languages that separate words with spaces. Korean glues particles onto the
-   * stem, so a memory stored as `주 개발 언어는 TypeScript` indexes the token
-   * `언어는`, and the quoted-exact query `언어` matched nothing — recall of a
-   * memory the user had just saved silently returned zero hits while the same
-   * text was plainly there (`언어*` finds it, `언어` does not).
-   *
-   * The trailing `*` costs nothing for languages that already matched — an
-   * exact term is a prefix of itself — and makes agglutinative queries work
-   * without re-indexing every memory under a CJK-aware tokenizer.
-   *
-   * `prefix` and `joiner` pick how strict the match is. See
-   * {@link keywordSearch}: the exact, all-terms form runs first and the looser
-   * forms only when it finds nothing.
-   */
   private escapeFts5(
     query: string,
     options: { prefix?: boolean; joiner?: ' ' | ' OR ' } = {},
@@ -2982,17 +2857,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
 
       const exact = this.escapeFts5(query)
       if (exact) {
-        // Widen only when the stricter form found nothing, so a query that
-        // already worked keeps returning exactly what it did.
-        //
-        // Exact whole terms, all required, is right for a language that puts
-        // spaces between words. Korean glues particles onto the stem, so a
-        // memory stored as `주 개발 언어는 TypeScript` indexes `언어는` and a
-        // search for `언어` matched nothing — recall of a memory the user had
-        // just saved returned zero hits while the text was plainly there. And
-        // recall is asked in whole sentences ("주력 언어 프로그래밍", "내 노트북
-        // OS") that no single memory contains every word of. Against real data
-        // those two went from 0 hits to 8 and 9 through these fallbacks.
         const matched = options?.widenWhenEmpty
           ? firstNonEmpty(
               () => match(exact),
@@ -3010,7 +2874,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
         }))
       }
     } catch {
-      // Fall back to LIKE if the FTS parser rejects the query.
     }
 
     const rows = this.db.prepare(`
@@ -3075,9 +2938,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
       if (!needsEligibleRanking) {
         matches = await this.vectorBackend.search(new Float32Array(queryEmbedding), limit, this.embeddingModel)
       } else {
-      // Every backend maintains the authoritative SQLite embedding cache.
-      // Rank eligible rows locally when filtering; global KNN followed by a
-      // filter cannot guarantee scoped recall, regardless of over-fetch size.
       const statement = this.db.prepare(`
         SELECT m.rowid, m.embedding FROM memories m
         WHERE m.rowid > @cursor AND m.embedding IS NOT NULL AND m.embedding_model = @model
@@ -3094,7 +2954,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
           const embedding = blobToFloat32Array(row.embedding)
           if (embedding.length !== vector.length) continue
           const distance = cosineDistance(vector, embedding)
-          // Orthogonal/opposite vectors provide no positive semantic evidence.
           if (distance < 1) matches.push({ memoryRowid: row.rowid, distance })
         }
         matches.sort((a, b) => a.distance - b.distance)
@@ -3243,8 +3102,6 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
     }
   }
 
-  /** Subscribe to live audit events. Returns an unsubscribe handle.
-   *  Subscribers fire AFTER the audit row has been persisted. */
   subscribeAudit(listener: (entry: MemoryAuditEntry) => void): () => void {
     this.auditSubscribers.add(listener)
     return () => {
@@ -3294,12 +3151,10 @@ export class SqliteSemanticIndex implements SemanticMemoryStore {
       createdAt,
     }
     if (this.auditSubscribers.size > 0) {
-      // Snapshot subscribers — listeners are free to add/remove themselves.
       for (const listener of Array.from(this.auditSubscribers)) {
         try {
           listener(entry)
         } catch {
-          // A failing listener must not block the audit write.
         }
       }
     }

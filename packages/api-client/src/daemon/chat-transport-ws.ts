@@ -68,7 +68,6 @@ export async function runBrowserWebSocketChat(
       try {
         socket.close()
       } catch {
-        // Ignore close failures during teardown.
       }
       callback()
     }
@@ -100,7 +99,6 @@ export async function runBrowserWebSocketChat(
             finish(resolve)
           }
         } catch {
-          // Ignore malformed payloads from the server.
         }
       })()
     }
@@ -160,12 +158,6 @@ export async function runDaemonWsClientChat(params: {
 }
 
 export function isRetryableLocalWsError(error: unknown): boolean {
-  // Treat any failure that looks like "WS isn't usable here" as retryable so
-  // the caller falls back to plain HTTP+SSE. Covers:
-  //   - timeout / connect / ECONNREFUSED / socket   (transport-level fails)
-  //   - "Unexpected server response: 404|426"        (no WS handler at the
-  //     path — happens against test mocks and during rolling daemon upgrades
-  //     where /ws hasn't been wired yet)
   return error instanceof Error
     && /timeout|connect|ECONNREFUSED|socket|unexpected server response/i.test(
       error.message,

@@ -7,11 +7,6 @@ export const registerTools: FeatureToolRegistrar = (registry, deps) => {
   }
 }
 
-/**
- * Second-pass registration inside buildRuntime: re-registers the apps tools
- * (overriding the buildToolRegistry ones) now that the semantic index exists so
- * app content is searchable.
- */
 export const registerRuntimeTools: FeatureRuntimeToolRegistrar = (registry, deps) => {
   for (const tool of createAppsTools({
     dataDir: deps.dataDir,

@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type {
+  ContentPart,
   ChatRequest,
   ChatResponse,
   ILLMProvider,
@@ -16,12 +17,20 @@ import type {
 } from '@sepilotd/core'
 import { AcpStdioClient, type AcpClientSpec } from '../acp/client.js'
 import type { JsonRpcMessage } from '../acp/rpc.js'
-import { extractContent, toApiError } from './utils.js'
+import { extractContent, ProviderError, toApiError } from './utils.js'
+import { codexToolOutputSchema, parseCodexToolResponse, withCodexToolInstructions } from './codex-tool-transport.js'
 
 const DEFAULT_CONTEXT_WINDOW = 192_000
 const DEFAULT_MAX_OUTPUT_TOKENS = 128_000
 const DEFAULT_TIMEOUT_MS = 120_000
 const MODEL_LIST_TIMEOUT_MS = 15_000
+
+class CodexHostProtocolError extends Error {
+  constructor(message: string, readonly usage: TokenUsage) {
+    super(message)
+    this.name = 'CodexHostProtocolError'
+  }
+}
 
 interface CodexAppServerClient {
   start(): void
@@ -40,6 +49,7 @@ export interface CodexCatalogModel {
 
 interface CodexProviderOptions {
   models?: string[]
+  structuredToolCalling?: boolean
   defaultContextWindow?: number
   defaultMaxOutputTokens?: number
   env?: NodeJS.ProcessEnv
@@ -79,7 +89,7 @@ function uniqueModels(models: string[]): string[] {
   return Array.from(new Set(models.map((model) => model.trim()).filter(Boolean))).sort()
 }
 
-function toModelInfo(model: CodexCatalogModel): ModelInfo {
+function toModelInfo(model: CodexCatalogModel, structuredToolCalling = false): ModelInfo {
   return {
     id: model.id,
     name: model.name,
@@ -87,7 +97,7 @@ function toModelInfo(model: CodexCatalogModel): ModelInfo {
     maxOutputTokens: Math.min(model.maxOutputTokens, model.contextWindow),
     capabilities: {
       vision: model.vision,
-      toolUse: false,
+      toolUse: structuredToolCalling,
       streaming: false,
       embedding: false,
       thinking: true,
@@ -109,8 +119,8 @@ function configuredModel(
   }
 }
 
-function messageForPrompt(message: Message): string {
-  const content = extractContent(message)
+function messageForPrompt(message: Message, nextImage: () => number): string {
+  const content = typeof message.content === 'string' ? message.content : message.content.map(part => part.type === 'text' ? part.text : part.type === 'image' ? `[Image attachment ${nextImage()}]` : '').join('\n')
   const toolCalls = message.toolCalls?.length
     ? `\nTool calls: ${JSON.stringify(message.toolCalls)}`
     : ''
@@ -120,14 +130,86 @@ function messageForPrompt(message: Message): string {
   return `[${message.role}${toolName}]\n${content}${toolCalls}`
 }
 
+const CODEX_DISABLED_BUILTIN_TOOL_FEATURES = [
+  'shell_tool',
+  'unified_exec',
+  'code_mode_host',
+  'apps',
+  'plugins',
+  'remote_plugin',
+  'browser_use',
+  'browser_use_external',
+  'in_app_browser',
+  'computer_use',
+  'image_generation',
+  'view_image',
+  'multi_agent',
+  'multi_agent_v2',
+  'skill_search',
+  'tool_suggest',
+  'sleep_tool',
+  'goals',
+  'memories',
+] as const
+
+export const CODEX_APP_SERVER_ARGS: readonly string[] = [
+  'app-server',
+  '--listen',
+  'stdio://',
+  ...CODEX_DISABLED_BUILTIN_TOOL_FEATURES.flatMap((feature) => ['-c', `features.${feature}=false`]),
+  '-c',
+  'web_search="disabled"',
+]
+
+export const CODEX_TRANSPORT_BOUNDARY = [
+  "You are the language model behind a host application. Codex's own execution environment is disabled for this session: do not invoke Codex's shell, code mode, file, patch, web, MCP, plugin, skill, or subagent tools. The Codex sandbox and approval settings apply only to those disabled Codex tools.",
+  "If a Codex tool answers that it is disabled or unavailable, that is expected and says nothing about the host's tools or environment: never report it as a host failure or blocker. Do that work — a shell or git command included — with the host tool that runs commands.",
+  'The host application has its own tools and executes them itself, under its own permissions. When the transcript defines a tool-call format, every tool it lists is available to you, including tools that read, create, or edit files. To use one, write the call in exactly that format as your response. That is ordinary response text, not Codex tool use, and the host returns the result in a later message. Do not claim that a listed host tool is unavailable.',
+  'When the transcript defines no tool-call format, answer in text.',
+  'Return only the next assistant response for the transcript below.',
+].join(' ')
+
+const CODEX_DEVELOPER_INSTRUCTIONS = [
+  "Codex's own tools (shell commands, code mode, file access, patches, browsing, MCP servers, plugins, skills, subagents) are disabled and must not be invoked. The read-only sandbox applies only to them. A disabled-tool answer from Codex is expected and is not a host failure; run commands through the host's tools instead.",
+  'The user message is a transcript from a host application that executes its own tools. When it defines a tool-call format, request the tools it lists, file writes included, by writing calls in that format as your response text; that is not Codex tool use. Otherwise answer in text.',
+].join(' ')
+
 export function formatCodexProviderPrompt(request: ChatRequest): string {
+  let imageNumber = 0
   return [
     '[Transport boundary]',
-    'Act only as the language model for the transcript below. Do not use tools, read files, run commands, browse, access MCP servers, delegate work, or modify state. Return only the next assistant response based on the supplied transcript.',
+    CODEX_TRANSPORT_BOUNDARY,
     request.systemPrompt ? `[system]\n${request.systemPrompt}` : '',
-    ...request.messages.map(messageForPrompt),
+    ...request.messages.map(message => messageForPrompt(message, () => ++imageNumber)),
     '[assistant]',
   ].filter(Boolean).join('\n\n')
+}
+
+export function formatCodexProviderInput(request: ChatRequest): Array<{ type: 'text'; text: string } | { type: 'image'; url: string }> {
+  const images = request.messages.flatMap(message => typeof message.content === 'string' ? [] : message.content.filter((part): part is Extract<ContentPart, { type: 'image' }> => part.type === 'image'))
+  if (images.length > 16) throw new Error('Codex image input exceeds the 16 attachment limit')
+  const input: Array<{ type: 'text'; text: string } | { type: 'image'; url: string }> = [{ type: 'text', text: formatCodexProviderPrompt(request) }]
+  let bytes = 0
+  for (const image of images) {
+    const source = image.source
+    const url = source.type === 'base64' ? `data:${source.mediaType};base64,${source.data}` : source.data
+    if (!/^data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}$/i.test(url)) {
+      const remote = new URL(url)
+      if (!['https:', 'http:'].includes(remote.protocol) || remote.username || remote.password) throw new Error('Codex image input requires an image data URL or credential-free HTTP(S) URL')
+    }
+    bytes += Buffer.byteLength(url)
+    if (bytes > 20 * 1024 * 1024) throw new Error('Codex image input exceeds the 20 MiB encoded payload limit')
+    input.push({ type: 'image', url })
+  }
+  return input
+}
+
+function assertNoNativeToolCalls(request: ChatRequest): void {
+  if (!request.tools?.length || request.toolChoice === 'none') return
+  throw new ProviderError({
+    code: 'INVALID_REQUEST',
+    message: `Codex provider does not support native tool calling (${request.tools.length} tool definition(s) received for model ${request.model}); use the prompt-react tool transport`,
+  })
 }
 
 function parseThreadId(result: unknown): string {
@@ -240,6 +322,7 @@ export class CodexProvider implements ILLMProvider {
   private readonly modelLister?: CodexProviderOptions['modelLister']
   private readonly contextWindow: number
   private readonly maxOutputTokens: number
+  private readonly structuredToolCalling: boolean
   private catalogAuthority: ModelCatalogAuthority = 'configured'
 
   constructor(options: CodexProviderOptions = {}) {
@@ -249,9 +332,10 @@ export class CodexProvider implements ILLMProvider {
     this.modelLister = options.modelLister
     this.contextWindow = options.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW
     this.maxOutputTokens = options.defaultMaxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
+    this.structuredToolCalling = options.structuredToolCalling ?? this.env.SEPILOTD_CODEX_STRUCTURED_TOOLS === '1'
     const configured = uniqueModels(options.models ?? [])
     this.models = (configured.length > 0 ? configured : ['default'])
-      .map((id) => toModelInfo(configuredModel(id, this.contextWindow, this.maxOutputTokens)))
+      .map((id) => toModelInfo(configuredModel(id, this.contextWindow, this.maxOutputTokens), this.structuredToolCalling))
   }
 
   get modelCatalogAuthority(): ModelCatalogAuthority {
@@ -315,12 +399,27 @@ export class CodexProvider implements ILLMProvider {
     const nextSet = new Set(modelIds)
     const added = modelIds.filter((id) => !previousSet.has(id))
     const removed = previousIds.filter((id) => !nextSet.has(id))
-    this.models.splice(0, this.models.length, ...deduplicated.map(toModelInfo))
+    this.models.splice(0, this.models.length, ...deduplicated.map(model => toModelInfo(model, this.structuredToolCalling)))
     this.catalogAuthority = 'endpoint'
     return { modelIds, added, removed }
   }
 
   async chat(request: ChatRequest, options?: LLMRequestOptions): Promise<ChatResponse> {
+    try {
+      return await this.chatOnce(request, options)
+    } catch (error) {
+      if (!(error instanceof CodexHostProtocolError) || options?.signal?.aborted) throw error
+      const retry = await this.chatOnce({
+        ...request,
+        systemPrompt: [request.systemPrompt, `[Host response correction] The previous response was rejected by the host: ${error.message}. Respond again with exactly one JSON object with toolCalls and answer; every argumentsJson must be a valid JSON object string.`].filter(Boolean).join('\n'),
+      }, options)
+      return { ...retry, usage: { ...retry.usage, inputTokens: retry.usage.inputTokens + error.usage.inputTokens, outputTokens: retry.usage.outputTokens + error.usage.outputTokens } }
+    }
+  }
+
+  private async chatOnce(request: ChatRequest, options?: LLMRequestOptions): Promise<ChatResponse> {
+    if (!this.structuredToolCalling) assertNoNativeToolCalls(request)
+    const structured = this.structuredToolCalling && Boolean(request.tools?.length) && request.toolChoice !== 'none'
     const timeoutMs = Math.max(1, request.timeoutMs ?? DEFAULT_TIMEOUT_MS)
     const workspace = await mkdtemp(join(tmpdir(), 'sepilot-codex-provider-'))
     let threadId = ''
@@ -335,7 +434,7 @@ export class CodexProvider implements ILLMProvider {
     })
     const client = this.createClient({
       command: this.command,
-      args: ['app-server', '--listen', 'stdio://'],
+      args: [...CODEX_APP_SERVER_ARGS],
       cwd: workspace,
       env: this.env,
       framing: 'ndjson',
@@ -366,6 +465,7 @@ export class CodexProvider implements ILLMProvider {
         void client.request('turn/interrupt', { threadId, turnId }, timeoutMs).catch(() => {})
       }
       client.stop()
+      completeTurn({ status: 'cancelled' })
     }
     let completionTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -384,11 +484,13 @@ export class CodexProvider implements ILLMProvider {
         sandbox: 'read-only',
         ephemeral: true,
         serviceName: 'sepilotd-provider',
-        developerInstructions: 'Act only as a language model transport. Never use tools, commands, files, browsing, MCP servers, plugins, skills, or subagents. Produce only the requested assistant response.',
+        baseInstructions: CODEX_TRANSPORT_BOUNDARY,
+        developerInstructions: CODEX_DEVELOPER_INSTRUCTIONS,
       }, timeoutMs))
       turnId = parseTurnId(await client.request('turn/start', {
         threadId,
-        input: [{ type: 'text', text: formatCodexProviderPrompt(request) }],
+        input: formatCodexProviderInput(structured ? withCodexToolInstructions(request) : request),
+        ...(structured ? { outputSchema: codexToolOutputSchema(request) } : {}),
         ...(request.model === 'default' ? {} : { model: request.model }),
         approvalPolicy: 'never',
         sandboxPolicy: {
@@ -402,6 +504,7 @@ export class CodexProvider implements ILLMProvider {
         )
       })
       const result = await Promise.race([completion, timedCompletion])
+      options?.signal?.throwIfAborted()
       if (toolViolation) {
         throw new Error(`Codex provider attempted to use a forbidden tool: ${toolViolation}`)
       }
@@ -410,10 +513,16 @@ export class CodexProvider implements ILLMProvider {
       }
       const content = (finalText || fallbackText).trim()
       if (!content) throw new Error('Codex app-server returned an empty assistant response')
+      let message: Message
+      try {
+        message = structured ? parseCodexToolResponse(content, request) : { role: 'assistant' as const, content }
+      } catch (error) {
+        throw new CodexHostProtocolError((error as Error).message, usage)
+      }
       return {
-        message: { role: 'assistant', content },
+        message,
         usage,
-        finishReason: 'stop',
+        finishReason: message.toolCalls?.length ? 'tool_use' : 'stop',
       }
     } finally {
       if (completionTimer) clearTimeout(completionTimer)
@@ -428,10 +537,15 @@ export class CodexProvider implements ILLMProvider {
       const response = await this.chat(request, options)
       const content = extractContent(response.message)
       if (content) yield { type: 'text', text: content }
+      for (const toolCall of response.message.toolCalls ?? []) {
+        yield { type: 'tool_call_start', toolCall: { id: toolCall.id, name: toolCall.name } }
+        yield { type: 'tool_call_delta', toolCallId: toolCall.id, delta: JSON.stringify(toolCall.arguments) }
+        yield { type: 'tool_call_end', toolCallId: toolCall.id }
+      }
       yield { type: 'usage', usage: response.usage }
       yield { type: 'done', finishReason: response.finishReason }
     } catch (error) {
-      yield { type: 'error', error: toApiError(error) }
+      yield { type: 'error', error: error instanceof ProviderError ? error.apiError : toApiError(error) }
     }
   }
 

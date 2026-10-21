@@ -1,6 +1,3 @@
-// DocClient — 글쓰기 모드 (canvas) doc session HTTP client.
-// SSE event 구독은 browser EventSource로 직접 (renderer에서). 여기서는 REST만.
-
 import type { DocChange, DocDiffPreview, DocSession } from '@sepilotd/core'
 export type {
   DocChange,
@@ -14,15 +11,10 @@ export interface DocClientOptions {
   token: string | null
 }
 
-// Bare auth — used for GET/DELETE/POST calls that don't carry a JSON body.
-// Fastify rejects requests with `content-type: application/json` and an empty
-// body, so empty-body calls (close / undo / reload / accept / cancel / list)
-// must NOT advertise a JSON content type.
 function authHeaders(token: string | null): Record<string, string> {
   return token ? { authorization: `Bearer ${token}` } : {}
 }
 
-// JSON-body auth — for POST calls that do send a stringified body.
 function jsonAuthHeaders(token: string | null): Record<string, string> {
   return { 'content-type': 'application/json', ...authHeaders(token) }
 }
@@ -30,7 +22,7 @@ function jsonAuthHeaders(token: string | null): Record<string, string> {
 async function jsonOrThrow<T>(r: Response, label: string): Promise<T> {
   if (!r.ok) {
     let body: unknown = null
-    try { body = await r.json() } catch { /* noop */ }
+    try { body = await r.json() } catch {}
     throw new Error(`${label} failed (${r.status}): ${JSON.stringify(body)}`)
   }
   const raw = (await r.json()) as { data: T }
@@ -123,7 +115,6 @@ export function createDocClient(opts: DocClientOptions) {
       return jsonOrThrow<DocDiffPreview[]>(r, 'doc.previews')
     },
 
-    /** SSE event stream URL — renderer가 EventSource로 직접 연결. token은 query param. */
     eventsUrl(): string {
       const params = new URLSearchParams()
       if (opts.token) params.set('token', opts.token)

@@ -86,13 +86,6 @@ export async function persistChannelsConfig(
   const tempPath = `${configPath}.tmp`
   let persistedConfig: SepilotdConfig = runtimeConfig
 
-  // Read the on-disk config so we only rewrite the `channels`
-  // section and leave the operator's other edits (memory settings,
-  // providers, agent flags, ...) untouched. The original code
-  // swallowed every read or YAML.parse failure and wrote
-  // `runtimeConfig` whole, silently clobbering every other field
-  // when the file was momentarily unreadable or had a transient
-  // YAML error.
   let raw: string | null = null
   try {
     raw = await readFile(configPath, 'utf-8')
@@ -104,8 +97,6 @@ export async function persistChannelsConfig(
       })
       throw err
     }
-    // ENOENT — first run, no config file yet. Writing the runtime
-    // config wholesale is the right thing.
   }
 
   if (raw !== null) {
@@ -123,8 +114,6 @@ export async function persistChannelsConfig(
         )
       }
     } catch (err) {
-      // YAML.parse threw — the file exists but is malformed.
-      // Refuse rather than wipe the operator's other edits.
       log.error('config.yaml is unparseable; channels-only persist refused', {
         path: configPath,
         error: err instanceof Error ? err.message : String(err),

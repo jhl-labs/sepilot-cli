@@ -36,10 +36,6 @@ const NOTIFICATION_RELAY_INVALID_RESPONSE_MAX_ATTEMPTS = 3
 const NOTIFICATION_RELAY_STATUS_UNCONFIRMED_MAX_ATTEMPTS = 3
 const NOTIFICATION_RELAY_POLL_INTERVAL_MS = 30_000
 const durableNotificationRedactionContext = createTraceRedactionContext({
-  // Durable local notifications may legitimately name a workspace path. Keep
-  // that useful context while still scrubbing credentials and PII. External
-  // relay payloads use the normal trace context below, which aliases local
-  // machine paths before they leave the daemon.
   env: {} as NodeJS.ProcessEnv,
   cwd: '',
   stateDir: '',
@@ -47,9 +43,6 @@ const durableNotificationRedactionContext = createTraceRedactionContext({
 
 function redactDurableNotificationText(value: string): string {
   return redactSensitiveText(value, durableNotificationRedactionContext, {
-    // Persistence is not a presentation limit. Callers own their domain
-    // bounds; avoid the trace redactor's 2,000-character default truncating an
-    // otherwise valid 8,000-character notification before it reaches storage.
     maxStringLength: Math.max(1, value.length),
   })
 }
@@ -70,10 +63,6 @@ export function externalNotificationRelayConfigured(): boolean {
   return notifyRelayFromEnv(process.env) !== null
 }
 
-// A third-party push relay (ntfy) is not one of our internal surfaces, so it may
-// only receive broadly-addressed notifications: no audience restriction (null,
-// broadcast) or an explicit wildcard. Anything scoped to specific surfaces
-// (e.g. audience:['desktop']) stays internal and is never exfiltrated.
 function isPushEligibleAudience(audience: NotificationAudience | undefined): boolean {
   if (audience == null) return true
   return audience.includes(ALL_NOTIFICATION_AUDIENCES)
@@ -83,14 +72,8 @@ function isApprovalTopic(topic: string | null | undefined): boolean {
   return typeof topic === 'string' && topic.startsWith('approval:')
 }
 
-// Build the redacted payload to relay to ntfy, or null when the notification is
-// not push-eligible. Exported for testing so the gate/redaction can be asserted
-// without an env-configured relay.
 export function buildNtfyRelayPayload(item: NotificationItem): NtfyNotification | null {
   if (!isPushEligibleAudience(item.audience)) return null
-  // Approval notifications summarize the exact command (executable + args) that
-  // is awaiting confirmation; that must never leave the machine. Relay the title
-  // (tool name) only.
   const relayBody = isApprovalTopic(item.topic) ? undefined : item.body
   return {
     title: redactSensitiveText(item.title, createTraceRedactionContext(), {
@@ -105,12 +88,6 @@ export function buildNtfyRelayPayload(item: NotificationItem): NtfyNotification 
   }
 }
 
-/**
- * Convert the same audience-gated, redacted notification used by ntfy into
- * Notification Relay's structured webhook contract. Topic prefixes are stable
- * notification-domain identifiers, so they are safe to use for type/priority
- * selection without matching user or model-authored prose.
- */
 export function buildNotifyRelayPayload(
   item: NotificationItem,
 ): NotifyRelayNotification | null {
@@ -207,7 +184,6 @@ function relayStatusLookupShouldKeepRetrying(
       || rejectedRelayStatusIsRetryable(httpStatus)
     )
   ) {
-    // Runtime-managed credentials can rotate without a daemon restart.
     return true
   }
   return attempt < NOTIFICATION_RELAY_STATUS_UNCONFIRMED_MAX_ATTEMPTS
@@ -217,9 +193,6 @@ async function runNotificationRelayOutboxDrain(
   env: NodeJS.ProcessEnv,
   fetchImpl?: typeof fetch,
 ): Promise<void> {
-  // Resolve configuration for every drain. Managed-env updates can enable,
-  // rotate, or disable Relay without a restart; credentials remain in this
-  // runtime-only boundary and are never copied into the durable outbox.
   const notifyRelay = notifyRelayFromEnv(env, fetchImpl)
   if (!notifyRelay) return
 
@@ -330,9 +303,6 @@ async function runNotificationRelayProviderReconciliation(
         })
         if (updated) publishNotification(updated)
       } catch (error) {
-        // The durable claim becomes eligible again after its stale lease. The
-        // status client itself converts network failures into bounded evidence;
-        // this path is for unexpected local persistence/runtime failures.
         logger.warn('failed to reconcile notify relay provider status', {
           error: error instanceof Error ? error.message : String(error),
         })
@@ -374,11 +344,6 @@ function reconcileNotificationRelayProviderStatuses(
   return reconciling
 }
 
-/**
- * Drain due Relay deliveries and reconcile provider status on independent
- * lanes. A slow status lookup must never head-of-line block a newly queued
- * notification from reaching Relay.
- */
 export function drainNotificationRelayDeliveries(options?: {
   env?: NodeJS.ProcessEnv
   fetchImpl?: typeof fetch
@@ -395,7 +360,6 @@ export interface NotificationRelayDeliveryWorker {
   stop(): Promise<void>
 }
 
-/** Restart-safe background pump for the notification Relay outbox. */
 export function createNotificationRelayDeliveryWorker(options?: {
   intervalMs?: number
 }): NotificationRelayDeliveryWorker {
@@ -434,9 +398,6 @@ export function publishStoredNotification(input: StoredNotificationInput): Notif
     && isPushEligibleAudience(normalizedAudience)
   const item = repo.upsert({
     id: input.id,
-    // Redact before the first durable write. Relay-only redaction is too late:
-    // UI/API readers and exported notification databases would otherwise keep
-    // the raw credential indefinitely even though the webhook was safe.
     title: redactDurableNotificationText(input.title),
     body: redactDurableNotificationText(input.body ?? ''),
     url: input.url ?? null,
@@ -468,8 +429,8 @@ export function publishChatCompletionNotification(
   },
 ): NotificationItem | null {
   const cfg = config?.notifications?.chatCompletion
-  if (!cfg?.enabled) return null
-  if (input.outcome === 'failed' && !cfg.includeFailures) return null
+  if (cfg?.enabled === false) return null
+  if (input.outcome === 'failed' && cfg?.includeFailures === false) return null
 
   const seconds = Math.max(1, Math.round(input.durationMs / 1000))
   const sessionTitle = input.sessionTitle?.trim() || input.sessionId
@@ -505,8 +466,6 @@ export function publishSchedulerRunNotification(input: {
     id: input.id,
     title: input.title,
     body: input.body,
-    // Name the job, not just the screen: someone who taps "your scheduled task
-    // finished" wants that task's result, not a list to hunt through.
     url: input.jobId
       ? `sepilotd://tasks?jobId=${encodeURIComponent(input.jobId)}`
       : 'sepilotd://tasks',
@@ -544,7 +503,6 @@ export function publishApprovalPendingNotification(
   _config: Pick<SepilotdConfig, 'notifications'> | undefined,
   input: {
     approval: PendingApproval
-    /** `parked` replaces the former `expired`: the run paused, nothing was denied. */
     outcome?: 'pending' | 'parked' | 'expired'
   },
 ): NotificationItem {

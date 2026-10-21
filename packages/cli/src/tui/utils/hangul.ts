@@ -370,12 +370,6 @@ function hasInlineInputControl(input: string): boolean {
   return false
 }
 
-/**
- * Apply one Ink input callback, including IME replacement chunks such as
- * `초<DEL>최근`. Ink only sets `key.delete` when DEL is the whole callback;
- * when an IME batches it with replacement text we must replay the control
- * byte ourselves instead of persisting it as prompt content.
- */
 export function applyHangulInputChunk(
   value: string,
   cursorOffset: number,
@@ -436,7 +430,6 @@ export function applyHangulInputChunk(
   }
 }
 
-/** Replay embedded terminal editing controls in already-buffered input. */
 export function replayInlineInputControls(input: string): string {
   let value = ''
   for (const ch of input) {

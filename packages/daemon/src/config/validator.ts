@@ -26,7 +26,6 @@ export function validateConfig(config: SepilotdConfig): ConfigValidationResult {
   const mcpServerNames = new Set<string>()
   const outboundWebhookTargets = new Set<string>()
 
-  // Check device
   if (!config.device.id || config.device.id === 'auto-generated-on-init') {
     warnings.push('Device ID is placeholder. Run "sepilot init" to generate a proper ID.')
   }
@@ -34,7 +33,6 @@ export function validateConfig(config: SepilotdConfig): ConfigValidationResult {
     warnings.push('Device name is "default". Set a meaningful name in config.yaml.')
   }
 
-  // Check providers
   if (config.providers.length === 0) {
     warnings.push('No LLM providers configured. Add at least one provider to config.yaml.')
   }
@@ -192,18 +190,14 @@ export function validateConfig(config: SepilotdConfig): ConfigValidationResult {
     )
   }
 
-  // Check ports
   if (config.daemon.port === Number(config.gateway?.url?.match(/:(\d+)/)?.[1])) {
     errors.push('Daemon and Gateway ports cannot be the same.')
   }
 
-  // Check security
   if (!config.security.auditLog) {
     warnings.push('Audit logging is disabled. Enable for security compliance.')
   }
 
-  // Surface the unsandboxed default. sandbox 'local' runs tool commands with no
-  // isolation; operators should know they are relying on the tool policy alone.
   const sandbox = config.security.sandbox ?? 'local'
   if (sandbox === 'local') {
     warnings.push(
@@ -227,7 +221,6 @@ export function validateConfig(config: SepilotdConfig): ConfigValidationResult {
     )
   }
 
-  // Check channels
   const channelValidation = configChannelsUpdateSchema.safeParse(config.channels)
   if (!channelValidation.success) {
     for (const issue of channelValidation.error.issues) {
@@ -236,7 +229,6 @@ export function validateConfig(config: SepilotdConfig): ConfigValidationResult {
     }
   }
 
-  // Check MCP servers
   for (const server of config.mcp.servers) {
     if (mcpServerNames.has(server.name)) {
       errors.push(`MCP server "${server.name}" is duplicated. MCP server names must be unique.`)

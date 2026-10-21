@@ -16,7 +16,6 @@ export interface BackgroundChatJob {
     code?: string
     message: string
   }
-  /** Structured termination reason of the completed run, when known. */
   stopReason?: RunStopReason
   createdAt: string
   updatedAt: string
@@ -199,6 +198,7 @@ function parseProgressAction(value: unknown): BackgroundChatProgressAction | und
 
 export interface BackgroundChatJobStore {
   init(): Promise<void>
+  takeInterruptedOnLoad?(): BackgroundChatJob[]
   get(jobId: string): Promise<BackgroundChatJob | undefined>
   set(jobId: string, job: BackgroundChatJob): Promise<void>
   touchRunning(jobId: string, updatedAt?: string): Promise<BackgroundChatJob | undefined>
@@ -224,7 +224,7 @@ export interface BackgroundChatSessionReader {
 
 const HOUR_MS = 60 * 60 * 1000
 const DEFAULT_TERMINAL_RETENTION_MS = 24 * HOUR_MS
-const DEFAULT_RUNNING_RETENTION_MS = 6 * HOUR_MS
+const DEFAULT_RUNNING_RETENTION_MS = 15 * 60 * 1000
 const PARTIAL_CONTENT_LIMIT = 32_000
 
 export class JsonBackgroundChatJobStore implements BackgroundChatJobStore {
@@ -233,6 +233,7 @@ export class JsonBackgroundChatJobStore implements BackgroundChatJobStore {
   private readonly runningRetentionMs: number
   private readonly now: () => number
   private jobs = new Map<string, BackgroundChatJob>()
+  private interruptedOnLoad: BackgroundChatJob[] = []
   private initialized = false
   private initPromise?: Promise<void>
   private writeQueue = Promise.resolve()
@@ -269,25 +270,32 @@ export class JsonBackgroundChatJobStore implements BackgroundChatJobStore {
       const raw = await readFile(this.filePath, 'utf-8')
       const nowIso = new Date(this.now()).toISOString()
       for (const job of parsePersistedJobs(raw)) {
-        this.jobs.set(
-          job.jobId,
-          job.status === 'running'
-            ? {
-                ...job,
-                status: 'failed',
-                error: {
-                  code: 'BACKGROUND_CHAT_INTERRUPTED',
-                  message: 'Background chat was interrupted by daemon restart before completion.',
-                },
-                updatedAt: nowIso,
-              }
-            : job,
-        )
+        if (job.status !== 'running') {
+          this.jobs.set(job.jobId, job)
+          continue
+        }
+        const interrupted: BackgroundChatJob = {
+          ...job,
+          status: 'failed',
+          error: {
+            code: 'BACKGROUND_CHAT_INTERRUPTED',
+            message: `Background chat was interrupted by daemon restart before completion. Its session keeps every completed step; continue from the last checkpoint with \`sepilot sessions resume ${job.sessionId}\` (POST /api/v1/sessions/${job.sessionId}/resume).`,
+          },
+          updatedAt: nowIso,
+        }
+        this.jobs.set(job.jobId, interrupted)
+        this.interruptedOnLoad.push(cloneJob(interrupted))
       }
       await this.persist()
     } catch (error) {
       if ((error as { code?: unknown }).code !== 'ENOENT') throw error
     }
+  }
+
+  takeInterruptedOnLoad(): BackgroundChatJob[] {
+    const jobs = this.interruptedOnLoad
+    this.interruptedOnLoad = []
+    return jobs
   }
 
   async get(jobId: string): Promise<BackgroundChatJob | undefined> {
@@ -360,17 +368,18 @@ export class JsonBackgroundChatJobStore implements BackgroundChatJobStore {
         changed = true
         continue
       }
+      const lastHeartbeat = Number.isFinite(updatedAt) ? updatedAt : createdAt
       if (
         job.status === 'running' &&
-        Number.isFinite(createdAt) &&
-        now - createdAt > this.runningRetentionMs
+        Number.isFinite(lastHeartbeat) &&
+        now - lastHeartbeat > this.runningRetentionMs
       ) {
         this.jobs.set(jobId, {
           ...job,
           status: 'failed',
           error: {
             code: 'BACKGROUND_CHAT_STALE',
-            message: 'Background chat job exceeded its retention window.',
+            message: 'Background chat job stopped reporting progress (no heartbeat) and is presumed lost.',
           },
           updatedAt: new Date(now).toISOString(),
         })

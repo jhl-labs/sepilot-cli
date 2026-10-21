@@ -45,13 +45,6 @@ export interface StorageLayer {
   degradedStores: StorageDegradedStore[]
 }
 
-/**
- * Build the per-user session / memory / channel replay / usage
- * stores that sit on the local filesystem under dataDir. Needs
- * encryption (for session-store at-rest crypto) and
- * providerRegistry (for semantic-index embedding lookups) from the
- * security + agent layers.
- */
 export async function assembleStorageLayer(args: {
   config: SepilotdConfig
   dataDir: string

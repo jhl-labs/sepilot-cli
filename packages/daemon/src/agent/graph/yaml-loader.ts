@@ -107,7 +107,6 @@ export class YamlGraphAgentLoader {
         }, 150)
       })
     } catch {
-      // The directory may not exist yet during early startup.
     }
   }
 

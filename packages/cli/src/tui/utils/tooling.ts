@@ -58,7 +58,7 @@ export function summarizeToolInput(
   toolName?: string,
 ): string {
   if (toolName === 'terminal.run') {
-    const summary = `$ ${terminalCommandLabel(input ?? {})}`
+    const summary = `$ ${compactTerminalCommandLabel(input ?? {})}`
     return summary.length > 120
       ? `${summary.slice(0, 119)}…`
       : summary
@@ -118,7 +118,7 @@ export function buildStoredToolCallState(options: {
   output?: string
   meta?: string
   approvalRequestId?: string
-  approvalState?: 'live' | 'stale'
+  approvalState?: ToolCallState['approvalState']
   resumeAvailable?: boolean
   editDiff?: string
 }): ToolCallState {
@@ -187,22 +187,39 @@ export function splitTerminalOutput(output?: string): {
   }
 }
 
+const SHELL_WRAPPER_NAMES = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh'])
+const QUOTED_SEGMENT_KEEP_CHARS = 16
+
+export function compactTerminalCommandLabel(input: Record<string, unknown>): string {
+  const executable = typeof input.executable === 'string' ? input.executable : ''
+  const args = Array.isArray(input.args) ? input.args.map((arg) => String(arg)) : []
+  const scriptIndex = args.findIndex((arg) => arg === '-c' || arg === '-lc')
+  const script = SHELL_WRAPPER_NAMES.has(commandBasename(executable)) && scriptIndex >= 0
+    ? args[scriptIndex + 1]
+    : undefined
+  const label = script ?? terminalCommandLabel(input)
+  return abbreviateQuotedSegments(label.replace(/\s+/g, ' ').trim())
+}
+
+export function abbreviateQuotedSegments(text: string): string {
+  return text.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, (segment) => {
+    if (segment.length <= QUOTED_SEGMENT_KEEP_CHARS + 2) return segment
+    const quote = segment[0]
+    return `${quote}${segment.slice(1, QUOTED_SEGMENT_KEEP_CHARS - 1).trimEnd()}…${quote}`
+  })
+}
+
 export function terminalCommandLabel(input: Record<string, unknown>): string {
   const executable = typeof input.executable === 'string' ? input.executable : ''
   const args = Array.isArray(input.args)
     ? input.args.map((arg) => String(arg))
     : []
   if (!executable) {
-    // terminal.run also accepts a plain `command` string instead of
-    // executable/args — label with it rather than "unknown".
     const command = typeof input.command === 'string' ? input.command.trim() : ''
     if (command) {
       return command
     }
 
-    // Keep any structured args visible even when an older/incomplete event
-    // omitted the executable. Returning only "unknown" hides the useful part
-    // of the command and regresses the original fallback contract.
     return ['unknown', ...args].join(' ').trim()
   }
   return [executable, ...normalizeCommandLabelArgs(args, executable)].join(' ').trim()
@@ -265,4 +282,22 @@ export function buildDiffLines(
       value: line,
     }))
   })
+}
+
+const META_SEPARATOR = ' · '
+
+function isExecutionPostureMeta(part: string): boolean {
+  return /^(?:host execution, no sandbox|[\w-]+ sandbox)(?: \(.*\))?$/.test(part)
+}
+
+export function toolExecutionPostureMeta(meta: string | undefined): string | undefined {
+  return meta?.split(META_SEPARATOR).find(isExecutionPostureMeta)
+}
+
+export function rowToolMeta(meta: string | undefined, status: string): string | undefined {
+  if (!meta) return undefined
+  const parts = meta.split(META_SEPARATOR)
+    .filter((part) => !isExecutionPostureMeta(part))
+    .filter((part) => !(status === 'success' && part === 'Execution finished'))
+  return parts.length > 0 ? parts.join(META_SEPARATOR) : undefined
 }

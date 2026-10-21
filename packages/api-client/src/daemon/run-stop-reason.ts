@@ -18,10 +18,6 @@ export interface RunStopCardCopy {
 interface StopCopyEntry {
   title: string
   body: string
-  /**
-   * Body used when the daemon reported `detail.used`/`detail.budget`. Keeps
-   * the numbers in the sentence instead of a bare "budget exhausted".
-   */
   bodyWithBudget?: string
 }
 
@@ -95,6 +91,10 @@ const EN_COPY: StopCopyTable = {
     title: 'Provider error',
     body: 'The model provider failed, so the run stopped.',
   },
+  agent_incomplete: {
+    title: 'Task not completed',
+    body: 'The agent reported that it could not finish this task with its current workflow.',
+  },
 }
 
 const KO_COPY: StopCopyTable = {
@@ -165,6 +165,10 @@ const KO_COPY: StopCopyTable = {
     title: '프로바이더 오류',
     body: '모델 프로바이더가 실패해 실행을 멈췄습니다.',
   },
+  agent_incomplete: {
+    title: '작업 미완료',
+    body: '에이전트가 현재 워크플로로는 이 작업을 끝낼 수 없다고 보고했습니다.',
+  },
 }
 
 const ACTION_LABELS: Record<RunStopLocale, Record<RunStopNextAction, string>> = {
@@ -174,6 +178,7 @@ const ACTION_LABELS: Record<RunStopLocale, Record<RunStopNextAction, string>> = 
     approve_pending: 'Answer pending approval',
     raise_budget: 'Retry with a larger budget',
     retry: 'Retry',
+    escalate: 'Retry with {target}',
   },
   ko: {
     resume: '이어서 실행',
@@ -181,13 +186,21 @@ const ACTION_LABELS: Record<RunStopLocale, Record<RunStopNextAction, string>> = 
     approve_pending: '대기 중 승인 처리',
     raise_budget: '예산 늘려 재시도',
     retry: '다시 시도',
+    escalate: '{target}(으)로 다시 시도',
   },
 }
 
-/**
- * Fallback next actions when the daemon sent an empty `nextActions` list.
- * Older daemons may omit the list; newer ones own the decision.
- */
+const ESCALATION_HINT: Record<RunStopLocale, string> = {
+  en: 'A deeper workflow ({target}) can explore, plan, validate and review this task; it takes longer.',
+  ko: '더 깊은 워크플로({target})가 탐색·계획·검증·리뷰 단계를 거쳐 이 작업을 다시 시도할 수 있습니다. 시간은 더 걸립니다.',
+}
+
+export function escalationTarget(reason: RunStopReason): string | undefined {
+  const detail = reason.detail
+  const target = detail?.escalateBot ?? detail?.escalateMode
+  return typeof target === 'string' && target.trim() ? target.trim() : undefined
+}
+
 const DEFAULT_ACTIONS: Record<Exclude<RunStopCode, 'completed'>, RunStopNextAction[]> = {
   iteration_budget: ['resume', 'raise_budget'],
   node_budget: ['resume', 'raise_budget'],
@@ -205,6 +218,7 @@ const DEFAULT_ACTIONS: Record<Exclude<RunStopCode, 'completed'>, RunStopNextActi
   inactivity: ['retry'],
   user_abort: ['resume'],
   provider_error: ['retry'],
+  agent_incomplete: ['retry'],
 }
 
 const UNKNOWN_COPY: Record<RunStopLocale, StopCopyEntry> = {
@@ -219,19 +233,12 @@ function interpolate(template: string, values: Record<string, string | number | 
   })
 }
 
-/** True when a surface should render a stop card for this reason. */
 export function shouldRenderStopCard(
   reason: RunStopReason | null | undefined,
 ): reason is RunStopReason {
   return Boolean(reason && reason.code !== 'completed')
 }
 
-/**
- * Localized copy for a run-stop card. Pure: the same reason always produces
- * the same title/body/actions, so surfaces can render it without parsing the
- * daemon's prose. `completed` yields an empty card (no title, no actions) so
- * callers can guard with `shouldRenderStopCard` and never show it.
- */
 export function describeStopReason(
   reason: RunStopReason,
   locale: RunStopLocale = 'en',
@@ -256,6 +263,10 @@ export function describeStopReason(
         ? `${body} 미충족: ${detail.criteria.join(', ')}`
         : `${body} Unmet: ${detail.criteria.join(', ')}`
   }
+  const target = escalationTarget(reason)
+  if (target && (reason.nextActions ?? []).includes('escalate')) {
+    body = `${body} ${interpolate(ESCALATION_HINT[locale], { target })}`
+  }
   const kinds =
     reason.nextActions && reason.nextActions.length > 0
       ? reason.nextActions
@@ -265,23 +276,18 @@ export function describeStopReason(
   const actions: RunStopCardAction[] = []
   for (const kind of kinds) {
     if (seen.has(kind) || !labels[kind]) continue
+    if (kind === 'escalate' && !target) continue
     seen.add(kind)
-    actions.push({ kind, label: labels[kind] })
+    actions.push({ kind, label: interpolate(labels[kind], { target }) })
   }
   return { title: entry.title, body, actions }
 }
 
-/** Every code the copy tables cover; used by parity tests and pickers. */
 export const RUN_STOP_CODES: RunStopCode[] = [
   'completed',
   ...(Object.keys(EN_COPY) as Array<Exclude<RunStopCode, 'completed'>>),
 ]
 
-/**
- * Map a daemon stream error code to the stop code it implies when the frame
- * did not carry a structured `stopReason` (older daemons). Returns undefined
- * for codes that are not run stops.
- */
 export function stopCodeFromErrorCode(code: string | undefined): RunStopCode | undefined {
   switch (code) {
     case 'APPROVAL_TIMEOUT':

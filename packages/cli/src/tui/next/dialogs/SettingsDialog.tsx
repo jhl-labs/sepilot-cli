@@ -76,8 +76,6 @@ export function SettingsDialog({
       }
       return
     }
-    // Ink reports escape as part of some terminal arrow sequences, so handle
-    // directional keys before a standalone Escape.
     if (key.escape) {
       if (column === 'item') setColumn('category')
       else onClose()

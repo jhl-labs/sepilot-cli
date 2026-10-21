@@ -141,6 +141,7 @@ export async function runSurfaceChatStream(
       throw createIncompleteDaemonChatStreamError()
     }
   } catch (error) {
+    streamController.settleLiveViews()
     const abortMeta = getDaemonChatRunAbortMeta(error)
     if (abortMeta) {
       params.bindings.setAgentState('done')

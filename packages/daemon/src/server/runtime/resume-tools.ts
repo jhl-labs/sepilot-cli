@@ -81,14 +81,6 @@ function sameJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right))
 }
 
-/**
- * Rebuild the exact tool surface captured before a run paused.
- *
- * An exact allowlist is mandatory, including for legacy checkpoints. An
- * explicit empty list remains empty; missing scope must never degrade to the
- * full daemon registry. Canonical skill metadata is revalidated as an
- * additional integrity check, not as a substitute for the captured surface.
- */
 export function resolveCheckpointToolRegistry(
   source: ToolRegistry,
   checkpoint: CheckpointToolScope,

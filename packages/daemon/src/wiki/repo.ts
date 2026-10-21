@@ -52,10 +52,6 @@ function ensureSchema(db: SqliteDatabase): void {
       title, body, content='wiki_nodes', content_rowid='rowid'
     )`,
   ).run()
-  // Triggers keep the FTS index in sync after this point. For databases
-  // that pre-existed the FTS table, the index is empty until rebuilt; the
-  // line below fills it once. The 'rebuild' command is idempotent and
-  // cheap on small tables.
   db.prepare(
     `INSERT INTO wiki_nodes_fts(wiki_nodes_fts) VALUES ('rebuild')`,
   ).run()
@@ -78,7 +74,6 @@ function ensureSchema(db: SqliteDatabase): void {
 }
 
 export interface WikiSearchHit extends WikiNode {
-  /** Snippet of the body around the matching terms (HTML-safe plain text). */
   snippet: string
 }
 
@@ -126,9 +121,6 @@ export function createWikiRepo(): WikiRepo {
           .get(parentId) as { m: number }
         order = maxRow.m + 1
       }
-      // Preserve existing body when the caller does not include one — the
-      // edit dialog sends only metadata, and clobbering the body to '' on
-      // every metadata edit destroys content.
       const body =
         input.body !== undefined ? input.body : (existing?.body ?? '')
       db.prepare(
@@ -160,8 +152,6 @@ export function createWikiRepo(): WikiRepo {
     search(query, limit = 50) {
       const q = query.trim()
       if (!q) return []
-      // Escape FTS5 syntax characters by quoting each whitespace-separated
-      // term so user queries like `name: foo` don't blow up the parser.
       const ftsQuery = q
         .split(/\s+/)
         .filter(Boolean)
@@ -183,8 +173,6 @@ export function createWikiRepo(): WikiRepo {
         })[]
         return rows.map((r) => ({ ...rowToNode(r), snippet: r.snippet }))
       } catch {
-        // FTS5 may reject odd queries; fall back to a LIKE search so the
-        // user always gets a deterministic response instead of a 500.
         const like = `%${q.replace(/[%_]/g, (c) => `\\${c}`)}%`
         const rows = db
           .prepare(

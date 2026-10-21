@@ -1,22 +1,12 @@
 import type { ToolSecurityDescriptor } from '@sepilotd/core'
 
-/**
- * Canonical built-in tool security catalog.
- *
- * Tool effects used to be copied into independent read-only, plan-mode and
- * approval-guard name lists. That made a newly registered bookkeeping or
- * observation tool writable-by-default in one gate and blocked-by-default in
- * another. The registry now attaches this single descriptor to each built-in
- * tool and every policy gate consumes it. Unknown/plugin tools still fail
- * closed unless their registration declares an explicit descriptor.
- */
 const descriptors = new Map<string, ToolSecurityDescriptor>()
 
 function register(
   effect: ToolSecurityDescriptor['effect'],
   rationale: string,
   names: readonly string[],
-  options: Pick<ToolSecurityDescriptor, 'mutationResultBoundary'> = {},
+  options: Pick<ToolSecurityDescriptor, 'mutationResultBoundary' | 'reach' | 'egressGuard' | 'writesArtifact'> = {},
 ): void {
   for (const name of names) {
     if (descriptors.has(name)) {
@@ -26,104 +16,141 @@ function register(
   }
 }
 
-register('observe', 'Reads information without a durable user-directed mutation', [
-  'fs.read',
-  'fs.list',
-  'fs.glob',
-  'fs.search',
-  'git.status',
-  'git.diff',
-  'git.log',
-  'gitea.actions.runs.inspect',
-  'web.search',
-  'webfetch',
-  'jpad.workspaces',
-  'jpad.pages.list',
-  'jpad.pages.get',
-  'market.quote',
-  'browser.remote_snapshot',
-  'browser.navigate',
-  'browser.extract',
-  'browser.screenshot',
-  'computer.list_windows',
-  'computer.list_elements',
-  'computer.observe',
-  'computer.wait',
-  'assistant.status',
-  'system.info',
-  'self.info',
-  'usage.report',
-  'process.list',
-  'process.sessions',
-  'process.read',
-  'process.follow',
-  'process.wait',
-  'service.list',
-  'service.status',
-  'service.logs',
-  'service.native.status',
-  'service.native.logs',
-  'skill',
-  'skillhub.search',
-  'lsp',
-  'code.diagnostics',
-  'code.symbols',
-  'code.dependencies',
-  'doc.get',
-  'doc.outline',
-  'notebook.inspect',
-  'apps.list',
-  'apps.read',
-  'apps.search',
-  'office.list_open_documents',
-  'office.read_active',
-  'office.read_selection',
-  'office.preview_edit',
-  'office.read_slide',
-  'office.capture_slide',
-  'media.inspect',
-  'media.extract_text',
-  'media.transcribe',
-  'image_gen.providers',
-  'image_gen.job',
-  'image_gen.file',
-  'pages.scan',
-  'pages.status',
-  'schedule_list',
-  'schedule_get',
-  'schedule_runs',
-  'knowledge.search',
-  'knowledge.read',
-  'memory.list',
-  'memory.search',
-  'memory.graph.search',
-  'memory.graph.neighbors',
-  'memory.graph.page',
-  'memory.graph.audit',
-  'memory.daily.read',
-  'memory.journal.inspect',
-  'memory.daily.list',
-  'memory.daily.search',
-  'memory.documents.search',
-  'memory.documents.list',
-  'memory.documents.get',
-  'memory.documents.preview',
-  'memory.audit',
-  'memory.reminders.list',
-  'memory.export',
-  'memory.tag.suggest',
-  'memory.diff',
-  'memory.usage',
-  'memory.context.snapshot',
-  'memory.conflicts.find',
-  'memory.search.related',
-  'memory.search.by_tag',
-  'memory.history',
-  'memory.tag.list',
-  'memory.summarize',
-  'memory.pinned.list',
-  'monitor.report',
-])
+register(
+  'observe',
+  'Reads files, git history or code analysis inside the user workspace',
+  [
+    'fs.read',
+    'fs.list',
+    'fs.glob',
+    'fs.search',
+    'git.status',
+    'git.diff',
+    'git.log',
+    'code.diagnostics',
+    'code.symbols',
+    'code.dependencies',
+    'notebook.inspect',
+    'media.inspect',
+    'media.extract_text',
+    'pages.scan',
+  ],
+  { reach: 'workspace' },
+)
+
+register(
+  'observe',
+  'Fetches network content only from hosts permitted by the egress allowlist',
+  [
+    'webfetch',
+    'browser.navigate',
+    'browser.extract',
+  ],
+  { reach: 'network', egressGuard: 'allowlist' },
+)
+
+register(
+  'observe',
+  'Fetches an allowlist-checked page and saves a PNG at a caller-chosen path as validation evidence',
+  ['browser.screenshot'],
+  { reach: 'network', egressGuard: 'allowlist', writesArtifact: true },
+)
+
+register(
+  'observe',
+  'Queries fixed or configured network endpoints without per-request allowlist checks',
+  [
+    'web.search',
+    'market.quote',
+    'skillhub.search',
+    'jpad.workspaces',
+    'jpad.pages.list',
+    'jpad.pages.get',
+    'gitea.actions.runs.inspect',
+  ],
+  { reach: 'network' },
+)
+
+register(
+  'observe',
+  'Reads host-private state such as memory, knowledge, processes, desktop or app data',
+  [
+    'lsp',
+    'tool.output.read',
+    'browser.remote_snapshot',
+    'computer.list_windows',
+    'computer.list_elements',
+    'computer.observe',
+    'computer.wait',
+    'assistant.status',
+    'system.info',
+    'self.info',
+    'usage.report',
+    'process.list',
+    'process.sessions',
+    'process.read',
+    'process.follow',
+    'process.wait',
+    'service.list',
+    'service.status',
+    'service.logs',
+    'service.native.status',
+    'service.native.logs',
+    'skill',
+    'doc.get',
+    'doc.outline',
+    'apps.list',
+    'apps.read',
+    'apps.search',
+    'office.list_open_documents',
+    'office.read_active',
+    'office.read_selection',
+    'office.preview_edit',
+    'office.read_slide',
+    'office.capture_slide',
+    'media.transcribe',
+    'image_gen.providers',
+    'image_gen.job',
+    'image_gen.file',
+    'pages.status',
+    'schedule_list',
+    'schedule_get',
+    'schedule_runs',
+    'knowledge.search',
+    'knowledge.read',
+    'memory.list',
+    'memory.search',
+    'memory.graph.search',
+    'memory.graph.neighbors',
+    'memory.graph.page',
+    'memory.graph.audit',
+    'memory.daily.read',
+    'memory.journal.inspect',
+    'memory.daily.list',
+    'memory.daily.search',
+    'memory.documents.search',
+    'memory.documents.list',
+    'memory.documents.get',
+    'memory.documents.preview',
+    'memory.audit',
+    'memory.reminders.list',
+    'memory.export',
+    'memory.tag.suggest',
+    'memory.diff',
+    'memory.usage',
+    'memory.context.snapshot',
+    'memory.conflicts.find',
+    'memory.search.related',
+    'memory.search.by_tag',
+    'memory.history',
+    'memory.tag.list',
+    'memory.summarize',
+    'memory.pinned.list',
+    'monitor.report',
+    'event.destinations',
+  ],
+  { reach: 'host' },
+)
 
 register(
   'internal-state',
@@ -135,6 +162,9 @@ register(
 register('internal-state', 'Mutates bounded agent-owned control metadata only', [
   'question',
   'monitor.evaluate',
+  'monitor.watch',
+  'monitor.watches',
+  'session.schedule_wakeup',
   'subagent.dispatch',
   'subagent.job',
   'doc.diff_preview',
@@ -162,6 +192,7 @@ register('workspace-write', 'Writes files or the active document in the user wor
 
 register('external-write', 'Changes durable agent, application, browser, or remote-system state', [
   'notification.publish',
+  'event.deliver',
   'jpad.pages.create',
   'jpad.pages.update',
   'a2a.send',
@@ -221,6 +252,7 @@ register('external-write', 'Changes durable agent, application, browser, or remo
 register('process-lifecycle', 'Starts, stops, signals, or reconfigures a managed execution', [
   'process.write',
   'external_acp.run',
+  'external_cli.run',
   'image_gen.cancel',
   'process.signal',
   'service.disable',
@@ -242,6 +274,12 @@ register('dynamic', 'Effect is derived from validated invocation arguments and e
 export const UNKNOWN_TOOL_SECURITY: ToolSecurityDescriptor = {
   effect: 'unknown',
   rationale: 'No audited security descriptor is registered; fail closed',
+}
+
+export function builtinToolNamesWithEffect(
+  effect: ToolSecurityDescriptor['effect'],
+): string[] {
+  return [...descriptors].filter(([, descriptor]) => descriptor.effect === effect).map(([name]) => name)
 }
 
 export function builtinToolSecurityDescriptor(

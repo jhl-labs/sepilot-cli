@@ -52,11 +52,6 @@ export function collectSessionInteractionState(
   }
 }
 
-/**
- * Content-free interaction readiness for assistant/operator dashboards.
- * Deliberately reads only session metadata and in-memory registries; history
- * analysis remains owned by the full session-management endpoint.
- */
 export async function buildSessionInteractionSummary(
   runtime: SessionInteractionRuntime,
 ): Promise<SessionInteractionSummary> {

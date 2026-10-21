@@ -517,7 +517,6 @@ async function existingFiles(files: PlannedFile[]): Promise<string[]> {
       await stat(file.absolutePath)
       conflicts.push(file.relativePath)
     } catch {
-      // Missing files are expected.
     }
   }
   return conflicts

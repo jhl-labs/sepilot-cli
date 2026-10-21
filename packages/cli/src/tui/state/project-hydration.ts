@@ -1,14 +1,3 @@
-// Pulled out of App.tsx so the connect-on-mount project-discovery
-// branch — list -> match-by-workspace-or-session -> auto-create when
-// a workspace is detected — can live as a single async helper with a
-// proper result type and be unit-tested without rendering App.
-//
-// Two helper exports also move with this module:
-//   - sortProjects: deterministic newest-first ordering (the picker
-//     and /project info both rely on it)
-//   - upsertProject: dedup + sort, used after createProject and
-//     attachSessionToProject responses to refresh the local state
-
 import type { DaemonProject } from '@sepilotd/api-client'
 import {
   findProjectBySession,
@@ -55,21 +44,6 @@ export type ProjectHydrationResult =
   | { ok: true; cancelled: true }
   | { ok: false }
 
-/**
- * Resolve the initial project selection at boot time.
- *
- * Steps:
- *   1. fetch and sort the daemon's project list
- *   2. pick the right initial project — match by workspace if we have
- *      one, else find by session id
- *   3. if neither matched and a workspace was detected, create a new
- *      project named after the workspace and use that
- *
- * Returns the available projects so the caller can store them, plus
- * the selection (or null when no workspace and no project matched).
- * A failure anywhere in the chain returns ok=false — project discovery
- * is best-effort and must not block chat boot.
- */
 export async function resolveInitialProject(opts: {
   httpClient: ProjectHydrationHttpClient
   detectedWorkspace: WorkspaceProject | null

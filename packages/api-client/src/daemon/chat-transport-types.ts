@@ -74,7 +74,6 @@ export interface ManagedSurfaceStreamRunnerParams {
   doneFallbackText: string
   errorFallbackText: string
   errorLabel: string
-  /** See StreamEventControllerOptions.onEmptyCompletion. */
   onEmptyCompletion?: () => void
   approvalResumeAvailable?: boolean
   createSeedMessages?: (assistantId: string) => SurfaceMessage[]

@@ -43,7 +43,6 @@ export async function versionCommand(options: { url?: string; check?: boolean })
         payload.updateAvailable = payload.latest !== cliVersion
       }
     } catch {
-      // best-effort; silent failure mirrors prior behaviour.
     }
   }
 

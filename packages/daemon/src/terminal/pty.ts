@@ -20,7 +20,6 @@ export interface AgentPtyOptions {
   onExit(exitCode: number): void
 }
 
-/** Keep CLI configuration, but never forward daemon control credentials or injected Node code. */
 export function terminalEnvironment(source: NodeJS.ProcessEnv): Record<string, string> {
   return Object.fromEntries(
     Object.entries(source).filter(
@@ -33,7 +32,6 @@ export function terminalEnvironment(source: NodeJS.ProcessEnv): Record<string, s
 export function resolveAgentExecutable(command: string, env: Record<string, string>): string {
   const extensions = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', '.com', ''] : ['']
   for (const directory of (env.PATH ?? env.Path ?? '').split(delimiter)) {
-    // Do not accidentally execute a repository-local file from an empty/relative PATH entry.
     if (!isAbsolute(directory)) continue
     for (const extension of extensions) {
       const file = join(directory, command + extension)
@@ -41,7 +39,6 @@ export function resolveAgentExecutable(command: string, env: Record<string, stri
         accessSync(file, constants.X_OK)
         if (statSync(file).isFile()) return file
       } catch {
-        /* try next */
       }
     }
   }
@@ -85,7 +82,6 @@ export function spawnAgentPty(options: AgentPtyOptions): AgentPty {
     COLORTERM: 'truecolor',
   }
   const executable = resolveAgentExecutable(options.command, env)
-  // Standalone macOS/Linux binaries use Bun's built-in PTY, without native addon assets.
   const bun = (globalThis as unknown as { Bun?: BunPtyRuntime }).Bun
   if (bun?.Terminal && process.platform !== 'win32') {
     const decoder = new StringDecoder('utf8')
@@ -135,7 +131,6 @@ export function spawnAgentPty(options: AgentPtyOptions): AgentPty {
     }
   }
   const pty = nativeRequire('node-pty') as typeof NodePty
-  // Windows npm shims require cmd.exe. Only a resolved allowlisted executable is passed.
   const shim = process.platform === 'win32' && /\.(cmd|bat)$/i.test(executable)
   const child = pty.spawn(
     shim ? (process.env.COMSPEC ?? 'cmd.exe') : executable,

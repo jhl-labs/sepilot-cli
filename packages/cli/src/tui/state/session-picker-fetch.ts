@@ -1,19 +1,3 @@
-// Pulled out of App.tsx so the session-picker fetch logic — list +
-// (when no search query) augment with workspace-project sessions
-// missing from the page — can live as a single async function with a
-// proper result type instead of as an inline useEffect.
-//
-// Two extra wrinkles compared to a straight list call:
-//
-//   1. When the operator hasn't typed a query, we want to surface the
-//      workspace project's recent sessions even if they fall off the
-//      list page. We fetch their detail records one-by-one (capped to
-//      PROJECT_SESSION_PICKER_FETCH_LIMIT) and merge them in.
-//   2. Cancellation: a long-running augment can outlive the picker
-//      being closed or another query being typed; the caller passes a
-//      cancelled() predicate that we check at every await boundary so
-//      a stale fetch never updates the surface.
-
 import type {
   DaemonSessionDetail,
   DaemonSessionMeta,
@@ -89,8 +73,6 @@ export async function loadSessionPickerItems(opts: {
       },
     )
     if (opts.cancelled()) return { ok: true, cancelled: true }
-    // Keep the client-side guard for compatibility with older daemons that
-    // may ignore an unknown workspaceRoot query parameter.
     listItems = result.items.filter((session) => (
       sessionBelongsToWorkspace(session, opts.workspaceRoot)
     ))

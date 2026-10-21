@@ -55,13 +55,6 @@ interface OllamaChatChunk {
   eval_count?: number
 }
 
-/**
- * Ollama sends `done: true` on every terminal chunk regardless of *why* it
- * stopped, and only `done_reason` distinguishes a natural stop from a
- * num_predict/context truncation (`'length'`). Prefer `done_reason` and treat
- * a truncation as `length` so the loop knows the answer is incomplete; fall
- * back to the coarse `done` flag for older Ollama builds that omit it.
- */
 function mapOllamaFinishReason(
   doneReason: string | undefined,
   done: boolean | undefined,
@@ -74,17 +67,9 @@ function mapOllamaFinishReason(
 }
 
 function mapRole(role: Message['role']): string {
-  return role // ollama uses same role names
+  return role
 }
 
-/**
- * Ollama's chat API splits multimodal turns into a plain text `content`
- * field plus a separate `images: string[]` array of base64 payloads.
- * `extractContent` alone would have dropped the image entirely (it
- * filters to text parts only), so we walk the ContentPart[] and keep
- * both halves. URL-source images are not pre-fetched here — Ollama
- * accepts only base64 today, so a remote URL is simply skipped.
- */
 export function toOllamaMessage(msg: Message): {
   role: string
   content: string
@@ -101,8 +86,6 @@ export function toOllamaMessage(msg: Message): {
     } else if (part.type === 'image' && part.source.type === 'base64') {
       images.push(part.source.data)
     }
-    // Documents and URL-source images are silently dropped: Ollama has
-    // no first-class equivalent.
   }
   return {
     role: mapRole(msg.role),
@@ -111,17 +94,6 @@ export function toOllamaMessage(msg: Message): {
   }
 }
 
-// Ollama doesn't expose per-model capability flags in /api/tags, so we infer
-// from the model id as a fallback. Names like 'nomic-embed-text',
-// 'qwen3-embedding:8b', 'bge-m3', 'all-minilm', 'mxbai-embed-large' are
-// embedding-only — they accept tokens, return vectors, can't follow chat
-// instructions or call tools. Vision-input names include the classic 'vl' /
-// 'vision' / 'image' / 'multimodal' markers plus common model families that
-// do not carry those tokens (llava, bakllava, moondream, minicpm-v,
-// granite*vision). The default is a chat-capable text model
-// (toolUse=true, embedding=false). When SEPILOTD_OLLAMA_CAPABILITY_PROBE is
-// set, `/api/show` capabilities take priority over these regexes (structural,
-// not a per-model name branch).
 const EMBEDDING_ONLY_PATTERN =
   /(?:^|[-_/:])(embed(?:ding)?|bge[-_].*m3|nomic[-_]embed|all[-_]minilm|mxbai|gte|arctic[-_]embed|snowflake[-_]arctic[-_]embed)(?:[-_:]|$)/i
 const VISION_PATTERN =
@@ -141,32 +113,11 @@ interface OllamaModelCapabilityProbe {
   permanentlyUnavailable: boolean
 }
 
-/**
- * On by default: the name-regex fallback guesses `tools` for every non-embedding
- * model, and guessing wrong is not a soft failure. Sending a `tools` array to a
- * model that does not advertise them makes Ollama answer 500, which surfaces as
- * an opaque "Internal Server Error" only after the whole turn has been built —
- * observed at ~108s on a cloud model, with nothing pointing at tool support.
- *
- * The probe itself is cheap and non-fatal: one `/api/show` per model, issued
- * with bounded concurrency and a shared deadline. Any model whose probe fails
- * keeps its last-known or regex-derived defaults.
- * Set SEPILOTD_OLLAMA_CAPABILITY_PROBE=0 to fall back to pure name matching.
- */
 export function isOllamaCapabilityProbeEnabled(): boolean {
   const raw = process.env.SEPILOTD_OLLAMA_CAPABILITY_PROBE?.trim().toLowerCase()
   return raw !== '0' && raw !== 'false' && raw !== 'off'
 }
 
-/**
- * Map Ollama's `/api/show` `capabilities` array (e.g.
- * `['completion','tools','vision','thinking','embedding']`) onto our
- * ModelInfo capability flags. When the probe reports capabilities we trust it
- * over the name regex: a model that does not advertise `tools` must not be
- * sent a `tools` array (that hard-errors the run on non-tool models like
- * gemma2/phi3), and a model advertising `vision` gets vision even without a
- * telltale name.
- */
 export function ollamaCapabilitiesFromProbe(capabilities: string[]): {
   vision: boolean
   toolUse: boolean
@@ -201,15 +152,21 @@ function buildModelInfo(id: string, probed?: string[]): ModelInfo {
       streaming: !isEmbedding,
       embedding: isEmbedding,
       thinking: hasThinking,
+      thinkingEffort: 'binary',
     },
   }
 }
 
-/**
- * Query Ollama `/api/show` for a model's advertised capabilities. Returns the
- * `capabilities` string array, or `null` when the endpoint is unavailable or
- * the build predates the field (older Ollama). Never throws.
- */
+export function ollamaThinkOption(
+  level: ChatRequest['thinkingLevel'] | 'auto' | undefined,
+  model: ModelInfo | undefined,
+): { think?: boolean | 'low' | 'medium' | 'high' } {
+  if (level === undefined || level === 'auto' || !model?.capabilities.thinking) return {}
+  if (level === 'off') return { think: false }
+  if (model.capabilities.thinkingControl === 'think-levels') return { think: level === 'max' ? 'high' : level }
+  return { think: true }
+}
+
 export async function fetchOllamaModelCapabilities(
   baseUrl: string,
   model: string,
@@ -239,11 +196,6 @@ async function probeOllamaModelCapabilities(
     })
     if (!res.ok) {
       await res.body?.cancel().catch(() => undefined)
-      // `/api/tags` can retain a remotely retired model after the model
-      // endpoint has made its permanent unavailability authoritative. Only
-      // HTTP 410 is strong enough to remove that row: 404 can mean an older
-      // `/api/show` surface, while auth, timeout, and 5xx failures do not prove
-      // that a listed model is gone.
       return { capabilities: null, permanentlyUnavailable: res.status === 410 }
     }
     const data = (await res.json()) as { capabilities?: unknown }
@@ -301,13 +253,6 @@ export class OllamaProvider implements ILLMProvider {
     this.models = config.models.map((m) => buildModelInfo(m))
   }
 
-  /**
-   * Ollama's SDK only attaches its internal AbortController to streaming
-   * requests. Non-streaming `chat()` calls otherwise reach `fetch()` without
-   * a signal, so a caller-side deadline can return while Ollama keeps
-   * generating. Use a request-scoped client whose fetch implementation adds
-   * the caller signal while preserving any signal supplied by the SDK.
-   */
   private clientForSignal(signal?: AbortSignal): Ollama {
     if (!signal) return this.client
 
@@ -383,13 +328,6 @@ export class OllamaProvider implements ILLMProvider {
     return added
   }
 
-  /**
-   * When SEPILOTD_OLLAMA_CAPABILITY_PROBE is enabled, replace the name-regex
-   * capability guesses with the model's real `/api/show` capabilities. Best
-   * effort and non-fatal: any retained model whose probe fails keeps its last
-   * known metadata, while a newly discovered model keeps conservative
-   * name-derived defaults. No-op when the env gate is off.
-   */
   async probeCapabilities(options: OllamaCapabilityProbeOptions = {}): Promise<void> {
     const probedCapabilities = (await this.probeModelCapabilities(
       this.models.map((model) => model.id),
@@ -465,7 +403,6 @@ export class OllamaProvider implements ILLMProvider {
         messages.unshift({ role: 'system', content: normalized.systemText })
       }
 
-      // Map tool definitions to Ollama format
       const tools = request.tools?.map(t => ({
         type: 'function' as const,
         function: {
@@ -480,6 +417,7 @@ export class OllamaProvider implements ILLMProvider {
         messages,
         stream: false,
         tools: tools?.length ? tools : undefined,
+        ...ollamaThinkOption(request.thinkingLevel, this.models.find((model) => model.id === request.model)),
         options: {
           temperature: request.temperature,
           num_predict: request.maxTokens,
@@ -546,6 +484,7 @@ export class OllamaProvider implements ILLMProvider {
         messages,
         stream: true,
         tools: tools?.length ? tools : undefined,
+        ...ollamaThinkOption(request.thinkingLevel, this.models.find((model) => model.id === request.model)),
         options: {
           temperature: request.temperature,
           num_predict: request.maxTokens,
@@ -560,11 +499,6 @@ export class OllamaProvider implements ILLMProvider {
 
       try {
         for await (const chunk of response) {
-          // Ollama exposes reasoning models' live progress through
-          // `message.thinking`. Propagate it even when capability discovery
-          // did not advertise thinking: the response field is authoritative,
-          // and dropping it makes an active upstream stream look silent to the
-          // first-token watchdog until content or a tool call appears.
           if (chunk.message?.thinking) {
             yield { type: 'thinking', text: chunk.message.thinking }
           }

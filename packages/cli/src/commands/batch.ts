@@ -36,15 +36,6 @@ export interface BatchFacadeInput {
   jobs: Pick<JobsClient, 'submitBatch' | 'get' | 'getItems' | 'cancel'>
   writer: { append(line: string): void | Promise<void> }
   pollMs?: number
-  /**
-   * Total elapsed-time cap for the polling loop, in milliseconds. When
-   * the daemon never transitions to a terminal state (network blip,
-   * crash without status update) the CLI would otherwise hang. Default:
-   * 60 minutes — overridable via `SEPILOTD_BATCH_TIMEOUT_MS`. Tests
-   * pass an explicit small value via this field instead of relying on
-   * the env var. `0` disables the watchdog (used by tests with stubbed
-   * pollers).
-   */
   timeoutMs?: number
   onProgress?(snap: BatchProgressUpdate): void
 }
@@ -76,11 +67,6 @@ function resolveBatchTimeoutMs(explicit?: number): number {
   return DEFAULT_BATCH_TIMEOUT_MS
 }
 
-/**
- * Thrown by `runBatchFacade` when the polling loop exceeds its
- * elapsed-time cap. The verb wrapper catches this and prints a
- * resume-with-`batch:resume` hint, then exits 2.
- */
 export class BatchPollingTimeoutError extends Error {
   readonly jobId: string
   readonly elapsedMs: number
@@ -94,9 +80,6 @@ export class BatchPollingTimeoutError extends Error {
   }
 }
 
-// Daemon job items can contain chat envelopes (`{ data: { content, usage } }`),
-// flat chat results (`{ content, usage }`), or subagent results
-// (`{ output, usage }`). Normalize them before writing resumable JSONL.
 function unwrapJobResult(result: unknown): TextLikeJobResult {
   if (!result || typeof result !== 'object') return {}
   const envelope = result as { data?: unknown }
@@ -176,9 +159,6 @@ export async function runBatchFacade(
       const snap = await jobs.get(submitted.jobId)
       const fetched = await jobs.getItems(submitted.jobId, nextIdx)
       for (const it of fetched.items) {
-        // Defensive: even though getItems is `since=nextIdx`, the
-        // daemon may return idx<nextIdx if a previous result was
-        // re-fetched on cursor reset. Skip already-written items.
         if (it.idx < nextIdx || writtenIndices.has(it.idx)) continue
         const t = tasks[it.idx]
         if (!t) continue
@@ -207,8 +187,6 @@ export async function runBatchFacade(
         if (!failed) ok++
         totalTokens += tokens
         writtenIndices.add(it.idx)
-        // Advance only across a contiguous prefix. A fast item 3 must not
-        // hide the still-running item 1 on the next poll.
         while (writtenIndices.delete(nextIdx)) nextIdx++
       }
       if (
@@ -218,10 +196,6 @@ export async function runBatchFacade(
       ) {
         break
       }
-      // Watchdog: if the daemon never reaches a terminal state (network
-      // blip, crash without status update), fail loudly with a resume
-      // hint instead of hanging forever. `batch:resume <jobId>` re-tails
-      // the same daemon-side run.
       if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) {
         throw new BatchPollingTimeoutError(
           submitted.jobId,
@@ -317,7 +291,6 @@ export async function batchCommand(
     return
   }
 
-  // Streaming append writer (or stdout when --output not provided).
   const outputPath = options.output
   if (outputPath) {
     try {

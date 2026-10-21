@@ -13,12 +13,6 @@ export function createStreamConnectTimeoutError(timeoutMs: number): Error {
   return new Error(`stream-connect-timeout after ${timeoutMs}ms`)
 }
 
-/**
- * Bound the wait for HTTP response headers separately from the long-lived
- * stream idle window. Before the daemon opens SSE, keepalive frames do not
- * exist, so a stuck pre-flight/router call otherwise looks like an endless
- * pending fetch.
- */
 export async function openChatStreamWithConnectTimeout(
   responsePromise: Promise<Response>,
   options: {

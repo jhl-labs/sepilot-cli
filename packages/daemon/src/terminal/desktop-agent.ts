@@ -26,7 +26,6 @@ interface LiveSession {
   pendingBytes: number
   listeners: Set<(event: DesktopAgentEvent) => void>
 }
-/** sepilot-multi's persistent PTY + terminal grid model, with ordered snapshot/stream handoff. */
 export class DesktopAgentSessions {
   private sessions = new Map<string, LiveSession>()
   constructor(private readonly spawn: (options: AgentPtyOptions) => AgentPty = spawnAgentPty) {}
@@ -181,7 +180,6 @@ export class DesktopAgentSessions {
   async subscribe(id: string, listener: (event: DesktopAgentEvent) => void): Promise<() => void> {
     const live = this.require(id)
     if (live.listeners.size >= 8) throw new Error('이 세션의 연결 수가 너무 많습니다.')
-    // Snapshot and subscription share the same output queue; no missing or duplicated tail.
     const ready = live.tail.then(() => {
       if (!this.sessions.has(id)) throw new Error('세션이 종료되었습니다.')
       if (live.listeners.size >= 8) throw new Error('이 세션의 연결 수가 너무 많습니다.')

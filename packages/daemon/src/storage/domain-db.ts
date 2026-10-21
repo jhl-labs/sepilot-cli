@@ -23,10 +23,6 @@ export function openDomainDb(input: OpenDomainDbInput): SqliteDatabase {
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   secureDir(dir)
   const db = openDatabase(file, { timeout: DEFAULT_SQLITE_BUSY_TIMEOUT_MS })
-  // Tighten perms on the db file (and the WAL/SHM sidecars that
-  // better-sqlite3 may have created during the open above) so a
-  // co-tenant on a shared host cannot read team-docs PATs / memory
-  // contents / personal-docs markdown that the daemon owns.
   secureFile(file)
   secureFile(`${file}-wal`)
   secureFile(`${file}-shm`)
@@ -41,11 +37,9 @@ export function closeAllDomainDbs(): void {
     try {
       db.close()
     } catch {
-      /* ignore */
     }
   }
   cache.clear()
 }
 
-/** @deprecated Use closeAllDomainDbs; retained for existing focused tests. */
 export const closeAllDomainDbsForTests = closeAllDomainDbs

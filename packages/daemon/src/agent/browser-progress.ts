@@ -1,6 +1,5 @@
 import type { Message, ToolCall } from '@sepilotd/core'
 
-/** Stop replaying clicks after two complete cycles with no observed change. */
 export function repeatedBrowserClickWithoutProgress(messages: Message[]): boolean {
   const start = messages.findLastIndex(message => message.role === 'user')
   const calls = new Map<string, ToolCall>()

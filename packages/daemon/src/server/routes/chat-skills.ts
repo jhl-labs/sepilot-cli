@@ -15,11 +15,6 @@ interface CwdSkillRegistry extends ISkillRegistry {
   ): Promise<Awaited<ReturnType<ISkillRegistry['get']>>>
 }
 
-/**
- * Sentinel error thrown when a chat request references a skill that the
- * daemon's skill registry does not know about. Surfaced to the client as a
- * 404 `{ error: 'SKILL_NOT_FOUND', name }` body.
- */
 export class SkillNotFoundError extends Error {
   readonly skillName: string
 
@@ -75,13 +70,6 @@ function formatSkillContentForPrompt(skill: Awaited<ReturnType<ISkillRegistry['g
   return lines.join('\n')
 }
 
-/**
- * An explicitly selected skill is user-requested guidance, while ReadOnly is
- * an execution capability ceiling. Loading the guidance cannot widen that
- * ceiling: every declared tool still goes through the current-turn registry
- * and policy gate. Keep ordinary compatibility checks for all write-capable
- * modes so a supervised-only workflow cannot silently become unattended.
- */
 function canLoadExplicitSkillAtAutonomy(
   required: AutonomyLevel | undefined,
   current: AutonomyLevel | undefined,
@@ -89,14 +77,6 @@ function canLoadExplicitSkillAtAutonomy(
   return current === AutonomyLevel.ReadOnly || autonomyAllows(required, current)
 }
 
-/**
- * Resolve `skillRefs` from a chat request to the concatenated SKILL.md content
- * that should be prepended to the system prompt. Returns `''` when no refs
- * are supplied. Throws `SkillNotFoundError` for the first missing skill so
- * the caller can short-circuit with a 404 — silent fallback would let the
- * agent run without the requested skill content, which is worse than
- * surfacing the typo to the caller.
- */
 export async function resolveSkillRefsContent(
   refs: ReadonlyArray<{ name: string }> | undefined,
   registry: ISkillRegistry,
@@ -184,10 +164,6 @@ const PRESENTATION_REVIEW_INTENT =
 const PRESENTATION_SLIDE_BY_SLIDE_INTENT =
   /\b(?:slide[\s-]*by[\s-]*slide|one\s+slide\s+at\s+a\s+time)\b|(?:한\s*(?:장|슬라이드)씩|슬라이드\s*별로)/i
 
-// Mutation words can occur inside an explicit prohibition ("do not edit",
-// "수정하지 말고"). Treat that combination as review intent only when the
-// same request also asks to read/review the deck; a request such as "create a
-// read-only deck" must still load the authoring workflow.
 const PRESENTATION_READ_ONLY_INTENT =
   /\b(?:read[\s-]*only|review[\s-]*only|without\s+(?:editing|modifying|changing|saving)|(?:do\s+not|don['’]?t|never)\s+(?:(?:make\s+(?:any\s+)?)?(?:edits?|changes?|modifications?)|edit|modify|change|save|write|update)|no\s+(?:edits?|changes?|modifications?))\b|(?:읽기\s*전용|보기\s*전용|원본\s*유지|(?:수정|편집|변경|저장|쓰기)(?:은|는|을|를)?\s*(?:하지\s*(?:마|말|않)|안\s*(?:하|해)|없이|금지))/i
 
@@ -258,12 +234,6 @@ export function autoOfficeSkillNames(
   return names
 }
 
-/**
- * A terse navigation request is actionable only when the immediately
- * preceding turn contains a successful read-only presentation tool result.
- * Keep this shared with all transports so auto mode does not send a stateful
- * Office continuation through a generic graph that may lose the active slide.
- */
 export function isPresentationReviewContinuation(
   message: string,
   previousMessages: readonly Message[],
@@ -287,13 +257,6 @@ export function resolvePresentationReviewRoutingMode<TMode extends string | unde
     : requestedMode
 }
 
-/**
- * Decide whether attached PPTX text should stay out of the first model turn.
- * Unlike `autoOfficeSkillNames`, this is deliberately not a presentation-topic
- * fallback: whole-deck summaries and authoring requests still need the normal
- * extractor, while an explicit read/review workflow must observe one slide at
- * a time through the read-only Office tools.
- */
 export function shouldDeferPptxAttachmentText(
   message: string,
   refs: ReadonlyArray<{ name: string }> | undefined,
@@ -329,11 +292,13 @@ export async function resolveOfficeAutoSkillContent(
   previousMessages?: readonly Message[],
   loadedSkillIds?: Set<string>,
   intentMessage: string = message,
+  automaticSkillInventory?: readonly string[],
 ): Promise<string> {
   const refNames = new Set((refs ?? []).map((ref) => ref.name))
   const hasExplicitPresentationSkill = [...refNames]
     .some((name) => PRESENTATION_SKILLS.has(name))
   const names = autoOfficeSkillNames(message, previousMessages, intentMessage).filter((name) => {
+    if (automaticSkillInventory && !automaticSkillInventory.includes(name)) return false
     if (refNames.has(name)) return false
     return !(hasExplicitPresentationSkill && PRESENTATION_SKILLS.has(name))
   })
@@ -447,6 +412,44 @@ export async function resolveImageGeneratorAutoSkillContent(
   ].join('\n') + '\n\n---\n\n'
 }
 
+export function loadedSkillNames(prefix: string): string[] {
+  return [...new Set([...prefix.matchAll(/^\[Skill: ([^\]\n]+)\]$/gm)].map((match) => match[1]!.trim()))]
+}
+
+export function buildSkillsLoaded(input: {
+  strictPrefix: string
+  callerSkillNames: ReadonlyArray<string>
+  botPrefix: string
+  autoPrefix: string
+}): Array<{ id: string; source: 'selected' | 'router' | 'bot' | 'auto' }> | null {
+  const caller = new Set(input.callerSkillNames)
+  const skills = [
+    ...loadedSkillNames(input.strictPrefix).map((id) => ({ id, source: caller.has(id) ? 'selected' as const : 'router' as const })),
+    ...loadedSkillNames(input.botPrefix).map((id) => ({ id, source: 'bot' as const })),
+    ...loadedSkillNames(input.autoPrefix).map((id) => ({ id, source: 'auto' as const })),
+  ]
+  return skills.length > 0 ? skills : null
+}
+
+export async function filterLoadableSkillRefs(
+  refs: ReadonlyArray<{ name: string }>,
+  registry: ISkillRegistry,
+  cwd: string | undefined,
+  currentAutonomy: AutonomyLevel | undefined,
+  workspaceRoot: string | undefined,
+  reserved = 0,
+): Promise<Array<{ name: string }>> {
+  const loadable: Array<{ name: string }> = []
+  for (const ref of refs) {
+    if (reserved + loadable.length >= MAX_EXPLICIT_SKILL_REFS) break
+    const skill = await resolveSkill(registry, ref.name, cwd, workspaceRoot).catch(() => undefined)
+    if (!skill || skill.metadata.enabled === false) continue
+    if (!canLoadExplicitSkillAtAutonomy(skill.metadata.autonomy_required, currentAutonomy)) continue
+    loadable.push({ name: ref.name })
+  }
+  return loadable
+}
+
 async function resolveSkill(
   registry: ISkillRegistry,
   name: string,
@@ -500,10 +503,6 @@ function expandDeclaredToolNames(declaredTools: string[] | undefined): string[] 
   return [...expanded]
 }
 
-/**
- * Render a `SkillNotFoundError` into the agreed wire format and return the
- * Fastify reply so handlers can `return sendSkillNotFoundReply(...)`.
- */
 export function sendSkillNotFoundReply(
   reply: FastifyReply,
   err: SkillNotFoundError,

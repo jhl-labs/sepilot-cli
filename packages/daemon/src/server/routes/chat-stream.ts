@@ -1,3 +1,4 @@
+import { resolveTurnMemoryPolicy, memoryToolAllowed } from '../../memory/turn-policy.js'
 import { resolvePersonaMemoryScope } from '../../memory/persona-scope.js'
 import { withSelectedBrowserTarget } from '../../tools/browser-target.js'
 import { remoteBrowserBridge } from '../../tools/browser-remote.js'
@@ -13,14 +14,15 @@ import { resolveInstantModeToolNames } from '../../agent/instant-mode-tool-inten
 import { resolveSkillExecutionContext } from '../../skills/execution-policy.js'
 import {
   formatContextCompactionNotice,
-  loadAutoCompactedSessionContext,
+  loadAutoCompactedSessionContextWithinBudget,
+  loadLatestRoutedPersona,
   loadLatestRunContract,
   resolveSessionContextMaxMessages,
 } from '../../agent/auto-compaction.js'
-import { fallbackSessionTitle, updateSessionTitleFromFirstTurn } from '../../agent/session-title.js'
+import { fallbackSessionTitle } from '../../agent/session-title.js'
 import { triggerDreamingTurn } from '../../memory/dreaming.js'
 import { publishChatCompletionNotification } from '../../notifications/publish.js'
-import { buildSystemPrompt } from '../../agent/system-prompt.js'
+import { buildDeferredSystemPrompt } from '../../agent/system-prompt.js'
 import {
   applyWritingDocFallback,
   snapshotWritingDocStart,
@@ -36,13 +38,14 @@ import {
 } from '../../agent/custom/persona-resolver.js'
 import { createPersonaRepo } from '../../persona/repo.js'
 import {
-  withContextualToolExposure, withAuthorizedToolExposure,
+  withContextualToolExposure, withTurnToolAuthority,
   withDirectApiMemoryToolset,
   withSwarmToolsForSession,
   withWritingDocTools,
 } from '../../tools/role-filter.js'
 import {
   chatRequestSchema,
+  excludesLocalContext,
   isDesktopExternalAgentMode,
   resolveChatHardMaxIterations,
   resolveChatMaxIterations,
@@ -52,6 +55,8 @@ import {
   resolveImageGeneratorAutoSkillContent,
   resolveOfficeAutoSkillContent,
   resolveSkillRefsContent,
+  filterLoadableSkillRefs,
+  buildSkillsLoaded,
   shouldDeferPptxAttachmentText,
   sendSkillNotFoundReply,
   sendSkillUnavailableReply,
@@ -104,11 +109,22 @@ import {
 import { IntentRouter, type IntentRouterOptions } from '../../agent/intent-router.js'
 import { createAuxiliaryLlmTurnBudget } from '../../agent/auxiliary-llm.js'
 import {
+  applyRoleBotRequestDefaults,
+  applyRoutedRoleBot,
+  keepContinuingRoleBot,
+  roleBotLongTermInjectKb,
+  roleBotModeRouterOptions,
+  withRoleBotPersonas,
+  routerPersonaCandidates,
+  roleBotSkillRefs,
+} from '../chat-bots.js'
+import {
   applyIntentRouting,
   resolveInitialExecutionMode,
   logIntentRouterDecision,
   INTENT_ROUTER_CIRCUIT_BREAKER,
   resolveIntentRouterModel,
+  routingLeavesMemoryIntentUnresolved,
 } from './chat-intent.js'
 import {
   findUnknownChatPersonaIds,
@@ -126,6 +142,8 @@ import {
 } from '../chat-memory-context.js'
 import { resolveScopedFileMemoryReadView } from '../../memory/scoped-file-memory-read-view.js'
 import { stopReasonProviderError, stopReasonUserAbort } from '../../agent/stop-reason.js'
+import { DEFAULT_LIVE_VIEW_STILLS, createLiveViewTap, type LiveViewTap } from '../../views/live-view-event-tap.js'
+import { liveViewRegistry } from '../../views/live-view-registry.js'
 
 const logger = createLogger('route.chat-stream')
 
@@ -311,13 +329,11 @@ async function replayPersistedChatStream(
     try {
       if (!reply.raw.writableEnded) reply.raw.end()
     } catch {
-      /* noop */
     }
   }
 }
 
 export async function chatStreamRoutes(app: FastifyInstance) {
-  // POST /chat/stream — SSE streaming response
   app.post<{ Body: ChatBody }>(
     '/chat/stream',
     {
@@ -335,7 +351,12 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           .status(503)
           .send({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Runtime not initialized' } })
 
-      const body = request.body
+      const roleBotRequest = applyRoleBotRequestDefaults(request.body, runtime.roleBots)
+      if (roleBotRequest.error) {
+        return reply.status(400).send({ error: { code: roleBotRequest.error.code, message: roleBotRequest.error.message, details: { unknownIds: roleBotRequest.error.unknownIds } } })
+      }
+      const body = roleBotRequest.body
+      const explicitRoleBot = roleBotRequest.bot
       const baseScopeTags = readChatMemoryScope(request.headers, request.authContext)
 
       if (isExtensionWritingModeDenied(request.authContext, body.mode)) {
@@ -418,10 +439,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
         return
       }
 
-      // Claim before the first session/workspace read. The response listeners
-      // release pre-flight failures; the run-level finally releases successful
-      // streams. The lease itself is idempotent, so late socket events cannot
-      // release a newer owner of the same session.
       const sessionLeaseLifecycle = createSessionBusyLeaseLifecycle()
       request.raw.once('aborted', sessionLeaseLifecycle.releasePreflight)
       reply.raw.once('finish', sessionLeaseLifecycle.releasePreflight)
@@ -467,9 +484,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
         throw error
       }
 
-      // Explicit per-turn autonomy selection plus a structured trace. Real
-      // ceilings are enforced by channel ACL and tool policy, not by treating
-      // the configured local default as a security boundary.
       const autonomyResolution = resolveRequestedAutonomy(runtime.autonomy, body.autonomy)
       const effectiveAutonomy = autonomyResolution.effective
       const {
@@ -484,7 +498,9 @@ export async function chatStreamRoutes(app: FastifyInstance) {
         (await runtime.customDefs
           ?.agentsForCwd(requestCwd, requestWorkspaceRoot)
           .catch(() => [])) ?? []
-      const persistedPersonas = createPersonaRepo().list()
+      const storedPersonas = createPersonaRepo().list()
+      const userDefinedPersonaIds = new Set([...storedPersonas.map((persona) => persona.id), ...customAgents.map((agent) => agent.id)])
+      const persistedPersonas = withRoleBotPersonas(storedPersonas, runtime.roleBots)
       const personaSelection = resolveChatPersonaSelection(body, existingSession)
       const unknownPersonaIds = findUnknownChatPersonaIds(
         personaSelection,
@@ -541,10 +557,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
       const selectedProvider = selection.provider
       const selectedModel = selection.model
 
-      // Pre-flight skill validation: user-requested skillRefs are validated
-      // before the SSE stream opens so unknown/unavailable refs produce 4xx
-      // responses (matching the original behavior). The effective post-routing
-      // set is validated again below before its tool allowlist is constructed.
       const declaredSkillToolNames = new Set<string>()
       const autoLoadedSkillToolNames = new Set<string>()
       const loadedExecutionSkillIds = new Set<string>()
@@ -582,17 +594,9 @@ export async function chatStreamRoutes(app: FastifyInstance) {
         return reply
       }
 
-      // Register disconnect handling before hook/routing/context preflight.
-      // Those steps can involve slow storage or auxiliary-model calls; if the
-      // client presses Ctrl+C before SSE headers are opened, registering only
-      // beside reply.hijack() permanently misses the closed socket and lets the
-      // abandoned run retain its limiter lease until the inactivity watchdog.
       let clientClosed = false
       let terminalSessionPersisted = false
       let activeModeRouter: AgentModeRouter | null = null
-      // Set when the approval registry parks this run: the prompt stays open
-      // and its checkpoint stays on disk, so the stream ends with an
-      // APPROVAL_TIMEOUT frame plus a resumable `approval_timeout` done.
       let parkedDecision: PendingDecision | null = null
       const preflightAbortController = new AbortController()
       const stopRun = async () => {
@@ -601,17 +605,11 @@ export async function chatStreamRoutes(app: FastifyInstance) {
         await activeModeRouter?.stop().catch(() => {})
       }
       registerSseDisconnectHandler(request, reply, stopRun)
-      // Some embedders and lightweight test runtimes predate the active-run
-      // registry. Disconnect cancellation must remain available through the
-      // socket handler even when the explicit cancel endpoint is unavailable.
       const unregisterRunCanceller =
         runtime.activeRuns?.registerCanceller(sessionId, stopRun) ?? (() => undefined)
 
       let lifecycle: ReturnType<typeof createSseLifecycle> | null = null
       try {
-        // pre:user:prompt — fires before any session/user_message side
-        // effects so a handler can abort (4xx) or rewrite the prompt before
-        // it reaches the agent and the session journal.
         const userPromptHook = await runtime.hookRegistry.trigger({
           event: 'pre:user:prompt',
           data: {
@@ -666,10 +664,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           }
           const parts: ContentPart[] = [{ type: 'text', text: finalPrompt }, ...built.parts]
           requiresNativeMultimodal = requiresNativeMultimodalInput(parts)
-          // Tag the payload so engine.buildInitialMessages can recover the
-          // ContentPart[] verbatim instead of stuffing JSON into a string
-          // message (which is what was making vision models answer the
-          // wrong question).
           agentInput = encodeMultimodalInput(parts)
         }
 
@@ -708,7 +702,7 @@ export async function chatStreamRoutes(app: FastifyInstance) {
             session = (await runtime.sessions.updateMeta?.(session.id, patch)) ?? session
           }
         }
-        const previousContext = await loadAutoCompactedSessionContext({
+        const previousContext = await loadAutoCompactedSessionContextWithinBudget({
           sessionStore: runtime.sessions,
           sessionId,
           provider: selectedProvider,
@@ -734,10 +728,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           finalPrompt,
         )
 
-        // ── Intent routing ────────────────────────────────────────────────
-        // Run BEFORE reply.hijack() so errors can still be sent as normal
-        // JSON responses. Skill prefix resolution (which needs `send`) is
-        // deferred to after the SSE stream opens.
         const auxiliaryLlmBudget = createAuxiliaryLlmTurnBudget()
         const routerCfg = runtime.config.agent.intentRouter
         let intentRouter: IntentRouter | null = null
@@ -761,7 +751,11 @@ export async function chatStreamRoutes(app: FastifyInstance) {
                 model: routerModel,
                 graphRegistry: runtime.graphRegistry,
                 skillRegistry: runtime.skillRegistry,
-                personaList: () => resolvePersonaCatalog(customAgents, persistedPersonas),
+                personaList: () => routerPersonaCandidates(
+                  resolvePersonaCatalog(customAgents, persistedPersonas),
+                  runtime.roleBots,
+                  userDefinedPersonaIds,
+                ),
                 currentAutonomy: effectiveAutonomy,
                 cwd: requestCwd,
                 workspaceRoot: requestWorkspaceRoot,
@@ -782,15 +776,13 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           }
         }
 
-        // A session-bound solo persona and an explicit panel are deliberate
-        // user selections. Do not let intent routing silently replace either.
         const panelLocked =
           body.mode === 'persona-panel' && (personaSelection.personaIds?.length ?? 0) > 0
         const personaLocked = panelLocked || Boolean(personaSelection.persona)
         const effectiveIntentRouting = personaLocked ? { enabled: false } : body.intentRouting
         const routingMode = body.mode
 
-        const routing = await applyIntentRouting({
+        const initialRouting = await applyIntentRouting({
           defaultMode: runtime.config.agent.mode,
           router: intentRouter,
           graphRegistry: runtime.graphRegistry,
@@ -804,14 +796,25 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           },
           isMultimodal: requiresNativeMultimodal,
         })
+        const continuingRouting = initialRouting.decision.contractRelation === 'continue'
+          ? keepContinuingRoleBot(
+              initialRouting,
+              await loadLatestRoutedPersona(runtime.sessions, sessionId).catch(() => undefined),
+              runtime.roleBots,
+            )
+          : initialRouting
+        const { routing, bot: routedRoleBot } = applyRoutedRoleBot(continuingRouting, runtime.roleBots)
+        const turnRoleBot = explicitRoleBot ?? routedRoleBot
 
         if (clientClosed || reply.raw.destroyed) return reply
 
-        await runtime.sessions.appendEvent(sessionId, {
+const memoryPolicy = resolveTurnMemoryPolicy(body.memoryPolicy, routing.decision.memoryPolicy, routingLeavesMemoryIntentUnresolved(routing.decision))
+                await runtime.sessions.appendEvent(sessionId, {
           type: 'router_decision',
           id: randomUUID(),
           timestamp: new Date().toISOString(),
           decision: {
+            memoryPolicy,
             mode: routing.decision.mode,
             persona: routing.decision.persona,
             skillIds: routing.decision.skillIds,
@@ -823,12 +826,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           },
         })
 
-        // ── Structured log: per-decision telemetry ───────────────────────
-        // Emitted for every turn so dashboards/log-aggregators can track
-        // routing quality without instrumenting the database.
-        // TODO: wire Prometheus-style counters (intentRouterCalls,
-        // intentRouterLatency, intentRouterTokens) once the daemon exposes
-        // registerCounter/registerHistogram helpers.
         logIntentRouterDecision(
           logger,
           routing,
@@ -842,11 +839,13 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           routerCfg?.model,
         )
 
-        // Resolve the post-routing skill set before the tool registry is scoped.
-        // This keeps the streaming path in parity with /chat: a declared skill
-        // can expose only its own tools, and a router-selected skill uses its
-        // stable declaration rather than inheriting the full registry.
+        const botSkillRefs = await filterLoadableSkillRefs(
+          roleBotSkillRefs(turnRoleBot, routing.effectiveSkillRefs),
+          runtime.skillRegistry, requestCwd, effectiveAutonomy, requestWorkspaceRoot,
+          routing.effectiveSkillRefs.length,
+        )
         let skillPrefix = ''
+        let botSkillPrefix = ''
         let officeAutoSkillContent = ''
         let imageGenSkillContent = ''
         try {
@@ -860,7 +859,17 @@ export async function chatStreamRoutes(app: FastifyInstance) {
             requestWorkspaceRoot,
             loadedExecutionSkillIds,
           )
-          officeAutoSkillContent = resolveInitialExecutionMode(routing, runtime.config.agent.mode) === 'instant' ? '' : await resolveOfficeAutoSkillContent(
+          botSkillPrefix = await resolveSkillRefsContent(
+            botSkillRefs,
+            runtime.skillRegistry,
+            runtime.toolRegistry,
+            requestCwd,
+            effectiveAutonomy,
+            autoLoadedSkillToolNames,
+            requestWorkspaceRoot,
+            loadedExecutionSkillIds,
+          )
+          officeAutoSkillContent = resolveInitialExecutionMode(routing, runtime.config.agent.mode, false, resolveRequestSurface(request) ?? undefined) === 'instant' ? '' : await resolveOfficeAutoSkillContent(
             officeAutoIntent,
             routing.effectiveSkillRefs,
             runtime.skillRegistry,
@@ -872,6 +881,7 @@ export async function chatStreamRoutes(app: FastifyInstance) {
             previousMessages,
             loadedExecutionSkillIds,
             finalPrompt,
+            turnRoleBot ? turnRoleBot.skills ?? [] : undefined,
           )
           imageGenSkillContent = await resolveImageGeneratorAutoSkillContent(
             message,
@@ -902,17 +912,16 @@ export async function chatStreamRoutes(app: FastifyInstance) {
         )
         const agentsFiles = await collectAgentsMd({
           cwd: requestCwd,
+          includeUserLevel: !excludesLocalContext(body),
           boundaryRoot: requestWorkspaceRoot,
         })
         const agentsMemory = formatAgentsMdSection(agentsFiles) ?? undefined
-        const relevantKnowledgeContext = await buildChatKnowledgeContext({
+        const relevantKnowledgeContext = memoryPolicy.read && memoryPolicy.automaticRead !== false ? await buildChatKnowledgeContext({
           registry: app.chatKnowledgeProviders,
           message: finalPrompt,
           previousMessages,
-          allowLocalKnowledge: request.authContext?.kind !== 'extension',
-        })
-        // Direct-API surface: trim the memory toolset (default `lean`). Channels
-        // run through the pipeline and keep the full `runtime.toolRegistry`.
+          allowLocalKnowledge: request.authContext?.kind !== 'extension' && !excludesLocalContext(body),
+        }) : undefined
         const directApiToolRegistry = withWritingDocTools(
           withSwarmToolsForSession(
             withDirectApiMemoryToolset(
@@ -921,23 +930,26 @@ export async function chatStreamRoutes(app: FastifyInstance) {
             ),
             sessionId,
           ),
-          // The same expression the doc.* tools resolve with.
           body.writingDocId ?? getDocRegistry().getActiveId(),
         )
         const activeRemoteBrowser = remoteBrowserBridge(runtime.toolRegistry).list().some(
           (connection) => connection.sessionId === sessionId,
         )
-        const initialMode = resolveInitialExecutionMode(routing, runtime.config.agent.mode, activeRemoteBrowser)
-        const authorizedToolRegistry = withSelectedBrowserTarget(withAuthorizedToolExposure(directApiToolRegistry, {
-          explicitToolNames: body.toolNames, declaredSkillToolNames,
+        const initialMode = resolveInitialExecutionMode(routing, runtime.config.agent.mode, activeRemoteBrowser, resolveRequestSurface(request) ?? undefined)
+        const turnToolAuthority = withTurnToolAuthority(directApiToolRegistry, {
+          explicitToolNames: (body.toolNames ?? directApiToolRegistry.list().map(tool => tool.name)).filter(name => memoryToolAllowed(name, memoryPolicy)), declaredSkillToolNames,
           personaAllowedTools: personaObj?.allowedTools, personaDeniedTools: personaObj?.deniedTools,
-        }), activeRemoteBrowser)
+        })
+        const delegationToolRegistry = withSelectedBrowserTarget(turnToolAuthority.delegation, activeRemoteBrowser)
+        const authorizedToolRegistry = withSelectedBrowserTarget(turnToolAuthority.own, activeRemoteBrowser)
         const agentToolRegistry = withContextualToolExposure(authorizedToolRegistry, {
           surface: resolveRequestSurface(request),
           semanticRouting: true,
           activeRemoteBrowser,
           selectedGroups: routing.decision.toolGroups,
+          botToolGroups: turnRoleBot?.toolGroups,
           routedMode: initialMode,
+          routingConfidence: routing.decision.confidence,
           routingFallback: routing.decision.fallback,
           activeWritingDocument: Boolean(body.writingDocId ?? getDocRegistry().getActiveId()),
           swarmSession: sessionId.startsWith('swarm_'),
@@ -953,16 +965,18 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           ),
         })
         const closedToolSurface = body.toolNames !== undefined || declaredSkillToolNames.size > 0
-        const baseSystemPrompt = await buildSystemPrompt({
+        const { prompt: baseSystemPrompt, systemToolGuidance } = await buildDeferredSystemPrompt({
           config: runtime.config,
           profile: initialMode === 'instant' ? 'instant' : 'agent',
+          longTermInjectKb: roleBotLongTermInjectKb(turnRoleBot),
+          skillInventory: turnRoleBot ? (turnRoleBot.skills ?? []) : undefined,
           tools: agentToolRegistry,
           skills: runtime.skillRegistry,
-          fileMemory: resolveScopedFileMemoryReadView(
+          fileMemory: !excludesLocalContext(body) && memoryPolicy.read && memoryPolicy.automaticRead !== false ? resolveScopedFileMemoryReadView(
             runtime.fileMemory,
             runtime.fileMemoryRegistry,
             scopeTags,
-          ),
+          ) : undefined,
           agentsMemory,
           relevantMemoryContext: relevantKnowledgeContext,
           customInstructions: personaObj?.systemPromptAddition,
@@ -971,23 +985,16 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           workspaceRoot: requestWorkspaceRoot,
           sessionId,
           closedToolSurface,
-          // Session history already supplies same-session context; journals
-          // can aggregate unrelated conversations from the same day.
           includeDailyNotes: false,
         })
         let strictFinalAnswerProtocol = process.env.SEPILOTD_STRICT_ANSWER_PROTOCOL === '1'
-        // 글쓰기 모드(mode='writing') 자동 컨텍스트:
-        // - 활성 doc session이 있으면 system prompt에 outline + (작은 doc) 전체 본문
-        //   + doc.* 도구 우선 사용 안내를 prepend.
-        // - desktop이 chat 보낼 때 별도 컨텍스트 button 누를 필요 없이 LLM이
-        //   바로 활성 문서를 알게 됨. canvas UX의 핵심.
         const docPrefix = buildWritingDocPrefix(
           body.mode,
           body.writingDocId,
           requestWorkspaceRoot,
         )
         const shellPrefix = buildShellModePrefix(body.mode)
-        const systemPrompt = () => shellPrefix + docPrefix + skillPrefix + baseSystemPrompt
+        const systemPrompt = () => shellPrefix + docPrefix + skillPrefix + botSkillPrefix + baseSystemPrompt
         const writingDocStart = snapshotWritingDocStart(
           body.mode,
           body.writingDocId,
@@ -1009,8 +1016,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
                 label: approval.tool,
                 since: Date.parse(approval.requestedAt),
               }
-              // Same abort-without-cancel path the decision watchdog uses:
-              // the wait rejects through `signal`, the registry entry stays.
               void activeModeRouter?.stop().catch(() => {})
             },
           })
@@ -1026,28 +1031,32 @@ export async function chatStreamRoutes(app: FastifyInstance) {
 
         const createModeRouter = (nextSelection: typeof selection) =>
           new AgentModeRouter({
+            systemToolGuidance,
             provider: nextSelection.provider,
             tools: agentToolRegistry,
             authorizedTools: authorizedToolRegistry,
+            delegationTools: delegationToolRegistry,
             activeRemoteBrowser,
             policy: runtime.policyEngine,
             autonomy: effectiveAutonomy,
             auxiliaryLlmBudget,
-            semanticIndex: runtime.semanticIndex,
+            semanticIndex: excludesLocalContext(body) ? undefined : runtime.semanticIndex,
             systemPrompt: systemPrompt(),
             previousMessages,
-            maxIterations: resolveChatMaxIterations(body),
+            maxIterations: resolveChatMaxIterations({ ...body, maxIterations: body.maxIterations ?? turnRoleBot?.maxIterations }),
+            ...roleBotModeRouterOptions(turnRoleBot),
             hardMaxIterations: resolveChatHardMaxIterations(body),
             auditLogger: runtime.auditLogger,
             usageTracker: runtime.usageTracker,
             spendBudget: runtime.config.limits,
             hookRegistry: runtime.hookRegistry,
             deviceName: runtime.config.device.name,
-            thinkingLevel,
+            thinkingLevel: thinkingLevel ?? runtime.config.agent.thinkingLevel,
+            thinkingLevelSource: thinkingLevel === undefined ? 'default' : 'request',
             maxTokens,
             temperature,
             textDeltaMode,
-            ragEnabled,
+            ragEnabled: ragEnabled ?? turnRoleBot?.documents,
             panelPersonas: resolvedPanelPersonas,
             panelStrategy,
             providerCircuitBreaker: runtime.providerCircuitBreaker,
@@ -1111,21 +1120,11 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           }
         }
 
-        // SSE keepalive + agent inactivity watchdog.
-        // Keepalive comment frames stop proxies/cli watchdogs from idling the
-        // connection while the agent is waiting on a slow first token
-        // (cold-start, big context). Inactivity timer fires once if no real
-        // event arrives within SEPILOTD_AGENT_INACTIVITY_MS — without it, an
-        // LLM/tool hang inside the for-await loop kept the run lease alive
-        // forever because the cosmetic keepalive frames hid the lockup.
         const AGENT_INACTIVITY_MS = resolveAgentInactivityMs()
         const inactivityProbe = createAgentInactivityProbe()
         lifecycle = createSseLifecycle({
           reply,
           inactivityMs: AGENT_INACTIVITY_MS,
-          // Pending human decision != stall. While an approval/question is
-          // outstanding the stall watchdog stays quiet and only the separate,
-          // explicitly named decision bound can end the run.
           pendingDecision: () => inactivityProbe.pendingDecision(),
           decisionTimeoutMs: resolvePendingDecisionTimeoutMs(),
           onInactivity: () => {
@@ -1137,9 +1136,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
         })
 
         await send('session', { sessionId })
-        // Surface skipped attachments (oversized/malformed/wrong-type/out-of-root)
-        // instead of silently dropping them, so the user knows their file was
-        // not included in the turn.
         if (skippedAttachments.length > 0) {
           await send('warning', {
             type: 'warning',
@@ -1153,17 +1149,19 @@ export async function chatStreamRoutes(app: FastifyInstance) {
         if (userImageArtifacts.length > 0) {
           await send('artifacts', { artifacts: userImageArtifacts })
         }
-        // Emit the routing decision as the first typed event so consumers can
-        // display what configuration is driving this turn before text arrives.
         await send('router_decision', {
           type: 'router_decision',
           id: randomUUID(),
           decision: routing.decision,
         })
+        const skillsLoaded = buildSkillsLoaded({
+          strictPrefix: skillPrefix,
+          callerSkillNames: (body.skillRefs ?? []).map((ref) => ref.name),
+          botPrefix: botSkillPrefix,
+          autoPrefix: officeAutoSkillContent + imageGenSkillContent,
+        })
+        if (skillsLoaded) await send('skills_loaded', { type: 'skills_loaded', skills: skillsLoaded })
 
-        // Auto skills were resolved before the tool registry was scoped so
-        // their declared tools participate in the same least-privilege set as
-        // explicit/router-selected skills.
         skillPrefix += officeAutoSkillContent
         skillPrefix += imageGenSkillContent
         strictFinalAnswerProtocol =
@@ -1177,18 +1175,8 @@ export async function chatStreamRoutes(app: FastifyInstance) {
         let terminalStateChangeEvent: Extract<AgentEvent, { type: 'state_change' }> | null = null
         let providerError: ApiError | null = null
 
-        // 한 번의 chat-stream 요청 = 한 개의 task. Settings → Agent Stats 의
-        // productivity KPI(completion rate, throughput/day, channel resolution)
-        // 가 task.started/task.completed 이벤트 카운트에 의존하는데, channel
-        // pipeline 만 발화시키고 일반 chat 흐름은 발화 안 시켜서 desktop/cli/web
-        // 사용자에겐 항상 0/n/a 로 보이는 문제가 있었음. 여기서 한 turn 단위로
-        // 묶어 emit. taskId 는 새 UUID — sessionId/run 메타와 별개로 추적된다.
         const taskId = randomUUID()
         const taskStartedAt = Date.now()
-        // Opt-in chat-completion notifications: when the user enables this in
-        // config the daemon publishes an in-app notification at the end of
-        // every chat run, so other surfaces (and the desktop tray toast when
-        // the window is unfocused) can surface "your chat finished".
         const requestSurface = resolveRequestSurface(request)
         const notifyChatCompletion = (
           outcome: 'completed' | 'failed',
@@ -1204,7 +1192,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
               errorMessage,
             })
           } catch {
-            // best-effort — never let a notification failure break the chat reply.
           }
         }
         const recordTaskEvent = (
@@ -1231,7 +1218,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
               },
             ])
           } catch {
-            // Observability is best-effort; never block the chat flow on it.
           }
         }
         recordTaskEvent('task.started', 'info')
@@ -1256,10 +1242,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           }
           if (event.type === 'error') {
             providerError = event.error
-            // Delay the public error frame until the run has been classified.
-            // A provider can fail after successful tool execution; that path
-            // closes with a transparent retained-evidence INCOMPLETE instead
-            // of making stream clients discard the later terminal message.
             return
           }
           if (isReplayableLiveAgentEvent(event)) {
@@ -1276,12 +1258,10 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           noteEvent(event)
           await emitEvent(event)
         }
-        // Tell the user their earlier conversation was replaced by a summary.
-        // Compaction changes what the assistant can recall, so it must not be
-        // something the user only infers from a thinner answer.
         if (compactionNotice) {
           await emitEvent({ type: 'thinking', content: compactionNotice })
         }
+        let liveViewTap: LiveViewTap | undefined
         try {
           for (let attemptIndex = 0; attemptIndex < selections.length; attemptIndex += 1) {
             const attemptSelection = selections[attemptIndex]!
@@ -1293,6 +1273,10 @@ export async function chatStreamRoutes(app: FastifyInstance) {
             let retrying = false
             activeModeRouter = modeRouter
             activeAttempt = attempt
+            if (clientClosed) {
+              await modeRouter.stop().catch(() => {})
+              break
+            }
 
             await appendChatProviderAttemptEvent(
               runtime.sessions,
@@ -1302,7 +1286,13 @@ export async function chatStreamRoutes(app: FastifyInstance) {
               'started',
             )
 
-            for await (const event of modeRouter.run(
+            const attemptViewTap = createLiveViewTap({
+              views: liveViewRegistry(runtime.toolRegistry),
+              sessionId,
+              stills: runtime.config.views?.stills ?? DEFAULT_LIVE_VIEW_STILLS,
+            })
+            liveViewTap = attemptViewTap
+            for await (const event of attemptViewTap.wrap(modeRouter.run(
               agentInput,
               {
                 sessionId,
@@ -1326,21 +1316,30 @@ export async function chatStreamRoutes(app: FastifyInstance) {
                 systemPrompt: systemPrompt(),
                 previousMessages,
                 toolAllowlist: authorizedToolRegistry.list().map((tool) => tool.name),
+                delegationToolAllowlist: delegationToolRegistry.list().map((tool) => tool.name),
                 ...resolveSkillExecutionContext(
                   loadedExecutionSkillIds,
                   new Set([...declaredSkillToolNames, ...autoLoadedSkillToolNames]),
                 ),
                 runContract: previousRunContract,
                 runContractScope: 'previous-turn',
+                deadlineAt: body.deadlineAt,
+                  completionRequest: body.completionRequest,
+                memoryPolicy,
                 memoryQuery: finalPrompt,
                 scopeTags,
                 primaryAgentId: runtime.primaryAgents?.get(sessionId),
                 autoApprove: runtime.autoApprove,
                 requireToolApproval: body.requireToolApproval,
                 preferPromptReact: existingSession?.preferPromptReact,
+                ...(requestSurface ? { surface: requestSurface } : {}),
+                providerAttempt: { attempt, isFallbackPending: () => retrying },
+                ...(turnRoleBot?.id ? { roleBotId: turnRoleBot.id } : {}),
+                ...(body.toolNames !== undefined ? { requestedToolNames: body.toolNames } : {}),
+                requestAuthorityComplete: true,
               },
               requestMode,
-            )) {
+            ))) {
               if (clientClosed) {
                 break
               }
@@ -1411,9 +1410,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
             }
             break
           }
-          // stop() may make a router return normally. A watchdog trip is
-          // nevertheless a terminal failure, not permission to synthesize a
-          // successful done event and fallback final answer.
           if (lifecycle.isInactivityTripped() || parkedDecision) {
             throw new Error(
               parkedDecision
@@ -1448,9 +1444,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
             notifyChatCompletion('completed')
           }
 
-          // emitEvent closure 가 providerError 를 mutate 하기 때문에 TS의
-          // control-flow narrowing이 여전히 null 로만 보고 .code 접근에서
-          // 'never' 추정을 내림 — 명시적 alias 로 풀어준다.
           const finalProviderError = providerError as ApiError | null
           const retainedEvidenceIncomplete = finalProviderError && !terminalDoneEvent
             ? outputTracker.providerFailureContent(finalProviderError)
@@ -1521,31 +1514,31 @@ export async function chatStreamRoutes(app: FastifyInstance) {
               assistantChatContent,
             )
 
+            const liveViewRecords = liveViewTap?.records() ?? []
             await runtime.sessions.appendEvent(sessionId, {
               type: 'assistant_message',
               id: randomUUID(),
               timestamp: new Date().toISOString(),
               content: assistantChatContent,
+              ...(liveViewRecords.length > 0 ? { views: liveViewRecords } : {}),
             })
-            await updateSessionTitleFromFirstTurn({
-              sessions: runtime.sessions,
-              session,
-              provider: activeSelection.provider,
-              model: activeSelection.model,
-              firstMessage: finalPrompt,
-              assistantReply: assistantChatContent,
-            })
-            triggerDreamingTurn(runtime.dreaming, sessionId, 'chat-stream', scopeTags)
+            if (!finalProviderError && doneEvent && (!doneEvent.stopReason || doneEvent.stopReason.kind === 'completed')) {
+              app.sessionTitleUpdates?.schedule({
+                sessions: runtime.sessions,
+                session,
+                provider: activeSelection.provider,
+                model: activeSelection.model,
+                firstMessage: finalPrompt,
+                assistantReply: assistantChatContent,
+              })
+              if (!excludesLocalContext(body)) triggerDreamingTurn(runtime.dreaming, sessionId, 'chat-stream', scopeTags)
+            }
             finalMessageEvent = {
               type: 'message',
               content: assistantChatContent,
             }
           }
 
-          // Outcome review, memory-write verification, and strict answer
-          // protocol may intentionally suppress speculative provider chunks.
-          // Preserve the public buffered-stream contract by emitting the
-          // verified final body once, after every guard has accepted it.
           if (
             !clientClosed
             && finalMessageEvent
@@ -1604,10 +1597,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
           })
           notifyChatCompletion('failed', err instanceof Error ? err.message : String(err))
           if (lifecycle.isInactivityTripped() || parkedDecision) {
-            // Convert the abort/throw into a structured signal the cli can
-            // recognise instead of a generic INTERNAL_ERROR, and say *what*
-            // stalled (provider never responded vs. a stuck step). The run
-            // lease and keepalive timer are released by the outer finally.
             try {
               if (!reply.raw.writableEnded) {
                 const parked = parkedDecision as PendingDecision | null
@@ -1649,8 +1638,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
                   stopReason: timeoutFrame.stopReason,
                 }
                 await persistAgentSessionEvent(runtime.sessions, sessionId, failedDoneEvent)
-                // A parked run is resumable from its checkpoint; do not mark
-                // the session abandoned the way a genuine stall does.
                 if (!parked) {
                   await runtime.sessions.updateMeta?.(sessionId, { status: 'abandoned' })
                 }
@@ -1661,29 +1648,18 @@ export async function chatStreamRoutes(app: FastifyInstance) {
                 reply.raw.end()
               }
             } catch {
-              /* best-effort */
             }
             return
           }
           throw err
         }
       } catch (err) {
-        // SSE handlers are responsible for terminating the response so
-        // the client doesn't hang. Surface the error frame, then close.
         try {
           if (!reply.raw.writableEnded) {
-            // If we throw before `reply.hijack()` / `reply.raw.writeHead`,
-            // the response goes out with only Fastify's defaults — no
-            // Content-Type, no CORS headers — and the browser blocks the
-            // chunked body with a generic "blocked by CORS policy" error
-            // that hides the real cause. Emit a proper SSE error frame
-            // with the right headers so the renderer sees it as a stream
-            // event instead of a CORS failure.
             if (!reply.raw.headersSent) {
               try {
                 reply.hijack()
               } catch {
-                /* hijack is idempotent; ignore "already hijacked" */
               }
               reply.raw.writeHead(
                 200,
@@ -1704,7 +1680,6 @@ export async function chatStreamRoutes(app: FastifyInstance) {
             })
           }
         } catch {
-          /* best-effort */
         }
         try {
           const failedSession = await runtime.sessions.get(sessionId)
@@ -1723,25 +1698,20 @@ export async function chatStreamRoutes(app: FastifyInstance) {
             terminalSessionPersisted = true
           }
         } catch {
-          /* best-effort terminal-state repair */
         }
         throw err
       } finally {
-        // Always tear down lifecycle timers and force-close the stream so
-        // the cli sees EOF, even on uncaught throws.
         lifecycle?.dispose()
         unregisterRunCanceller()
         if (clientClosed && !terminalSessionPersisted) {
           try {
             await runtime.sessions.updateMeta?.(sessionId, { status: 'abandoned' })
           } catch {
-            /* best-effort disconnect-state repair */
           }
         }
         try {
           if (!reply.raw.writableEnded) reply.raw.end()
         } catch {
-          /* noop */
         }
         runLease?.release()
         sessionLeaseLifecycle.releaseRun()

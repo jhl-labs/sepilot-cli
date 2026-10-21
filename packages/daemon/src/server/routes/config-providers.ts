@@ -238,8 +238,6 @@ async function detectOpenAiCompatibilityProfile(
       }
     }
   } catch {
-    // Compatibility metadata is optional. A conforming /models response is
-    // still useful when an endpoint does not advertise a known profile.
   }
   return undefined
 }
@@ -640,12 +638,6 @@ export function registerConfigProvidersRoutes(app: FastifyInstance): void {
     },
   )
 
-  // Server-side model rediscovery for a *stored* provider. Clients only ever
-  // see redacted apiKeys, so they cannot call discover-models themselves for
-  // key-protected providers; this route runs discovery with the daemon's own
-  // (unredacted) stored credentials, persists the refreshed model list into
-  // the provider's config entry, and returns the models. Raw credentials are
-  // never included in the response.
   app.post<{ Params: ConfigProviderIdParams }>('/config/providers/:id/refresh-models', {
     preValidation: zodRequestValidation({
       params: {
@@ -682,7 +674,6 @@ export function registerConfigProvidersRoutes(app: FastifyInstance): void {
         timeoutMs: 10_000,
       })
     } catch (error) {
-      // Discovery failed: leave the stored config untouched.
       const message = extractValidationErrorMessage(error)
       const code = message.startsWith('Model discovery not supported')
         ? 'PROVIDER_TYPE_UNSUPPORTED'

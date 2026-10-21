@@ -149,20 +149,12 @@ export class ChannelReplayStore {
 
     const records: ChannelReplayRecord[] = []
     for (const name of await readdir(this.replayDir)) {
-      // Skip rotated-aside corrupted records — they are forensic
-      // copies, not live dedupe state.
       if (name.includes('.broken-')) continue
       const filePath = join(this.replayDir, name)
       try {
         const raw = await readFile(filePath, 'utf-8')
         records.push(JSON.parse(raw) as ChannelReplayRecord)
       } catch (err) {
-        // A bad file here is dedupe state (channel message
-        // already-processed marker). Silently `rm` would
-        // resurrect the message and let the channel handler
-        // process it twice. Rotate aside instead so the operator
-        // sees the corruption and the dedupe key stays out of
-        // service until they investigate.
         const aside = `${filePath}.broken-${Date.now()}`
         log.warn('replay record unreadable; rotating aside', {
           path: filePath,
@@ -245,10 +237,6 @@ export class ChannelReplayStore {
           removed++
         }
       } catch (err) {
-        // Same rationale as list(): unreadable file is dedupe
-        // state, not garbage. Rotate aside instead of deleting
-        // so the channel can't re-deliver a previously-processed
-        // message just because the marker became unreadable.
         const aside = `${filePath}.broken-${Date.now()}`
         log.warn('replay record unreadable during prune; rotating aside', {
           path: filePath,

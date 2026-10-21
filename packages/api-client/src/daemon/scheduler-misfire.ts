@@ -17,7 +17,6 @@ export function normalizeSchedulerMisfirePolicy(value: unknown): SchedulerMisfir
   return { version: 1, policy: raw.policy, maxLatenessMs: Number(raw.maxLatenessMs) }
 }
 
-/** No new policy for legacy jobs; their engine-level grace remains unchanged. */
 export function schedulerMisfirePolicyFromMetadata(
   metadata: Record<string, unknown> | null | undefined,
 ): SchedulerMisfirePolicy | null {
@@ -34,6 +33,5 @@ export function schedulerMissedEvidence(
     if (value.version === 1 && value.reason === 'late' && Number.isFinite(value.scheduledAt)
       && Number.isFinite(value.detectedAt)) return true
   }
-  // Exact legacy engine diagnostic, not natural-language intent routing.
   return /^missed by \d+ms$/.test(job.lastError ?? '')
 }

@@ -61,7 +61,6 @@ export function createPersonaRepo(): PersonaRepo {
       const now = Date.now()
       const id = input.id ?? crypto.randomUUID()
       const existing = db.prepare('SELECT memory_scope FROM persona WHERE id=?').get(id) as { memory_scope: string } | undefined
-      // Isolation is a lifetime identity boundary: editing tone must not move history.
       if (existing?.memory_scope === 'isolated' && input.memoryScope === 'shared') throw new Error('Create a new persona to leave an isolated memory space')
       db.prepare(
         `INSERT INTO persona (id, name, system_prompt, is_active, created_at, updated_at, memory_scope)

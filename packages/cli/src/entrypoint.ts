@@ -14,8 +14,6 @@ const ROOT_PROMPT_CONTEXT_VALUE_OPTIONS = [
 const ROOT_EXIT_OPTIONS = new Set(['--help', '-h', '--version', '-V'])
 
 export function loadCliVersion(packageJsonUrl: URL = new URL('../package.json', import.meta.url)): string {
-  // A build-time override (set by `@sepilotd/bundle`'s `bun build --compile`,
-  // which can't read `package.json` from inside Bun's virtual filesystem) wins.
   const fromEnv = process.env.SEPILOT_VERSION?.trim()
   if (fromEnv) return fromEnv
   try {

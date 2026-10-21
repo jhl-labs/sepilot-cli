@@ -5,13 +5,9 @@ import { enforceOutputLimit, resolveToolOutputMaxBytes } from './output-limit.js
 import { collectFallbackFiles, isEnoent } from './fallback-file-search.js'
 import { classifyToolCwd, rejectToolCwd, resolveToolCwd } from './path-utils.js'
 
-// `limit` bounds matches per file; a broad query over a large tree still
-// returned tens of thousands of characters under the byte cap. Bound the
-// whole result too and say which files were left out, so the model narrows
-// the query instead of reading a truncated dump.
 const MAX_TOTAL_MATCH_LINES = 200
 import { runRipgrepCapture } from './ripgrep-run.js'
-import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
+import { rejectUnsupportedToolInputFields, type ToolDefinitionRuntime, type ToolResult } from './registry.js'
 
 function buildSearchMatcher(query: string, fixedStrings: boolean): (line: string) => number {
   if (fixedStrings) {
@@ -77,14 +73,16 @@ async function fallbackSearch(options: {
 }
 
 export function createFsSearchTool(): ToolDefinitionRuntime {
-  return {
+  const tool: ToolDefinitionRuntime = {
     name: 'fs.search',
     description:
       'Search file contents under a directory with ripgrep and return matching lines as `path:line:col:text`. `limit` caps matches per file (default 100, max 500). Prefer fs.read for content of a known file and fs.glob for filename-only matches; reach for fs.search when you need to locate text across an unknown set of files. Narrow with `glob: "*.ts"` and `fixedStrings: true` first; broad regex over a large repo is slow and noisy.',
     resumeSafety: 'replay-safe',
     scheduling: { mode: 'parallel-safe', resource: 'filesystem' },
+    validateInput: (input) => rejectUnsupportedToolInputFields(tool, input),
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         cwd: { type: 'string', description: 'Directory to search. Supports ~/ paths. Defaults to the active session cwd. A file path scopes the search to that single file.' },
         query: { type: 'string', description: 'Text or regex to search for.' },
@@ -100,6 +98,8 @@ export function createFsSearchTool(): ToolDefinitionRuntime {
       required: ['query'],
     },
     async execute(input, context): Promise<ToolResult> {
+      const unsupported = rejectUnsupportedToolInputFields(tool, input)
+      if (unsupported) return unsupported
       const start = Date.now()
       const requestedCwd = resolveToolCwd(input.cwd, context?.cwd)
       const query = typeof input.query === 'string' ? input.query.trim() : ''
@@ -115,9 +115,8 @@ export function createFsSearchTool(): ToolDefinitionRuntime {
         ? Math.max(1, Math.min(500, Math.trunc(input.limit)))
         : 100
       const args = [
-        // Do not inherit RIPGREP_CONFIG_PATH. A user config can enable
-        // --follow and make a workspace search traverse an outside symlink.
         '--no-config',
+        '--with-filename',
         '--line-number',
         '--column',
         '--color',
@@ -143,23 +142,15 @@ export function createFsSearchTool(): ToolDefinitionRuntime {
             code: rejection.code,
           }
         }
-        // "Search this file" is an unambiguous scope. Honour it instead of
-        // sending the model on another round trip: search from the file's
-        // directory with the file itself as the only target.
         const fileScope = cwdKind === 'file' ? basename(requestedCwd) : null
         const cwd = fileScope ? dirname(requestedCwd) : requestedCwd
         if (!fileScope && typeof input.glob === 'string' && input.glob.trim()) {
           args.push('-g', input.glob)
         }
-        // A model-controlled query can begin with "--". Without the option
-        // terminator ripgrep interprets values such as --follow as flags and can
-        // traverse a workspace symlink into an outside directory.
         args.push('--', query, fileScope ?? '.')
         const scopeNote = fileScope
           ? `[fs.search: cwd ${requestedCwd} is a file; searched only that file, paths are relative to ${cwd}]\n`
           : ''
-        // Stream rg with a byte cap instead of a 10MB execFile maxBuffer that
-        // throws (losing every match) on huge result sets.
         const maxBytes = resolveToolOutputMaxBytes('fs.search')
         let stdout: string
         let streamTruncated = false
@@ -193,9 +184,6 @@ export function createFsSearchTool(): ToolDefinitionRuntime {
             durationMs: Date.now() - start,
           }
         }
-        // Detect any file that hit the per-file cap so the agent knows
-        // the result for that file is incomplete and can decide to
-        // narrow the query rather than treating it as exhaustive.
         const allLines = text.split('\n').filter(Boolean)
         const matchesByFile = new Map<string, number>()
         for (const line of allLines) {
@@ -253,4 +241,5 @@ export function createFsSearchTool(): ToolDefinitionRuntime {
       }
     },
   }
+  return tool
 }

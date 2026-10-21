@@ -34,16 +34,6 @@ import {
   registerExtensionsFeatureRoutes,
 } from '../generated/feature-registration.js'
 
-/**
- * Phase D0–D6 capability routes (`/capabilities`, `/persona`, `/snippets`,
- * `/prompt-templates`, `/personal-docs`, `/wiki/*`, `/network`, `/settings/json`,
- * `/message-queue/snapshot`, `/quick-input/publish`, `/notifications*`,
- * `/scheduler/jobs`, `/backup`, `/github/*`, `/mcp/*`).
- *
- * desktop UI/UX parity 시리즈가 약속한 thin surface ↔ daemon 계약면.
- * 기존 `/api/v1/*` 라우트와 경로 네임스페이스가 분리되어 있어 충돌 없이
- * 병렬로 노출된다.
- */
 export const capabilityRoutes: FastifyPluginAsync = async (app) => {
   await registerCapabilitiesRoute(app)
   await registerNetworkCapabilityRoutes(app, defaultNetworkProbe)

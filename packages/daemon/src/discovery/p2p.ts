@@ -41,7 +41,7 @@ export class P2PServer {
             try {
               const msg = JSON.parse(line) as P2PMessage
               this.handleMessage(msg, socket)
-            } catch { /* malformed JSON */ }
+            } catch {}
           }
         })
 
@@ -69,11 +69,9 @@ export class P2PServer {
     }
   }
 
-  /** Connect to a remote device */
   async connect(host: string, port: number): Promise<string> {
     return new Promise((resolve, reject) => {
       const socket = createConnection({ host, port }, () => {
-        // Send identification
         const id = randomUUID()
         this.send(socket, {
           id: randomUUID(), from: this.config.deviceId, fromName: this.config.deviceName,
@@ -86,7 +84,6 @@ export class P2PServer {
     })
   }
 
-  /** Send a message to a connected device */
   async sendTo(connectionId: string, type: P2PMessage['type'], payload: Record<string, unknown>): Promise<void> {
     const socket = this.connections.get(connectionId)
     if (!socket) throw new Error(`No connection: ${connectionId}`)
@@ -96,7 +93,6 @@ export class P2PServer {
     })
   }
 
-  /** Register message handler */
   onMessage(handler: (msg: P2PMessage, reply: (msg: P2PMessage) => void) => void): void {
     this.handlers.push(handler)
   }
@@ -106,7 +102,6 @@ export class P2PServer {
   }
 
   private handleMessage(msg: P2PMessage, socket: Socket): void {
-    // Auto-respond to pings
     if (msg.type === 'ping') {
       this.send(socket, {
         id: randomUUID(), from: this.config.deviceId, fromName: this.config.deviceName,
@@ -114,18 +109,17 @@ export class P2PServer {
       })
     }
 
-    // Track connection
     if (!Array.from(this.connections.values()).includes(socket)) {
       this.connections.set(msg.from, socket)
     }
 
     const reply = (replyMsg: P2PMessage) => this.send(socket, replyMsg)
     for (const handler of this.handlers) {
-      try { handler(msg, reply) } catch { /* handler error */ }
+      try { handler(msg, reply) } catch {}
     }
   }
 
   private send(socket: Socket, msg: P2PMessage): void {
-    try { socket.write(JSON.stringify(msg) + '\n') } catch { /* write error on closed socket */ }
+    try { socket.write(JSON.stringify(msg) + '\n') } catch {}
   }
 }

@@ -6,11 +6,13 @@ import {
 } from '@sepilotd/api-client'
 
 export const DEFAULT_CLI_AGENT_MODE = 'react' as const
+export const DEFAULT_TUI_AGENT_MODE = 'auto' as const
 
 export interface CliChatOptionInput {
   model?: string
   provider?: string
   persona?: string
+  bot?: string
   mode?: string | DaemonAgentMode
   thinkingLevel?: string
   projectId?: string | null
@@ -20,7 +22,6 @@ export interface CliChatOptionInput {
   cwd?: string
   workspaceRoot?: string
   skillRefs?: ChatSkillRef[]
-  /** Explicit per-turn autonomy selection; daemon policy still applies. */
   autonomy?: string
 }
 
@@ -83,16 +84,15 @@ export function buildCliChatOptions(
   if (!options) return undefined
   const projectId = options.projectId?.trim()
   const cwd = options.cwd ?? (projectId ? undefined : process.cwd())
-  // A launch directory is not an OS sandbox request. Explicit roots remain
-  // strict; otherwise the daemon's configured tool/approval policy applies.
   const workspaceRoot = options.workspaceRoot
-  const mode = normalizeMode(options.mode) ?? DEFAULT_CLI_AGENT_MODE
+  const mode = normalizeMode(options.mode) ?? (options.bot ? undefined : DEFAULT_CLI_AGENT_MODE)
 
   const sanitized = sanitizeChatOptions(
     {
       model: options.model,
       provider: options.provider,
       persona: options.persona,
+      bot: options.bot,
       mode,
       thinkingLevel: normalizeThinkingLevel(options.thinkingLevel),
       projectId: options.projectId ?? undefined,
@@ -106,6 +106,5 @@ export function buildCliChatOptions(
     },
     { ...DEFAULT_CHAT_OPTION_DEFAULTS, thinkingLevel: undefined },
   )
-  // Even `auto` is an explicit CLI choice; omission inherits shared daemon UI defaults.
   return { ...sanitized, mode }
 }

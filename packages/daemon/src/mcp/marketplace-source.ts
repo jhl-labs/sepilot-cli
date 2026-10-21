@@ -147,12 +147,10 @@ export class McpMarketplaceSource {
         try {
           await simpleGit(path).pull()
         } catch {
-          // ignore pull failures for offline work
         }
         return
       }
     } catch {
-      /* not cloned yet */
     }
     await mkdir(path, { recursive: true })
     await simpleGit().clone(mp.url, path, ['--depth', '1'])

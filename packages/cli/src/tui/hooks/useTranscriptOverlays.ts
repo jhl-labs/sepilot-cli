@@ -1,15 +1,3 @@
-// Three small overlay/transcript flags App.tsx kept inline:
-//
-// - helpOpen — the F1 / /help modal visibility
-// - showMcp — the MCP status panel toggle
-// - transcriptClearedAt — timestamp of the last /clear; render passes
-//   it to ChatView so messages older than this time are hidden until
-//   the next session reset
-//
-// All three are simple boolean / nullable-number flags with no
-// derived logic. Bundling them keeps the App.tsx hook block tidy and
-// avoids three more "useState" lines drifting apart over time.
-
 import { useState } from 'react'
 
 export interface UseTranscriptOverlaysResult {

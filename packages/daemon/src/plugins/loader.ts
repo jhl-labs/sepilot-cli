@@ -97,10 +97,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-// Duck-typed view of a registry that supports scoped plugin registration so a
-// partially-registered plugin can be unwound. The tool + provider-factory
-// registries implement these; other registries (channels/hooks/skills) simply
-// skip scoping.
 interface ScopedRegistry {
   beginPluginScope(pluginId: string): void
   endPluginScope(): string[]
@@ -402,7 +398,6 @@ export class PluginLoader {
         )
       }
     } catch {
-      // Plugins dir may not exist.
     }
     return manifests
   }
@@ -572,9 +567,6 @@ export class PluginLoader {
       }
 
       const context = this.createPluginContext(plugin, registries)
-      // Scope this plugin's tool/provider registrations so a failure part-way
-      // through registration can be fully unwound (no orphaned tools/factories),
-      // and so the registries reject any attempt to shadow a built-in.
       beginRegistrationScope(registries.tools, name)
       beginRegistrationScope(registries.providers, name)
       try {
@@ -588,7 +580,6 @@ export class PluginLoader {
         unwindRegistrationScope(registries.providers)
         throw registerError
       }
-      // Success: close the scope without unwinding.
       endRegistrationScope(registries.tools)
       endRegistrationScope(registries.providers)
       plugin.module = module

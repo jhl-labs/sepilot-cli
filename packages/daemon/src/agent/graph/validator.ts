@@ -20,12 +20,10 @@ export function validateGraph<
   const edges = graph.getEdges()
   const start = graph.getStartNode()
 
-  // Check start node exists
   if (!nodes.has(start)) {
     errors.push(`Start node '${start}' not found in graph`)
   }
 
-  // Check all edge targets exist
   for (const [from, edge] of edges) {
     if (edge.type === 'direct') {
       if (edge.to !== '__end__' && !nodes.has(edge.to)) {
@@ -41,7 +39,6 @@ export function validateGraph<
     }
   }
 
-  // Check for unreachable nodes
   const reachable = new Set<string>()
   const queue = [start]
   while (queue.length > 0) {
@@ -73,7 +70,6 @@ export function validateGraph<
     }
   }
 
-  // Check nodes with no outgoing edges (should only be terminal nodes)
   for (const name of nodes.keys()) {
     if (!edges.has(name) && name !== '__end__') {
       warnings.push(`Node '${name}' has no outgoing edge (implicit terminal)`)

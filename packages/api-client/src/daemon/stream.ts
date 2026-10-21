@@ -258,3 +258,20 @@ function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
     signal?.addEventListener('abort', abort, { once: true })
   })
 }
+
+export interface DaemonHarnessNote {
+  tag: string
+  text: string
+}
+
+const HARNESS_NOTE_PATTERN = /^\[([A-Za-z][\w-]{0,31})\]\s+(\S[\s\S]*)$/
+
+export function parseDaemonHarnessNote(content: string | undefined | null): DaemonHarnessNote | null {
+  if (!content) return null
+  const match = HARNESS_NOTE_PATTERN.exec(content)
+  if (!match) return null
+  const tag = match[1]!.toLowerCase()
+  const text = match[2]!.trim()
+  if (!text) return null
+  return { tag, text }
+}

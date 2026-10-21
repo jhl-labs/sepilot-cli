@@ -52,9 +52,6 @@ function resolveCoworkMaxTotalTokens(): number | null {
   return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : null
 }
 
-// Bound the plan length. A cowork plan's total cost is Σ(role budget × plan
-// length); the length is model-controlled (decomposer output + mid-run
-// retry/backtrack insertions), so cap it to keep runaway cost in check.
 function capCoworkPlan(subtasks: CoworkSubtask[]): CoworkSubtask[] {
   const max = resolveCoworkMaxSubtasks()
   return subtasks.length > max ? subtasks.slice(0, max) : subtasks
@@ -75,9 +72,6 @@ type CoworkExecutableRole = 'coder' | 'reviewer' | 'researcher'
 function coworkModelSupportsTextGeneration(
   model: Deps['provider']['models'][number],
 ): boolean {
-  // Embedding-only catalog entries cannot serve any coordinator text node.
-  // A provider may expose a hybrid model with embedding + tool/chat support;
-  // preserve it when generation capability is explicit.
   return model.capabilities.embedding !== true || model.capabilities.toolUse === true
 }
 
@@ -89,8 +83,6 @@ function resolveCoworkTextGenerationModel(
     const candidate = preferred?.trim()
     if (!candidate) continue
     const known = provider.models.find((model) => model.id === candidate)
-    // An explicitly selected main model can be absent from a stale catalog;
-    // honor it unless current metadata proves that it is embedding-only.
     if (!known || coworkModelSupportsTextGeneration(known)) return candidate
   }
   return provider.models.find(coworkModelSupportsTextGeneration)?.id ?? 'default'
@@ -158,8 +150,6 @@ function normalizeCoworkPlanForContract(
   }
 
   const fallbackReviewer = fallbackSubtasks.find((subtask) => normalizeCoworkRole(subtask.role) === 'reviewer')
-  // Reserve the last slot for the appended reviewer so review is never dropped
-  // by the cap.
   return fallbackReviewer
     ? [...capCoworkPlan(normalized).slice(0, resolveCoworkMaxSubtasks() - 1), { ...fallbackReviewer }]
     : capCoworkPlan(normalized)
@@ -394,12 +384,6 @@ function buildSpecialistInput(
       'You own one bounded evidence packet, not the whole run. Search/read high-signal material for the assigned scope, then summarize concrete findings, uncertainty, and coverage gaps so the next specialist can continue.',
   } satisfies Record<CoworkExecutableRole, string>
 
-  // Observation-only coder children are deliberately capability-isolated.
-  // Repeating the full parent request here makes weaker models execute sibling
-  // phases (for example tests/build inside the browser-QA child) even though
-  // the assigned user message is correctly scoped.  They only need completed
-  // sibling outcomes so they can avoid duplicate work.  Mutation-owning coders
-  // and evidence/review specialists still receive the parent boundary.
   const parentBoundary = role === 'coder' && !coderOwnsMutation
     ? formatPriorCoworkResults(parent.coworkTaskResults ?? [])
     : [
@@ -505,11 +489,6 @@ function cloneCoworkSeedContractForRole(
   const contract = parent.seedContract
   if (!contract) return undefined
   if (role === 'coder') {
-    // A cowork plan deliberately decomposes one parent outcome into bounded
-    // child tasks.  A test/build, browser-QA, or evidence-only coder child must
-    // not inherit the parent's edit requirement: doing so activates the coder
-    // edit guard after successful validation and forces a fabricated source
-    // change.  Mutation-bearing coder tasks retain full artifact ownership.
     if (inputExpressesMutationIntent(instruction)) {
       return cloneRunContract(contract)
     }
@@ -558,7 +537,7 @@ function capCoworkSpecialistMaxTokens(
   if (role === 'coder') {
     return {
       ...context,
-      graphId: 'coder',
+      graphId: 'deep-coder',
       maxContinuationCycles: Math.min(
         context.maxContinuationCycles ?? COWORK_CODER_MAX_CONTINUATION_CYCLES,
         COWORK_CODER_MAX_CONTINUATION_CYCLES,
@@ -590,10 +569,6 @@ function buildRoleChildState(
   const seedContract = cloneCoworkSeedContractForRole(parent, role, instruction)
   const specialistContext = buildSpecialistInput(parent, role, instruction)
   return childStateFrom(parent, {
-    // Keep the assigned task as the child's sole executable user request.
-    // Parent context remains available as a system boundary, but classifiers,
-    // planners, completion guards, and the model itself must not mistake later
-    // parent phases for this child's current authorization.
     input: instruction,
     currentUserContent: instruction,
     messages: [
@@ -601,10 +576,6 @@ function buildRoleChildState(
       { role: 'user', content: instruction },
     ],
     memories: [],
-    // Each specialist reasons only from its own current-turn tool evidence.
-    // Parent evidence is aggregated again in mapRoleChildOut; inheriting it
-    // here makes completion guards and prompts confuse sibling work for work
-    // performed by this child.
     toolCallHistory: [],
     recentToolResults: [],
     evidenceLedger: undefined,
@@ -650,11 +621,6 @@ function mapRoleChildOut(parent: AgentState, child: AgentState): AgentState {
   const task = currentSubtask(parent)
   const role = task ? normalizeCoworkRole(task.role) : 'discuss'
   const visibleOutput = child.output.trim()
-  // A child graph can run without a GraphExecutionContext in tests and
-  // embedded callers. In that case its reporter may apply top-level
-  // presentation and remove the reviewer verdict label. Recover only the
-  // authoritative final debate blocker so the parent can still schedule the
-  // required coder/reviewer backtrack.
   const parentDebateCount = parent.debateRounds?.length ?? 0
   const childOwnedDebate = child.debateRounds?.slice(parentDebateCount).at(-1)
   const debateVerdict = role === 'reviewer' && childOwnedDebate
@@ -681,10 +647,6 @@ function mapRoleChildOut(parent: AgentState, child: AgentState): AgentState {
     ...(child.toolCallHistory ?? []),
   ].slice(-200)
   parent.evidenceLedger = mergeEvidenceLedgers(parentEvidenceLedger, child.evidenceLedger)
-  // syncParentStateFromChild intentionally mirrors a child while it is live,
-  // which means the transient child memory list replaces the parent's list.
-  // Rebuild durable cowork summaries from structured task results before the
-  // current result is captured.
   parent.memories = (parent.coworkTaskResults ?? []).map((result) =>
     formatCoworkMemory(result.role, result.result),
   )
@@ -721,9 +683,6 @@ function finalReviewerVerdictLine(text: string): string | null {
       return marker?.index === undefined ? null : line.slice(marker.index)
     })
     .filter((line): line is string => line !== null)
-  // The reviewer response contract is an explicit verdict envelope. Preserve
-  // the last explicit decision even when the model puts supporting evidence
-  // after it; trailing explanation must not turn UNVERIFIED into completion.
   return verdictLines.at(-1) ?? null
 }
 
@@ -1030,11 +989,6 @@ function refreshCoworkPlanStrings(state: AgentState): void {
 export function buildCoworkGraph(deps: Deps): AgentGraph {
   const graph = new AgentGraph()
   const coderGraph = buildCoderGraph(deps)
-  // A cowork reviewer is already the independent critical pass. Nesting a
-  // proposer/critic/resolver debate inside it multiplies the same evidence and
-  // can recursively retry a negative finding without giving the coder another
-  // chance to act. Keep cowork review single-pass; explicit reviewer mode can
-  // still opt into debate independently.
   const reviewerGraph = buildReviewerGraph(deps)
   const researcherGraph = buildResearcherGraph(deps)
 
@@ -1066,10 +1020,6 @@ export function buildCoworkGraph(deps: Deps): AgentGraph {
   graph.addNode(
     'decompose',
     async function* (state: AgentState, context?: GraphExecutionContext) {
-      // Decomposition is an internal aux call (like planning/deliberation):
-      // route it through the configured aux model when the provider has it,
-      // otherwise fall back to the run's main model. Keeps expensive main
-      // models off the pre-dispatch planning round-trip.
       const auxModel = context?.auxModel?.trim()
       const model = resolveCoworkTextGenerationModel(deps.provider, [
         auxModel && deps.provider.models.some((entry) => entry.id === auxModel)
@@ -1152,10 +1102,6 @@ export function buildCoworkGraph(deps: Deps): AgentGraph {
         const task = currentSubtask(state)
         if (!task) return state
 
-        // Top-level cost guard: bound the total number of specialist dispatches
-        // (and, when configured, cumulative tokens) so a model-grown plan cannot
-        // run the swarm unboundedly. On exhaustion we stop dispatching and let
-        // synthesize surface an INCOMPLETE result.
         const maxDispatches = resolveCoworkMaxDispatches()
         const maxTotalTokens = resolveCoworkMaxTotalTokens()
         const usedTokens = state.totalUsage.inputTokens + state.totalUsage.outputTokens
@@ -1173,9 +1119,6 @@ export function buildCoworkGraph(deps: Deps): AgentGraph {
         const { role, instruction, choices } = task
         const normalizedRole = normalizeCoworkRole(role)
         if (normalizedRole === 'discuss') {
-          // Non-interactive run (no requestQuestion transport): a discuss step
-          // cannot get a human answer, so skip it instead of spending latency on
-          // a canned "no interactive response" note.
           if (!context?.requestQuestion) {
             state.planIndex += 1
             continue
@@ -1276,7 +1219,6 @@ export function buildCoworkGraph(deps: Deps): AgentGraph {
         state.planIndex += 1
         return state
       }
-      // A specialist subgraph just ran — count it against the dispatch budget.
       state.coworkDispatchCount = (state.coworkDispatchCount ?? 0) + 1
       const rawResult = state.output.trim()
       let result = rawResult || `${role} completed without a final response.`
@@ -1461,7 +1403,6 @@ export function buildCoworkGraph(deps: Deps): AgentGraph {
               .join('\n\n'),
           },
         ],
-        // Final synthesized answer is user-facing — honor overrides.
         temperature: context?.temperature,
         maxTokens: context?.maxTokens ?? 8192,
       }
@@ -1480,10 +1421,6 @@ export function buildCoworkGraph(deps: Deps): AgentGraph {
         if (isAbortError(error) || context?.signal?.aborted) {
           throw getAbortError(context?.signal, 'Cowork synthesis aborted')
         }
-        // Specialist results are already bounded, persisted run evidence. A
-        // late text-generation transport failure must not erase them and end
-        // the CLI without a reply. Preserve the evidence packet verbatim and
-        // let the ordinary completion gate reject unsupported success claims.
         state.output = results
           ? `Cowork specialist results (final synthesis unavailable):\n\n${results}`
           : 'INCOMPLETE: cowork specialists produced no result and final synthesis was unavailable.'

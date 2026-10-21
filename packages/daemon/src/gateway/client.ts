@@ -4,12 +4,6 @@ import type { Comment, CommentInput, JobHandle, JobInput } from '@sepilotd/core'
 import { GatewayClient as SharedGatewayClient } from '@sepilotd/api-client'
 import { isNodeFsError } from '../utils/fs-error.js'
 
-/**
- * Load the gateway bearer token the daemon presents on every gateway
- * call. Returns null when the file does not exist (the gateway is
- * optional). Other read errors throw so a permissions flap doesn't
- * silently demote the daemon to anonymous gateway requests.
- */
 export async function loadGatewayToken(dataDir: string): Promise<string | null> {
   const tokenPath =
     process.env.GATEWAY_TOKEN_PATH ?? join(dataDir, 'security', 'gateway.token')

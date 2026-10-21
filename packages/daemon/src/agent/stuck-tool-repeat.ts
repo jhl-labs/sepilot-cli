@@ -1,34 +1,16 @@
-import type { Message } from '@sepilotd/core'
-
-/**
- * Detect a stuck agent loop: the same tool called with the same
- * arguments K or more times within the most recent window of the
- * tool-call history. The graph's duplicate-tool-call repair only
- * catches dupes *within a single turn*; this catches the
- * cross-turn case (e.g. `fs.glob` re-issued every turn with no
- * progress) that burns the iteration budget on long-horizon tasks.
- *
- * Terminal-Bench `modernize-fortran-build` surfaced the pattern —
- * see docs/plans/2026-05-13-agent-loop-readonly-repeat.md.
- *
- * This is a general "you're stuck" signal, not a dataset-fitting
- * heuristic: it triggers on the *structural* property "same tool +
- * same args, K times in the recent window", with no special-casing
- * for any tool name, task, or dataset.
- */
+import type { Message, ToolSecurityEffect } from '@sepilotd/core'
+import { createHash } from 'node:crypto'
 
 export interface StuckToolRepeatEntry {
   tool: string
   input: Record<string, unknown>
   status: 'success' | 'error'
   failureCode?: string
-  /**
-   * Policy or approval refused the call before execution. Such entries are
-   * friction, not failures: they never feed the repeated-failure or
-   * permanent-failure buckets. The exact-repeat threshold still counts them,
-   * so an identical blocked call issued over and over is caught there.
-   */
   blocked?: boolean
+  output?: string
+  outputFingerprint?: string
+  executionObserved?: boolean
+  securityEffect?: ToolSecurityEffect
   ts: number
 }
 
@@ -40,6 +22,7 @@ export const DEFAULT_LOW_NOVELTY_MAX_UNIQUE_SIGNATURES = 6
 export const DEFAULT_TARGET_REPEAT_THRESHOLD = 4
 export const DEFAULT_FAILURE_REPEAT_THRESHOLD = 2
 export const DEFAULT_PERMANENT_FAILURE_CHURN_THRESHOLD = 4
+export const DEFAULT_EXECUTION_FAILURE_CHURN_THRESHOLD = 6
 export const DEFAULT_NO_OP_MUTATION_REPEAT_THRESHOLD = 3
 export const MAX_STUCK_REPEAT_REPAIRS = 2
 
@@ -83,13 +66,30 @@ function stableSerialize(value: unknown): string {
   return JSON.stringify(value) ?? 'null'
 }
 
-/**
- * Structural signature of a tool invocation: tool name + stable-serialized
- * arguments. Shared with the failed-attempt guard so "same action" is decided
- * by one deterministic definition instead of content matching.
- */
 export function signatureOf(entry: Pick<StuckToolRepeatEntry, 'tool' | 'input'>): string {
   return `${entry.tool}:${stableSerialize(entry.input ?? {})}`
+}
+
+export function findRepeatedInvalidToolCall(
+  history: readonly StuckToolRepeatEntry[],
+  proposed: readonly Pick<StuckToolRepeatEntry, 'tool' | 'input'>[],
+): Pick<StuckToolRepeatEntry, 'tool' | 'input'> | undefined {
+  const counts = new Map<string, number>()
+  for (const entry of history.slice(-DEFAULT_STUCK_REPEAT_WINDOW)) {
+    if (entry.status === 'success' && entry.executionObserved === true
+      && !entry.blocked && entry.securityEffect !== 'internal-state') {
+      counts.clear()
+      continue
+    }
+    const signature = signatureOf(entry)
+    if (entry.status === 'error' && entry.failureCode === 'INVALID_INPUT_PERMANENT'
+      && entry.executionObserved === false && !entry.blocked) {
+      counts.set(signature, (counts.get(signature) ?? 0) + 1)
+    } else {
+      counts.delete(signature)
+    }
+  }
+  return proposed.find(entry => (counts.get(signatureOf(entry)) ?? 0) >= DEFAULT_FAILURE_REPEAT_THRESHOLD)
 }
 
 function normalizeLowNoveltyString(value: string): string {
@@ -121,6 +121,15 @@ function stableSerializeLowNovelty(value: unknown): string {
 
 function lowNoveltySignatureOf(entry: StuckToolRepeatEntry): string {
   return `${entry.tool}:${stableSerializeLowNovelty(entry.input ?? {})}`
+}
+
+function observationSignatureOf(entry: StuckToolRepeatEntry): string {
+  const target = lowNoveltySignatureOf(entry)
+  if (entry.status !== 'success' || entry.blocked || entry.executionObserved !== true
+    || entry.securityEffect !== 'observe' || !entry.output?.trim()) return target
+  const fingerprint = entry.outputFingerprint?.trim()
+    || createHash('sha256').update(entry.output).digest('hex')
+  return `${target}:observation:${fingerprint}`
 }
 
 const SHELL_EXECUTABLES = new Set(['bash', 'dash', 'sh', 'zsh', 'fish', 'csh', 'tcsh'])
@@ -162,21 +171,13 @@ function terminalFailureScope(input: Record<string, unknown>): string {
 
 function failureScopeOf(entry: StuckToolRepeatEntry): string {
   if (entry.tool === 'terminal.run') {
+    if (entry.failureCode === 'EXIT_NONZERO_PERMANENT') return signatureOf(entry)
     return `${entry.tool}:${terminalFailureScope(entry.input)}`
   }
   if (entry.tool.startsWith('memory.')) return entry.tool
   return lowNoveltySignatureOf(entry)
 }
 
-/**
- * A mutation that repeats an earlier successful call with byte-identical
- * arguments leaves the target exactly as it already is, so it is not progress
- * — yet it does reset the low-novelty barrier below, and mutation tools are
- * not tracked for low novelty at all. That is what lets a write / re-write
- * cycle longer than the exact-repeat window run unchecked until the iteration
- * budget is gone. Counted across the whole run rather than a window, because
- * the point of the cycle is that it is too long for the window to see.
- */
 function detectRepeatedNoOpMutation(
   history: StuckToolRepeatEntry[],
   mutationTools: ReadonlySet<string>,
@@ -200,23 +201,12 @@ export interface StuckToolRepeatResult {
   stuck: boolean
   tool?: string
   count?: number
-  kind?: 'exact' | 'target_repeat' | 'low_novelty' | 'no_op_mutation' | 'repeated_failure' | 'permanent_failure_churn'
+  kind?: 'exact' | 'target_repeat' | 'low_novelty' | 'no_op_mutation' | 'repeated_failure' | 'permanent_failure_churn' | 'execution_failure_churn'
   uniqueSignatures?: number
   tools?: string[]
-  /**
-   * The repair budget is spent and the loop persists anyway. `stuck` stays
-   * false (no further repair message should be injected), but the caller must
-   * escalate: close the evidence phase and force a final synthesis instead of
-   * letting the loop run the remaining iteration budget unchecked.
-   */
   exhausted?: boolean
 }
 
-/**
- * Returns `{ stuck: true, tool, count }` when, within the last
- * `window` history entries, some (tool, args) signature appears at
- * least `threshold` times. Otherwise `{ stuck: false }`.
- */
 export function detectStuckToolRepeat(
   history: StuckToolRepeatEntry[] | undefined,
   options: {
@@ -230,13 +220,8 @@ export function detectStuckToolRepeat(
     targetRepeatThreshold?: number
     noOpMutationRepeatThreshold?: number
     failureRepeatThreshold?: number
-    /**
-     * Optional run-wide ceiling for distinct structured permanent failures.
-     * Callers should enable this only for an observe-only phase: without a
-     * mutation boundary, permanent source failures cannot be repaired by
-     * guessing more endpoints, executables, or discovery targets forever.
-     */
     permanentFailureChurnThreshold?: number
+    executionFailureChurnThreshold?: number
   } = {},
 ): StuckToolRepeatResult {
   const threshold = options.threshold ?? DEFAULT_STUCK_REPEAT_THRESHOLD
@@ -247,27 +232,48 @@ export function detectStuckToolRepeat(
     return { stuck: false }
   }
   const recent = history.slice(-window)
-  const counts = new Map<string, { count: number; tool: string }>()
+  const counts = new Map<string, { count: number; tool: string; outcome: string }>()
   for (const entry of recent) {
-    // An error followed by a successful retry is a changed outcome, not four
-    // copies of one unchanged result. Keep status in the exact-repeat bucket;
-    // output-level equality is unavailable in the bounded history record.
-    const sig = `${entry.status}:${signatureOf(entry)}`
+    const sig = signatureOf(entry)
+    const outcome = JSON.stringify([entry.status, entry.failureCode, entry.outputFingerprint ?? entry.output])
     const existing = counts.get(sig)
-    if (existing) existing.count += 1
-    else counts.set(sig, { count: 1, tool: entry.tool })
+    if (existing?.outcome === outcome) existing.count += 1
+    else counts.set(sig, { count: 1, tool: entry.tool, outcome })
   }
   for (const { count, tool } of counts.values()) {
     if (count >= threshold) return { stuck: true, tool, count, kind: 'exact' }
   }
 
-  const failureCounts = new Map<string, { count: number; tool: string }>()
+  const failureCounts = new Map<string, { count: number; tool: string; scope: string; code: string; outcome?: string }>()
+  const seenMutations = new Set<string>()
   for (const entry of recent) {
+    if (entry.status === 'success' && entry.executionObserved !== false && !entry.blocked) {
+      const mutation = entry.securityEffect === 'workspace-write'
+        || options.lowNoveltyBarrierTools?.has(entry.tool)
+      const signature = signatureOf(entry)
+      if (mutation && !seenMutations.has(signature)) {
+        for (const [key, failure] of failureCounts) {
+          if (failure.tool === 'terminal.run' && failure.code === 'EXIT_NONZERO_PERMANENT') {
+            failureCounts.delete(key)
+          }
+        }
+        seenMutations.add(signature)
+      }
+      for (const [key, failure] of failureCounts) {
+        const scope = failureScopeOf({ ...entry, failureCode: failure.code })
+        if (failure.scope === scope) failureCounts.delete(key)
+      }
+      continue
+    }
     if (entry.status !== 'error' || !entry.failureCode || entry.blocked) continue
-    const key = `${failureScopeOf(entry)}:${entry.failureCode}`
+    const scope = failureScopeOf(entry)
+    const key = `${scope}:${entry.failureCode}`
+    const outcome = entry.failureCode === 'EXIT_NONZERO_PERMANENT'
+      ? entry.outputFingerprint ?? entry.output
+      : undefined
     const existing = failureCounts.get(key)
-    if (existing) existing.count += 1
-    else failureCounts.set(key, { count: 1, tool: entry.tool })
+    if (existing && existing.outcome === outcome) existing.count += 1
+    else failureCounts.set(key, { count: 1, tool: entry.tool, scope, code: entry.failureCode, outcome })
   }
   for (const { count, tool } of failureCounts.values()) {
     if (count >= failureRepeatThreshold) {
@@ -276,6 +282,7 @@ export function detectStuckToolRepeat(
   }
 
   const permanentFailureChurnThreshold = options.permanentFailureChurnThreshold
+  const executionFailureChurnThreshold = options.executionFailureChurnThreshold
   if (
     permanentFailureChurnThreshold !== undefined
     && permanentFailureChurnThreshold > 0
@@ -284,6 +291,7 @@ export function detectStuckToolRepeat(
       entry.status === 'error'
       && !entry.blocked
       && entry.failureCode?.endsWith('_PERMANENT') === true
+      && entry.failureCode !== 'EXIT_NONZERO_PERMANENT'
     ))
     if (permanentFailures.length >= permanentFailureChurnThreshold) {
       const toolCounts = new Map<string, number>()
@@ -307,9 +315,29 @@ export function detectStuckToolRepeat(
     }
   }
 
-  // Pagination changes (`offset`, `limit`, page size) do not make a fourth
-  // read of the same target novel. Catch this earlier than the broad
-  // low-novelty window while still allowing several legitimate chunks.
+  if (
+    executionFailureChurnThreshold !== undefined
+    && executionFailureChurnThreshold > 0
+  ) {
+    const executionFailures = recent.filter((entry) => (
+      entry.tool === 'terminal.run'
+      && entry.status === 'error'
+      && !entry.blocked
+      && entry.failureCode === 'EXIT_NONZERO_PERMANENT'
+    ))
+    if (executionFailures.length >= executionFailureChurnThreshold) {
+      const tools = [...new Set(executionFailures.map((entry) => entry.tool))]
+      return {
+        stuck: true,
+        tool: tools[0] ?? 'terminal.run',
+        count: executionFailures.length,
+        kind: 'execution_failure_churn',
+        uniqueSignatures: new Set(executionFailures.map((entry) => signatureOf(entry))).size,
+        tools,
+      }
+    }
+  }
+
   if (
     options.trackedTools
     && options.trackedTools.size > 0
@@ -318,7 +346,7 @@ export function detectStuckToolRepeat(
     const targetCounts = new Map<string, { count: number; tool: string }>()
     for (const entry of recent) {
       if (!options.trackedTools.has(entry.tool)) continue
-      const signature = lowNoveltySignatureOf(entry)
+      const signature = observationSignatureOf(entry)
       const existing = targetCounts.get(signature)
       if (existing) existing.count += 1
       else targetCounts.set(signature, { count: 1, tool: entry.tool })
@@ -356,9 +384,6 @@ export function detectStuckToolRepeat(
   }
   if (options.lowNoveltyBarrierTools && options.lowNoveltyBarrierTools.size > 0) {
     const barrierTools = options.lowNoveltyBarrierTools
-    // Only the first of a byte-identical mutation changed anything; later
-    // repeats are no-ops and must not pass as the progress that resets the
-    // window below.
     const seenMutations = new Set<string>()
     const windowStart = history.length - lowNoveltyRecent.length
     const isNoOpRepeat: boolean[] = []
@@ -384,7 +409,7 @@ export function detectStuckToolRepeat(
   if (lowNoveltyEntries.length < lowNoveltyMinCalls) {
     return { stuck: false }
   }
-  const signatures = new Set(lowNoveltyEntries.map(lowNoveltySignatureOf))
+  const signatures = new Set(lowNoveltyEntries.map(observationSignatureOf))
   if (signatures.size <= lowNoveltyMaxUniqueSignatures) {
     const toolCounts = new Map<string, number>()
     for (const entry of lowNoveltyEntries) {
@@ -419,6 +444,16 @@ export function buildStuckToolRepeatMessage(
       ].join(' '),
     }
   }
+  if (kind === 'execution_failure_churn') {
+    return {
+      role: 'system',
+      content: [
+        `Recent validation/execution attempts have failed ${count} times with non-zero results across varied commands.`,
+        'Stop guessing additional test commands or wrappers. Inspect the latest failure evidence and either make one concrete product correction, run the smallest directly relevant check, or report INCOMPLETE with the exact unresolved failure.',
+        'Do not spend more turns re-running equivalent failing checks without a new workspace mutation or a materially different prerequisite.',
+      ].join(' '),
+    }
+  }
   if (kind === 'low_novelty') {
     return {
       role: 'system',
@@ -434,8 +469,8 @@ export function buildStuckToolRepeatMessage(
     return {
       role: 'system',
       content: [
-        `You have read the same target ${count} times with only pagination or display arguments changing.`,
-        'The evidence already gathered is sufficient for this pass. Stop rereading this target and synthesize the answer now.',
+        `You have read the same target ${count} times without distinct executor-confirmed observations.`,
+        'Stop repeating this read and synthesize the retained evidence; repetition does not establish that the evidence is sufficient.',
         'If a specific missing fact still blocks the answer, state that fact as INCOMPLETE instead of issuing another broad read.',
       ].join(' '),
     }
@@ -471,9 +506,6 @@ export function buildStuckToolRepeatMessage(
   }
 }
 
-/**
- * Decide whether to inject the repair message this turn.
- */
 export function shouldRepairStuckToolRepeat(options: {
   history: StuckToolRepeatEntry[] | undefined
   repairedCount: number
@@ -488,6 +520,7 @@ export function shouldRepairStuckToolRepeat(options: {
   lowNoveltyMaxUniqueSignatures?: number
   targetRepeatThreshold?: number
   permanentFailureChurnThreshold?: number
+  executionFailureChurnThreshold?: number
 }): StuckToolRepeatResult {
   const {
     history,
@@ -503,12 +536,10 @@ export function shouldRepairStuckToolRepeat(options: {
     lowNoveltyMaxUniqueSignatures,
     targetRepeatThreshold,
     permanentFailureChurnThreshold,
+    executionFailureChurnThreshold,
   } = options
   if (isLastIteration) return { stuck: false }
   if (repairedCount >= maxRepairs) {
-    // Out of repair messages. If the loop persists regardless, report
-    // exhaustion so the caller can foreclose the run instead of silently
-    // letting the loop consume the remaining iteration budget.
     const verdict = detectStuckToolRepeat(history, {
       threshold,
       window,
@@ -519,6 +550,7 @@ export function shouldRepairStuckToolRepeat(options: {
       lowNoveltyMaxUniqueSignatures,
       targetRepeatThreshold,
       permanentFailureChurnThreshold,
+      executionFailureChurnThreshold,
     })
     return verdict.stuck ? { ...verdict, stuck: false, exhausted: true } : { stuck: false }
   }
@@ -532,15 +564,10 @@ export function shouldRepairStuckToolRepeat(options: {
     lowNoveltyMaxUniqueSignatures,
     targetRepeatThreshold,
     permanentFailureChurnThreshold,
+    executionFailureChurnThreshold,
   })
 }
 
-/**
- * Resolve the concrete history entry behind an `exact` stuck verdict so the
- * caller can record it as a failed attempt (same structural signature the
- * failed-attempt guard blocks on). Low-novelty verdicts span many distinct
- * signatures, so they have no single blockable entry and return undefined.
- */
 export function findStuckRepeatEntry(
   history: StuckToolRepeatEntry[] | undefined,
   result: StuckToolRepeatResult,
@@ -548,19 +575,20 @@ export function findStuckRepeatEntry(
 ): StuckToolRepeatEntry | undefined {
   if (!result.stuck || !result.tool) return undefined
   if (result.kind !== 'exact' && result.kind !== 'no_op_mutation') return undefined
-  // A no-op mutation cycle is detected across the whole run precisely because
-  // it is longer than the exact-repeat window, so scan the whole run for it.
   const recent = result.kind === 'no_op_mutation' ? (history ?? []) : (history ?? []).slice(-window)
-  const counts = new Map<string, { count: number; entry: StuckToolRepeatEntry }>()
+  const counts = new Map<string, { count: number; entry: StuckToolRepeatEntry; outcome?: string }>()
   for (const entry of recent) {
     if (entry.tool !== result.tool) continue
     const sig = signatureOf(entry)
+    const outcome = result.kind === 'exact'
+      ? JSON.stringify([entry.status, entry.failureCode, entry.outputFingerprint ?? entry.output])
+      : undefined
     const existing = counts.get(sig)
-    if (existing) {
+    if (existing && existing.outcome === outcome) {
       existing.count += 1
       existing.entry = entry
     } else {
-      counts.set(sig, { count: 1, entry })
+      counts.set(sig, { count: 1, entry, outcome })
     }
   }
   let best: { count: number; entry: StuckToolRepeatEntry } | undefined

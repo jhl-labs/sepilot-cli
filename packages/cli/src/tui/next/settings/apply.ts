@@ -2,13 +2,11 @@ import type { SettingsItem } from './schema.js'
 
 export interface SettingsApplyDeps {
   setSessionValue(key: string, value: unknown): void
-  /** PUT /api/v1/config accepts a dotted-key update document. */
   putConfig(updates: Record<string, unknown>): Promise<void>
 }
 
 const UNSAFE_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor'])
 
-/** Immutable nested set for local view-model updates. */
 export function setAtPath(
   target: Record<string, unknown>,
   path: string,
@@ -52,8 +50,6 @@ export async function applySetting(
       return { ok: false, error: `settings: ${item.id}${suffix}` }
     }
 
-    // The daemon config API accepts a partial dotted-key update document, not
-    // a nested replacement of the complete config snapshot.
     await deps.putConfig({ [item.configPath]: value })
     return { ok: true }
   } catch (error) {

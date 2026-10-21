@@ -33,7 +33,6 @@ export interface KnowledgeChatDeps {
   changed(activityId: string): void
 }
 
-/** Personal profile tools share the same canonical store and review queue as the UI. */
 export function createKnowledgeChatTools(deps: KnowledgeChatDeps): ToolDefinitionRuntime[] {
   const lifecycle = createKnowledgeLifecycle(deps.repo)
   const basic = (['search', 'save'] as const).map(
@@ -92,7 +91,6 @@ export function createKnowledgeChatTools(deps: KnowledgeChatDeps): ToolDefinitio
             },
       async execute(raw, context) {
         const started = Date.now()
-        // Channels and extension principals cannot access the owner's unscoped Wiki.
         if (
           !context?.sessionId ||
           context.channelContext ||
@@ -166,7 +164,6 @@ export function createKnowledgeChatTools(deps: KnowledgeChatDeps): ToolDefinitio
           const title = redactSensitive(input.title).redacted
           const body = redactSensitive(input.body).redacted
           const excerpt = redactSensitive(input.evidence).redacted
-          // Stable content identity makes a replay safe even after a lost tool receipt.
           const id = `chat-${createHash('sha256')
             .update(JSON.stringify([context.sessionId, title, body, input.kind]))
             .digest('hex')}`

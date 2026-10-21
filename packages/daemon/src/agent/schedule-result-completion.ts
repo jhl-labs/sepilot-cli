@@ -103,11 +103,6 @@ export function normalizeExplicitScheduleListToolCalls(
     : toolCall)
 }
 
-/**
- * Turn a successful scheduler result into the final answer without asking an
- * LLM to restate structured rows. This prevents evidence truncation and model
- * priors from inventing or dropping scheduled jobs.
- */
 export function deterministicScheduleResultFromMessages(
   messages: readonly Message[],
   userInput: string,

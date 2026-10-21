@@ -317,7 +317,6 @@ export class AcpSwarmAgentRuntimeAdapter implements SwarmAgentRuntimeAdapter {
   }
 
   async resize(_handle: SwarmAgentHandle, _cols: number, _rows: number): Promise<void> {
-    // ACP stdio agents are not pane-backed; resize is intentionally a no-op.
   }
 
   async waitForIdle(
@@ -487,7 +486,6 @@ export class A2ASwarmAgentRuntimeAdapter implements SwarmAgentRuntimeAdapter {
   }
 
   async resize(_handle: SwarmAgentHandle, _cols: number, _rows: number): Promise<void> {
-    // Remote A2A agents are not pane-backed; resize is intentionally a no-op.
   }
 
   async waitForIdle(

@@ -1,6 +1,5 @@
 import { spawn } from 'node:child_process'
 
-/** A short-lived owned process: neither descendants nor output may outlive its budget. */
 export async function runBoundedCommand(input: {
   command: string
   args?: string[]
@@ -27,8 +26,6 @@ export async function runBoundedCommand(input: {
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
     let terminationSent = false
-    // Each launch owns a POSIX process group. Killing just a shell/ssh PID
-    // abandons grandchildren (and can leave inherited stdout pipes open).
     const killTree = () => {
       if (!child.pid || terminationSent) return
       terminationSent = true
@@ -39,7 +36,7 @@ export async function runBoundedCommand(input: {
         killer.once('error', () => { child.kill('SIGKILL') })
         killer.unref()
       } else {
-        try { process.kill(-child.pid, 'SIGKILL') } catch { /* already exited */ }
+        try { process.kill(-child.pid, 'SIGKILL') } catch {}
       }
     }
     const cleanup = () => {
@@ -66,7 +63,6 @@ export async function runBoundedCommand(input: {
     child.stdout.on('data', (chunk: Buffer) => capture(stdout, chunk))
     child.stderr.on('data', (chunk: Buffer) => capture(stderr, chunk))
     child.once('error', fail)
-    // Even a successful shell must not leave an unowned background child.
     child.once('exit', killTree)
     child.once('close', (exitCode, signal) => {
       if (settled) return
@@ -74,7 +70,7 @@ export async function runBoundedCommand(input: {
       cleanup()
       resolve({ exitCode, signal, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') })
     })
-    child.stdin.on('error', () => { /* early exit / EPIPE */ })
+    child.stdin.on('error', () => {})
     child.stdin.end(input.stdin)
     input.signal?.addEventListener('abort', abort, { once: true })
     const timer = setTimeout(() => fail(new Error(`command timed out after ${input.timeoutMs}ms`)), input.timeoutMs)

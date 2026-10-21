@@ -68,8 +68,6 @@ export function writable(record: KnowledgeRecord): z.infer<typeof KnowledgeWrite
   return { ...fields, expectedRevision: revision }
 }
 
-// Decision identity excludes model-written rationale and incidental source/session details.
-// Preserve Markdown whitespace; only normalize line endings and Unicode representation.
 function proposalContentKey(input: z.infer<typeof KnowledgeProposalInput>): string {
   return createHash('sha256')
     .update(
@@ -83,7 +81,6 @@ function proposalContentKey(input: z.infer<typeof KnowledgeProposalInput>): stri
     .digest('hex')
 }
 
-/** One transactional service for chat and UI decisions; no hidden auxiliary LLM call. */
 export function createKnowledgeMaintenance(
   repo: KnowledgeRepo,
   activity: ReturnType<typeof createKnowledgeActivityStore>,
@@ -317,7 +314,6 @@ export function createKnowledgeMaintenance(
                 '대화 중 Wiki 갱신 제안이 꺼져 있습니다. 명시적인 사용자 저장·수정 요청만 처리하세요.',
                 409,
               )
-            // Include pre-migration proposals without changing their externally referenced IDs.
             const previous = db
               .prepare(
                 `SELECT data FROM knowledge_content_proposals WHERE content_key=?

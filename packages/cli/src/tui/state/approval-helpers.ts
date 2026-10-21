@@ -1,8 +1,3 @@
-// Pure helpers around the approval-related slices of useChat. Pulled
-// out so the conversion (payload -> cli ApprovalRequest) and the
-// stale-recovery prompt copy can be unit-tested without rendering
-// useChat or driving a real daemon stream.
-
 import type { ApprovalRequest } from '../types.js'
 
 export interface ApprovalRequestPayload {
@@ -18,14 +13,6 @@ export interface ApprovalRequestPayload {
   context?: string
 }
 
-/**
- * Translate a daemon `approval_request` stream payload into the cli
- * ApprovalRequest shape. Falls back when the payload omits parts that
- * older daemon builds didn't emit:
- *   - missing toolCall.id  -> fresh uuid (so the cli has a stable key)
- *   - missing toolCall.name -> 'unknown' (so the picker still renders)
- *   - missing arguments     -> {}
- */
 export function approvalRequestFromPayload(opts: {
   payload: ApprovalRequestPayload
   sessionId: string | null
@@ -82,13 +69,6 @@ function stableStringify(value: unknown): string {
   return JSON.stringify(value)
 }
 
-/**
- * Copy that goes into the SYSTEM_MESSAGE after a stale-run approval
- * resolves: the approve / deny verbs lead to different recovery paths
- * (a new chat run vs. continuing without the tool) and the operator
- * needs to see why the next event in the transcript is one or the
- * other.
- */
 export function buildStaleApprovalNotice(opts: { approved: boolean }): string {
   return opts.approved
     ? 'Recorded approval for a stale run. Starting a fresh recovery run from the latest session state.'

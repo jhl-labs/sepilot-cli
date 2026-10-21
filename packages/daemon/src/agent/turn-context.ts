@@ -123,11 +123,6 @@ const conversationGraphemeSegmenter = new Intl.Segmenter(undefined, {
   granularity: 'grapheme',
 })
 
-/**
- * Replay terminal replacement controls that may exist in legacy session
- * events. DEL/BS removes the preceding grapheme; other non-text C0 controls
- * are discarded before history is sent back to a model.
- */
 export function replayConversationTextControls(input: string): string {
   let value = ''
   for (const ch of input) {

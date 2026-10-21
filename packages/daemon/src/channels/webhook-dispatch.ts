@@ -156,11 +156,6 @@ export function getChannelWebhookDispatcher(runtime: ChannelWebhookRuntime): Cha
 
   const drainOnce = async (limit = 20): Promise<number> => {
     if (draining) return 0
-    // The 5s interval is unref'd but outlives the runtime in long-lived
-    // worker processes (tests, embedded daemons): once the ingress database
-    // has been closed by shutdown, a late tick must stop the dispatcher
-    // instead of throwing "database connection is not open" as an unhandled
-    // timer error.
     if (!queue.isOpen()) {
       dispatcher.stop()
       return 0

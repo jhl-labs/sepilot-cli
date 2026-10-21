@@ -86,9 +86,6 @@ export function buildImportedSessionEvents(
 
     switch (event.type) {
       case 'user_message':
-        // Attachment ids are capabilities in the source daemon's authenticated
-        // file registry. They are not transferable with a JSON-only share and
-        // must not be allowed to alias an unrelated local upload after import.
         return {
           type: 'user_message',
           id: randomUUID(),

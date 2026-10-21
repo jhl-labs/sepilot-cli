@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto'
 
-/** Bounded, serializable run evidence; never reset on a phase transition. */
 export interface WorkProgress {
   revision: number
   seen: string[]
@@ -26,7 +25,6 @@ function stable(value: unknown): string {
   return JSON.stringify(value) ?? 'null'
 }
 
-/** New failures are useful evidence too; retries, prose and todos are not. */
 export function observeWorkProgress(
   current: WorkProgress | undefined,
   observation: ProgressObservation,
@@ -35,7 +33,6 @@ export function observeWorkProgress(
   if (observation.blocked || observation.executionObserved !== true
     || observation.securityEffect === 'internal-state') return result
   const input = { ...observation.input }
-  // An annotation or a longer deadline does not make the same result new.
   delete input.actionPurpose
   delete input.timeoutMs
   const output = observation.outputFingerprint
@@ -46,8 +43,6 @@ export function observeWorkProgress(
   if (result.seen.includes(fingerprint)) return result
   return {
     revision: result.revision + 1,
-    // A memory bound, not a task deadline; global iteration/recovery budgets
-    // still bound pathological streams of unique but unhelpful observations.
     seen: [...result.seen, fingerprint].slice(-4096),
   }
 }

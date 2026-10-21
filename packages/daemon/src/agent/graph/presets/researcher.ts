@@ -14,11 +14,6 @@ export type ResearchDepth = 'standard' | 'deep'
 
 type ResearchPhase = 'search' | 'verification'
 
-// Verification consumes the evidence packet produced by search. Keep only
-// tools that can inspect a named source directly; broad discovery belongs to
-// the search phase, which the parent graph can re-enter when verification
-// reports a gap. This is intentionally a conservative capability boundary:
-// an unclassified integration is not silently promoted into verification.
 const RESEARCH_VERIFICATION_TOOL_NAMES = new Set([
   'webfetch',
   'browser.navigate',
@@ -38,13 +33,6 @@ export function isResearchVerificationTool(toolName: string): boolean {
   return RESEARCH_VERIFICATION_TOOL_NAMES.has(toolName)
 }
 
-/**
- * Resolve the verification surface from capability metadata as well as the
- * built-in generic readers. An integration's exact authenticated source
- * reader must remain visible here; otherwise the phase-local projection also
- * removes canonical-route ownership and permits a generic unauthenticated
- * transport for that same URL. Only observe tools may opt in.
- */
 export function researchVerificationToolNames(tools: ToolRegistry): string[] {
   return tools.list()
     .filter((tool) => (
@@ -102,11 +90,6 @@ const RESEARCH_PHASE_BATCH_LIMITS: Record<ResearchPhase, number> = {
   verification: 3,
 }
 
-/**
- * A graph iteration can contain a model-generated batch, so iteration limits
- * alone do not bound evidence volume. Keep each phase to one compact packet
- * while retaining a larger explicit deep-research allowance.
- */
 export function resolveResearchPhaseToolBudget(
   parent: Pick<AgentState, 'maxIterations' | 'maxToolCallsPerTurn' | 'seedContract'>,
   phase: ResearchPhase,
@@ -151,21 +134,11 @@ export function researchRunActualToolCallCount(s: AgentState): number {
   ) {
     return Math.max(0, Math.floor(s.researchRunToolCallCount))
   }
-  // Resume compatibility for checkpoints written before the run counter was
-  // introduced. Counting retained executions is conservative and auditable;
-  // subsequent phase handoffs switch to the exact accumulated counter.
   return (s.toolCallHistory ?? [])
     .filter((entry) => entry.executionObserved !== false)
     .length
 }
 
-/**
- * Convert the run's already allocated reasoning effort into an execution
- * ceiling. This is a runaway guard, not a completion target: evidence novelty
- * decides whether another round is useful. The 200-call upper bound matches
- * the retained tool-history window, so the controller never continues after
- * it can no longer audit every execution used by its own decision.
- */
 export function resolveResearchRunToolBudget(
   parent: Pick<
     AgentState,
@@ -194,10 +167,6 @@ export function resolveResearchRunToolBudget(
   )
 }
 
-/**
- * Close a research phase after its bounded evidence packet is full. This is a
- * normal handoff to the phase reporter, not global task-budget exhaustion.
- */
 export function enforceResearchPhaseToolBudget(
   s: AgentState,
   phase: ResearchPhase,
@@ -208,9 +177,6 @@ export function enforceResearchPhaseToolBudget(
   const runBudget = resolveResearchRunToolBudget(s, depth)
   const runCalls = researchRunActualToolCallCount(s)
   if (phaseCalls < phaseBudget && runCalls < runBudget) {
-    // Bound the next generated batch by the remaining packet capacity. Without
-    // this dynamic cap, a four-call batch after six recorded calls could make
-    // an eight-call phase execute ten observations before the next guard.
     s.maxToolCallsPerTurn = Math.min(
       resolveResearchPhaseBatchLimit(s.maxToolCallsPerTurn, phase),
       phaseBudget - phaseCalls,
@@ -276,11 +242,6 @@ function researchPhaseGuard(
   }
 }
 
-/**
- * Route the researcher graph after the verification subgraph: re-search when the
- * verification flagged unresolved gaps and the run still has re-search budget,
- * otherwise finalize. Exported for direct unit testing of the routing contract.
- */
 export function routeAfterVerification(
   s: AgentState,
   depth: ResearchDepth = 'standard',
@@ -324,12 +285,6 @@ function declaredToolInput(
   )
 }
 
-/**
- * Set fingerprint of successful observe results. Call ids, timestamps,
- * duplicated observations, and undeclared presentation arguments are not
- * evidence novelty; a different source identity or different complete result
- * fingerprint is.
- */
 export function researchObservationFingerprint(
   history: AgentState['toolCallHistory'],
   tools: ToolRegistry,
@@ -354,16 +309,10 @@ export function researchObservationFingerprint(
     .digest('hex')
 }
 
-/** Skip a second verification pass when re-search added no successful evidence. */
 export function routeAfterSearch(
   s: AgentState,
   depth: ResearchDepth = 'standard',
 ): 'verification_subgraph' | 'finalizer' {
-  // The executor has already closed an explicitly exact tool workflow after
-  // recording every permitted outcome. A verification subgraph cannot add
-  // evidence because the user's closed capability boundary exposes no
-  // remaining source tool; entering it only spends model turns and can replace
-  // a valid findings summary with a progress-only verification draft.
   if (
     s.stuckRepeatForcedFinal === true
     && s.forcedFinalSynthesisReason === 'exact-tool-budget'
@@ -568,8 +517,6 @@ export function buildResearcherGraph(
         mergeChildInto(parent, child)
         parent.researchRunToolCallCount = runCalls
         parent.planIndex = child.planIndex
-        // Count each completed search pass for diagnostics and an optional
-        // operator-provided ceiling. Default convergence is evidence-driven.
         parent.researchRounds = (parent.researchRounds ?? 0) + 1
         parent.researchSearchBaselineFingerprint = child.researchSearchBaselineFingerprint
         parent.researchSearchAddedEvidence = searchAddedEvidence

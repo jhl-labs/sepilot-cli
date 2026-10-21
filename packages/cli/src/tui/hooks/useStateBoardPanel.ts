@@ -3,21 +3,11 @@ import type { AgentStateBoardSnapshot, DaemonStateBoardResponse } from '@sepilot
 import { formatStateBoardText } from '@sepilotd/presentation'
 import type { SlashCommand } from '../commands/slash-registry.js'
 
-/**
- * Structural shape of a `state_board` session event as it arrives over the
- * session-watch stream. Typed locally (not imported from daemon) so this stays
- * within surface dependency boundaries.
- */
 export interface StateBoardEventLike {
   type: string
   board?: AgentStateBoardSnapshot
 }
 
-/**
- * Reducer core: return the board from a `state_board` event, or the previous
- * board for any other event. Pure and structural — no content parsing — so it
- * can route live session-watch frames into the panel deterministically.
- */
 export function applyStateBoardEvent(
   previous: AgentStateBoardSnapshot | null,
   event: StateBoardEventLike,
@@ -33,12 +23,6 @@ export interface StateBoardSlashDeps {
   onBoard?: (response: DaemonStateBoardResponse) => void
 }
 
-/**
- * Build the `/state` slash command. Fetches the board for the current (or an
- * explicitly named) session and renders it into the transcript, mirroring how
- * `/usage current` and `/mcp` surface daemon state. Extracted as a factory so
- * it is unit-testable without rendering the full App.
- */
 export function createStateBoardSlashCommand(deps: StateBoardSlashDeps): SlashCommand {
   return {
     name: '/state',
@@ -75,10 +59,6 @@ export interface UseStateBoardPanelResult {
   reset: () => void
 }
 
-/**
- * Live board state container for a future exclusive panel. Holds the latest
- * board plus a routing method for incoming session-watch `state_board` frames.
- */
 export function useStateBoardPanel(): UseStateBoardPanelResult {
   const [board, setBoard] = useState<AgentStateBoardSnapshot | null>(null)
   const [source, setSource] = useState<DaemonStateBoardResponse['source'] | null>(null)

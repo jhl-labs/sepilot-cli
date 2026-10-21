@@ -44,6 +44,7 @@ import {
 import { parseReminderTime } from '../memory/reminders.js'
 import { parseRelativePastTimestamp } from '../memory/time-relative.js'
 import { rememberUserMemory } from '../memory/user-memory.js'
+import { MemorySelectionError, validateMemorySelection } from '../memory/forget-selected.js'
 import {
   explicitlyRequestsAppIndex,
   filterAppIndexEntries,
@@ -58,6 +59,7 @@ export interface MemoryRememberToolDeps {
 }
 
 export interface MemoryForgetToolDeps {
+  forgetSelected?: (ids: string[], scopeTags: string[], options?: { dryRun?: boolean }) => Promise<unknown>
   forgetAll?: (scopeTags: string[], options?: { dryRun?: boolean }) => Promise<unknown>
   fileMemory?: Pick<
     FileMemory,
@@ -147,7 +149,6 @@ export interface MemoryExportImportToolDeps {
 }
 
 export interface MemoryTagSuggestToolDeps {
-  /** Function that calls the LLM and returns 3-5 lowercase topic tags. */
   suggestTags?: (content: string) => Promise<string[]>
 }
 
@@ -165,11 +166,7 @@ export interface MemorySummarizeToolDeps {
     get(id: string): Promise<MemoryEntry | null>
     listRecent(limit: number): Promise<Array<Omit<MemoryEntry, 'score'>>>
   }
-  /** Returns an LLM summary for the supplied memory contents. Null when
-   *  no provider is configured. */
   summarize?: (contents: string[], options?: { instruction?: string; targetChars?: number }) => Promise<string | null>
-  /** Optional file-memory registry — when present, callers may pass
-   *  saveTo to land the summary in a daily-note section. */
   fileMemoryRegistry?: ScopedFileMemoryRegistry
   fileMemory?: Pick<FileMemory, 'appendToDailySection' | 'getDailyNotePath'>
 }
@@ -230,7 +227,6 @@ export interface MemoryHistoryToolDeps {
 }
 
 export interface MemoryConflictsToolDeps {
-  /** Returns contradiction candidates without mutating memory. */
   findRecentContradictions?: (options?: { maxPairs?: number }) => Promise<Array<{
     winnerId: string
     supersededIds: string[]
@@ -322,9 +318,7 @@ const ALLOWED_MEMORY_SOURCES: ReadonlyArray<MemoryEntry['source']> = [
 const SEARCH_DEFAULT_LIMIT = 8
 const SEARCH_MAX_LIMIT = 50
 const SEARCH_SNIPPET_MAX_CHARS = 320
-// Upper bound on a single memory.documents.ingest content payload, so an
-// arbitrarily large document cannot flood chunking + the embedding queue.
-const MAX_DOCUMENT_INGEST_BYTES = 4 * 1024 * 1024 // 4MB
+const MAX_DOCUMENT_INGEST_BYTES = 4 * 1024 * 1024
 
 function isInternalAppDocument(doc: Pick<MemoryDocument, 'id' | 'path' | 'tags'>): boolean {
   return isAppIndexMemoryEntry({
@@ -516,14 +510,15 @@ export function createMemoryListTool(deps: MemoryListToolDeps): ToolDefinitionRu
 export function createMemoryForgetTool(deps: MemoryForgetToolDeps): ToolDefinitionRuntime {
   return {
     name: 'memory.forget',
-    description: 'Delete durable user memory. For ALL owned memory use {all:true}: clears long-term notes, daily journals, learned facts, procedures and ingested documents. Use all:true,dryRun:true to inspect counts and retained stores without deleting anything; a preview is a snapshot, not an authorization requirement. The result identifies retained stores. Otherwise either remove a single bullet item from a section (provide `section` and `item`) or clear an entire section (provide only `section`). Call only when the user explicitly asks to delete, clear, forget, or 비워 their memory. This does not affect the current conversation history.',
+    description: 'Delete durable user memory. To forget selected semantic memories, use ids from memory.search or memory.list; only entries in the caller write scope can be deleted. For ALL owned memory use {all:true}: clears long-term notes, daily journals, learned facts, procedures and ingested documents. With ids or all:true, dryRun:true previews without deleting; preview is not an authorization requirement. The result identifies retained stores. Alternatively remove a bullet item with section/item or clear a whole section with section. Selectors ids, all, and section/item are mutually exclusive. Call only when the user explicitly asks to delete or forget memory. This does not affect current conversation history.',
     resumeSafety: 'replay-safe',
     scheduling: { mode: 'sequential', resource: 'memory' },
     inputSchema: {
       type: 'object',
       properties: {
-        dryRun: { type: 'boolean', description: 'With all:true, return a non-destructive reset preview. Default false.' },
-        all: { type: 'boolean', const: true, description: 'Delete all memory owned by the caller across memory stores. Mutually exclusive with section/item.' },
+        ids: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 256 }, minItems: 1, maxItems: 100, description: 'Exact semantic memory IDs returned by memory.search or memory.list. Mutually exclusive with all and section/item.' },
+        dryRun: { type: 'boolean', description: 'With ids or all:true, return a non-destructive preview. Default false.' },
+        all: { type: 'boolean', const: true, description: 'Delete all memory owned by the caller across memory stores. Mutually exclusive with ids and section/item.' },
         section: {
           type: 'string',
           description: 'Section title to target (e.g. "Stable Facts", "Open Loop Queue", "User Memory").',
@@ -533,10 +528,26 @@ export function createMemoryForgetTool(deps: MemoryForgetToolDeps): ToolDefiniti
           description: 'Optional. The exact bullet text to remove (substring match, case-insensitive). Omit to clear the whole section.',
         },
       },
-      anyOf: [{ required: ['section'] }, { required: ['all'] }],
+      oneOf: [{ required: ['section'] }, { required: ['all'] }, { required: ['ids'] }],
     },
     async execute(input, context): Promise<ToolResult> {
       const startedAt = Date.now()
+      if (input.ids !== undefined) {
+        try {
+          validateMemorySelection(input.ids)
+          if (input.all !== undefined || input.section !== undefined || input.item !== undefined
+            || (input.dryRun !== undefined && typeof input.dryRun !== 'boolean')) {
+            throw new MemorySelectionError('INVALID_INPUT_PERMANENT', 'Use ids alone with optional dryRun, or all:true, or section with optional item.')
+          }
+          if (!deps.forgetSelected) return { status: 'error', code: 'MEMORY_UNAVAILABLE_USER', output: 'Selected memory deletion is unavailable; nothing was deleted.', durationMs: Date.now() - startedAt }
+          const result = await deps.forgetSelected(input.ids, context?.scopeTags ?? [], { dryRun: input.dryRun === true })
+          return { status: 'success', output: JSON.stringify(result), durationMs: Date.now() - startedAt }
+        } catch (error) {
+          return { status: 'error', code: error instanceof MemorySelectionError ? error.code : 'MEMORY_DELETE_FAILED',
+            output: error instanceof MemorySelectionError ? error.message : `Selected memory deletion did not complete and may be partial. Retry the same IDs. ${String(error)}`,
+            durationMs: Date.now() - startedAt }
+        }
+      }
       if (input.dryRun !== undefined && (typeof input.dryRun !== 'boolean' || input.all !== true)) {
         return { status: 'error', code: 'INVALID_INPUT_PERMANENT', output: 'dryRun requires all:true and a boolean value.', durationMs: Date.now() - startedAt }
       }
@@ -734,7 +745,6 @@ export function createMemorySearchTool(deps: MemorySearchToolDeps): ToolDefiniti
       } else {
         options.limit = SEARCH_DEFAULT_LIMIT
       }
-      // Over-fetch a bit so the post-filter still has enough hits to return.
       const requestedLimit = options.limit
 
       const sources = Array.isArray(input.sources)
@@ -886,8 +896,6 @@ export function createMemorySearchTool(deps: MemorySearchToolDeps): ToolDefiniti
         score: entry.score,
       }))
 
-      // Best-effort: bump access counter for the ids actually surfaced to
-      // the agent. We don't await; failure is silent.
       if (visible.length > 0 && deps.semanticIndex.recordAccess) {
         void deps.semanticIndex.recordAccess(visible.map((entry) => entry.id)).catch(() => {})
       }
@@ -1542,7 +1550,6 @@ export function createMemoryDailyListTool(deps: MemoryDailyToolDeps): ToolDefini
 
       let dateKeys: string[]
       try {
-        // Over-fetch when filtering so the post-filter still hits `limit`.
         const fetchLimit = (sinceKey !== undefined || untilKey !== undefined)
           ? Math.min(Math.max(limit, 14) * 6, 365)
           : limit
@@ -1987,9 +1994,6 @@ export function createMemoryUpdateTool(deps: MemoryUpdateToolDeps): ToolDefiniti
         }
       }
 
-      // Reject foreign-scope / lifecycle tag injection from user-supplied tags.
-      // Without this, `tags: ['scope:user:<other>']` re-owned the memory into
-      // another scope, and `archived` / `superseded` arbitrarily hid it.
       const forbiddenUpdateTags = findForbiddenUserTags([...(explicitTags ?? []), ...addTags, ...removeTags])
       if (forbiddenUpdateTags.length > 0) {
         return {
@@ -2003,8 +2007,6 @@ export function createMemoryUpdateTool(deps: MemoryUpdateToolDeps): ToolDefiniti
       const existingScopeTags = (existing.tags ?? []).filter(isReservedTag)
       let nextTags: string[]
       if (explicitTags) {
-        // Preserve existing scope tags so the agent can't accidentally strip
-        // ownership when rewriting tag list.
         nextTags = uniqueOrdered([...explicitTags, ...existingScopeTags])
       } else {
         const removeSet = new Set(removeTags.map((tag) => tag.toLowerCase()))
@@ -2079,7 +2081,6 @@ export function createMemoryUpdateTool(deps: MemoryUpdateToolDeps): ToolDefiniti
           },
         })
       } catch {
-        // Audit failure shouldn't break the update — surface a warning instead.
       }
 
       return {
@@ -2392,7 +2393,6 @@ export function createMemoryDocumentsPreviewTool(
           durationMs: Date.now() - startedAt,
         }
       }
-      // Hide cross-scope documents from preview just like get/search.
       if (context?.scopeTags && context.scopeTags.length > 0
         && !isMemoryVisibleInScope(doc.tags, context.scopeTags)) {
         return {
@@ -2478,7 +2478,6 @@ export function createMemoryDocumentsGetTool(
           durationMs: Date.now() - startedAt,
         }
       }
-      // Hide cross-scope documents from view.
       if (context?.scopeTags && context.scopeTags.length > 0
         && !isMemoryVisibleInScope(doc.tags, context.scopeTags)) {
         return {
@@ -2604,7 +2603,6 @@ export function createMemoryDocumentsUpdateTool(
         }
       }
 
-      // Preserve scope tags so the caller can't strip ownership.
       const existingScopeTags = (existing.tags ?? []).filter(isReservedTag)
       let nextTags: string[] | undefined
       if (explicitTags) {
@@ -3016,11 +3014,6 @@ export function createMemoryMaintenanceTool(deps: MemoryMaintenanceToolDeps): To
       }
 
       const confirm = input.confirm === true
-      // Scope guard (symmetric with rejectScopedIncludeAll): maintenance prune is
-      // daemon-wide and NOT scoped per user, so a destructive run (confirm:true)
-      // from a scoped, non-operator context would prune *every* user's memories.
-      // Enforce operator-only in code — the prompt-only guard in the description
-      // was not binding. Dry-run previews (confirm:false) stay allowed.
       if (confirm && context?.scopeTags && context.scopeTags.length > 0) {
         return {
           status: 'error',
@@ -3032,9 +3025,6 @@ export function createMemoryMaintenanceTool(deps: MemoryMaintenanceToolDeps): To
 
       const options: MemoryMaintenanceOptions = {}
       if (typeof input.staleAfterDays === 'number' && input.staleAfterDays > 0) {
-        // Floor at 1 day: a fractional value (e.g. 0.001) would make almost
-        // every conversation memory a stale prune candidate — an accidental or
-        // hostile full wipe. Never prune below a one-day age.
         options.staleAfterDays = Math.max(1, input.staleAfterDays)
       }
       if (typeof input.lowImportance === 'number'
@@ -3163,9 +3153,6 @@ export function createMemoryContextSnapshotTool(
         }
       }
 
-      // Graph stats/search currently describe the daemon-wide graph. Do not
-      // expose them through a scoped snapshot until the graph has a scoped
-      // projection equivalent to semantic memory filtering.
       if (scopeTags.length === 0 && deps.semanticIndex?.getGraphStats) {
         try {
           const graphSummary: Record<string, unknown> = {
@@ -3325,13 +3312,6 @@ function isReservedTag(tag: string): boolean {
   return RESERVED_TAG_PREFIXES.some((prefix) => lower === prefix.replace(/:$/, '') || lower.startsWith(prefix))
 }
 
-/**
- * Reserved/system tags a user-facing write (memory.remember / memory.update)
- * must never set directly: `scope:*` ownership tags (foreign-scope injection)
- * and lifecycle tags like `archived` / `superseded` / `archived-by:*`
- * (arbitrary hide/supersede). Scope tags are attached by the runtime from the
- * execution context; lifecycle tags are managed by dedicated operations.
- */
 function findForbiddenUserTags(tags: readonly string[]): string[] {
   return tags.filter((tag) => isReservedTag(tag))
 }
@@ -3800,7 +3780,6 @@ export function createMemoryHistoryTool(deps: MemoryHistoryToolDeps): ToolDefini
           durationMs: Date.now() - startedAt,
         }
       }
-      // Validate optional time-range filters before doing any work.
       let sinceMs: number | undefined
       let untilMs: number | undefined
       if (typeof input.since === 'string' && input.since.trim().length > 0) {
@@ -3833,7 +3812,6 @@ export function createMemoryHistoryTool(deps: MemoryHistoryToolDeps): ToolDefini
 
       const current = await deps.semanticIndex.get(id)
       const scopeTags = context?.scopeTags ?? []
-      // If the memory exists and is cross-scope, refuse without leaking content.
       if (current && scopeTags.length > 0 && !isMemoryVisibleInScope(current.tags, scopeTags)) {
         return {
           status: 'error',
@@ -3845,9 +3823,6 @@ export function createMemoryHistoryTool(deps: MemoryHistoryToolDeps): ToolDefini
 
       const limitInput = typeof input.limit === 'number' ? input.limit : 50
       const limit = Math.max(1, Math.min(Math.floor(limitInput), 500))
-      // Over-fetch when post-filtering will trim the result so we don't
-      // return a short page just because most matches landed outside the
-      // time/action window.
       const willPostFilter = sinceMs !== undefined || untilMs !== undefined || actionsFilter !== null
       const fetchLimit = willPostFilter ? Math.min(limit * 4, 2000) : limit
 
@@ -3873,8 +3848,6 @@ export function createMemoryHistoryTool(deps: MemoryHistoryToolDeps): ToolDefini
       }
       entries = entries.slice(0, limit)
 
-      // For deleted memories, we still surface scope-mismatched ones as
-      // not-found so the audit doesn't leak content owned by another user.
       if (!current && scopeTags.length > 0 && entries.length > 0) {
         const visible = entries.filter((entry) => {
           const ownerTags = entry.after?.tags ?? entry.before?.tags
@@ -4048,7 +4021,6 @@ export function createMemoryDiffTool(deps: MemoryDiffToolDeps): ToolDefinitionRu
           durationMs: Date.now() - startedAt,
         }
       }
-      // Scope guard: caller must be able to see BOTH sides.
       const scopeTags = context?.scopeTags
       if (scopeTags && scopeTags.length > 0) {
         if (!isMemoryVisibleInScope(left.tags, scopeTags)
@@ -4257,7 +4229,6 @@ export function createMemorySummarizeTool(deps: MemorySummarizeToolDeps): ToolDe
         }
       }
 
-      // Optional saveTo: append the summary to a daily-note section.
       let savedTo: { path?: string; section?: string; date?: string } | undefined
       const saveTo = (input.saveTo && typeof input.saveTo === 'object') ? input.saveTo as { date?: unknown; section?: unknown } : undefined
       if (saveTo) {
@@ -4445,7 +4416,6 @@ export function createMemoryMergeTool(deps: MemoryMergeToolDeps): ToolDefinition
       }
 
       const confirm = input.confirm === true
-      // Union of all non-system tags.
       const tagUnion = uniqueOrdered(
         entries.flatMap((entry) => entry.tags ?? []).filter((tag) => !isMemoryArchived([tag]) && !isMemorySuperseded([tag])),
       )
@@ -4536,7 +4506,6 @@ export function createMemoryMergeTool(deps: MemoryMergeToolDeps): ToolDefinition
           })
           archivedIds.push(loser.id)
         } catch {
-          // continue
         }
       }
 
@@ -4675,11 +4644,6 @@ export function createMemoryRemindAtTool(deps: MemoryReminderToolDeps): ToolDefi
       const scopeTags = context?.scopeTags ?? []
       const scope = parseScopeFromTags(scopeTags)
 
-      // Prefer the live channelContext (carries the channel handle that just
-      // delivered this turn) over scope tags — scope tags are stable but a
-      // channelContext.chatKey is what RemindersScheduler needs to route the
-      // delivery back to the same chat. Fall back to the scope tags so REST
-      // callers without channelContext keep working.
       const ctxChannel = context?.channelContext
       const channelType = ctxChannel?.channel ?? scope.channelType
       const chatId = ctxChannel?.chatKey
@@ -4710,12 +4674,6 @@ export function createMemoryRemindAtTool(deps: MemoryReminderToolDeps): ToolDefi
   }
 }
 
-/**
- * channelContext.chatKey is the canonical session key the channel pipeline
- * uses internally — for most channels it's already `<channelType>:<channelId>`.
- * Pull just the channelId portion so RemindersScheduler can address the
- * channel SDK with a plain chat id.
- */
 function extractChatIdFromKey(chatKey: string, channelType?: string): string {
   if (!chatKey) return chatKey
   if (channelType) {
@@ -4795,7 +4753,6 @@ export function createMemoryRemindersCancelTool(deps: MemoryReminderToolDeps): T
           durationMs: Date.now() - startedAt,
         }
       }
-      // Confirm the reminder belongs to the caller scope before cancelling.
       const scopeTags = context?.scopeTags ?? []
       const ours = await deps.reminders.listForScope(scopeTags)
       const match = ours.find((reminder) => reminder.id === id)
@@ -4915,7 +4872,6 @@ export function createMemoryExportTool(deps: MemoryExportImportToolDeps): ToolDe
       const includeAllScopes = input.includeAllScopes === true
       const scopeTags = context?.scopeTags ?? []
 
-      // Validate optional time-range filters before doing any work.
       let createdAfterIso: string | undefined
       let createdBeforeIso: string | undefined
       if (typeof input.createdAfter === 'string' && input.createdAfter.trim().length > 0) {
@@ -4961,8 +4917,6 @@ export function createMemoryExportTool(deps: MemoryExportImportToolDeps): ToolDe
         let all: Array<Omit<MemoryEntry, 'score'>> = []
         try {
           if ((createdAfterIso || createdBeforeIso) && typeof deps.semanticIndex.listRecentWithTimestamps === 'function') {
-            // Use the time-range-aware variant when available so the SQL
-            // backend can prune at the source.
             all = await deps.semanticIndex.listRecentWithTimestamps(SEMANTIC_LIST_LIMIT, {
               createdAfter: createdAfterIso,
               createdBefore: createdBeforeIso,
@@ -5069,9 +5023,6 @@ export function createMemoryImportTool(deps: MemoryExportImportToolDeps): ToolDe
         semanticSkipped: 0,
         remindersAdded: 0,
         warnings: [] as string[],
-        // Populated only when dryRun=true so the caller can preview which
-        // ids would be added vs. replaced vs. skipped (cross-scope or
-        // already-present under conflict=skip).
         addIds: [] as string[],
         replaceIds: [] as string[],
         skipIds: [] as string[],
@@ -5117,15 +5068,10 @@ export function createMemoryImportTool(deps: MemoryExportImportToolDeps): ToolDe
         for (const entry of payload.semanticEntries) {
           if (!entry.id || !entry.content) continue
           if (applyIdsFilter && !applyIdsFilter.has(entry.id)) continue
-          // Strip any scope:* tags from the source before re-tagging with the
-          // importer scope. Keeping the source's scope tags would let an
-          // imported dump re-materialize memories tagged for *another* user's
-          // scope, making them visible cross-scope.
           const sourceTagsWithoutScope = (entry.tags ?? []).filter(
             (tag) => typeof tag === 'string' && !tag.toLowerCase().startsWith('scope:'),
           )
           const importTags = attachScopeTags(sourceTagsWithoutScope, scopeTags)
-          // Coerce an unknown/hostile source to a safe allowed value.
           const importSource: MemoryEntry['source'] =
             (ALLOWED_MEMORY_SOURCES as readonly string[]).includes(entry.source)
               ? entry.source
@@ -5142,7 +5088,6 @@ export function createMemoryImportTool(deps: MemoryExportImportToolDeps): ToolDe
               if (dryRun) stats.skipIds.push(entry.id)
               continue
             }
-            // Refuse to replace a memory belonging to another scope.
             if (!isMemoryWritableInScope(existing.tags, scopeTags)) {
               stats.semanticSkipped += 1
               if (dryRun) stats.skipIds.push(entry.id)
@@ -5201,7 +5146,6 @@ export function createMemoryImportTool(deps: MemoryExportImportToolDeps): ToolDe
               await deps.reminders.add({
                 dueAt: reminder.dueAt,
                 content: reminder.content,
-                // Strip foreign scope tags before re-tagging with importer scope.
                 scopeTags: attachScopeTags(
                   (reminder.scopeTags ?? []).filter(
                     (tag) => typeof tag === 'string' && !tag.toLowerCase().startsWith('scope:'),
@@ -5222,7 +5166,6 @@ export function createMemoryImportTool(deps: MemoryExportImportToolDeps): ToolDe
         stats.warnings.push('reminders store unavailable; reminders ignored')
       }
 
-      // Trim id lists when not in dryRun so the response stays compact.
       const responseStats: Record<string, unknown> = { ...stats }
       if (!dryRun) {
         delete responseStats.addIds
@@ -5629,9 +5572,6 @@ function parseExportPayload(input: unknown): MemoryExportPayload {
   }
   let parsed: unknown
   if (typeof input === 'object') {
-    // Object payloads previously bypassed the version/shape gate entirely — a
-    // malformed object (or one with non-array sections) then threw uncaught
-    // inside the import loop. Validate it the same as a parsed string.
     parsed = input
   } else if (typeof input === 'string') {
     const trimmed = input.trim()
@@ -5647,8 +5587,6 @@ function parseExportPayload(input: unknown): MemoryExportPayload {
   if (candidate.version !== '1.0') {
     throw new Error(`unsupported export version ${String(candidate.version)}`)
   }
-  // Validate the optional section shapes up front so a non-array section can
-  // never throw an uncaught error mid-import (crashing the tool call).
   if (candidate.semanticEntries !== undefined && !Array.isArray(candidate.semanticEntries)) {
     throw new Error('semanticEntries must be an array')
   }

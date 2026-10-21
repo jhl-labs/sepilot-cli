@@ -34,12 +34,6 @@ export interface StatsSnapshot {
     bySession: number
     byAlways: number
     stale: number
-    /**
-     * Top-N rules sorted by hitCount desc — operator's "where is the
-     * automation budget actually going?" answer. Rules with zero
-     * hits are excluded so the slot doesn't surface a wall of "0"s
-     * on a daemon with mostly-unused fixtures.
-     */
     topHits: Array<{
       tool: string
       pattern: string
@@ -107,11 +101,6 @@ export function buildStats(
       hitCount: d.hitCount ?? 0,
     }))
 
-  // pendingApprovals across all sessions isn't surfaced by sessions
-  // list (it's a per-session-detail field), so we don't pre-compute
-  // it here — keep the headline accurate to what the list response
-  // already gives us. A future revision can add a daemon-side
-  // pending count if operators ask for it.
   return {
     sessions: {
       total: sessionCounters.total,
@@ -136,18 +125,8 @@ export function buildStats(
   }
 }
 
-/**
- * Render the dashboard layout for a given snapshot. Exported so the
- * chat shell `/stats` slash can reuse the exact same layout — keeps
- * cli verb and chat slash visually identical so an operator
- * pivoting between surfaces doesn't have to re-orient.
- */
 export function formatStatsSnapshot(data: StatsSnapshot): string {
   const lines: string[] = []
-  // Each section starts with a single-line headline followed by
-  // bullet rows; an operator scrolling fast sees the headline,
-  // a careful read picks up the bullets. Empty bullets get a
-  // muted "—" so the section doesn't collapse and look broken.
   lines.push(chalk.cyan('Daemon snapshot'))
   lines.push('')
   lines.push(chalk.bold('Sessions'))
@@ -332,10 +311,6 @@ function formatEventTime(value: string): string {
 export async function statsCommand(options: StatsOptions = {}): Promise<void> {
   const client = new DaemonClient(options.url)
   try {
-    // Two parallel calls: sessions list (with metrics so we can sum
-    // approval counters) + decisions list. The compute is cheap and
-    // running them concurrently avoids serial latency on the
-    // dashboard view.
     const [sessions, decisionsResp] = await Promise.all([
       client.sessions(undefined, { metrics: true }),
       client.listRememberedApprovals(),

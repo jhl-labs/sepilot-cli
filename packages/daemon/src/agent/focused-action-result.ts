@@ -50,8 +50,6 @@ function formatProcessStartResult(output: string, korean: boolean): string {
       record = parsed as Record<string, unknown>
     }
   } catch {
-    // A third-party process tool may return plain text. Its successful output
-    // is still grounded evidence, so retain it verbatim below.
   }
 
   if (!record) {
@@ -107,7 +105,6 @@ function formatVisibleUrlOpenResult(output: string, korean: boolean): string {
       url = textField((parsed as Record<string, unknown>).url)
     }
   } catch {
-    // Preserve a successful third-party implementation's plain-text receipt.
   }
 
   if (korean) {
@@ -120,12 +117,6 @@ function formatVisibleUrlOpenResult(output: string, korean: boolean): string {
     : `ANSWER: Opened the requested page in the default browser.${output.trim() ? `\n${output.trim()}` : ''}`
 }
 
-/**
- * Finish a structurally bounded, single-action request from its successful
- * current-turn result. There is no reason to ask a provider to restate this
- * evidence, and provider-empty final replies must not turn one successful
- * action into repeated tool/reviewer cycles.
- */
 export function deterministicFocusedActionResult(
   input: string,
   result: ObservedActionResult,

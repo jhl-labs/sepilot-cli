@@ -62,20 +62,12 @@ export class ChannelSessionStore {
     await this.init()
     const bindings: ChannelSessionBinding[] = []
     for (const name of await readdir(this.sessionDir)) {
-      // Live bindings are stored as "<sha256>.json". Backup and
-      // rotated-aside copies are forensic artifacts, not active
-      // "Telegram chat <-> session" pairings.
       if (!name.endsWith('.json')) continue
       const filePath = join(this.sessionDir, name)
       try {
         const raw = await readFile(filePath, 'utf-8')
         bindings.push(JSON.parse(raw) as ChannelSessionBinding)
       } catch (err) {
-        // The original code silently `rm`d unreadable bindings —
-        // a transient EBUSY/EAGAIN could destroy the user's
-        // chat-to-session mapping forever. Rotate aside instead so
-        // the operator can recover or re-pair, and the broken
-        // file is preserved for forensics.
         const aside = `${filePath}.broken-${Date.now()}`
         log.warn('channel session binding unreadable; rotating aside', {
           path: filePath,

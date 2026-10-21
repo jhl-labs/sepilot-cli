@@ -46,7 +46,6 @@ export interface ChannelIngressQueue {
   markDone(id: string, doneAt?: number): void
   markFailed(id: string, error: string, nextAttemptAt: number): void
   drainDue(process: (record: ChannelIngressRecord) => Promise<void>, limit?: number): Promise<number>
-  /** False once the backing domain database has been closed (e.g. shutdown). */
   isOpen(): boolean
 }
 

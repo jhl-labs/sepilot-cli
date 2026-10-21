@@ -270,12 +270,6 @@ function apiPath(path: string): string {
   return `/api/v1${path.startsWith('/') ? path : `/${path}`}`
 }
 
-/**
- * Thrown when a gateway delegation response envelope does not match the
- * expected shape. Surfacing a named error (instead of letting a downstream
- * property access throw an opaque TypeError) makes malformed/negotiation
- * mismatches visible at the boundary.
- */
 export class GatewayResponseError extends Error {
   constructor(message: string) {
     super(message)

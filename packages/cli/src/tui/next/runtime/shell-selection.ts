@@ -1,6 +1,5 @@
 export type ShellKind = 'next' | 'legacy'
 
-/** The inline shell is default; legacy remains an explicit recovery path. */
 export function selectShell(env: Record<string, string | undefined>): ShellKind {
   return env.SEPILOT_TUI?.trim().toLowerCase() === 'legacy' ? 'legacy' : 'next'
 }

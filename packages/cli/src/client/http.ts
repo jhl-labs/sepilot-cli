@@ -77,16 +77,11 @@ export interface CliFileMemorySectionUpdateResult extends CliFileMemorySection {
 export class DaemonClient extends SharedDaemonClient {
   public readonly jobs: JobsClient
   public readonly migration: MigrationClient
-  /** Same-origin token for callers that need to build their own typed client. */
   public readonly token: string | null
 
   constructor(baseUrl?: string) {
     const resolvedBaseUrl = resolveDaemonBaseUrl(baseUrl)
-    const token = loadDaemonToken()
-    // memoryScope is lazy/cached so the daemon can isolate per-user
-    // memory the same way desktop/web already do. Surface QA Round 5
-    // X02 flagged the cli as the only surface not advertising
-    // X-Memory-Scope-User-Id.
+    const token = loadDaemonToken(resolvedBaseUrl)
     super({
       baseUrl: resolvedBaseUrl,
       token,
@@ -94,10 +89,6 @@ export class DaemonClient extends SharedDaemonClient {
       memoryScope: resolvedBaseUrl ? memoryScopeFor(resolvedBaseUrl, token) : undefined,
     })
     this.token = token
-    // Standalone factory clients reuse the same origin/token. The
-    // shared `DaemonClient` constructor already coerces undefined
-    // `baseUrl` into the bundled default; mirror that for the
-    // factories so the jobs/migration clients hit the same daemon.
     this.jobs = createJobsClient({ origin: this.baseUrl, token })
     this.migration = createMigrationClient({ origin: this.baseUrl, token })
   }

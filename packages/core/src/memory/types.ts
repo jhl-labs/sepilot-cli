@@ -1,5 +1,6 @@
 import type { Timestamp, SessionId } from '../types/common.js'
 import type { MemoryContextItem } from './semantic-index.js'
+import type { LiveViewRecord } from '../views/types.js'
 import type {
   DebateRoundSummary,
   EditCheckpointSummary,
@@ -35,14 +36,6 @@ export interface SessionStartEvent extends BaseEvent {
   metadata: { provider: string; model: string; device: string }
 }
 
-/**
- * Durable, non-secret reference to a daemon-managed chat upload.
- *
- * Session journals intentionally keep only the opaque file id and display
- * metadata. The backing path and bytes remain inside the authenticated daemon
- * file service, so session history never exposes an absolute local path or
- * inflates JSONL records with base64 payloads.
- */
 export interface SessionAttachmentRef {
   fileId: string
   mimeType: string
@@ -61,13 +54,8 @@ export interface AssistantMessageEvent extends BaseEvent {
   content: string
   thinkingLevel?: string
   thinking?: string
-  /**
-   * Set when something other than a live chat turn wrote this message — today,
-   * a scheduled job reporting into the conversation it was created from. Such a
-   * message is a complete answer of its own, not an interim step of the last
-   * user turn, so surfaces must not fold it into that turn's execution log.
-   */
   origin?: 'scheduler'
+  views?: LiveViewRecord[]
 }
 
 export interface RouterDecisionEvent extends BaseEvent {
@@ -76,11 +64,11 @@ export interface RouterDecisionEvent extends BaseEvent {
     mode: string
     persona: string
     skillIds: string[]
+    memoryPolicy?: { read: boolean; write: boolean; automaticRead?: boolean; automaticWrite?: boolean }
     toolGroups?: string[]
     reason: string
     confidence: 'high' | 'medium' | 'low'
     fallback: boolean
-    /** The classifier was not consulted (explicit caller mode or command). */
     skipped?: boolean
   }
 }
@@ -153,7 +141,6 @@ export interface ApprovalRequestEvent extends BaseEvent {
   tool: string
   input: Record<string, unknown>
   status: 'pending' | 'resolved'
-  /** Assistant-text tail captured with the request — audit trail for *why* the tool was proposed. */
   context?: string
 }
 
@@ -167,17 +154,6 @@ export interface ApprovalResponseEvent extends BaseEvent {
   scope?: ApprovalScope
 }
 
-/**
- * Persisted analogue of the transient `auto_approval` AgentEvent. The
- * agent emits the AgentEvent for the cli to render a visible
- * "auto-approved by <scope> rule" banner; this journal entry captures
- * the same decision durably so a later `sessions show` audit can answer
- * "what tools ran without an explicit prompt, and which remembered rule
- * authorised them?". Without it, an operator reviewing a long session
- * could see tool_call → tool_result pairs with no consent trail and have
- * no way to tell whether each tool was approved interactively, by an
- * always-rule, or by a session-rule that had been registered earlier.
- */
 export interface AutoApprovalEvent extends BaseEvent {
   type: 'auto_approval'
   requestId: string
@@ -240,6 +216,7 @@ export interface ContextCompactEvent extends BaseEvent {
   removedMessageCount?: number
   preservedMessageCount?: number
   preservedMessages?: Message[]
+  throughEventId?: string
 }
 
 export interface MemorySummaryEvent extends BaseEvent {
@@ -312,7 +289,6 @@ export interface SessionEndEvent extends BaseEvent {
   totalTokens: { input: number; output: number }
   totalCost: number
   duration_ms: number
-  /** Structured stop cause of the run that ended this session turn. */
   stopReason?: RunStopReason
 }
 
@@ -390,45 +366,22 @@ export interface PanelSynthesizingEvent extends BaseEvent {
   panelists: number
 }
 
-/**
- * Serializable snapshot of the agent state board. Mirrors the daemon's
- * in-memory board (`agent/graph/state-board.ts`) using core-owned types so the
- * board can travel through the append-only session journal, the daemon read
- * endpoint, api-client, and surfaces without any of them importing daemon
- * internals. Assembly stays purely structural — no content parsing.
- */
 export interface AgentStateBoardSnapshot {
-  /** Verbatim contract goal — never compressed or summarized. */
   goal: string
-  /** Verbatim acceptance criteria. */
   completionCriteria: AgentAcceptanceCriterion[]
-  /** Full contract for verbatim rendering, when a contract exists. */
   contract?: AgentRunContract
-  /** Planner working-memory plan, flattened with hierarchy depth. */
   plan: AgentStateBoardPlanStep[]
-  /** Session todo list. */
   todos: TodoItem[]
-  /** Planner decisions already taken (1 line each). */
   decisions: string[]
-  /** Failed attempts re-injected every turn as "do NOT repeat" input. */
   failedAttempts: AgentFailedAttempt[]
-  /** Open questions to verify or escalate rather than guess. */
   openQuestions: AgentOpenQuestion[]
-  /** Pre-rendered evidence-ledger section (counts, gaps, validation runs). */
   evidenceSection: string | null
-  /**
-   * Terminal completion diagnostics accepted by the presentation boundary.
-   * These are auditable criterion verdicts, not proof by themselves: a `met`
-   * verdict still needs criterion-scoped tool evidence before an evaluation
-   * surface may call the criterion supported.
-   */
   completion?: AgentStateBoardCompletion
 }
 
 export interface AgentStateBoardCriterionVerdict {
   id: string
   verdict: 'met' | 'unmet' | 'not_applicable'
-  /** Exact tool-call ids explicitly linked by the accepted criterion protocol. */
   evidenceToolCallIds?: string[]
 }
 
@@ -442,24 +395,12 @@ export interface AgentStateBoardCompletion {
   }
 }
 
-/**
- * Board change journaled to the append-only session log. Persisting it via
- * `appendEvent` also broadcasts it through `WatchedSessionStore` — persistence
- * and notification are one event (opencode-style), no second store.
- */
 export interface StateBoardEvent extends BaseEvent {
   type: 'state_board'
-  /** Board snapshot time in epoch ms (distinct from the ISO `timestamp`). */
   at: number
   board: AgentStateBoardSnapshot
 }
 
-/**
- * Acknowledgement journaled when a user steering note (mid-run instruction or
- * question) is accepted for an active run. The message is persisted here as
- * durable recovery evidence; the live run's `AgentState.steeringNotes` carries
- * the mutable in-memory copy consumed by the agent loop.
- */
 export interface SteeringAckEvent extends BaseEvent {
   type: 'steering_ack'
   noteId: string
@@ -467,22 +408,11 @@ export interface SteeringAckEvent extends BaseEvent {
   message: string
 }
 
-/**
- * Journaled when the agent loop consumes a queued steering note at an
- * iteration boundary (see daemon `agent/graph/state-board.ts`
- * `takeUnconsumedSteeringNotes`) — the durable record that the note was
- * surfaced to the model, distinct from `SteeringAckEvent` (queued) above.
- */
 export interface SteeringConsumedEvent extends BaseEvent {
   type: 'steering_consumed'
   noteId: string
 }
 
-/**
- * Journaled when an operator retracts a queued steering note before the agent
- * consumes it. A note id may have exactly one of consumed or cancelled as its
- * terminal state.
- */
 export interface SteeringCancelledEvent extends BaseEvent {
   type: 'steering_cancelled'
   noteId: string
@@ -545,26 +475,13 @@ export interface SessionMeta {
   device: string
   status: 'active' | 'completed' | 'abandoned'
   cwd?: string
-  /** CLI working directory uses normal tool policy; omitted legacy bindings stay strict. */
   workspaceIsolation?: 'policy' | 'strict'
   starred?: boolean
   messageCount: number
   totalTokens: { input: number; output: number }
   totalCost: number
   tags: string[]
-  /**
-   * Persona roster bound to this conversation. Order is significant for
-   * collaborative turns. An empty array explicitly restores the default
-   * assistant, while an omitted field means no roster has been configured.
-   */
   personaIds?: string[]
-  /** Server-bound isolated persona memory identity. */
   memoryNamespace?: string
-  /**
-   * Observed transport-flip capability for this session's model: once a run
-   * detects the model cannot surface reasoning in native tool-calling mode, the
-   * flip to the prompt-react text protocol is persisted here so later turns skip
-   * the re-detection cost. Structural capability fact, not a model-name branch.
-   */
   preferPromptReact?: boolean
 }

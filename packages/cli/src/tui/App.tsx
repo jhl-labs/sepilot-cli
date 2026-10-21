@@ -58,6 +58,12 @@ import {
   type SwarmAttachTarget,
 } from './components/SwarmAttachView.js'
 import type { ProviderSetupStep } from './components/ProviderSetupModal.js'
+import {
+  firstProviderSetupStep,
+  previousProviderSetupStep,
+  validateProviderConnection,
+  type ProviderConnectionFieldKey,
+} from './utils/provider-wizard.js'
 import { buildModePickerList, findModeMatch } from './components/ModePicker.js'
 import { buildSessionPickerList } from './components/SessionPicker.js'
 import { loadProjectSessionRegistry, removeProjectSession } from './project-sessions.js'
@@ -178,6 +184,7 @@ import { buildStreamingProgress } from './utils/streaming.js'
 import { EXIT_HINT_TIMEOUT_MS, resolveCtrlCIntent } from './utils/exit-prompt.js'
 import { formatSkillInstallResult, SKILLS_COMMAND_USAGE } from './utils/skill-store.js'
 import {
+  buildProviderPickerList,
   buildProviderModelPickerList,
   findModelMatch,
   findProviderMatch,
@@ -195,8 +202,6 @@ import {
   buildProviderSetupSuccessMessage,
   derivePreferredProviderFallback,
   findBuiltinProviderPreset,
-  isValidProviderEnvVarName,
-  managedProviderApiKeyEnvVar,
   reconcileProviderModelDiscovery,
   type ConfiguredProviderRecord,
   type ProviderSetupDraft,
@@ -398,8 +403,6 @@ export const __appTesting = {
   buildA2aGuide,
 }
 
-// ProjectSelectionSource is now exported by ./hooks/useProjectSelection.
-// Re-imported below where the hook is consumed.
 type ProviderSetupMode = 'new' | 'edit'
 
 interface ProviderSetupState {
@@ -424,6 +427,7 @@ interface ProviderSetupState {
   validating: boolean
   saving: boolean
   error: string | null
+  errorField?: ProviderConnectionFieldKey | null
 }
 
 interface ProviderDeleteConfirmState {
@@ -692,14 +696,6 @@ export function App({ config }: AppProps) {
     closeUsageDashboard,
   } = useUsageDashboard()
   const exclusivePanel = useExclusivePanel()
-  // Every overlay-hook close handler is registered with the exclusivity
-  // coordinator. When loadUsageDashboard / loadMemorySearch (or any future
-  // load that opens a panel) calls exclusivePanel.begin(), the coordinator
-  // dismisses every other registered panel automatically — so opening a
-  // dashboard now also collapses the file/session/model/mode/autonomy/
-  // provider-setup pickers if they happened to be open. The legacy
-  // OverlayState block messages stay in place for the manual open paths
-  // (Ctrl+S, /files, etc.) that don't go through begin().
   useEffect(() => {
     exclusivePanel.register('usage', closeUsageDashboard)
     exclusivePanel.register('memory', closeMemorySearchPanel)
@@ -731,17 +727,9 @@ export function App({ config }: AppProps) {
   const [localShellCommand, setLocalShellCommand] = useState<LocalShellCommandState | null>(null)
   const lastLocalShellCommandRef = useRef<string | null>(null)
   const localShellAborterRef = useRef<AbortController | null>(null)
-  // Ctrl+O terminal transcript mode. The TUI normally owns the alternate
-  // screen, so Ctrl+O temporarily leaves it and writes the whole conversation
-  // into the host terminal scrollback for drag-select copy.
   const [copyView, setCopyView] = useState(false)
   const [activityPanelHidden, setActivityPanelHidden] = useState(false)
-  // True while the approval modal's inline comment editor is open; suspends
-  // the global y/s/a/n/Esc shortcuts so typed feedback isn't misread as a
-  // decision (or a run cancel).
   const [approvalCommentActive, setApprovalCommentActive] = useState(false)
-  // End-of-turn recap (duration, tool calls, files, tokens). Default on;
-  // toggled with /recap and persisted in cli-state.json.
   const [recapEnabled, setRecapEnabled] = useState(true)
   const recapSnapshotRef = useRef<TurnRecapSnapshot | null>(null)
   const pendingTerminalTranscriptRef = useRef<null | {
@@ -768,8 +756,6 @@ export function App({ config }: AppProps) {
     resetTokenSpeedStats,
   } = useChat(wsClient, httpClient)
   const streamProgressNow = useStreamProgressTimer(state.isStreaming || localShellCommand !== null)
-  // Capture a snapshot when a run starts and emit a one-shot recap system
-  // message when it ends. The snapshot ref doubles as the edge detector.
   useEffect(() => {
     if (state.isStreaming) {
       if (!recapSnapshotRef.current) {
@@ -1007,7 +993,6 @@ export function App({ config }: AppProps) {
     try {
       stdout.write(TUI_ENTER_SEQUENCE)
     } catch {
-      // Best-effort terminal restoration; the process may already be exiting.
     }
     setCopyView(false)
   }, [stdout])
@@ -1027,7 +1012,6 @@ export function App({ config }: AppProps) {
       stdout.write(TUI_EXIT_SEQUENCE)
       stdout.write(formatTerminalTranscriptDump(pending.transcript, pending.messageCount))
     } catch {
-      // The clipboard fallback still gives the user a way to paste elsewhere.
     }
     void copyTextToClipboard(pending.transcript).catch(() => undefined)
   }, [copyView, stdout])
@@ -1056,8 +1040,6 @@ export function App({ config }: AppProps) {
     },
     [dispatch],
   )
-  // Terminal transcript mode is wired through useKeybindings's single
-  // useInput so Esc/Ctrl+O can restore the alternate screen cleanly.
 
   const commandPaletteItems = useMemo(
     () =>
@@ -1177,7 +1159,6 @@ export function App({ config }: AppProps) {
     ],
   )
 
-  // Suggest /compact once per session when context usage crosses 80%.
   useEffect(() => {
     if (
       currentContextTokens == null ||
@@ -1201,20 +1182,14 @@ export function App({ config }: AppProps) {
 
   const modelPickerList = useMemo(
     () =>
-      buildProviderModelPickerList(providers, state.provider, state.model, modelQuery, {
-        defaultProviderId: daemonDefaultProvider,
-        defaultModelId: daemonDefaultModel,
-        mru: modelMru,
-      }),
-    [
-      daemonDefaultModel,
-      daemonDefaultProvider,
-      modelMru,
-      modelQuery,
-      providers,
-      state.model,
-      state.provider,
-    ],
+      buildProviderPickerList(
+        providers,
+        state.provider,
+        daemonDefaultProvider,
+        daemonDefaultModel,
+        modelQuery,
+      ),
+    [daemonDefaultModel, daemonDefaultProvider, modelQuery, providers, state.provider],
   )
   const modePickerList = useMemo(
     () => buildModePickerList(agentModes, state.mode, modeQuery),
@@ -1391,8 +1366,6 @@ export function App({ config }: AppProps) {
 
   const loadMemorySearch = useCallback(
     async (query: string) => {
-      // Acquiring exclusivity dismisses the usage dashboard and bumps its
-      // in-flight request id so any pending fetch ignores its own response.
       const ticket = exclusivePanel.begin('memory')
       setMemorySearchOpen(true)
       setMemorySearchQuery(query)
@@ -1709,17 +1682,16 @@ export function App({ config }: AppProps) {
   const focusModelPickerSelection = useCallback(
     (target: 'session' | 'default', query = '') => {
       const preferredProvider = target === 'default' ? daemonDefaultProvider : state.provider
-      const preferredModel = target === 'default' ? daemonDefaultModel : state.model
-      const ordered = buildProviderModelPickerList(providers, state.provider, state.model, query, {
-        defaultProviderId: daemonDefaultProvider,
-        defaultModelId: daemonDefaultModel,
-        mru: modelMru,
-      }).ordered
+      const ordered = buildProviderPickerList(
+        providers,
+        state.provider,
+        daemonDefaultProvider,
+        daemonDefaultModel,
+        query,
+      ).ordered
       const preferredIndex = ordered.findIndex(
         (item) =>
-          item.kind === 'model' &&
-          item.providerId === preferredProvider &&
-          item.modelId === preferredModel,
+          item.kind === 'provider' && item.providerId === preferredProvider,
       )
 
       setModelPickerIndex(preferredIndex >= 0 ? preferredIndex : 0)
@@ -1757,7 +1729,7 @@ export function App({ config }: AppProps) {
       setProviderSetup({
         mode: options.providerId ? 'edit' : 'new',
         allowPresetSelection: !options.providerId && !requestedPreset,
-        step: options.providerId || requestedPreset ? 'providerId' : 'preset',
+        step: firstProviderSetupStep(!options.providerId && !requestedPreset),
         applyToCurrentSession: false,
         preset: fallbackPreset,
         selectedPresetIndex: Math.max(
@@ -1823,7 +1795,7 @@ export function App({ config }: AppProps) {
         setProviderSetup({
           mode: options.providerId ? 'edit' : 'new',
           allowPresetSelection: !options.providerId && !requestedPreset,
-          step: options.providerId || requestedPreset ? 'providerId' : 'preset',
+          step: firstProviderSetupStep(!options.providerId && !requestedPreset),
           applyToCurrentSession: false,
           preset,
           selectedPresetIndex: Math.max(
@@ -1888,7 +1860,7 @@ export function App({ config }: AppProps) {
         current
           ? {
               ...current,
-              step: 'providerId',
+              step: 'connection',
               preset,
               selectedPresetIndex: index,
               sourceProviderId: draft.sourceProviderId,
@@ -1902,6 +1874,7 @@ export function App({ config }: AppProps) {
                 preset.type === 'ollama' ? [] : buildProviderModelSuggestions(draft),
               modelSuggestionIndex: 0,
               error: null,
+              errorField: null,
             }
           : current,
       )
@@ -1934,60 +1907,8 @@ export function App({ config }: AppProps) {
       if (!current || current.loading || current.validating || current.saving) {
         return current
       }
-
-      switch (current.step) {
-        case 'confirm':
-          return {
-            ...current,
-            step: 'model',
-            error: null,
-          }
-        case 'model':
-          return {
-            ...current,
-            step:
-              current.preset?.type === 'ollama'
-                ? 'baseUrl'
-                : current.preset?.type === 'custom'
-                  ? 'headers'
-                  : 'apiKeyValue',
-            error: null,
-          }
-        case 'headers':
-          return {
-            ...current,
-            step: current.apiKeyValue.length > 0 ? 'apiKeyValue' : 'apiKeyEnv',
-            error: null,
-          }
-        case 'apiKeyValue':
-          return {
-            ...current,
-            step: current.preset?.type === 'custom' ? 'baseUrl' : 'providerId',
-            error: null,
-          }
-        case 'baseUrl':
-          return {
-            ...current,
-            step: 'providerId',
-            error: null,
-          }
-        case 'apiKeyEnv':
-          return {
-            ...current,
-            step: 'apiKeyValue',
-            error: null,
-          }
-        case 'providerId':
-          return current.allowPresetSelection
-            ? {
-                ...current,
-                step: 'preset',
-                error: null,
-              }
-            : null
-        case 'preset':
-          return null
-      }
+      const step = previousProviderSetupStep(current.step, current.allowPresetSelection)
+      return step ? { ...current, step, error: null, errorField: null } : current
     })
   }, [])
 
@@ -2104,212 +2025,81 @@ export function App({ config }: AppProps) {
     if (!current || current.loading || current.validating || current.saving || !current.preset) {
       return
     }
-
-    const nextProviderId = current.providerId.trim()
-    const rawNextBaseUrl = current.baseUrl.trim()
-    const normalizedCustomBaseUrl = rawNextBaseUrl.replace(/\/+$/, '')
-    const nextBaseUrl =
-      current.preset?.type === 'custom' && normalizedCustomBaseUrl
-        ? normalizedCustomBaseUrl.endsWith('/v1')
-          ? normalizedCustomBaseUrl
-          : `${normalizedCustomBaseUrl}/v1`
-        : rawNextBaseUrl
-    const nextApiKeyEnvVar = current.apiKeyEnvVar.trim()
-    const nextApiKeyValue = current.apiKeyValue
-    const nextHeadersText = (current.headersText ?? '').trim()
-    const nextModel = current.model.trim()
+    const preset = current.preset
 
     switch (current.step) {
       case 'preset':
         selectProviderSetupPreset(current.selectedPresetIndex)
         return
-      case 'providerId':
-        if (!nextProviderId) {
+      case 'connection': {
+        const validation = validateProviderConnection(
+          {
+            providerId: current.providerId,
+            baseUrl: current.baseUrl,
+            apiKeyEnvVar: current.apiKeyEnvVar,
+            apiKeyValue: current.apiKeyValue,
+            headersText: current.headersText ?? '',
+          },
+          preset,
+        )
+        if (!validation.ok) {
           setProviderSetup((state) =>
-            state ? { ...state, error: 'Provider id is required.' } : state,
+            state ? { ...state, error: validation.error, errorField: validation.field } : state,
           )
           return
         }
-        setProviderSetup((state) =>
-          state
-            ? {
-                ...state,
-                providerId: nextProviderId,
-                step:
-                  current.preset?.type === 'ollama' || current.preset?.type === 'custom'
-                    ? 'baseUrl'
-                    : 'apiKeyValue',
-                error: null,
-              }
-            : state,
-        )
-        return
-      case 'baseUrl': {
-        if (!nextBaseUrl) {
-          setProviderSetup((state) =>
-            state ? { ...state, error: 'Base URL is required.' } : state,
-          )
-          return
-        }
-        setProviderSetup((state) =>
-          state ? { ...state, baseUrl: nextBaseUrl, loading: true, error: null } : state,
-        )
-        if (current.preset.type === 'custom') {
+        const normalized = validation.values
+        if (!validation.discovery) {
+          const draft: ProviderSetupDraft = {
+            sourceProviderId: current.sourceProviderId,
+            preset,
+            providerId: normalized.providerId,
+            baseUrl: normalized.baseUrl,
+            apiKeyEnvVar: normalized.apiKeyEnvVar,
+            model: current.model.trim(),
+            models: current.modelSuggestions,
+          }
           setProviderSetup((state) =>
             state
               ? {
                   ...state,
-                  baseUrl: nextBaseUrl,
-                  loading: false,
-                  step: 'apiKeyValue',
+                  ...normalized,
+                  modelSuggestions: buildProviderModelSuggestions(draft),
+                  modelSuggestionIndex: 0,
+                  step: 'model',
                   error: null,
+                  errorField: null,
                 }
               : state,
           )
           return
         }
-        const discoveredModels = await detectOllamaModels(nextBaseUrl)
+        setProviderSetup((state) =>
+          state ? { ...state, ...normalized, loading: true, error: null, errorField: null } : state,
+        )
+        const discoveredModels = validation.discovery.kind === 'ollama'
+          ? await detectOllamaModels(validation.discovery.baseUrl).catch(() => [])
+          : await httpClient
+              .discoverProviderModels({
+                type: validation.discovery.type,
+                baseUrl: validation.discovery.baseUrl,
+                apiKey: validation.discovery.apiKey,
+                headers: validation.discovery.headers,
+              })
+              .then((result) => result.models)
+              .catch(() => [])
         const selection = reconcileProviderModelDiscovery({
-          currentModel: nextModel,
+          currentModel: current.model.trim(),
           discoveredModels,
           fallbackModels: current.modelSuggestions.length > 0
             ? current.modelSuggestions
-            : current.preset.suggestedModels,
-          defaultModel: current.preset.type === 'ollama' ? 'llama3.3' : undefined,
-        })
-        const draft: ProviderSetupDraft = {
-          sourceProviderId: current.sourceProviderId,
-          preset: current.preset,
-          providerId: nextProviderId || current.providerId,
-          baseUrl: nextBaseUrl,
-          apiKeyEnvVar: nextApiKeyEnvVar || current.apiKeyEnvVar,
-          model: selection.model,
-          models: selection.modelSuggestions,
-        }
-        setProviderSetup((state) =>
-          state
-            ? {
-                ...state,
-                providerId: draft.providerId,
-                baseUrl: draft.baseUrl,
-                model: draft.model,
-                modelSuggestions: selection.modelSuggestions,
-                modelSuggestionIndex: selection.modelSuggestionIndex,
-                step: 'model',
-                loading: false,
-                error: null,
-              }
-            : state,
-        )
-        return
-      }
-      case 'apiKeyEnv': {
-        if (!nextApiKeyEnvVar && current.preset.type !== 'custom') {
-          setProviderSetup((state) =>
-            state ? { ...state, error: 'API key env var is required.' } : state,
-          )
-          return
-        }
-        if (nextApiKeyEnvVar && !isValidProviderEnvVarName(nextApiKeyEnvVar)) {
-          setProviderSetup((state) =>
-            state
-              ? {
-                  ...state,
-                  error: 'API key env var must match [A-Za-z_][A-Za-z0-9_]*.',
-                }
-              : state,
-          )
-          return
-        }
-        const draft: ProviderSetupDraft = {
-          sourceProviderId: current.sourceProviderId,
-          preset: current.preset,
-          providerId: nextProviderId || current.providerId,
-          baseUrl: nextBaseUrl || current.baseUrl,
-          apiKeyEnvVar: nextApiKeyEnvVar,
-          model: nextModel || current.model,
-        }
-        setProviderSetup((state) =>
-          state
-            ? {
-                ...state,
-                providerId: draft.providerId,
-                apiKeyEnvVar: draft.apiKeyEnvVar,
-                model: draft.model,
-                modelSuggestions: buildProviderModelSuggestions(draft),
-                modelSuggestionIndex: 0,
-                step: draft.preset.type === 'custom' ? 'headers' : 'model',
-                error: null,
-              }
-            : state,
-        )
-        return
-      }
-      case 'apiKeyValue': {
-        if (!nextApiKeyValue.length) {
-          setProviderSetup((state) =>
-            state ? { ...state, apiKeyValue: '', step: 'apiKeyEnv', error: null } : state,
-          )
-          return
-        }
-        const managedEnvVar = managedProviderApiKeyEnvVar({
-          providerId: nextProviderId || current.providerId,
-          preset: current.preset,
-          currentEnvVar: nextApiKeyEnvVar,
+            : preset.suggestedModels,
+          defaultModel: preset.type === 'ollama' ? 'llama3.3' : undefined,
         })
         setProviderSetup((state) =>
           state
             ? {
                 ...state,
-                apiKeyValue: nextApiKeyValue,
-                apiKeyEnvVar: managedEnvVar,
-                step: current.preset?.type === 'custom' ? 'headers' : 'model',
-                error: null,
-              }
-            : state,
-        )
-        return
-      }
-      case 'headers': {
-        let headers: Record<string, string>
-        try {
-          headers = parseProviderHeadersInput(nextHeadersText)
-        } catch (error) {
-          setProviderSetup((state) =>
-            state
-              ? {
-                  ...state,
-                  error: error instanceof Error ? error.message : 'Invalid custom headers.',
-                }
-              : state,
-          )
-          return
-        }
-        setProviderSetup((state) =>
-          state ? { ...state, headersText: nextHeadersText, loading: true, error: null } : state,
-        )
-        const discoveredModels = await httpClient
-          .discoverProviderModels({
-            type: current.preset.type,
-            baseUrl: nextBaseUrl || current.baseUrl,
-            apiKey:
-              nextApiKeyValue.length > 0
-                ? nextApiKeyValue
-                : (nextApiKeyEnvVar ? `\${${nextApiKeyEnvVar}}` : undefined),
-            headers,
-          })
-          .then((result) => result.models)
-          .catch(() => [])
-        const selection = reconcileProviderModelDiscovery({
-          currentModel: nextModel,
-          discoveredModels,
-          fallbackModels: current.modelSuggestions,
-        })
-        setProviderSetup((state) =>
-          state
-            ? {
-                ...state,
-                headersText: nextHeadersText,
                 model: selection.model,
                 modelSuggestions: selection.modelSuggestions,
                 modelSuggestionIndex: selection.modelSuggestionIndex,
@@ -2322,7 +2112,8 @@ export function App({ config }: AppProps) {
         )
         return
       }
-      case 'model':
+      case 'model': {
+        const nextModel = current.model.trim()
         if (!nextModel) {
           setProviderSetup((state) =>
             state ? { ...state, error: 'Model name is required.' } : state,
@@ -2330,27 +2121,20 @@ export function App({ config }: AppProps) {
           return
         }
         setProviderSetup((state) =>
-          state
-            ? {
-                ...state,
-                model: nextModel,
-                step: 'confirm',
-                error: null,
-              }
-            : state,
+          state ? { ...state, model: nextModel, step: 'confirm', error: null } : state,
         )
         return
+      }
       case 'confirm':
         await saveProviderSetup({
           ...current,
-          providerId: nextProviderId,
-          baseUrl: nextBaseUrl,
-          apiKeyEnvVar: nextApiKeyEnvVar,
-          apiKeyValue: nextApiKeyValue,
-          model: nextModel,
+          providerId: current.providerId.trim(),
+          baseUrl: current.baseUrl.trim(),
+          apiKeyEnvVar: current.apiKeyEnvVar.trim(),
+          model: current.model.trim(),
         })
     }
-  }, [providerSetup, saveProviderSetup, selectProviderSetupPreset])
+  }, [httpClient, providerSetup, saveProviderSetup, selectProviderSetupPreset])
 
   const applyProviderModelSelection = useCallback(
     (
@@ -2837,7 +2621,6 @@ export function App({ config }: AppProps) {
     void refreshProjectSessionIds(workspaceProject)
   }, [refreshProjectSessionIds, workspaceProject])
 
-  // Connect on mount
   useEffect(() => {
     let cancelled = false
 
@@ -2852,9 +2635,6 @@ export function App({ config }: AppProps) {
         if (cancelled) return
         setVersion(health.version)
         setConnectionStatus('connected')
-        // One-time notice about sepilot-managed Docker containers left over
-        // from previous sessions. Fire-and-forget; the helper swallows errors
-        // and returns [] when Docker is unavailable, so this never blocks.
         void buildLeftoverContainerBanner().then((lines) => {
           if (cancelled || lines.length === 0) return
           dispatch({ type: 'SYSTEM_MESSAGE', content: lines.join('\n') })
@@ -2929,9 +2709,6 @@ export function App({ config }: AppProps) {
             perPage: 100,
             workspaceRoot: FILE_PICKER_ROOT_DIR,
           })
-          // Sort explicitly rather than relying on the daemon's list order —
-          // next/App.tsx does the same, and resume must attach the most
-          // recent workspace session even if that contract ever changes.
           initialSessionId = workspaceSessions.items
             .filter((session) => sessionBelongsToWorkspace(session, FILE_PICKER_ROOT_DIR))
             .slice()
@@ -3222,16 +2999,9 @@ export function App({ config }: AppProps) {
   useEffect(() => {
     if (!modelPickerOpen) return
     if (providers.length === 0) {
-      // First-ever open (or after a hard failure): fetch synchronously so
-      // the picker has something to show and can surface loading/error state.
       void loadProviders().catch(() => {})
       return
     }
-    // Subsequent opens: real rediscovery in the background, gated by a
-    // 5-minute TTL cache. The daemon re-runs discovery server-side with its
-    // stored (unredacted) credentials per provider, then we reload the
-    // provider list. Failures are silent and leave the existing list in
-    // place; a fresh result updates it in place.
     const pickerOptions = {
       defaultProviderId: daemonDefaultProvider,
       defaultModelId: daemonDefaultModel,
@@ -3245,8 +3015,6 @@ export function App({ config }: AppProps) {
           providers.map((provider) => provider.id),
         ),
       (nextProviders) => {
-        // Remap the selection so a changed item list does not silently move
-        // the highlight onto a different provider/model.
         const previousOrdered = buildProviderModelPickerList(
           providers,
           state.provider,
@@ -3288,7 +3056,6 @@ export function App({ config }: AppProps) {
         if (cancelled) return
         setFileIndexPaths(new Set(index.entries.map((entry) => entry.path)))
       } catch {
-        // Leave the set empty; normalization simply becomes a no-op.
       }
     })()
     return () => {
@@ -4215,11 +3982,6 @@ export function App({ config }: AppProps) {
     )
   }, [state.isStreaming, state.sessionId])
 
-  // Stateless commands live in this registry. The dispatcher checks it first
-  // and only falls through to the legacy switch for commands that still need
-  // closure access to large blocks of local state. As more commands are
-  // moved here the switch shrinks toward zero. Adding a new stateless
-  // command no longer requires editing the switch (OCP).
   const slashCommandRegistry = useMemo(() => {
     const registry = new SlashCommandRegistry()
     registry.register({
@@ -5043,9 +4805,6 @@ export function App({ config }: AppProps) {
           type: 'SYSTEM_MESSAGE',
           content: buildResumePreflightSummary(session, forceResume),
         })
-        // No run checkpoint on the daemon → the resume endpoint is
-        // guaranteed to 404. Don't fire a doomed request; the preflight
-        // summary above already tells the user to just keep typing.
         if (!session.resumableRun && !forceResume) {
           return
         }
@@ -5246,8 +5005,6 @@ export function App({ config }: AppProps) {
           try {
             await recordRecapPreference(enabled)
           } catch {
-            // Preference persistence is best-effort; the in-session toggle
-            // above already applied.
           }
           dispatch({
             type: 'SYSTEM_MESSAGE',
@@ -5466,8 +5223,6 @@ export function App({ config }: AppProps) {
             })
             return
           }
-          // For sub-commands beyond list/run, the runId is the FIRST positional
-          // arg after the subcommand. Fall back to the last-known run.
           let id = rest[0] ?? null
           let usingDefault = false
           if (!id && lastSwarmRunId) {
@@ -5482,7 +5237,6 @@ export function App({ config }: AppProps) {
             return
           }
           const usingDefaultHint = usingDefault ? ` (last run ${id})` : ''
-          // Remember this id as the latest, even when reading.
           setLastSwarmRunId(id)
           if (sub === 'status') {
             const run = await swarmClient.get(id)
@@ -6704,10 +6458,6 @@ export function App({ config }: AppProps) {
     usageSummary,
   ])
 
-  // Slash commands live in slashCommandRegistry. This dispatcher
-  // is just a registry lookup with a fallback for unknown commands. Handlers
-  // capture their own state via the registry's useMemo deps, so this hook
-  // does not need a giant deps array of its own.
   const handleSlashCommand = useCallback(
     async (cmd: string) => {
       const [command, ...args] = splitSlashCommandInput(cmd)
@@ -6924,9 +6674,6 @@ export function App({ config }: AppProps) {
     ],
   )
 
-  // Messages typed while the agent is streaming are queued and sent
-  // automatically when the turn ends, instead of forcing the user to wait
-  // (or Esc-abort) before giving the next instruction.
   const queuedInputsRef = useRef<Array<{ text: string; displayText?: string }>>([])
   const [queuedInputCount, setQueuedInputCount] = useState(0)
 
@@ -7003,8 +6750,6 @@ export function App({ config }: AppProps) {
       exitPlanConfirmArmedRef.current,
     )
     if (decision.kind === 'confirm-exit') {
-      // First plan -> build toggle: arm a confirmation so the user
-      // deliberately reviews the plan before the agent starts editing.
       exitPlanConfirmArmedRef.current = true
       dispatch({
         type: 'SYSTEM_MESSAGE',
@@ -7109,8 +6854,6 @@ export function App({ config }: AppProps) {
 
   const handleCtrlC = useCallback(() => {
     if (state.pendingApproval) {
-      // ApprovalModal owns Ctrl+C so the same request is not resolved twice by
-      // the raw stdin listener and Ink's input listener.
       return
     }
     if (localShellAborterRef.current) {
@@ -7220,9 +6963,6 @@ export function App({ config }: AppProps) {
       },
       onCtrlS: () => {
         if (shortcutInputBlocked) return
-        // While a turn is streaming, Ctrl+S with in-progress composer text
-        // steers the live run instead of queuing it (the default Enter
-        // behavior) or opening the session picker (the non-busy binding).
         if (inputBusy && inputValue.trim()) {
           const message = inputValue.trim()
           setInputValue('')
@@ -7243,9 +6983,6 @@ export function App({ config }: AppProps) {
               })
               return
             }
-            // Steer failed — restore the composer so the typed text isn't
-            // lost. On 409 (no active run) the user can then just hit Enter
-            // to send it as a normal message, matching the guidance text.
             setInputValue(result.originalMessage)
             dispatch({
               type: 'SYSTEM_MESSAGE',
@@ -7327,13 +7064,9 @@ export function App({ config }: AppProps) {
       },
       onEscape: () => {
         if (approvalCommentActive) {
-          // ApprovalModal's comment editor owns Esc (cancels the draft);
-          // falling through here would cancel the whole run.
           return
         }
         if (state.pendingApproval) {
-          // ApprovalModal maps Esc to a one-off denial. Do not also cancel the
-          // surrounding run from this global key handler.
           return
         }
         if (localShellAborterRef.current) {
@@ -7414,8 +7147,6 @@ export function App({ config }: AppProps) {
         if (shortcutInputBlocked) return
         setActivityPanelHidden((hidden) => !hidden)
       },
-      // Ctrl+O terminal transcript mode takes over the keymap exclusively while
-      // open so copy-mode keys do not accidentally fire pickers/autonomy/actions.
       copyViewActive: copyView,
       onCopyClose: closeCopyView,
     },
@@ -7452,20 +7183,11 @@ export function App({ config }: AppProps) {
     )
   }
 
-  // Layout heights
-  // Reserve the very first row of the alt screen as a blank spacer.
-  // Some terminals/SSH clients (Termius, some Wezterm/Ghostty configs) draw
-  // chrome over row 1 of the alternate screen, which would clip the top
-  // half of the header glyphs. By rendering row 1 as an empty row and
-  // pushing actual content down, the header stays visible regardless of
-  // the host terminal. The total output still fills exactly `termHeight`
-  // rows so Ink takes the clearTerminal render path (no trailing newline
-  // → no terminal scroll on full frames).
   const TOP_SPACER_ROWS = 1
   const layoutHeight = Math.max(1, termHeight)
   const INLINE_PANEL_GAP_ROWS = 1
   const MODAL_MARGIN_ROWS = 2
-  const headerHeight = 2 // 1 content row + 1 borderBottom
+  const headerHeight = 2
   const maxInputEditorRows = Math.max(2, Math.min(8, Math.floor(termHeight / 4)))
   const inputHeight = calculateInputBoxHeight({
     value: inputValue,
@@ -7635,9 +7357,6 @@ export function App({ config }: AppProps) {
   const commandPaletteHeight = showCommandPalette
     ? fitInlinePanelHeight(
         calculateListPanelHeight({
-          // Pin to max so the panel height does not shrink as the user types
-          // and filters the list, which would reflow chatHeight per keystroke
-          // and flicker the chat region.
           itemCount: commandPaletteMaxVisibleItems,
           reservedRows: 3,
           maxVisibleItems: commandPaletteMaxVisibleItems,
@@ -7654,7 +7373,6 @@ export function App({ config }: AppProps) {
   const attachmentPaletteHeight = showAttachmentPalette
     ? fitInlinePanelHeight(
         calculateListPanelHeight({
-          // Pin to max — same rationale as commandPaletteHeight above.
           itemCount: attachmentPaletteMaxVisibleItems,
           reservedRows: 3,
           maxVisibleItems: attachmentPaletteMaxVisibleItems,
@@ -7730,10 +7448,10 @@ export function App({ config }: AppProps) {
         : 0
   const providerSetupReservedRows =
     providerSetup?.step === 'confirm'
-      ? 8
-      : providerSetup?.step === 'model' || providerSetup?.step === 'headers'
-        ? 7
-        : 6
+      ? 13
+      : providerSetup?.step === 'connection'
+        ? 11
+        : 7
   const providerSetupMaxVisibleItems = calculateListViewportCapacity(
     remainingInlineRows,
     providerSetupReservedRows,
@@ -7987,6 +7705,8 @@ export function App({ config }: AppProps) {
             validating: providerSetup.validating,
             saving: providerSetup.saving,
             error: providerSetup.error,
+            errorField: providerSetup.errorField ?? null,
+            allowPresetSelection: providerSetup.allowPresetSelection,
             maxVisibleItems: providerSetupMaxVisibleItems,
             onSelectPresetIndex: (index) => {
               setProviderSetup((current) =>
@@ -7996,27 +7716,27 @@ export function App({ config }: AppProps) {
             onSelectPreset: selectProviderSetupPreset,
             onProviderIdChange: (value) => {
               setProviderSetup((current) =>
-                current ? { ...current, providerId: value, error: null } : current,
+                current ? { ...current, providerId: value, error: null, errorField: null } : current,
               )
             },
             onBaseUrlChange: (value) => {
               setProviderSetup((current) =>
-                current ? { ...current, baseUrl: value, error: null } : current,
+                current ? { ...current, baseUrl: value, error: null, errorField: null } : current,
               )
             },
             onApiKeyEnvVarChange: (value) => {
               setProviderSetup((current) =>
-                current ? { ...current, apiKeyEnvVar: value, error: null } : current,
+                current ? { ...current, apiKeyEnvVar: value, error: null, errorField: null } : current,
               )
             },
             onApiKeyValueChange: (value) => {
               setProviderSetup((current) =>
-                current ? { ...current, apiKeyValue: value, error: null } : current,
+                current ? { ...current, apiKeyValue: value, error: null, errorField: null } : current,
               )
             },
             onHeadersTextChange: (value) => {
               setProviderSetup((current) =>
-                current ? { ...current, headersText: value, error: null } : current,
+                current ? { ...current, headersText: value, error: null, errorField: null } : current,
               )
             },
             onModelChange: (value) => {
@@ -8248,10 +7968,6 @@ export function App({ config }: AppProps) {
       <Box height={TOP_SPACER_ROWS} flexShrink={0} />
       <Header
         version={version}
-        // Before the user picks a model (or sends the first turn) the reducer
-        // holds the 'default' sentinel. Show the resolved daemon default so a
-        // fresh session displays the real model (e.g. qwen3.5:cloud @ ollama)
-        // instead of "default @ default" (CLI_BACKLOG.md B9).
         model={state.model === 'default' && daemonDefaultModel ? daemonDefaultModel : state.model}
         provider={
           state.provider === 'default' && daemonDefaultProvider
@@ -8319,17 +8035,7 @@ export function App({ config }: AppProps) {
         debateRounds={state.debateRounds}
       />
       <OverlayPanels {...overlayPanels} />
-      {/*
-        Elastic filler. The frame *must* render exactly `layoutHeight` rows so
-        Ink takes the `outputHeight >= stdout.rows` full-screen-clear path
-        instead of incremental line patching — incremental updates of a frame
-        that's a row short leave stale fragments behind (a previous frame's
-        longer line bleeding through a shorter one). The heights above are
-        budgeted to sum to `layoutHeight`, but a child that renders shorter
-        than its reservation (e.g. an inline panel that bails to `null`) would
-        under-fill. This grows to absorb any such slack so the total is always
-        exactly `layoutHeight`; in the common case it is 0 rows and invisible.
-      */}
+      {}
       <Box flexGrow={1} flexShrink={1} minHeight={0} />
       <InputBox
         value={inputValue}

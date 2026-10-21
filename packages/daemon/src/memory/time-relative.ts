@@ -1,27 +1,3 @@
-/**
- * Backward-looking time parser for memory queries.
- *
- * Where `parseReminderTime` (in reminders.ts) is FUTURE-looking ("fire
- * this in 5 minutes"), this helper resolves PAST relative phrases into
- * absolute ISO timestamps so `memory.search ?createdAfter=yesterday`
- * etc. work without the caller having to compute Date math.
- *
- * Supported forms (case-insensitive English; bare Korean):
- *
- *   today / 오늘                  — start of today (00:00 local)
- *   yesterday / 어제              — start of yesterday
- *   <N>(s|m|h|d|w) ago            — exact relative offset
- *   <N> (seconds|minutes|hours|
- *        days|weeks) ago          — same, spelled out
- *   <N>(초|분|시간|일|주) 전       — Korean equivalents
- *   last week / 지난주             — exactly 7 days ago
- *   last month / 지난달            — exactly 30 days ago
- *   <ISO-8601 timestamp>          — passed straight through
- *
- * Returns null on unrecognised input so callers can return INVALID_INPUT
- * with a precise error message instead of silently treating it as "now".
- */
-
 const ENGLISH_OFFSET_RE = /^(\d+)\s*(s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?|d|days?|w|weeks?)\s+ago$/i
 const KOREAN_OFFSET_RE = /^(\d+)\s*(초|분|시간|시|일|주)\s*전$/
 const ISO_DATE_TIME_HINT = /\d{4}-\d{2}-\d{2}/

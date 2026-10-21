@@ -443,8 +443,6 @@ export async function registerSchedulerCapabilityRoutes(
         const result = await trigger(id, parsed.data)
         publishWatchSnapshot()
         if (!result.started) {
-          // Reporting ok for a run that never started makes the surface's
-          // "Run now" look like it worked.
           void reply.status(409).send({
             code: 'CONFLICT',
             message: `job is not runnable (enabled: ${store.get(id)?.enabled === true}, status: ${store.get(id)?.status ?? 'unknown'}); manual run was not started`,
@@ -474,10 +472,6 @@ export async function registerSchedulerCapabilityRoutes(
         publishWatchSnapshot()
         return store.get(id)
       })
-      // A job that fires while nobody is at the screen can't answer an approval
-      // prompt — the prompt just times out and the run accomplishes nothing.
-      // Turning this on grants that job's own session a standing approval; the
-      // flag is persisted and the executor replays the grant on every fire.
       a.post('/scheduler/jobs/:id/unattended', async (req, reply) => {
         if (!requireDesktopSurface(reply)) return reply
         const store = getStore()

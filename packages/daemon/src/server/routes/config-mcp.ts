@@ -225,9 +225,6 @@ export function registerConfigMcpRoutes(app: FastifyInstance): void {
           return 'not_found' as const
         }
 
-        // Dedupe and persist; trimming is already enforced by the schema.
-        // The config schema makes `disabledTools` a required array with a
-        // default of [], so an empty list still has to be an array.
         server.disabledTools = Array.from(new Set(body.disabledTools))
         await applyAndPersistRuntimeUpdate(runtime, new Set(['mcp.servers']))
         return 'ok' as const

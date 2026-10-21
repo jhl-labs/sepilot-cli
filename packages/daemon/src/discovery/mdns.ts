@@ -44,7 +44,7 @@ export class MdnsDiscovery {
       try {
         const data = JSON.parse(msg.toString())
         if (data.service !== SERVICE_TYPE) return
-        if (data.id === this.config.deviceId) return // Ignore self
+        if (data.id === this.config.deviceId) return
 
         const device: DiscoveredDevice = {
           id: data.id,
@@ -57,9 +57,9 @@ export class MdnsDiscovery {
 
         this.devices.set(device.id, device)
         for (const listener of this.listeners) {
-          try { listener(device) } catch { /* handler error ignored */ }
+          try { listener(device) } catch {}
         }
-      } catch { /* malformed message */ }
+      } catch {}
     })
 
     await new Promise<void>((resolve) => {
@@ -68,13 +68,12 @@ export class MdnsDiscovery {
           this.socket!.addMembership(MDNS_ADDR)
           resolve()
         } catch {
-          resolve() // Continue even if multicast fails (e.g., in Docker)
+          resolve()
         }
       })
-      this.socket!.on('error', () => resolve()) // Don't fail startup
+      this.socket!.on('error', () => resolve())
     })
 
-    // Broadcast presence
     if (this.stopped) return
     this.broadcast()
     this.broadcastTimer = setInterval(() => this.broadcast(), this.config.broadcastIntervalMs ?? 30000)
@@ -88,13 +87,12 @@ export class MdnsDiscovery {
       this.broadcastTimer = null
     }
     if (this.socket) {
-      try { this.socket.close() } catch { /* socket already closed */ }
+      try { this.socket.close() } catch {}
       this.socket = null
     }
   }
 
   getDevices(): DiscoveredDevice[] {
-    // Remove stale devices (not seen in 2 minutes)
     const cutoff = Date.now() - 120_000
     for (const [id, dev] of this.devices) {
       if (dev.lastSeen.getTime() < cutoff) this.devices.delete(id)
@@ -117,6 +115,6 @@ export class MdnsDiscovery {
     })
     try {
       this.socket.send(msg, 0, msg.length, MDNS_PORT, MDNS_ADDR)
-    } catch { /* send error on closed socket */ }
+    } catch {}
   }
 }

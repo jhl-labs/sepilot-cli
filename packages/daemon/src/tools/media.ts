@@ -24,8 +24,6 @@ function truncateText(value: string, max: number): string {
     : value
 }
 
-// Always cap the number of PDF pages OCR'd, independent of caller input, so the
-// tool never fans out an unbounded number of rasterization/OCR subprocesses.
 function getOcrMaxPages(): number {
   const raw = Number(process.env.SEPILOTD_OCR_MAX_PAGES)
   return Number.isFinite(raw) && raw >= 1 ? Math.min(200, Math.trunc(raw)) : OCR_DEFAULT_MAX_PAGES
@@ -174,7 +172,6 @@ export function createMediaTranscribeTool(deps?: SpeechToolDeps): ToolDefinition
         return {
           output: message,
           status: 'error',
-          // Missing-binary is a permanent config issue, not a transient failure.
           code: isSpeechBinaryMissingError(error) ? 'SPEECH_BINARY_MISSING_PERMANENT' : undefined,
           durationMs: Date.now() - start,
         }

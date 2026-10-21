@@ -17,9 +17,6 @@ import {
   isUserMessage,
 } from './chat-surface-message-guards.js'
 
-// Surface helpers split out by domain. Re-exported here so existing import
-// sites keep working while the file shrinks toward formatting/reconciliation
-// concerns only.
 export {
   applyApprovalResolution,
   approvalNoteCopy,
@@ -228,7 +225,6 @@ function shouldAppendLiveMessage(message: Message): boolean {
     return Boolean(message.content.trim())
   }
 
-  // Tool messages: keep them once they've materialized any payload.
   return Boolean(message.content.trim() || message.toolResult)
 }
 
@@ -379,8 +375,27 @@ function failedAttemptGuardMeta(output: string | undefined): string | null {
 }
 
 function appendReason(label: string, output: string | undefined): string {
-  const reason = extractFirstLine(output)
+  const reason = extractFailureReason(output)
   return reason ? `${label}: ${reason}` : label
+}
+
+const ERROR_CODE_LINE = /^\[error: ([A-Z0-9_]+)\]\s*(.*)$/
+
+function extractFailureReason(output: string | undefined): string | null {
+  const firstLine = extractFirstLine(output)
+  if (!output || !firstLine) return firstLine
+  const coded = ERROR_CODE_LINE.exec(firstLine)
+  if (!coded) return firstLine
+  const [, code, rest] = coded
+  if (rest?.trim()) return truncateReason(rest.trim())
+  const stderrStart = output.search(/(^|\n)\[stderr\]\s*\n/)
+  if (stderrStart >= 0) {
+    const stderrLine = output.slice(stderrStart).split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line && line !== '[stderr]')
+    if (stderrLine) return truncateReason(stderrLine)
+  }
+  return code ?? firstLine
 }
 
 const REASON_MAX_LEN = 160

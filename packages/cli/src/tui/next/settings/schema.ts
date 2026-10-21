@@ -11,9 +11,7 @@ export interface SettingsItem {
   scope: SettingsScope
   kind: 'choice' | 'toggle' | 'text' | 'action'
   sessionKey?: string
-  /** Dotted key accepted by PUT /api/v1/config. */
   configPath?: string
-  /** Existing picker or panel opened for non-scalar settings. */
   dialogId?: string
 }
 
@@ -32,7 +30,7 @@ export const SETTINGS_ITEMS: SettingsItem[] = [
   sessionChoice('model.session', 'model', 'Model (this session)', 'model'),
   persistedChoice('model.default', 'model', 'Default model', 'agent.defaultModel'),
   persistedAction('model.providers', 'model', 'Providers', 'providers'),
-  sessionChoice('agent.mode', 'agent', 'Agent mode (this session)', 'mode'),
+  sessionChoice('agent.mode', 'agent', 'Execution engine override (advanced, this session)', 'mode'),
   sessionChoice('agent.thinking', 'agent', 'Thinking level (this session)', 'thinkingLevel'),
   {
     id: 'agent.maxTokens',

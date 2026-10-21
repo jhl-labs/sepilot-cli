@@ -1,38 +1,18 @@
-import type { ChatRequest, ContentPart, ILLMProvider, Message, TokenUsage } from '@sepilotd/core'
+import type { ChatRequest, ContentPart, ILLMProvider, Message, ModelInfo, TokenUsage } from '@sepilotd/core'
 import { runAuxiliaryLlmChat } from './auxiliary-llm.js'
 import type { ProviderCircuitBreaker } from '../providers/circuit-breaker.js'
 import { CURRENT_AGENT_TURN_USER_METADATA_KEY } from './turn-context.js'
 import { coalesceAdjacentAssistantToolCallMessages } from './tool-protocol-context.js'
 
-/**
- * Context window assumed for a model that is not in the provider catalog.
- *
- * Every layer that sizes a prompt has to answer this question, and they were
- * answering it differently (8k in the run loops, 128k in the usage inspector,
- * 192k in the OpenAI-compatible provider defaults) — so the number the user
- * was shown was not the number the engine planned against. It is deliberately
- * conservative: overflowing an unknown window is a hard provider failure,
- * while compacting early only costs a summarization call. Operators fix the
- * real number by refreshing the provider's model list or declaring
- * `defaultContextWindow`.
- */
 export const DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW = 8_000
 
 const DEFAULT_MINIMUM_OUTPUT_TOKENS = 512
+const PREFER_FULL_INPUT_REFILL_SHARE = 0.125
 const MAX_TOOL_PROTOCOL_UNIT_TOKENS = 24_000
 const TOOL_PROTOCOL_CONTEXT_SHARE = 0.2
 export const DEFAULT_MAX_CURRENT_TURN_TOOL_OBSERVATIONS = 16
-// A large window can hold proportionally more distinct observations before the
-// working-memory projection has to fold any of them into a digest. Keep the
-// small-window default as a floor so narrow models are unaffected.
 const CONTEXT_TOKENS_PER_OBSERVATION = 4_096
 const MAX_CURRENT_TURN_TOOL_OBSERVATIONS_CEILING = 64
-// Working-memory limits bound the *prompt*: `compactOversizedToolProtocolUnits`
-// already folds anything above them into a rolling digest, so exceeding them is
-// a compaction event, not a reason to stop gathering evidence. Termination is a
-// separate, much larger bound: a turn that has accumulated several full
-// working-memory loads is no longer converging, and only then is closing the
-// tool surface the honest response.
 const TOOL_OBSERVATION_SYNTHESIS_BUDGET_MULTIPLIER = 4
 const TOOL_OBSERVATION_DIGEST_KIND = 'tool_observation_digest'
 
@@ -45,6 +25,7 @@ export interface ProviderContextFitOptions {
   safetyMarginTokens?: number
   tools?: ChatRequest['tools']
   renderMessages?: (messages: Message[]) => Message[]
+  preferFullInput?: boolean
 }
 
 export interface ProviderContextFitResult {
@@ -54,6 +35,19 @@ export interface ProviderContextFitResult {
   estimatedInputTokens: number
   droppedMessageCount: number
   outputTokensReduced: boolean
+}
+
+export function fitControlRequest(request: ChatRequest, model: ModelInfo | undefined): ChatRequest {
+  if (!model?.maxOutputTokens || !model.contextWindow || !request.maxTokens) return request
+  const fit = fitProviderContext(request.messages, {
+    contextWindowTokens: model.contextWindow,
+    requestedOutputTokens: request.maxTokens,
+    modelMaxOutputTokens: model.maxOutputTokens,
+    tools: request.tools,
+    preferFullInput: true,
+  })
+  if (fit.droppedMessageCount > 0) throw new Error('Control evidence exceeds the model context window')
+  return { ...request, messages: fit.requestMessages, maxTokens: fit.maxOutputTokens }
 }
 
 export interface ToolObservationCompactionOptions {
@@ -69,13 +63,7 @@ export interface ToolObservationBudgetEvaluation {
   limitCount: number
   estimatedTokens: number
   limitTokens: number
-  /**
-   * The current turn's evidence no longer fits bounded working memory, so the
-   * next provider request must be served from a compacted projection. This is
-   * routine context management and never by itself a reason to stop gathering.
-   */
   compactionRequired: boolean
-  /** Evidence kept growing past several working-memory loads without converging. */
   exceeded: boolean
   synthesisLimitCount: number
   synthesisLimitTokens: number
@@ -214,12 +202,6 @@ function resolveToolObservationTokenLimit(
   )
 }
 
-/**
- * Resolve how many distinct observations one turn may hold in working memory
- * before the projection starts folding the oldest ones into a digest. An
- * explicit operator/caller limit always wins; otherwise the limit scales with
- * the model's context window and never drops below the small-window default.
- */
 export function resolveToolObservationCountLimit(
   contextWindowTokens: number,
   configuredLimit?: number,
@@ -240,18 +222,6 @@ export function resolveToolObservationCountLimit(
   )
 }
 
-/**
- * Measure the current turn's accumulated external observations independently
- * of tool names.
- *
- * Two thresholds, deliberately distinct. `compactionRequired` says the prompt
- * must now be served from a compacted projection — routine, and already
- * handled by `compactOversizedToolProtocolUnits`. `exceeded` says the turn has
- * gathered several working-memory loads without converging and closing the
- * tool surface is the honest response. Treating the first as the second turns
- * ordinary long investigations (a repository review, a multi-file trace) into
- * premature, evidence-starved synthesis.
- */
 export function evaluateCurrentTurnToolObservationBudget(
   messages: readonly Message[],
   options: ToolObservationCompactionOptions,
@@ -317,12 +287,6 @@ export function evaluateCurrentTurnToolObservationBudget(
   }
 }
 
-/**
- * Project oversized assistant→tool protocol batches into bounded working
- * memory. This is deliberately tool-agnostic: any model can overproduce calls
- * and any tool can return large observations. The raw journal remains intact;
- * only the next provider request receives this compact projection.
- */
 export function compactOversizedToolProtocolUnits(
   messages: readonly Message[],
   options: ToolObservationCompactionOptions,
@@ -610,12 +574,6 @@ function estimateProviderInputTokens(
   return messageTokens + estimateToolDefinitionTokens(tools, charsPerToken)
 }
 
-/**
- * Fit one concrete provider request to a context window. Selection is done on
- * the native/persisted message representation so assistant tool calls and all
- * matching tool results remain atomic. `renderMessages` then accounts for the
- * actual provider representation (for example Prompt-ReAct's tool catalog).
- */
 export function fitProviderContext(
   messages: readonly Message[],
   options: ProviderContextFitOptions,
@@ -667,6 +625,22 @@ export function fitProviderContext(
 
   const allUnits = new Set(units.map((_, index) => index))
   const complete = evaluate(allUnits)
+  const fullInputOutputRoom = Math.floor(contextWindowTokens - complete.estimatedInputTokens - safetyMarginTokens)
+  if (options.preferFullInput && fullInputOutputRoom >= minimumOutputTokens) {
+    const maxOutputTokens = Math.min(requestedOutputTokens, fullInputOutputRoom)
+    return {
+      ...complete,
+      maxOutputTokens,
+      droppedMessageCount: 0,
+      outputTokensReduced: maxOutputTokens < requestedOutputTokens,
+    }
+  }
+  const refillOutputTokens = options.preferFullInput
+    ? Math.min(
+        requestedOutputTokens,
+        Math.max(minimumOutputTokens, Math.floor(contextWindowTokens * PREFER_FULL_INPUT_REFILL_SHARE)),
+      )
+    : requestedOutputTokens
   if (
     complete.estimatedInputTokens
       + requestedOutputTokens
@@ -740,9 +714,6 @@ export function fitProviderContext(
     )
   }
 
-  // Older units are optional. Add them newest-first only while the requested
-  // output budget still fits; required current-turn units may instead consume
-  // part of that output reserve, but never exceed the absolute context limit.
   for (let index = units.length - 1; index >= 0; index -= 1) {
     if (selectedUnits.has(index) || !units[index]?.providerSafe) continue
     const candidateUnits = new Set(selectedUnits)
@@ -750,7 +721,7 @@ export function fitProviderContext(
     const candidate = evaluate(candidateUnits)
     if (
       candidate.estimatedInputTokens
-        + requestedOutputTokens
+        + refillOutputTokens
         + safetyMarginTokens
       <= contextWindowTokens
     ) {
@@ -779,11 +750,6 @@ export function fitProviderContext(
   }
 }
 
-/**
- * Trim messages to fit within a model's context window.
- * Keeps system prompt + last N messages that fit.
- * Estimates 4 chars ≈ 1 token unless a calibrated ratio is supplied.
- */
 export function trimToContextWindow(
   messages: Message[],
   maxTokens: number,
@@ -863,17 +829,6 @@ export function supersedeStaleReadResults(messages: Message[]): Message[] {
   return changed ? next : messages
 }
 
-/**
- * Supersede stale recurring system reminders. Reminder push sites tag their
- * system message with `metadata.reminderKind` (a structural tag, e.g.
- * 'stuck' | 'backtrack' | 'completion_gate' | 'failed_attempt' | 'escalation').
- * These reminders are trim-exempt (role === 'system') so, over a long run,
- * every re-emission would accumulate unbounded. Here we keep only the most
- * recent message per kind and drop earlier duplicates. Untagged system
- * messages (static system prompt, board message, etc.) are left untouched.
- * Judgement is by tag + order only — no content matching. Only string-content
- * system messages can carry a reminderKind; non-string content is ignored.
- */
 export function supersedeStaleSystemReminders<
   T extends { role: string; content: string | ContentPart[]; metadata?: Record<string, unknown> },
 >(messages: T[]): T[] {
@@ -932,75 +887,28 @@ export function estimateMessageTokens(msg: Message, charsPerToken: number = 4): 
   return 10 + toolCallTokens
 }
 
-/**
- * Result of a semantic compression pass. `messages` is the new working
- * conversation: system messages + a single `[Compressed history]`
- * synthetic system message + the preserved tail. `summary` is the dense
- * paragraph the LLM produced; callers should stash it on AgentState so
- * future passes can extend rather than re-summarize. `upToIndex` is the
- * number of non-system conversation messages folded in so far.
- */
 export interface SemanticCompressionResult {
   messages: Message[]
   summary: string
   upToIndex: number
-  /**
-   * Tokens consumed by the summarization round-trip itself. Callers
-   * should fold this into the run's `totalUsage` so the cost gate sees
-   * compression cost — otherwise frequent recompression on long-horizon
-   * runs would be invisible to the budget.
-   */
   usage?: TokenUsage
 }
 
 export interface SemanticCompressionOptions {
-  /** Model id for the summarization LLM call. */
   model: string
-  /** Tokens reserved for output during the *target* run. Default 4096. */
   reserveForOutput?: number
-  /** How many recent messages to keep verbatim. Default 6. */
   preservedTailCount?: number
-  /** Minimum messages worth summarizing on the first pass. Default 4. */
   minNewMessagesToCompress?: number
-  /** Token budget for the summarization call itself. Default 400. */
   summarizationMaxTokens?: number
-  /** Optional abort signal for the LLM call. */
   signal?: AbortSignal
-  /** Provider circuit breaker so a provider outage fast-fails compression. */
   breaker?: ProviderCircuitBreaker
-  /** Shared optional-LLM wall-clock budget for the current agent turn. */
   auxiliaryLlmBudget?: import('./auxiliary-llm.js').AuxiliaryLlmTurnBudget
-  /** Calibrated chars-per-token ratio for estimation. Default 4. */
   charsPerToken?: number
-  /**
-   * Previously-stored compressed summary (rolling). When present the
-   * pass extends this summary with whatever new messages have arrived
-   * since `previousUpToIndex`.
-   */
   previousSummary?: string
-  /** Number of conversation messages already folded into previousSummary. */
   previousUpToIndex?: number
-  /**
-   * Maximum allowed length (in characters) for the rolling summary. When
-   * `previousSummary` exceeds this on entry, the function runs a second
-   * LLM pass that re-summarizes it down to a leaner paragraph before
-   * folding new messages in. Prevents the summary from drifting toward
-   * the model's full context window on long-horizon runs.
-   *
-   * Default 4000 chars (~1000 tokens). Set to 0 to disable.
-   */
   maxPreviousSummaryChars?: number
 }
 
-/**
- * Semantic compression: when raw trimming would drop older messages,
- * call the LLM once to produce a dense paragraph that captures goal,
- * decisions, codebase map, files touched, validation, errors, and the
- * open question. The result
- * replaces the dropped tail; the most recent N messages are preserved
- * verbatim. Returns null when no compression was warranted (already
- * fits, or too few new messages to be worth a round-trip).
- */
 export async function semanticCompress(
   messages: Message[],
   contextWindowTokens: number,
@@ -1040,10 +948,6 @@ export async function semanticCompress(
   if (newToSummarize.length === 0) return null
   if (!prevSummary && newToSummarize.length < minNew) return null
 
-  // Rolling re-compression: when the previous summary itself has grown
-  // past `maxPreviousSummaryChars`, fold it down before adding new
-  // messages — otherwise it bloats every later compaction call and
-  // eventually pushes the working window back over budget.
   let recompressionUsage: TokenUsage | undefined
   const maxSummaryChars = options.maxPreviousSummaryChars ?? 4000
   if (
@@ -1120,8 +1024,6 @@ export async function semanticCompress(
     content: `[Compressed history] ${summary}`,
   }
 
-  // Combine the recompression cost (if any) with the new fold pass so
-  // the caller's totalUsage sees both round-trips.
   const combinedUsage =
     recompressionUsage || usage
       ? {
@@ -1147,10 +1049,6 @@ export interface EmergencyRecoveryOptions {
   auxiliaryLlmBudget?: import('./auxiliary-llm.js').AuxiliaryLlmTurnBudget
 }
 
-/**
- * Last-resort recovery after a provider rejected a prompt as too large.
- * Uses a shrunken window because the declared provider context was optimistic.
- */
 export async function emergencyContextRecovery(
   messages: Message[],
   contextWindowTokens: number,
@@ -1185,7 +1083,6 @@ export async function emergencyContextRecovery(
       }
     }
   } catch {
-    // Keep provider context overflow from turning recovery into a hard failure.
   }
   return {
     messages: trimToContextWindow(

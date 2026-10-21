@@ -183,9 +183,6 @@ function renderEvent(event: SessionEvent): string {
       return `> **Phase:** entered \`${entered}\`\n\n`
     }
     case 'post_edit_findings': {
-      // Surface the same structural information the agent saw via
-      // reflectionMemo so the markdown reader can review what the run
-      // touched and which downstream files lit up.
       const lines = ['> **Post-edit findings**']
       if (event.editedFiles.length > 0) {
         lines.push(`> Edited: ${event.editedFiles.map((f) => `\`${f}\``).join(', ')}`)
@@ -287,9 +284,6 @@ export function serializeSessionMarkdown(
 
   md += `\n---\n*Tokens: ${session.totalTokens.input} in / ${session.totalTokens.output} out | Cost: $${session.totalCost.toFixed(4)}*\n`
 
-  // Phase trajectory summary — collapsed table so the analyst can see
-  // at a glance how the run's tokens were spent across named phases
-  // without grepping every phase_change line.
   const phaseTrajectory = renderPhaseTrajectorySection(events)
   if (phaseTrajectory) {
     md += `\n${phaseTrajectory}`

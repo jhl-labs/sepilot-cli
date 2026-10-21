@@ -1,33 +1,19 @@
-import type { FastifyInstance } from 'fastify'
+import { randomUUID } from 'node:crypto'
+import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { SubagentDispatcher } from '../../agent/subagent-dispatcher.js'
+import type { BackgroundSubagents } from '../../jobs/subagent.js'
+import type { DelegatedAgentExecutionPolicy } from '../../tools/registry.js'
+import { resolveAutonomy } from '../runtime/providers.js'
 import { listSubagentDelegationCategories } from '../../agent/subagent-categories.js'
 import { subagentDispatchRequestSchema } from './subagents-schema.js'
 import '../fastify-types.js'
 
 export interface SubagentRoutesDeps {
-  /**
-   * Resolver for the dispatcher instance. A function (not a direct
-   * reference) so the route stays valid when the runtime swaps the
-   * dispatcher during config reloads, and so tests can inject a
-   * stub without rebuilding the entire runtime object.
-   */
   dispatcher: () => SubagentDispatcher | null
+  backgroundSubagents?: () => BackgroundSubagents | null | undefined
+  callerExecutionPolicy?: () => DelegatedAgentExecutionPolicy | null
 }
 
-/**
- * `POST /api/v1/subagents/dispatch` — synchronous HTTP entry point for the
- * isolated subagent dispatcher. The dispatcher itself is also surfaced as
- * the `subagent.dispatch` LLM tool; this route exists so cli/desktop
- * surfaces (and external automation) can invoke a subagent without going
- * through the chat loop.
- *
- * Privilege-escalation attempts (asking for tools the parent does not
- * have) are rejected as 400 with `code: 'SUBAGENT_TOOL_ESCALATION'`.
- * Empty prompts → 400 `INVALID_REQUEST`. Anything else surfaces as
- * 500 `INTERNAL_ERROR`. The success body is the raw
- * `SubagentDispatchResult` (output, sessionId, iterations, usage,
- * truncated, status).
- */
 export function registerSubagentRoutes(app: FastifyInstance, deps: SubagentRoutesDeps): void {
   app.get('/subagents/categories', async (_request, reply) => {
     return reply.status(200).send({
@@ -64,6 +50,32 @@ export function registerSubagentRoutes(app: FastifyInstance, deps: SubagentRoute
       })
     }
 
+    if (parsed.data.background === true) {
+      const service = deps.backgroundSubagents?.()
+      const policy = deps.callerExecutionPolicy?.()
+      if (!service || !policy) {
+        return reply.status(503).send({
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Background subagent service not initialized',
+          },
+        })
+      }
+      const { background: _background, ...request } = parsed.data
+      if (request.contextMode === 'fork' && !request.parentSessionId) {
+        return reply.status(400).send({
+          error: { code: 'SUBAGENT_FORK_UNAVAILABLE', message: 'fork context requires parentSessionId' },
+        })
+      }
+      const parentSessionId = request.parentSessionId ?? `api-subagent:${randomUUID()}`
+      try {
+        const job = service.start({ ...request, parentSessionId, parentExecutionPolicy: policy })
+        return reply.status(202).send({ ...job, parentSessionId })
+      } catch (err) {
+        return sendDispatchError(reply, err)
+      }
+    }
+
     const controller = new AbortController()
     const abort = () => controller.abort(new Error('subagent client disconnected'))
     request.raw.once('aborted', abort)
@@ -73,26 +85,7 @@ export function registerSubagentRoutes(app: FastifyInstance, deps: SubagentRoute
       const result = await dispatcher.dispatch({ ...parsed.data, signal: controller.signal })
       return reply.status(200).send(result)
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      const code = (err as { code?: string }).code
-      if (code === 'SUBAGENT_TOOL_ESCALATION' || message.startsWith('SUBAGENT_TOOL_ESCALATION')) {
-        return reply.status(400).send({
-          error: { code: 'SUBAGENT_TOOL_ESCALATION', message },
-        })
-      }
-      if (code === 'SUBAGENT_CATEGORY_UNKNOWN' || message.startsWith('SUBAGENT_CATEGORY_UNKNOWN')) {
-        return reply.status(400).send({
-          error: { code: 'SUBAGENT_CATEGORY_UNKNOWN', message },
-        })
-      }
-      if (code === 'SUBAGENT_AGENT_UNKNOWN' || message.startsWith('SUBAGENT_AGENT_UNKNOWN')) {
-        return reply.status(400).send({
-          error: { code: 'SUBAGENT_AGENT_UNKNOWN', message },
-        })
-      }
-      return reply.status(500).send({
-        error: { code: 'INTERNAL_ERROR', message },
-      })
+      return sendDispatchError(reply, err)
     } finally {
       request.raw.off('aborted', abort)
       reply.raw.off('close', abort)
@@ -100,8 +93,36 @@ export function registerSubagentRoutes(app: FastifyInstance, deps: SubagentRoute
   })
 }
 
+function sendDispatchError(reply: FastifyReply, err: unknown) {
+  const message = err instanceof Error ? err.message : String(err)
+  const code = (err as { code?: string }).code
+  for (const known of [
+    'SUBAGENT_TOOL_ESCALATION',
+    'SUBAGENT_CATEGORY_UNKNOWN',
+    'SUBAGENT_AGENT_UNKNOWN',
+    'SUBAGENT_FORK_UNAVAILABLE',
+  ]) {
+    if (code === known || message.startsWith(known)) {
+      return reply.status(400).send({ error: { code: known, message } })
+    }
+  }
+  return reply.status(500).send({
+    error: { code: 'INTERNAL_ERROR', message },
+  })
+}
+
 export async function subagentRoutes(app: FastifyInstance) {
   registerSubagentRoutes(app, {
     dispatcher: () => app.runtime?.subagentDispatcher ?? null,
+    backgroundSubagents: () => app.runtime?.backgroundSubagents,
+    callerExecutionPolicy: () => {
+      const runtime = app.runtime
+      if (!runtime) return null
+      return {
+        autonomy: resolveAutonomy(runtime.config),
+        requireToolApproval: false,
+        allowedToolNames: runtime.toolRegistry.list().map((tool) => tool.name),
+      }
+    },
   })
 }

@@ -36,6 +36,7 @@ interface OpencodeProviderOptions {
   defaultContextWindow?: number
   defaultMaxOutputTokens?: number
   env?: NodeJS.ProcessEnv
+  disableDefaultPlugins?: boolean
   command?: string
   clientFactory?: (
     spec: AcpClientSpec,
@@ -64,14 +65,19 @@ function opencodeAcpArgs(env: NodeJS.ProcessEnv): string[] {
   return configured.length > 0 ? configured : ['--pure', 'acp']
 }
 
-function opencodeProviderEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return {
+function opencodeProviderEnv(
+  env: NodeJS.ProcessEnv,
+  disableDefaultPlugins = true,
+): NodeJS.ProcessEnv {
+  const next: NodeJS.ProcessEnv = {
     ...env,
     OPENCODE_PERMISSION: JSON.stringify({ '*': 'deny' }),
-    OPENCODE_DISABLE_DEFAULT_PLUGINS: 'true',
     OPENCODE_DISABLE_CLAUDE_CODE: 'true',
     OPENCODE_DISABLE_LSP_DOWNLOAD: 'true',
   }
+  if (disableDefaultPlugins) next.OPENCODE_DISABLE_DEFAULT_PLUGINS = 'true'
+  else delete next.OPENCODE_DISABLE_DEFAULT_PLUGINS
+  return next
 }
 
 function modelInfo(
@@ -178,6 +184,7 @@ export class OpencodeProvider implements ILLMProvider {
   readonly models: ModelInfo[]
   private readonly env: NodeJS.ProcessEnv
   private readonly command: string
+  private readonly disableDefaultPlugins: boolean
   private readonly clientFactory?: OpencodeProviderOptions['clientFactory']
   private readonly modelLister?: OpencodeProviderOptions['modelLister']
   private readonly contextWindow: number
@@ -187,6 +194,7 @@ export class OpencodeProvider implements ILLMProvider {
   constructor(options: OpencodeProviderOptions = {}) {
     this.env = options.env ?? process.env
     this.command = options.command ?? opencodeCommand(this.env)
+    this.disableDefaultPlugins = options.disableDefaultPlugins ?? true
     this.clientFactory = options.clientFactory
     this.modelLister = options.modelLister
     this.contextWindow = options.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW
@@ -258,7 +266,7 @@ export class OpencodeProvider implements ILLMProvider {
       command: this.command,
       args: opencodeAcpArgs(this.env),
       cwd: workspace,
-      env: opencodeProviderEnv(this.env),
+      env: opencodeProviderEnv(this.env, this.disableDefaultPlugins),
       framing: 'ndjson',
     }, {
       timeoutMs,

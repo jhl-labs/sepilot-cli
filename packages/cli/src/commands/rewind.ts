@@ -4,7 +4,6 @@ import { output } from '../output/formatter.js'
 export interface RewindOptions { url?: string; scope?: 'files' | 'conversation' | 'both'; apply?: boolean; turns?: string }
 export type RewindClient = Pick<DaemonClient, 'listSessionCheckpoints' | 'previewSessionRewind' | 'rewindSessionFiles' | 'session' | 'branchSession'>
 
-/** Conversation history is branched, never destroyed; file mutation requires explicit apply. */
 export async function runRewind(client: RewindClient, sessionId: string, checkpointId: string | undefined, options: RewindOptions = {}): Promise<unknown> {
   const scope = options.scope ?? 'files'
   if (scope !== 'conversation' && !checkpointId) return { scope, checkpoints: await client.listSessionCheckpoints(sessionId), next: 'Choose a checkpoint to preview, then use --apply to restore files.' }
@@ -22,8 +21,6 @@ export async function runRewind(client: RewindClient, sessionId: string, checkpo
     if (fromEventIndex === undefined) throw new Error('No user turn exists before this rewind point')
   }
   if (!options.apply) return { scope, preview, fromEventIndex, next: 'Preview only. Use --apply to create the conversation branch and/or restore files.' }
-  // Preserve the original conversation even if the subsequent file operation
-  // fails. Never switch the UI to this branch until all requested work succeeds.
   const branch = fromEventIndex === undefined ? undefined : await client.branchSession(sessionId, { fromEventIndex })
   try {
     const files = preview ? await client.rewindSessionFiles(sessionId, checkpointId!, preview.checkpointIds) : undefined

@@ -7,15 +7,6 @@ export interface Persona {
   deniedTools?: string[]
 }
 
-// Built-in roster aligned with the desktop's BUILTIN_PERSONAS fallback
-// (packages/desktop/lib/store/persona-store.ts). Both sides must share
-// ids — when the desktop falls back to its built-in roster (no custom
-// personas registered yet) and posts personaIds to chat-stream, the
-// daemon needs to resolve those same ids. A previous mismatch
-// (`translator` / `software-architect` etc. on desktop vs.
-// `coder` / `devops` etc. here) silently dropped panelists down to
-// just `default`, collapsing every persona-panel run into a single
-// muted answer.
 export const BUILT_IN_PERSONAS: Persona[] = [
   {
     id: 'default',

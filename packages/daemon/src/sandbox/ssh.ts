@@ -63,10 +63,8 @@ export class SshSandbox implements ISandbox {
   }
 
   async cleanup(): Promise<void> {
-    // Nothing to clean up for SSH
   }
 
-  /** Test SSH connectivity */
   async testConnection(): Promise<boolean> {
     try {
       const result = await this.run('echo ok', { timeoutMs: 10000 })

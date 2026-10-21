@@ -2,12 +2,8 @@ const DEFAULT_MAX_CONTEXT_LINES = 200
 const DEFAULT_MAX_CONTEXT_CHARS = 12000
 const FILESYSTEM_MAX_CONTEXT_CHARS = 8000
 const TERMINAL_MAX_CONTEXT_CHARS = 4000
-// Web content is denser than a `cat` of one source file — a benchmark page or
-// docs page is mostly the body the user wants to read, not noise. A tight cap
-// like 12k forces aggressive truncation, the model sees the "[truncated]"
-// marker, and falls back to training-data answers (which is how the qwen3.5
-// vs gemini3.5 hallucination on mobile happened). Give webfetch more room.
 const WEBFETCH_MAX_CONTEXT_CHARS = 20000
+const BROWSER_SNAPSHOT_MAX_CONTEXT_CHARS = 24000
 const CONTEXT_HEAD_LINES = 32
 const CONTEXT_TAIL_LINES = 16
 const TERMINAL_DIAGNOSTIC_HEAD_LINES = 12
@@ -79,11 +75,6 @@ function summarizeGitDiffStructure(
   const changedFileCount = structuralLines.filter((line) => line.startsWith('diff --git ')).length
   if (changedFileCount < 2) return ''
 
-  // A plain head/tail summary hides every middle file in a multi-file commit.
-  // Keep the structural map (exact paths and hunk ranges) so the next focused
-  // read can only use observed paths, then spend the remainder on
-  // representative patch content. Tool output remains ordinary untrusted
-  // evidence; only its compaction shape changes.
   const structureBudget = Math.max(1_000, Math.floor(maxChars * 0.55))
   const representativeBudget = Math.max(1_000, maxChars - structureBudget - 320)
   const structure = truncateByChars(structuralLines.join('\n'), structureBudget)
@@ -104,13 +95,6 @@ function summarizeGitDiffStructure(
   ].join('\n'), maxChars)
 }
 
-/**
- * Source reads are range evidence. A generic head/tail summary is actively
- * misleading here: the observation cache would remember the requested range
- * even though the model never saw the omitted middle. Keep one contiguous
- * prefix and expose its exact absolute line range so continuation and cache
- * coverage can agree on what was actually visible to the model.
- */
 function summarizeFsReadContiguousPage(
   lines: string[],
   normalized: string,
@@ -160,14 +144,6 @@ function truncateByChars(text: string, maxChars: number): string {
   return `${head}${marker}${tail}`.trim()
 }
 
-/**
- * Tool adapters append daemon-owned recovery and hint records after their raw
- * diagnostic payload. Those records are control-plane evidence: dropping a
- * recovery marker while retaining only part of its prose can turn an
- * executable capability transition into a false blocker. Preserve the
- * bounded records atomically for every verbose tool result, independent of
- * the command, repository, language, provider, or recovery scenario.
- */
 function preserveToolControlDirectives(
   lines: string[],
   summary: string,
@@ -189,9 +165,63 @@ function preserveToolControlDirectives(
     : combined.slice(0, maxChars).trimEnd()
 }
 
+function compactEvidenceText(text: string, limit: number): string {
+  if (text.length <= limit) return text
+  const marker = '\n... [middle omitted; tail preserved] ...\n'
+  if (limit <= marker.length) return text.slice(0, limit)
+  const available = limit - marker.length
+  const headLength = Math.floor(available / 2)
+  return `${text.slice(0, headLength)}${marker}${text.slice(-(available - headLength))}`
+}
+
+export function summarizeToolOutputForEvidence(
+  toolName: string,
+  output: string,
+  maxChars = 900,
+): string {
+  if (!Number.isFinite(maxChars) || maxChars < 0) {
+    throw new RangeError('Evidence budget must be a finite non-negative number')
+  }
+  const limit = Math.floor(maxChars)
+  const normalized = output.trim()
+  if (normalized.length <= limit) return normalized
+  if (toolName !== 'terminal.run' || limit < 256) {
+    return compactEvidenceText(normalized, limit)
+  }
+  const diagnostics = [...new Set(normalized.split('\n').filter(isTerminalDiagnosticLine))]
+  if (diagnostics.length === 0) return compactEvidenceText(normalized, limit)
+
+  const header = '[Diagnostic highlights — excerpts, not a verdict]\n'
+  const separator = '\n[Beginning/end excerpts]\n'
+  const diagnosticBudget = Math.floor((limit - header.length - separator.length) * 0.6)
+  const highlights = compactEvidenceText(diagnostics.join('\n'), diagnosticBudget)
+  const remainder = limit - header.length - highlights.length - separator.length
+  return `${header}${highlights}${separator}${compactEvidenceText(normalized, remainder)}`
+}
+
+function summarizeHeadFirst(
+  toolName: string,
+  lines: string[],
+  normalized: string,
+  maxContextChars: number,
+): string {
+  const header = `[${toolName} output summarized for agent context: ${lines.length} lines, ${normalized.length} chars; shown from the top, the rest is readable with tool.output.read]`
+  const kept: string[] = []
+  let used = header.length + 1
+  for (const line of lines) {
+    const cost = line.length + 1
+    if (used + cost > maxContextChars - 64) break
+    kept.push(line)
+    used += cost
+  }
+  const omitted = lines.length - kept.length
+  return [header, ...kept, ...(omitted > 0 ? [`...[${omitted} omitted line${omitted === 1 ? '' : 's'} at the end]...`] : [])].join('\n')
+}
+
 export function summarizeToolOutputForAgentContext(
   toolName: string,
   output: string,
+  toolCallId?: string,
 ): string {
   const normalized = output.trim()
   if (!normalized) {
@@ -199,21 +229,17 @@ export function summarizeToolOutputForAgentContext(
   }
 
   const lines = normalized.split('\n')
-  // terminal.run output can be verbose, so it gets a tighter byte budget —
-  // but only *large* output should be summarized. Small command output
-  // (e.g. `cloc --json` for a repo) must pass through verbatim; otherwise
-  // the "[…summarized…]" header and "…omitted lines…" marker make the model
-  // believe the result was truncated and it keeps re-running the command
-  // instead of answering with the data it already has.
   const maxContextChars = toolName === 'terminal.run'
     ? TERMINAL_MAX_CONTEXT_CHARS
     : toolName.startsWith('fs.')
       ? FILESYSTEM_MAX_CONTEXT_CHARS
       : toolName === 'webfetch'
         ? WEBFETCH_MAX_CONTEXT_CHARS
-        : DEFAULT_MAX_CONTEXT_CHARS
+        : toolName === 'browser.remote_snapshot'
+          ? BROWSER_SNAPSHOT_MAX_CONTEXT_CHARS
+          : DEFAULT_MAX_CONTEXT_CHARS
   const shouldCompact = (
-    lines.length > DEFAULT_MAX_CONTEXT_LINES
+    (!['tool.output.read', 'webfetch', 'browser.extract', 'browser.remote_snapshot'].includes(toolName) && lines.length > DEFAULT_MAX_CONTEXT_LINES)
     || normalized.length > maxContextChars
   )
 
@@ -221,8 +247,11 @@ export function summarizeToolOutputForAgentContext(
     return normalized
   }
 
+  const reference = toolCallId && /^[a-zA-Z0-9_-]{1,128}$/.test(toolCallId)
+    ? `[Captured output reference: ${toolCallId}]\n`
+    : ''
   const preserveControlDirectives = (summary: string): string =>
-    preserveToolControlDirectives(lines, summary, maxContextChars)
+    reference + preserveToolControlDirectives(lines, summary, maxContextChars)
 
   if (toolName === 'git.diff') {
     const structuredDiff = summarizeGitDiffStructure(lines, normalized, maxContextChars)
@@ -235,6 +264,11 @@ export function summarizeToolOutputForAgentContext(
   if (toolName === 'terminal.run') {
     const diagnosticSummary = summarizeTerminalDiagnostics(lines, normalized, maxContextChars)
     if (diagnosticSummary) return preserveControlDirectives(diagnosticSummary)
+  }
+
+  if (toolName === 'browser.remote_snapshot') {
+    const headOnly = summarizeHeadFirst(toolName, lines, normalized, maxContextChars)
+    return preserveControlDirectives(headOnly)
   }
 
   const head = lines.slice(0, CONTEXT_HEAD_LINES)

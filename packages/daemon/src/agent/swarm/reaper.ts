@@ -82,7 +82,6 @@ export async function removeTmuxSession(name: string): Promise<void> {
   try {
     await run('tmux', ['kill-session', '-t', name])
   } catch {
-    /* already gone */
   }
 }
 
@@ -133,7 +132,6 @@ export async function removeDaemonSwarmWorktree(worktree: ReaperWorktree): Promi
       })
       removedByGit = true
     } catch {
-      /* fall back to rm below */
     }
   }
   if (!removedByGit) {
@@ -145,7 +143,6 @@ export async function removeDaemonSwarmWorktree(worktree: ReaperWorktree): Promi
         cwd: worktree.originRepo,
       })
     } catch {
-      /* branch may already be gone */
     }
   }
 }

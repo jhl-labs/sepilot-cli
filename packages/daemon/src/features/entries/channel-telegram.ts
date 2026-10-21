@@ -31,16 +31,8 @@ export function registerChannelFactory(registry: ChannelFactoryRegistry): void {
               : undefined,
             loadPendingPairing: deps.loadTelegramPendingPairing,
             clearPendingPairing: deps.clearTelegramPendingPairing,
-            // Incoming voice notes are transcribed with a local whisper
-            // binary (never an external API). If whisper isn't installed
-            // this rejects with SPEECH_BINARY_MISSING and the channel
-            // tells the user how to enable it.
             transcribeAudioFile: async (path: string) =>
               (await transcribeAudio({ audioPath: path })).text,
-            // Reply to a voice note with a voice note. piper-backed,
-            // local-only; rejects with SPEECH_BINARY_MISSING if
-            // SEPILOTD_PIPER_MODEL isn't set, which the channel logs and
-            // skips (the text reply was already delivered).
             synthesizeReply: async (text: string) => {
               const r = await synthesizeSpeech({ text })
               return { audioPath: r.audioPath, temporary: r.temporary }

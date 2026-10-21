@@ -1,10 +1,5 @@
 import stringWidth from 'string-width'
 
-// Ink renders its own cursor glyph while hiding the terminal cursor. Native
-// IMEs, however, place their preedit/candidate UI at the terminal cursor. The
-// private-use marker reserves one cell and lets the stdout wrapper recover the
-// exact caret position from Ink's final (already wrapped) frame. On a TTY that
-// cell is blank because the hardware cursor itself is the visible caret.
 export const IME_CURSOR_MARKER = '\uE000'
 
 const CURSOR_GLYPH = '│'
@@ -47,15 +42,6 @@ function positionSequence(position: CursorPosition): string {
   return `${SAVE_CURSOR}${moveUp}\u001B[${position.column + 1}G${SHOW_CURSOR}`
 }
 
-/**
- * Wrap Ink's stdout so the hardware cursor follows the inline composer caret.
- *
- * Ink's incremental renderer expects every write to begin at the cursor it
- * left after the previous frame. Before forwarding another write, restore that
- * saved location. A frame containing the composer marker is then rendered,
- * saved at its normal trailing position, and the visible cursor is moved back
- * over the marker for native IME placement.
- */
 export function createImeCursorOutput(stdout: NodeJS.WriteStream): ImeCursorOutput {
   const enabled = Boolean(stdout.isTTY)
   let positioned = false

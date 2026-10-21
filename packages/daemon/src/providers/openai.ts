@@ -34,12 +34,7 @@ export class OpenAIProvider implements ILLMProvider {
       apiKey: config.apiKey,
       baseURL: config.baseUrl,
       defaultHeaders: config.headers,
-      // Keep SDK response bodies on the daemon's dispatcher-compatible path,
-      // including the compiled Bun EOF adapter used by local providers.
       fetch: getProviderSdkFetch(),
-      // The daemon's guarded provider layer owns bounded retries and circuit
-      // accounting. Disable the SDK's hidden retry loop so every retry follows
-      // the same observable policy.
       maxRetries: 0,
     })
     this.models = config.models.map((m) => ({
@@ -58,9 +53,11 @@ export class OpenAIProvider implements ILLMProvider {
   }
 
   async chat(request: ChatRequest, options?: LLMRequestOptions): Promise<ChatResponse> {
+    const model = this.models.find((candidate) => candidate.id === request.model)
     return createOpenAIChatResponse(this.client, request, options, {
-      thinkingControl: this.models.find((model) => model.id === request.model)
-        ?.capabilities.thinkingControl,
+      thinkingControl: model?.capabilities.thinkingControl,
+      reasoningEffortOffValue: model?.compatibility?.reasoningEffortOffValue,
+      reasoningEffortAliases: model?.compatibility?.reasoningEffortAliases,
     })
   }
 
@@ -69,9 +66,11 @@ export class OpenAIProvider implements ILLMProvider {
   }
 
   async *stream(request: ChatRequest, options?: LLMRequestOptions): AsyncIterable<StreamChunk> {
+    const model = this.models.find((candidate) => candidate.id === request.model)
     yield* streamOpenAIChatResponse(this.client, request, options, {
-      thinkingControl: this.models.find((model) => model.id === request.model)
-        ?.capabilities.thinkingControl,
+      thinkingControl: model?.capabilities.thinkingControl,
+      reasoningEffortOffValue: model?.compatibility?.reasoningEffortOffValue,
+      reasoningEffortAliases: model?.compatibility?.reasoningEffortAliases,
     })
   }
 }

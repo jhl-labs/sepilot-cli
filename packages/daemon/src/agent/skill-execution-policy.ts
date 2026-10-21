@@ -20,13 +20,7 @@ export interface SkillExecutionToolCallPartition {
 }
 
 export interface SkillExecutionToolCallPartitionOptions {
-  /**
-   * Reserve a bounded evidence phase for the currently actionable required
-   * skill stage before allowing optional observations. Outside those phases,
-   * unrelated calls retain their existing permissive behavior.
-   */
   prioritizeRequiredStages?: boolean
-  /** Only prioritize required stages whose canonical tool is actually visible. */
   availableToolNames?: ReadonlySet<string>
 }
 
@@ -211,9 +205,6 @@ function recordBindingValues(
       if (candidate.present) {
         values.set(binding.id, candidate.value)
       } else if (binding.allowMissing === true) {
-        // Missing is a concrete cursor constraint, not a wildcard. Once a
-        // stage means "the current target", a later explicit target could be
-        // a different item and must be rejected. Later omissions remain valid.
         values.set(binding.id, IMPLICIT_CURRENT_ARGUMENT)
       }
     }
@@ -271,9 +262,6 @@ function partitionFromObservedCalls(
       const limit = stageCallLimit(stage)
       return (state.counts.get(stage.id) ?? 0) >= limit
         || index < state.furthestStageIndex
-        // A dependency is evidence, not merely an ordering hint. Calls proposed
-        // earlier in this same model batch have not executed yet, so they must
-        // not unlock dependent calls until a later turn observes success.
         || (stage.requires ?? []).some(
           (dependency) => !state.satisfiedBeforeBatch.has(dependency),
         )
@@ -340,8 +328,6 @@ function completionFromObservedCalls(
           stageId: stage.id,
           tools: [...stage.tools],
         })
-        // Multiple active policies are intersected. A more permissive skill
-        // must never expand the retry budget declared by a stricter one.
         maxRetries = Math.min(maxRetries, active.policy.maxCompletionRetries ?? 1)
       }
     }

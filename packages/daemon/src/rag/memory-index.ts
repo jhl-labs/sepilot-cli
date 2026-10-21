@@ -1,11 +1,3 @@
-/**
- * In-memory RAG vector index (D3 MVP).
- *
- * sqlite-vec native binding 의존성을 피하기 위해 청크 벡터를 메모리에 보관하고
- * 단순 cosine similarity로 top-k 검색한다. 프로덕션용 sqlite-vec 기반 영속
- * 벡터 인덱스는 후속 iteration에서 교체된다.
- */
-
 export interface IndexedChunk {
   rowid: number
   documentId: string

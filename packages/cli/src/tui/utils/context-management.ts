@@ -28,9 +28,7 @@ interface ContextUsageSnapshot {
 export interface BuildContextManagementSummaryOptions {
   session: DaemonSessionDetail
   usage: ContextUsageSnapshot
-  /** Input tokens in the latest provider request, or the daemon's preflight estimate. */
   contextInputTokens?: number | null
-  /** Whether `contextInputTokens` is the daemon's preflight estimate. */
   contextEstimated?: boolean
   contextWindow?: number | null
   projectName?: string | null

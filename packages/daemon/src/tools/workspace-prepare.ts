@@ -3,6 +3,8 @@ import { isAbsolute, join, relative } from 'node:path'
 import { throwIfAborted } from '../abort.js'
 import { resolveToolPath } from './path-utils.js'
 import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
+import type { TerminalRunner } from './terminal.js'
+import { prepareReviewWorkspace, ReviewWorkspaceError } from './review-workspace.js'
 
 const PROJECT_DIRECTORY_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,78}[a-z0-9])?$/i
 
@@ -20,20 +22,17 @@ function isInside(root: string, candidate: string): boolean {
   return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`))
 }
 
-/**
- * Prepare one project directory under the immutable workspace collection root.
- * The input is deliberately a single portable path segment: callers cannot use
- * this convenience capability to select a broader filesystem root.
- */
-export function createWorkspacePrepareTool(): ToolDefinitionRuntime {
+export function createWorkspacePrepareTool(options: { reviewRunner?: TerminalRunner } = {}): ToolDefinitionRuntime {
   return {
     name: 'workspace.prepare',
     description:
-      'Create one new project directory directly under the active workspace root before starting a new development project. `path` must be a portable single-segment name such as `status-dashboard`; absolute paths, separators, `.` and `..` are rejected. Defaults to refusing an existing path; set onExisting="reuse" only when the user asked to continue an existing project. Use the returned absolute path as cwd/path for subsequent file, Git, build, test, and process tools. Do not call this for information-only work or when the active workspace already is the requested project.',
+      'Prepare a directory directly inside the active workspace. mode="project" (default) creates a new project directory. mode="review" prepares an independent detached Git worktree for an exact locally available ref/commit inside an existing repository, without switching its original branch, discarding changes or fetching remotely. Review mode requires ref and an isolated network-disabled runner; fetch using a separately authorized tool first. path must be a portable single-segment name; absolute paths, separators, "." and ".." are rejected. Existing paths require onExisting="reuse"; review reuse additionally requires the same clean detached worktree and exact revision. Use the returned path for subsequent tools. Do not treat a project directory as a review checkout.',
     resumeSafety: 'replay-risky',
     inputSchema: {
       type: 'object',
       properties: {
+        mode: { type: 'string', enum: ['project', 'review'], description: 'Project directory creation or detached review checkout (default: project)' },
+        ref: { type: 'string', description: 'Locally available Git ref or exact fetched commit revision; required only for review mode' },
         path: {
           type: 'string',
           description: 'Portable single-segment project directory name (1-80 characters)',
@@ -45,9 +44,15 @@ export function createWorkspacePrepareTool(): ToolDefinitionRuntime {
         },
       },
       required: ['path'],
+      additionalProperties: false,
     },
     async execute(input, context): Promise<ToolResult> {
       const startedAt = Date.now()
+      if (input.mode !== undefined && input.mode !== 'project' && input.mode !== 'review'
+        || input.ref !== undefined && input.mode !== 'review'
+        || input.onExisting !== undefined && input.onExisting !== 'error' && input.onExisting !== 'reuse') {
+        return failure('Invalid mode/reuse option; ref is only valid for review mode.', startedAt, 'INVALID_INPUT_PERMANENT')
+      }
       const requested = typeof input.path === 'string' ? input.path.trim() : ''
       if (!requested || !PROJECT_DIRECTORY_PATTERN.test(requested) || requested === '.' || requested === '..') {
         return failure(
@@ -75,6 +80,10 @@ export function createWorkspacePrepareTool(): ToolDefinitionRuntime {
         const candidate = join(root, requested)
         if (!isInside(root, candidate)) {
           return failure('Project path escapes the active workspace root.', startedAt, 'WORKSPACE_ESCAPE_PERMANENT')
+        }
+        if (input.mode === 'review') {
+          const prepared = await prepareReviewWorkspace(root, candidate, input, context, options.reviewRunner)
+          return { output: JSON.stringify(prepared), status: 'success', durationMs: Date.now() - startedAt }
         }
 
         let created = false
@@ -114,7 +123,7 @@ export function createWorkspacePrepareTool(): ToolDefinitionRuntime {
         return failure(
           error instanceof Error ? error.message : String(error),
           startedAt,
-          code === 'EACCES' || code === 'EPERM'
+          error instanceof ReviewWorkspaceError ? error.code : code === 'EACCES' || code === 'EPERM'
             ? 'EACCES_PERMANENT'
             : code === 'ENOSPC'
               ? 'ENOSPC_PERMANENT'

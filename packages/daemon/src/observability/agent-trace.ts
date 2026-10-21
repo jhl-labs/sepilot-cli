@@ -21,17 +21,15 @@ import {
 } from './trace-redaction.js'
 
 const DEFAULT_MAX_STRING_LENGTH = 16_000
-const MAX_ARRAY_ITEMS = 64
-const MAX_OBJECT_KEYS = 64
-const MAX_DEPTH = 6
+const DEFAULT_STRUCTURE_LIMITS = { maxArrayItems: 64, maxObjectKeys: 64, maxDepth: 6 }
+const FULL_STRUCTURE_LIMITS = { maxArrayItems: 1024, maxObjectKeys: 1024, maxDepth: 32 }
 
-// Trace entries are large (full LLM payloads), so checking every 8 writes
-// keeps overshoot bounded without dominating throughput.
+function traceStructureLimits() {
+  return process.env.SEPILOT_TRACE_FULL === '1' ? FULL_STRUCTURE_LIMITS : DEFAULT_STRUCTURE_LIMITS
+}
+
 const ROTATION_CHECK_INTERVAL = 8
 
-// Trace files default to a larger ceiling than daemon.log because each entry
-// carries a full LLM request/response. Operators who care about disk usage
-// can override via `logging.trace` in config.yaml or the Settings UI.
 const DEFAULT_TRACE_ROTATION: LogRotationOptions = {
   enabled: true,
   maxBytes: 50 * 1024 * 1024,
@@ -43,9 +41,6 @@ let writeQueue: Promise<void> = Promise.resolve()
 let rotationOptions: LogRotationOptions = { ...DEFAULT_TRACE_ROTATION }
 let writesSinceCheck = 0
 let traceSequence = 0
-// Auxiliary wrappers and their graph callers may log the same received
-// response. Preserve both trace entries but expose an identity for usage
-// reconciliation; equal-looking replies from separate requests remain distinct.
 const responseIds = new WeakMap<ChatResponse, string>()
 
 const SAFE_TRACE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/
@@ -58,12 +53,6 @@ const TRACE_IDENTIFIER_KEYS = [
   'sessionId',
   'toolCallId',
   'turnId',
-  // Structural fields, never free text: event/status/node/mode/graphId are
-  // fixed short identifiers emitted by call sites in this file (event type
-  // names, node/graph ids, run-status enums), not user or model content.
-  // Long structural names (e.g. 'supervisor.criterion-evidence-review') can
-  // still match LONG_TOKEN_RE and get wholesale-redacted; restore them when
-  // the original value is identifier-shaped.
   'event',
   'source',
   'status',
@@ -74,10 +63,6 @@ const TRACE_IDENTIFIER_KEYS = [
 
 const IDENTIFIER_KEY_SET: ReadonlySet<string> = new Set(TRACE_IDENTIFIER_KEYS)
 
-/**
- * Expensive request/response diagnostics are opt-in. Operational journals
- * remain available without this switch; agent-trace and TUI debug logs do not.
- */
 export function isSepilotDebugEnabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
@@ -97,7 +82,8 @@ function truncateString(value: string, limit = traceStringLimit()): string {
 }
 
 function sanitizeValue(value: unknown, depth = 0): unknown {
-  if (depth >= MAX_DEPTH) {
+  const limits = traceStructureLimits()
+  if (depth >= limits.maxDepth) {
     return '[max-depth]'
   }
 
@@ -119,10 +105,10 @@ function sanitizeValue(value: unknown, depth = 0): unknown {
 
   if (Array.isArray(value)) {
     const items = value
-      .slice(0, MAX_ARRAY_ITEMS)
+      .slice(0, limits.maxArrayItems)
       .map((item) => sanitizeValue(item, depth + 1))
-    if (value.length > MAX_ARRAY_ITEMS) {
-      items.push(`[+${value.length - MAX_ARRAY_ITEMS} more items]`)
+    if (value.length > limits.maxArrayItems) {
+      items.push(`[+${value.length - limits.maxArrayItems} more items]`)
     }
     return items
   }
@@ -131,11 +117,11 @@ function sanitizeValue(value: unknown, depth = 0): unknown {
     const entries = Object.entries(value)
     const sanitized = Object.fromEntries(
       entries
-        .slice(0, MAX_OBJECT_KEYS)
+        .slice(0, limits.maxObjectKeys)
         .map(([key, item]) => [key, sanitizeValue(item, depth + 1)]),
     )
-    if (entries.length > MAX_OBJECT_KEYS) {
-      sanitized.__truncated_keys__ = entries.length - MAX_OBJECT_KEYS
+    if (entries.length > limits.maxObjectKeys) {
+      sanitized.__truncated_keys__ = entries.length - limits.maxObjectKeys
     }
     return sanitized
   }
@@ -147,20 +133,31 @@ function sanitizeValue(value: unknown, depth = 0): unknown {
   return String(value)
 }
 
-function redactTraceEntry(entry: Record<string, unknown>): Record<string, unknown> {
+function stripLiveViewImages(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripLiveViewImages)
+  if (!value || typeof value !== 'object') return value
+  const out: Record<string, unknown> = {}
+  for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+    out[key] =
+      key === 'image' && typeof inner === 'string' && inner.startsWith('data:image/')
+        ? '[image]'
+        : stripLiveViewImages(inner)
+  }
+  return out
+}
+
+export function redactTraceEntry(entry: Record<string, unknown>): Record<string, unknown> {
   if (!isTraceRedactionEnabled()) {
     return entry
   }
   return redactSecretKeys(
-    entry,
+    stripLiveViewImages(entry),
     createTraceRedactionContext(),
     '',
     0,
     {
       maxStringLength: traceStringLimit(),
-      maxDepth: MAX_DEPTH,
-      maxArrayItems: MAX_ARRAY_ITEMS,
-      maxObjectKeys: MAX_OBJECT_KEYS,
+      ...traceStructureLimits(),
     },
   ) as Record<string, unknown>
 }
@@ -172,21 +169,8 @@ function restoreSafeTraceIdentifiers(
   return restoreIdentifiersDeep(original, redacted, 0) as Record<string, unknown>
 }
 
-/**
- * Structural identifiers are structural wherever they sit. A trace entry is a
- * tree — `agent.event` carries the real payload under `data`, graph nodes nest
- * their own envelopes — so restoring only the top-level keys left every nested
- * copy of the same identifier wholesale-redacted, which is what broke
- * tool-call correlation. Walk the original and the redacted value in parallel
- * and restore an identifier-keyed string at any depth, provided the original
- * is identifier-shaped (`SAFE_TRACE_IDENTIFIER`: no whitespace, bounded
- * length) so free text can never be reinstated through this path.
- *
- * Bounded by MAX_DEPTH like the redactor itself; anything deeper keeps the
- * redacted value.
- */
 function restoreIdentifiersDeep(original: unknown, redacted: unknown, depth: number): unknown {
-  if (depth > MAX_DEPTH) return redacted
+  if (depth > traceStructureLimits().maxDepth) return redacted
 
   if (Array.isArray(original) && Array.isArray(redacted)) {
     return redacted.map((item, index) =>
@@ -324,7 +308,6 @@ function trackTraceWrite(write: Promise<void>): void {
   )
 }
 
-/** Await every trace write started so far (detached writes included). */
 export async function flushAgentTraceWrites(): Promise<void> {
   await pendingTraceWrites
   await writeQueue
@@ -359,7 +342,6 @@ async function writeEntry(entry: Record<string, unknown>): Promise<void> {
       }
       await appendFile(path, `${line}\n`, { encoding: 'utf-8', mode: 0o600 })
     } catch {
-      // Trace logging must never throw into the agent execution path.
     }
   })
   await writeQueue
@@ -424,9 +406,6 @@ function chunkString(value: string): string[] {
 export async function logLlmCallTrace(
   params: LlmTraceLogParams,
 ): Promise<void> {
-  // Guard before touching `params`: sanitizing a full request/response is the
-  // expensive part, and callers on the default (non-debug) path must not pay
-  // for it. writeEntry re-checks, but only after the work is already done.
   if (!isSepilotDebugEnabled()) {
     return
   }
@@ -456,10 +435,6 @@ export async function logLlmCallTrace(
   })
 
   {
-    // Chunking happens on the raw text; per-string redaction/truncation is
-    // applied uniformly by writeEntry's redactTraceEntry pass below (each
-    // chunk is <= 16,000 chars, within the default trace string limit), so
-    // this does not double-redact or truncate below the chunk boundary.
     const systemPrompt = params.request.systemPrompt ?? ''
     const messagesJson = JSON.stringify(params.request.messages ?? [])
     const systemPromptChunks = chunkString(systemPrompt)
@@ -486,11 +461,6 @@ export async function logLlmCallTrace(
   }
 }
 
-/**
- * Fire-and-forget variant for call sites that must not add the trace write to
- * a latency-sensitive path (e.g. a promise raced against a timeout). Failures
- * are swallowed; `flushAgentTraceWrites` awaits the outstanding writes.
- */
 export function logLlmCallTraceDetached(params: LlmTraceLogParams): void {
   trackTraceWrite(logLlmCallTrace(params))
 }
@@ -552,7 +522,6 @@ export interface AgentDebugTraceParams {
   data?: Record<string, unknown>
 }
 
-/** Write one correlated, redacted diagnostic event when SEPILOT_DEBUG=1. */
 export async function logAgentDebugTrace(
   params: AgentDebugTraceParams,
 ): Promise<void> {

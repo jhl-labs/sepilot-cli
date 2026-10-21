@@ -2,6 +2,7 @@ import { createLogger } from '../../logger.js'
 import { startChannelWebhookDispatcher } from '../../channels/webhook-dispatch.js'
 import { createSchedulerTools } from '../../tools/scheduler.js'
 import { buildSchedulerStack } from './services.js'
+import { startEventRoutingFeature } from '../../generated/feature-registration.js'
 import { configureScheduler } from './scheduler.js'
 import { startRetentionSweeper } from '../../retention/sweeper.js'
 import { cleanupSessionRuntimeState } from '../routes/session-management.js'
@@ -10,12 +11,6 @@ import { validateScheduledSkillRefs } from '../../scheduler/skill-selection.js'
 
 const log = createLogger('runtime.lifecycle')
 
-/**
- * Run every side-effecting service on an assembled runtime graph:
- * channel adapters, mDNS discovery, auto-updater, scheduled jobs,
- * delegation worker, and graph agent loader. Kept separate from
- * graph construction so tests can opt out of side effects.
- */
 export function startRuntime(runtime: StartupCapabilities): void {
   runtime.notificationRelayWorker.start()
 
@@ -30,15 +25,14 @@ export function startRuntime(runtime: StartupCapabilities): void {
   }
   startChannelWebhookDispatcher(runtime)
 
+  const eventRoutingHooks = startEventRoutingFeature(runtime)
+
   runtime.mdns.start().catch(() => {
-    // mDNS is optional.
   })
 
   runtime.updater.start().catch(() => {
-    // Update checks are optional.
   })
 
-  // Build the SQLite-backed scheduler stack now that all deps are available.
   const schedulerStack = buildSchedulerStack({
     channels: runtime.channels,
     channelPipelineCapabilities: runtime,
@@ -55,9 +49,9 @@ export function startRuntime(runtime: StartupCapabilities): void {
     grantUnattendedApproval: (schedulerSessionId) =>
       runtime.approvalRegistry?.grantSessionAutoApproval(schedulerSessionId, 'unattended scheduled job'),
     waitForApproval: (args) => runtime.approvalRegistry.waitForApproval(args),
+    onRunFinished: eventRoutingHooks.onSchedulerRunFinished,
   })
 
-  // Register scheduler agent tools now that jobStore is live.
   for (const tool of createSchedulerTools({
     store: schedulerStack.jobStore,
     triggerSchedulerJob: schedulerStack.triggerSchedulerJob,
@@ -75,7 +69,6 @@ export function startRuntime(runtime: StartupCapabilities): void {
     runtime.toolRegistry.register(tool)
   }
 
-  // Expose on runtime so routes and the pipeline can consume them.
   runtime.jobStore = schedulerStack.jobStore
   runtime.schedulerEngine = schedulerStack.engine
   runtime.parseWhen = schedulerStack.parseWhen
@@ -92,10 +85,6 @@ export function startRuntime(runtime: StartupCapabilities): void {
 
   runtime.graphAgentLoader?.start()
 
-  // Retention sweeper: age out sessions/memory/usage past the configured
-  // window. No-op unless retention days are configured (or the env kill-switch
-  // is set). Session deletion reuses the complete-deletion path so nothing is
-  // orphaned.
   const retention = runtime.config.retention
   if (retention) {
     const intervalMs = Math.max(1, retention.sweepIntervalHours ?? 24) * 60 * 60 * 1000

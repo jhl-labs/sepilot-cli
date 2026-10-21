@@ -6,14 +6,6 @@ import type {
 } from '@sepilotd/core'
 import type { AgentSteeringNote } from './state-board.js'
 
-/**
- * Recover the latest board from a session journal by scanning back-to-front for
- * the most recent `state_board` event. Used on resume: after the run checkpoint
- * rehydrates `graphState`, any board journaled *after* that checkpoint is
- * replayed so evidence/failed-attempts accumulated since the last checkpoint
- * are not lost. Selection is purely structural (event type + order) — no
- * content parsing.
- */
 export function recoverStateBoard(
   events: readonly SessionEvent[],
 ): AgentStateBoardSnapshot | undefined {
@@ -24,7 +16,6 @@ export function recoverStateBoard(
   return undefined
 }
 
-/** Epoch-ms `at` of the most recent `state_board` event, or undefined. */
 export function latestStateBoardAt(events: readonly SessionEvent[]): number | undefined {
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i]
@@ -33,25 +24,11 @@ export function latestStateBoardAt(events: readonly SessionEvent[]): number | un
   return undefined
 }
 
-/**
- * Minimal state slice a recovered board can restore. The board is a *projection*
- * of run state, so the reverse merge is deliberately narrow and non-destructive:
- * only the two fields whose board types are identical to their canonical
- * `AgentState` fields, and only when the rehydrated checkpoint left them empty
- * (i.e. a crash between the board journal append and the checkpoint write lost
- * them). Existing non-empty state is never overwritten — a projection must not
- * clobber the source of truth.
- */
 export interface RecoverableBoardState {
   failedAttempts?: AgentFailedAttempt[]
   openQuestions?: AgentOpenQuestion[]
 }
 
-/**
- * Fill empty `failedAttempts`/`openQuestions` on the rehydrated graph state from
- * a strictly-newer journal board. Returns true if anything was restored. Pure
- * structured field replacement — no heuristics, no content parsing.
- */
 export function applyRecoveredBoard(
   state: RecoverableBoardState,
   board: AgentStateBoardSnapshot | undefined,
@@ -73,16 +50,6 @@ export interface RecoverableSteeringState {
   steeringNotes?: AgentSteeringNote[]
 }
 
-/**
- * Reconcile durable steering journal events with a checkpointed graph state.
- *
- * A steering acknowledgement can be appended after the last graph checkpoint,
- * and a cancellation can likewise happen before the next checkpoint. Replaying
- * the explicit note ids and terminal events closes both crash windows without
- * inferring intent from message text. Cancelled notes and delivered questions
- * are never reintroduced. Delivered instructions remain active without another
- * delivery acknowledgement.
- */
 export function reconcileRecoveredSteeringNotes(
   state: RecoverableSteeringState,
   events: readonly SessionEvent[],

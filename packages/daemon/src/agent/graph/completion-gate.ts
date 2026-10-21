@@ -26,25 +26,8 @@ import {
 import { parseTodoItems } from '../../tools/todo.js'
 import { hasAcceptedProvidedContextReview } from '../provided-context-review.js'
 
-/**
- * Completion gate: before a run with a contract that declares acceptance
- * criteria is allowed to finish, the final answer must be backed by at least
- * one *verified* evidence ledger entry (validation pass or artifact read-back).
- * Structured `CRITERION <id>: MET|UNMET` lines remain supported diagnostics:
- * once a model starts that protocol it must close every criterion, and an
- * explicit UNMET always blocks. A normal user-facing answer is not rejected
- * solely for omitting internal protocol text. Runs without acceptance criteria
- * (lightweight react turns) are never gated. Blocking is bounded so the gate
- * can never loop forever: past the block budget the run passes and reports
- * honestly.
- */
 export const MAX_COMPLETION_GATE_BLOCKS = 2
 
-/**
- * Operator knob for the block budget: `SEPILOTD_COMPLETION_GATE_MAX_BLOCKS`
- * (default MAX_COMPLETION_GATE_BLOCKS, clamped to 1..5). A general option for
- * the shared daemon — never a per-model or per-dataset branch.
- */
 export function resolveMaxCompletionGateBlocks(): number {
   const raw = process.env.SEPILOTD_COMPLETION_GATE_MAX_BLOCKS
   if (!raw) return MAX_COMPLETION_GATE_BLOCKS
@@ -53,8 +36,6 @@ export function resolveMaxCompletionGateBlocks(): number {
   return Math.min(5, Math.max(1, Math.floor(n)))
 }
 
-// Line parser for the gate's own structured output protocol (same family as
-// the existing ANSWER:/INCOMPLETE: stem parsers) — not content matching.
 const CRITERION_LINE = /^CRITERION\s+(\S+):\s*(MET|UNMET)(?:\s+EVIDENCE\s+([A-Za-z0-9][A-Za-z0-9_.:-]{0,127}(?:\s*,\s*[A-Za-z0-9][A-Za-z0-9_.:-]{0,127})*))?\s*$/i
 const HONEST_BLOCKER_STEM = /^\s*(?:UNVERIFIED|INCOMPLETE):/im
 const MAX_CRITERION_EVIDENCE_REFERENCES = 16
@@ -68,11 +49,8 @@ export interface CompletionGateResult {
   decision: 'pass' | 'block'
   unmet: string[]
   reason?: string
-  /** Criterion diagnostics retained for this exact tool-result episode. */
   criterionVerdictSnapshot?: AgentCriterionVerdictSnapshot
-  /** True only when the retry budget is exhausted and the caller must report INCOMPLETE. */
   budgetExhausted?: boolean
-  /** Structural cause of a block, so retry guidance never parses `reason`. */
   cause?: 'criteria' | 'observation_evidence' | 'evidence' | 'todo' | 'ui_audit'
 }
 
@@ -92,9 +70,6 @@ export function evaluateCompletionGate(
   > & Partial<Pick<AgentState, 'messages'>>,
   finalText: string,
 ): CompletionGateResult {
-  // Operator kill switch (`SEPILOTD_COMPLETION_GATE=off`) for lightweight or
-  // experimental runs. The gate is default-on: validation enforcement is a
-  // general capability improvement, not a tuning branch.
   if (process.env.SEPILOTD_COMPLETION_GATE === 'off') {
     return { decision: 'pass', unmet: [] }
   }
@@ -109,13 +84,6 @@ export function evaluateCompletionGate(
   )
   const effectiveVerdicts = criterionVerdictsFromSnapshot(criterionVerdictSnapshot)
   const referenceableExecutionIds = criterionReferenceableExecutionIds(state)
-  // Preserve ordinary bare MET protocol for contracts whose completion is
-  // proven by generic validation, while applying evidence precedence when a
-  // semantic review already established an exact criterion link. An explicit
-  // UNMET remains authoritative. A new MET is authoritative when all of its
-  // references are executor-confirmed. A bare/invalid MET is weaker than an
-  // existing exact MET on the same evidence episode and cannot erase it when
-  // a child graph hands its original candidate to a parent reporter.
   for (const [id, verdict] of currentVerdicts) {
     const retained = effectiveVerdicts.get(id)
     const retainedExactMet = retained?.verdict === 'MET'
@@ -152,10 +120,6 @@ export function evaluateCompletionGate(
   const missingImageBlockerVerdicts = isRenderedUiImageInputBlocker
     ? missingCriterionVerdictIds(criteria, effectiveVerdicts)
     : []
-  // The image-input exception is itself a structured partial-completion path:
-  // keep requiring explicit scope boundaries there so a visual blocker cannot
-  // silently excuse unrelated criteria. Ordinary successful completions remain
-  // free to use natural user-facing prose.
   const raw: CompletionGateResult = missingImageBlockerVerdicts.length > 0
     ? { decision: 'block', unmet: missingImageBlockerVerdicts, cause: 'criteria' }
     : evaluated
@@ -185,8 +149,6 @@ export function evaluateCompletionGate(
     })
   }
   if ((state.completionGateBlocks ?? 0) >= resolveMaxCompletionGateBlocks()) {
-    // Block budget exhausted: pass honestly instead of looping forever, but
-    // keep the unresolved verdict visible so the caller can report it.
     if (raw.decision === 'block') {
       if (canAcceptStructurallyVerifiedArtifactDraft(state, finalText, raw)) {
         return withCriterionSnapshot({
@@ -272,9 +234,6 @@ export function buildCompletionGateBudgetExhaustedOutput(
   return [
     `INCOMPLETE: ${sentence}`,
     draft
-      // Real tool work happened and the model produced a substantive draft;
-      // discarding it into a bare "no final answer" wastes the run. Surface
-      // it honestly marked as unverified instead of pretending it is done.
       ? 'The draft below did not pass completion verification — treat it as unverified.'
       : 'The previous completion draft was rejected by the completion gate and is not being reported as a finished result.',
     `Next required action: ${completionGateRecoveryHint(result, { includeProtocolStems: false })}`,
@@ -319,12 +278,6 @@ function verifiedEvidenceEntries(
   ].filter((entry) => entry.verified)
 }
 
-/**
- * Whether the contract promised something to be produced. Such a run still owes
- * verification of what it produced, so observation evidence must not stand in
- * for it. Contracts often carry no executionIntent at all, so this asks what
- * was promised rather than reading a mutation flag that is frequently absent.
- */
 function contractOwesArtifactWork(
   contract: AgentState['seedContract'] | undefined,
 ): boolean {
@@ -334,11 +287,6 @@ function contractOwesArtifactWork(
     || contract.executionIntent?.workspaceMutation === 'required'
 }
 
-/**
- * Successful read-only observation evidence. A run that produces nothing has
- * no validation run and no artifact read-back to offer, so this is the only
- * evidence it can carry.
- */
 function hasSuccessfulObservationEvidence(
   stateLedger: Pick<
     NonNullable<AgentState['evidenceLedger']>,
@@ -351,7 +299,7 @@ function hasSuccessfulObservationEvidence(
   ].some((entry) => entry.status === 'success')
 }
 
-function hasFreshVerifiedEvidence(
+export function hasFreshVerifiedEvidence(
   stateLedger: Pick<
     NonNullable<AgentState['evidenceLedger']>,
     'validationRuns' | 'artifactReadBacks' | 'artifactWrites'
@@ -414,7 +362,7 @@ const BROWSER_INTERACTION_SMOKE_TOOLS = new Set(['browser.click', 'browser.evalu
 
 type RenderedUiAuditViewport = 'desktop' | 'mobile'
 
-function latestSuccessfulArtifactWriteOrder(
+export function latestSuccessfulArtifactWriteOrder(
   ledger: Pick<NonNullable<AgentState['evidenceLedger']>, 'artifactWrites'> | undefined,
 ): EvidenceOrderMarker | null {
   let latest: AgentEvidenceLedgerEntry | null = null
@@ -1731,8 +1679,6 @@ function buildCriterionVerdictSnapshot(
     const id = canonicalIds.get(candidateId)
     if (!id) continue
     if (current.verdict === 'UNMET') {
-      // An explicit current UNMET is a material state transition and must
-      // invalidate a previously verified MET on the same evidence snapshot.
       latest.set(id, { id, verdict: 'unmet' })
       continue
     }
@@ -1865,10 +1811,6 @@ function evaluateWithoutBudget(
     return renderedUiAuditBlock
   }
 
-  // todoList signal integrated by P022-T3 (D6): a todo list the agent itself
-  // declared and left incomplete is a structural not-done signal — same
-  // bounded semantics as the criteria check (the block budget upstream in
-  // evaluateCompletionGate applies, so this can never loop forever).
   const openTodos = incompleteTodos(state.todoList)
   if (openTodos.length > 0) {
     const preview = openTodos
@@ -1890,12 +1832,6 @@ function evaluateWithoutBudget(
     if (unmet.length > 0) return { decision: 'block', unmet, cause: 'criteria' }
   }
 
-  // Closed operational work can be verified criterion-by-criterion without
-  // pretending that a source read, process probe, or external action receipt
-  // is a validation run. Every MET line must cite exact successful current-run
-  // executor evidence. External receipts are admitted only for the daemon's
-  // closed fallback exactly-once contract and establish tool-boundary success,
-  // not downstream provider finality.
   const executorEvidenceGaps = criterionScopedExecutorEvidenceGaps(
     state,
     criteria,
@@ -1927,23 +1863,12 @@ function evaluateWithoutBudget(
     }
   }
 
-  // Self-confirmation guard: prose or structured claims are not enough — the
-  // ledger must hold a verified entry after the latest successful write
-  // (structural check, no criterion-to-evidence text matching).
   const ledger = state.evidenceLedger
   if (hasAcceptedProvidedContextReview(state, finalText)) {
     return { decision: 'pass', unmet: [], reason: 'Independent review verified this exact answer against user-provided premises; no external effect or observation is owed' }
   }
   if (!hasFreshVerifiedEvidence(ledger)) {
     const latestWrite = latestSuccessfulArtifactWriteOrder(ledger)
-    // This guard asks "did you verify what you changed". A contract that
-    // forbids workspace mutation changes nothing, so it can never produce a
-    // validation run or an artifact read-back — the only evidence kinds the
-    // guard counts. Requiring them made the gate unsatisfiable by construction
-    // for read-only research: it blocked until the block budget ran out, and
-    // the collected findings were discarded with it. Observation evidence is
-    // what such a run has, and is what this gate already accepts
-    // criterion-by-criterion above.
     if (
       !latestWrite
       && !contractOwesArtifactWork(state.seedContract)
@@ -1967,10 +1892,6 @@ function evaluateWithoutBudget(
   return { decision: 'pass', unmet: [] }
 }
 
-/**
- * Structured retry instruction pushed into the conversation when the gate
- * blocks a completion attempt.
- */
 export function buildCompletionGateBlockMessage(
   result: CompletionGateResult,
   attempt: number,

@@ -20,9 +20,7 @@ export interface LeaderInput {
 }
 
 export interface LeaderOptions {
-  /** A `ctrl+<letter>` chord such as `ctrl+x`. */
   leaderKey: string
-  /** Follow-up key to command id. */
   bindings: Map<string, string>
 }
 

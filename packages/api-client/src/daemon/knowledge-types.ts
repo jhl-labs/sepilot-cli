@@ -1,4 +1,3 @@
-/** Personal knowledge is owned by the daemon profile, independent of Memory TTL. */
 export type PersonalKnowledgeKind =
   | 'fact'
   | 'concept'

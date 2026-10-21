@@ -45,11 +45,6 @@ function notificationPriority(value: unknown): 'low' | 'normal' | 'high' | 'crit
   throw new Error('priority must be low, normal, high, or critical.')
 }
 
-/**
- * Publish an explicit agent notification through the same persisted,
- * audience-gated notification path used by scheduler events. The tool never
- * receives relay credentials or destination ids; those remain runtime-only.
- */
 export function createNotificationPublishTool(): ToolDefinitionRuntime {
   return {
     name: 'notification.publish',

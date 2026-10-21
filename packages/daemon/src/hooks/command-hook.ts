@@ -19,24 +19,11 @@ export interface CommandHookConfig {
   async?: boolean
   enabled?: boolean
   event: HookEvent
-  /** Regex matched against the tool name for tool-scoped events. */
   toolMatcher?: string
-  /** Shell command. Receives the hook payload as JSON on stdin. */
   command: string
   timeoutMs?: number
 }
 
-/**
- * User-configured shell command run as a hook handler (Claude Code
- * settings-hook parity). Contract:
- *  - the payload is written to stdin as one newline-terminated JSON record
- *    (`{event, data}\n`) so append-only consumers produce valid JSONL,
- *  - exit 2 aborts the gated operation; stderr becomes the reason,
- *  - exit 0 with a JSON object on stdout may return
- *    `{action, reason}` or `{toolArguments}` (pre:tool:execute only),
- *  - timeouts, spawn errors, and other exit codes count as `continue`
- *    so a broken hook never takes down tool execution.
- */
 export class CommandHookHandler implements IHookHandler {
   readonly id: string
   readonly priority = 50
@@ -80,7 +67,6 @@ export class CommandHookHandler implements IHookHandler {
           maxOutputBytes: MAX_CAPTURED_OUTPUT_BYTES,
         })
         if (result.exitCode !== 0) throw new Error(`Background hook exited ${result.exitCode ?? 'by signal'}: ${result.stderr.slice(0, 2000)}`)
-        // Observational output, never interpreted as a retroactive allow/abort decision.
         return result
       })
       return { action: 'continue' }
@@ -160,7 +146,6 @@ export class CommandHookHandler implements IHookHandler {
         timeoutMs,
         maxOutputBytes: MAX_CAPTURED_OUTPUT_BYTES,
       })
-      // Signal termination is not exit 0: never interpret partial hook output.
       return result.exitCode === null ? null : { ...result, exitCode: result.exitCode }
     } catch (error) {
       logger.warn('command hook interrupted; continuing', {
@@ -172,7 +157,6 @@ export class CommandHookHandler implements IHookHandler {
   }
 }
 
-/** Register command hooks from config. */
 export function registerCommandHooks(
   hookRegistry: HookRegistry,
   hooks: readonly CommandHookConfig[],
@@ -184,7 +168,6 @@ export function registerCommandHooks(
   }
 }
 
-/** Replace all command hooks (config rebind path). */
 export function replaceCommandHooks(
   hookRegistry: HookRegistry,
   hooks: readonly CommandHookConfig[],

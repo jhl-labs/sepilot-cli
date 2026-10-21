@@ -3,7 +3,7 @@ import { readdir } from 'node:fs/promises'
 import { throwIfAborted } from '../abort.js'
 import { describeMissingPath } from './missing-path-hint.js'
 import { resolveToolCwd } from './path-utils.js'
-import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
+import { rejectUnsupportedToolInputFields, type ToolDefinitionRuntime, type ToolResult } from './registry.js'
 
 const DEFAULT_LIMIT = 200
 const MAX_LIMIT = 1_000
@@ -54,17 +54,13 @@ function describeListError(error: unknown, directory: string): { message: string
   }
 }
 
-/**
- * Lists one directory level without invoking an OS shell. Keeping directory
- * inventory separate from fs.read/fs.glob gives models one portable operation
- * for `ls`, `dir`, and `Get-ChildItem` style requests.
- */
 export function createFsListTool(): ToolDefinitionRuntime {
-  return {
+  const tool: ToolDefinitionRuntime = {
     name: 'fs.list',
     description:
       'List the immediate files and subdirectories in a directory without using an OS shell. Use this for requests such as "list files in the current folder". Omit cwd to list the active session cwd. Directory names end in "/" and symbolic links end in "@". Hidden entries are omitted by default but the result reports how many were omitted. Use fs.glob instead for recursive or pattern-based discovery.',
     resumeSafety: 'replay-safe',
+    validateInput: (input) => rejectUnsupportedToolInputFields(tool, input),
     scheduling: {
       mode: 'parallel-safe',
       resource: 'filesystem',
@@ -72,6 +68,8 @@ export function createFsListTool(): ToolDefinitionRuntime {
     },
     observationCoverage: {
       covers: (observedInput, requestedInput, context) => {
+        if (rejectUnsupportedToolInputFields(tool, observedInput)
+          || rejectUnsupportedToolInputFields(tool, requestedInput)) return false
         const observedDirectory = resolveToolCwd(observedInput.cwd, context.cwd)
         const requestedDirectory = resolveToolCwd(requestedInput.cwd, context.cwd)
         if (observedDirectory !== requestedDirectory) return false
@@ -85,6 +83,7 @@ export function createFsListTool(): ToolDefinitionRuntime {
     },
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         cwd: {
           type: 'string',
@@ -109,6 +108,8 @@ export function createFsListTool(): ToolDefinitionRuntime {
       },
     },
     async execute(input, context): Promise<ToolResult> {
+      const unsupported = rejectUnsupportedToolInputFields(tool, input)
+      if (unsupported) return unsupported
       const startedAt = Date.now()
       const directory = resolveToolCwd(input.cwd, context?.cwd)
       const limit = normalizeLimit(input.limit)
@@ -180,4 +181,5 @@ export function createFsListTool(): ToolDefinitionRuntime {
       }
     },
   }
+  return tool
 }

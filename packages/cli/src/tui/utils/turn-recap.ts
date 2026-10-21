@@ -1,6 +1,5 @@
 import type { ToolCallState } from '../types.js'
 
-/** Snapshot taken when a run starts, so the recap covers only this turn. */
 export interface TurnRecapSnapshot {
   startedAt: number
   toolCallCount: number
@@ -54,11 +53,6 @@ function formatTokens(count: number): string {
   return count >= 10_000 ? `${(count / 1000).toFixed(1)}k` : String(count)
 }
 
-/**
- * Builds a compact end-of-turn recap. Duration is always reported so users
- * get a clear terminal marker even when a provider omits usage and finalized
- * tool-call metadata.
- */
 export function buildTurnRecap(
   snapshot: TurnRecapSnapshot,
   toolCalls: ToolCallState[],
@@ -66,9 +60,6 @@ export function buildTurnRecap(
   endedAt: number,
 ): string {
   const turnCalls = toolCalls.slice(snapshot.toolCallCount)
-  // Daemon `done.usage` is scoped to one run, and chatReducer replaces usage
-  // with that latest assistant value. Subtracting the prior turn therefore
-  // makes a smaller second turn appear as zero tokens.
   const inputTokens = Math.max(0, usage?.input ?? 0)
   const outputTokens = Math.max(0, usage?.output ?? 0)
   const turnCost = Math.max(0, usage?.cost ?? 0)

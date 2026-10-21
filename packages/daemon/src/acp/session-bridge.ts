@@ -67,11 +67,6 @@ function mapDaemonStreamPayload(payload: DaemonChatStreamPayload): AcpSessionUpd
   }
 }
 
-/**
- * Bridge between ACP handlers and a running daemon. Prefer the daemon chat SSE
- * endpoint so ACP clients receive standard `session/update` notifications
- * while the turn is still running.
- */
 export function createAcpSessionBridge(deps: AcpSessionBridgeDeps): AcpBridge {
   const controllers = new Map<string, AbortController>()
   const listeners = new Map<string, Set<AcpUpdateListener>>()

@@ -10,7 +10,6 @@ import type {
 export interface A2AHttpPushDeliveryOptions {
   fetcher?: typeof fetch
   timeoutMs?: number
-  /** Maximum redirect hops to follow before refusing. Each hop is re-validated. */
   maxRedirects?: number
 }
 
@@ -29,12 +28,6 @@ export class A2AHttpPushDelivery implements A2APushDelivery {
   }
 
   async deliver(config: A2ATaskPushNotificationConfig, event: A2AStreamResponse): Promise<void> {
-    // The registration step only blocks literal private IPs, so a hostname
-    // whose A record resolves to 169.254.169.254 / 127.0.0.1 / a private LAN
-    // host slips through at registration and reaches `fetch` here untouched.
-    // Re-validate the URL (with async DNS) at delivery time and walk redirects
-    // manually so any 302 to a private target is also refused. Same shape as
-    // tools/web-fetch.ts.
     const initialUrl = config.pushNotificationConfig.url
     const deliveryOrigin = new URL(initialUrl).origin
     const controller = new AbortController()

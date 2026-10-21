@@ -19,12 +19,6 @@ export interface ChannelLayer {
   channels: ReturnType<typeof buildChannels>
 }
 
-/**
- * Build the channel adapter list. Needs the factory registry
- * (already populated with plugin-contributed factories by the
- * time this runs), the gateway client, and the ACL so newly
- * paired users persist to config.
- */
 export function assembleChannelLayer(args: {
   config: SepilotdConfig
   getConfig?: () => SepilotdConfig

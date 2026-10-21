@@ -18,54 +18,44 @@ function isPrivateIpv4(ip: string): boolean {
   if (parts.length !== 4) return true
   if (parts.some((p) => Number.isNaN(p) || p < 0 || p > 255)) return true
   const [a, b, c] = parts as [number, number, number, number]
-  if (a === 0) return true // 0.0.0.0/8
-  if (a === 10) return true // 10.0.0.0/8
-  if (a === 127) return true // loopback
-  if (a === 169 && b === 254) return true // link-local + cloud metadata
-  if (a === 172 && b >= 16 && b <= 31) return true // 172.16/12
-  if (a === 192 && b === 168) return true // 192.168/16
-  if (a === 100 && b >= 64 && b <= 127) return true // 100.64/10 CGNAT
-  if (a === 192 && b === 0 && c === 0) return true // 192.0.0/24 IETF
-  if (a === 192 && b === 0 && c === 2) return true // 192.0.2/24 documentation
-  if (a === 192 && b === 88 && c === 99) return true // deprecated 6to4 relay anycast
-  if (a === 198 && (b === 18 || b === 19)) return true // 198.18/15 benchmark
-  if (a === 198 && b === 51 && c === 100) return true // 198.51.100/24 documentation
-  if (a === 203 && b === 0 && c === 113) return true // 203.0.113/24 documentation
-  if (a >= 224) return true // multicast/reserved
+  if (a === 0) return true
+  if (a === 10) return true
+  if (a === 127) return true
+  if (a === 169 && b === 254) return true
+  if (a === 172 && b >= 16 && b <= 31) return true
+  if (a === 192 && b === 168) return true
+  if (a === 100 && b >= 64 && b <= 127) return true
+  if (a === 192 && b === 0 && c === 0) return true
+  if (a === 192 && b === 0 && c === 2) return true
+  if (a === 192 && b === 88 && c === 99) return true
+  if (a === 198 && (b === 18 || b === 19)) return true
+  if (a === 198 && b === 51 && c === 100) return true
+  if (a === 203 && b === 0 && c === 113) return true
+  if (a >= 224) return true
   return false
 }
 
 function isPrivateIpv6(ip: string): boolean {
   const lower = ip.toLowerCase()
   if (lower === '::1' || lower === '::') return true
-  if (/^f[cd]/.test(lower)) return true // fc00::/7 ULA
-  if (/^fe[89ab]/.test(lower)) return true // fe80::/10 link-local
-  if (/^fe[c-f]/.test(lower)) return true // fec0::/10 deprecated site-local
-  if (lower === '2001:db8' || lower.startsWith('2001:db8:')) return true // documentation
-  if (lower === '2002' || lower.startsWith('2002:')) return true // deprecated 6to4 transition range
-  if (lower === '64:ff9b:1::' || lower.startsWith('64:ff9b:1:')) return true // local-use NAT64
-  if (lower.startsWith('ff')) return true // multicast
+  if (/^f[cd]/.test(lower)) return true
+  if (/^fe[89ab]/.test(lower)) return true
+  if (/^fe[c-f]/.test(lower)) return true
+  if (lower === '2001:db8' || lower.startsWith('2001:db8:')) return true
+  if (lower === '2002' || lower.startsWith('2002:')) return true
+  if (lower === '64:ff9b:1::' || lower.startsWith('64:ff9b:1:')) return true
+  if (lower.startsWith('ff')) return true
   const dottedMapped = lower.match(/^::ffff:([\d.]+)$/)
   if (dottedMapped?.[1]) return isPrivateIpv4(dottedMapped[1])
-  // WHATWG URL parsing canonicalizes IPv4-mapped literals to hexadecimal
-  // (for example ::ffff:127.0.0.1 becomes ::ffff:7f00:1). Treat the final
-  // 32 bits as IPv4 so loopback/link-local addresses cannot bypass the guard.
   const hexMapped = lower.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/)
   if (hexMapped?.[1] && hexMapped[2]) {
     return isPrivateEmbeddedIpv4(hexMapped[1], hexMapped[2])
   }
-  // RFC 6052 well-known NAT64 prefix. A translator can otherwise turn the
-  // literal into a connection to loopback, metadata, or another private IPv4.
   const wellKnownNat64 = lower.match(/^64:ff9b::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/u)
   if (wellKnownNat64?.[1] && wellKnownNat64[2]) {
     return isPrivateEmbeddedIpv4(wellKnownNat64[1], wellKnownNat64[2])
   }
-  // IPv4-translatable addresses are reserved for translation within a host
-  // or network and must not be accepted as public outbound destinations.
   if (/^::ffff:0:[0-9a-f]{1,4}:[0-9a-f]{1,4}$/u.test(lower)) return true
-  // Deprecated IPv4-compatible IPv6 addresses (::/96) are not globally
-  // routable IPv6 destinations. Reject the whole range instead of allowing
-  // alternate spellings of loopback or link-local IPv4 targets.
   if (/^::[0-9a-f]{1,4}:[0-9a-f]{1,4}$/u.test(lower)) return true
   return false
 }
@@ -83,13 +73,6 @@ export function isPrivateAddress(value: string): boolean {
   return false
 }
 
-/**
- * Block obvious SSRF targets when accepting a caller-controlled URL.
- * Resolves the hostname and rejects when any returned address is private,
- * loopback, link-local, CGNAT, or multicast. Returns the validated address
- * so callers can pin the subsequent connection to the same DNS result.
- * For redirect chains the caller must call `assertPublicUrl` on each hop.
- */
 export async function assertPublicUrl(
   rawUrl: string,
   signal?: AbortSignal,
@@ -126,13 +109,13 @@ export async function assertPublicUrl(
     resolved = await raceWithAbort(dns.lookup(host, { all: true }), signal)
   } catch (error) {
     if (signal?.aborted) throw error
-    throw new Error('dns lookup failed')
+    throw createRetryableDnsError(error)
   }
   let selected: PublicUrlResolution | null = null
   for (const entry of resolved) {
     const family = isIP(entry.address)
     if (!family) {
-      throw new Error('dns lookup failed')
+      throw createRetryableDnsError(new Error(`unresolvable dns entry: ${entry.address}`))
     }
     if (isPrivateAddress(entry.address)) {
       throw new Error('refusing private/loopback host')
@@ -144,16 +127,17 @@ export async function assertPublicUrl(
       family: family === 4 ? 4 : 6,
     }
   }
-  if (!selected) throw new Error('dns lookup failed')
+  if (!selected) throw createRetryableDnsError(new Error('dns lookup returned no addresses'))
   return selected
 }
 
-/**
- * Pin an outbound connection to the address already approved by
- * `assertPublicUrl`. This closes the validation/connect DNS-rebinding window.
- * Callers own the returned dispatcher and must close it after consuming the
- * response body.
- */
+function createRetryableDnsError(cause: unknown): Error & { retryable: true } {
+  const code = cause instanceof Error && 'code' in cause ? (cause as NodeJS.ErrnoException).code : undefined
+  const error = new Error(`dns lookup failed${code ? `: ${code}` : ''}`)
+  if (cause instanceof Error) error.cause = cause
+  return Object.assign(error, { retryable: true as const })
+}
+
 export function createPinnedLookupDispatcher(resolution: PublicUrlResolution): Agent {
   const expectedHost = normalizeLookupHost(resolution.hostname)
   const lookup: LookupFunction = (hostname, options, callback) => {
@@ -178,12 +162,6 @@ export function createPinnedLookupDispatcher(resolution: PublicUrlResolution): A
   return dispatcher
 }
 
-/**
- * Build a direct dispatcher for a localhost origin that was independently
- * authorized by a managed-process session. The daemon's global dispatcher may
- * be a provider proxy, so inheriting it would make localhost unreachable and
- * could disclose a local URL to that proxy.
- */
 export function createManagedLoopbackDispatcher(rawUrl: string): Agent {
   const url = new URL(rawUrl)
   const hostname = normalizeLookupHost(url.hostname)
@@ -339,9 +317,6 @@ async function fetchPinnedWithSocket(
     })
     socket.once('error', finishError)
     socket.once('end', () => {
-      // Bun's node:net compatibility layer can leave the writable half open
-      // after the peer ends. Close it explicitly so the Unix proxy releases
-      // the corresponding upstream connection before the next request.
       socket.destroy()
       init?.signal?.removeEventListener('abort', onAbort)
       if (settled) return
@@ -363,16 +338,6 @@ async function fetchPinnedWithSocket(
   })
 }
 
-/**
- * Execute a request whose destination has already been validated and pinned by
- * the caller. Bun's npm-undici compatibility layer drops a later connection
- * made through a custom lookup dispatcher, so managed localhost requests use
- * a one-shot raw socket request with the validated literal address and no
- * pool. The same fallback is required for public pinned destinations in Bun:
- * its npm-undici compatibility layer can leave a request through a custom
- * lookup dispatcher pending forever. Node keeps using the supplied Undici
- * dispatcher normally.
- */
 export const fetchWithPinnedNetworkPolicy: typeof fetch = async (input, init) => {
   const rawUrl = typeof input === 'string'
     ? input
@@ -414,12 +379,6 @@ function normalizeLookupHost(hostname: string): string {
   return hostname.replace(/^\[(.*)\]$/, '$1').toLowerCase()
 }
 
-/**
- * Synchronous variant: rejects only when the hostname is a literal private
- * IP. Hostnames pass through unchecked. Use where async DNS lookup is not
- * possible (e.g. sync schema validators). Defends against the cheap path
- * (`http://127.0.0.1/...`, `http://169.254.169.254/...`) without DNS work.
- */
 export function rejectPrivateLiteralUrl(parsed: URL): void {
   const host = parsed.hostname.replace(/^\[(.*)\]$/, '$1')
   if (!host) throw new Error('missing host')

@@ -1,27 +1,12 @@
 type LiveTextDeltaState = 'pending' | 'answer' | 'blocked'
 
 export interface LiveTextDeltaEmitterOptions {
-  /**
-   * Prompt-ReAct providers often wrap final text in <final>...</final>.
-   * When enabled, stream only the body of that final/answer tag and suppress
-   * the closing tag if it arrives split across chunks.
-   */
   allowTaggedFinal?: boolean
-  /**
-   * Some providers ignore the final-answer stem despite the system prompt.
-   * When enabled, stream plain assistant text after it is no longer a possible
-   * ANSWER:/INCOMPLETE: prefix instead of buffering the whole response.
-   */
   allowUnmarkedFinal?: boolean
-  /**
-   * Optional guard for unmarked text. Prompt-ReAct can emit transport tags
-   * such as <tool_call> or <think>; callers can reject those starts so live
-   * streaming never exposes protocol/private text.
-   */
   isAllowedUnmarkedFinalStart?: (text: string) => boolean
 }
 
-const LIVE_ANSWER_PROTOCOL_STEM_PATTERN = /^\s*(ANSWER|INCOMPLETE):/i
+const LIVE_ANSWER_PROTOCOL_STEM_PATTERN = /^\s*(`|\*\*|__)?(ANSWER|INCOMPLETE)(?::\1|\1:)/i
 const TAGGED_FINAL_OPEN_PATTERN = /^\s*<(final|answer)>\s*/i
 
 function matchLiveAnswerProtocolStem(text: string): {
@@ -29,12 +14,12 @@ function matchLiveAnswerProtocolStem(text: string): {
   end: number
 } | null {
   const match = LIVE_ANSWER_PROTOCOL_STEM_PATTERN.exec(text)
-  if (!match?.[1]) {
+  if (!match?.[2]) {
     return null
   }
 
   return {
-    stem: match[1].toUpperCase() === 'ANSWER' ? 'answer' : 'incomplete',
+    stem: match[2].toUpperCase() === 'ANSWER' ? 'answer' : 'incomplete',
     end: match[0].length,
   }
 }
@@ -45,7 +30,8 @@ function couldBecomeAnswerProtocolStem(text: string): boolean {
     return true
   }
 
-  return 'ANSWER:'.startsWith(head) || 'INCOMPLETE:'.startsWith(head)
+  return ['', '`', '**', '__'].some((wrap) => [`${wrap}ANSWER:${wrap}`, `${wrap}ANSWER${wrap}:`, `${wrap}INCOMPLETE:${wrap}`, `${wrap}INCOMPLETE${wrap}:`]
+    .some((stem) => stem.startsWith(head)))
 }
 
 function couldBecomeTaggedFinalOpen(text: string): boolean {

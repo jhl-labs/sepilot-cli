@@ -81,11 +81,6 @@ import type { A2ATaskStore } from '../../a2a/server.js'
 export interface RuntimeServices {
   dataDir: string
   config: SepilotdConfig
-  /**
-   * True when startup used SEPILOTD_CONFIG_DEGRADED_OK after a parse or
-   * validation failure. Mutating config in this state can overwrite the
-   * damaged-but-recoverable file with a blank/default document.
-   */
   configLoadFailed?: boolean
   configLoadError?: string
   storageDegraded?: Array<{ store: string; error: string }>
@@ -129,6 +124,9 @@ export interface RuntimeServices {
   channelRouter: ChannelRouter
   delegationWorker: DelegationWorker
   notificationRelayWorker: import('../../notifications/publish.js').NotificationRelayDeliveryWorker
+  eventRouting?: import('../../event-routing/service.js').EventRoutingService
+  eventRoutingLlmRunner?: import('../../event-routing/llm-runner.js').LlmTurnRunner
+  eventRoutingProducers?: import('../../event-routing/producers/completion.js').CompletionProducers
   jobStore: JobStore
   schedulerEngine: SchedulerEngine
   parseWhen: typeof parseWhen
@@ -149,6 +147,7 @@ export interface RuntimeServices {
   graphAgentLoader?: YamlGraphAgentLoader
   userAgentLoader?: import('../../agent/user-agents/loader.js').UserAgentLoader
   userCommandStore?: import('../../agent/user-commands/loader.js').UserCommandStore
+  roleBots?: import('../../agent/bots/registry.js').RoleBotRegistry
   dreaming: DreamingEngine
   skillStore: SkillStore
   channelPipelineMonitor: ChannelPipelineMonitor
@@ -160,7 +159,6 @@ export interface RuntimeServices {
   approvalDecisions: ApprovalDecisionStore
   runLimiter: RunLimiter
   activeRuns: ActiveRunRegistry
-  /** At-most-one-active-turn-per-session lock shared by WS + HTTP/SSE paths. */
   sessionBusy: SessionBusyRegistry
   approvalCheckpoints: ApprovalCheckpointStore
   runCheckpoints: RunCheckpointStore
@@ -174,29 +172,18 @@ export interface RuntimeServices {
   configMutationService: ConfigMutationService
   subagentDispatcher: SubagentDispatcher
   backgroundSubagents?: BackgroundSubagents
-  /** Null when the `acp` feature is disabled in this build. */
   externalAcpAgentDispatcher: ExternalAcpAgentDispatcher | null
-  /** Null when the `a2a` feature is disabled in this build. */
+  externalCliDispatcher: import('../../external-cli/dispatcher.js').ExternalCliDispatcher | null
   a2aTaskStore: A2ATaskStore | null
   swarmRunRegistry: import('../../agent/swarm/index.js').SwarmRunRegistry
   swarmRunStore: import('../../agent/swarm/index.js').SwarmRunStore
   swarmTmuxPool: import('../../agent/swarm/index.js').TmuxSessionPool
   swarmLauncher: import('../../agent/swarm/index.js').AgentLauncher
   swarmAgentRuntime: import('../../agent/swarm/index.js').SwarmAgentRuntimeAdapter
-  /**
-   * Start a swarm run. Task 18 wires a stub that just calls run.start();
-   * Task 20 replaces it with the real engine kickoff (warm pool launch +
-   * supervisor agent loop).
-   */
   startSwarmRun: (
     run: import('../../agent/swarm/run/swarm-run.js').SwarmRun,
     opts: { warmPool: readonly string[]; autoApproveAgents: boolean; noSupervisor?: boolean },
   ) => Promise<void>
-  /**
-   * Forward keystrokes / resize to the tmux session backing one agent
-   * handle. Task 18 stubs this with `throw 'not implemented'`; Task 20
-   * wires it through SwarmTmuxPool.
-   */
   forwardSwarmKeys: (
     runId: string,
     handle: string,
@@ -208,19 +195,12 @@ export interface RuntimeServices {
       principal?: string
     },
   ) => Promise<void>
-  /** Capture the current cleaned tmux pane contents for a swarm agent. */
   captureSwarmAgent: (
     runId: string,
     handle: string,
     options?: { lines?: number; raw?: boolean },
   ) => Promise<string>
-  /**
-   * Stop all warm-pool tmux sessions for a swarm run, immediately. The
-   * DELETE route uses this so cancel terminates child agents promptly
-   * instead of waiting for the supervisor's next idle step.
-   */
   killSwarmRunAgents: (runId: string) => Promise<void>
-  /** Drive a swarm agent through send/wait/observe turns without a separate supervisor LLM. */
   driveSwarmAgent: (
     runId: string,
     input: import('../../agent/swarm/index.js').SwarmDriveInput,

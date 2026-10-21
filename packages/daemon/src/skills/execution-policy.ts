@@ -36,15 +36,6 @@ const canonicalBuiltinFingerprints = new Map(
   ] as const),
 )
 
-/**
- * Match a resolved skill against the artifact shipped in this runtime bundle.
- *
- * An ID, author string, or `builtin` tag is not an origin proof: each can be
- * copied by a workspace SKILL.md. Auto-discovered definitions are therefore
- * always rejected, and managed definitions must match the canonical metadata
- * and prompt body. `enabled` is intentionally excluded because it is a local
- * user preference preserved when built-ins are re-seeded.
- */
 export function isCanonicalBuiltinSkill(
   skill: ResolvedSkillDefinition,
   expectedSkillId: string = skill.metadata.id,
@@ -65,7 +56,6 @@ export function isCanonicalBuiltinSkill(
   )
 }
 
-/** Record every canonical built-in selected for the current turn. */
 export function addCanonicalBuiltinSelectedSkillId(
   target: Set<string> | undefined,
   skill: ResolvedSkillDefinition,
@@ -75,7 +65,6 @@ export function addCanonicalBuiltinSelectedSkillId(
   }
 }
 
-/** Record only canonical built-ins that carry trusted runtime execution rules. */
 export function addCanonicalBuiltinExecutionSkillId(
   target: Set<string> | undefined,
   skill: ResolvedSkillDefinition,
@@ -89,12 +78,6 @@ export function addCanonicalBuiltinExecutionSkillId(
   }
 }
 
-/**
- * Resolve only canonical policies shipped in this trusted runtime bundle.
- * Disk and marketplace skill metadata is intentionally not consulted: an
- * untrusted SKILL.md may narrow its own prompt/tool allowlist, but it cannot
- * inject control-flow rules into the generic agent engine.
- */
 export function resolveActiveSkillExecutionPolicies(
   executionSkillIds: readonly string[] | undefined,
 ): ActiveSkillExecutionPolicy[] {
@@ -131,13 +114,6 @@ export function resolveActiveSkillToolNames(
   ))]
 }
 
-/**
- * Resolve a specialist hint only when every canonical selected skill has one
- * routing tag and all of those tags agree. A skill with no specialist route is
- * part of a mixed workflow, not evidence that it can be silently ignored.
- * The hint comes from canonical built-in metadata, never from an untrusted
- * workspace or marketplace skill.
- */
 export function resolveActiveSkillSpecialistRoute(
   selectedSkillIds: readonly string[] | undefined,
 ): TrustedSkillSpecialistRoute | undefined {
@@ -173,12 +149,6 @@ export function resolveSkillExecutionContext(
   const executionSkillIds = selectedSkillIds.filter((skillId) =>
     trustedBuiltinExecutionProfiles.has(skillId)
   )
-  // Tool declarations and trusted execution policies have different trust
-  // boundaries. A loaded skill may select only tools that already survived
-  // request-boundary registry filtering, even when it is not a canonical
-  // built-in allowed to install control-flow rules. Preserve those declared
-  // tools into graph node profiles so a specialist route cannot erase the
-  // capability the selected skill was loaded to provide.
   const skillToolNames = [...new Set([
     ...selectedSkillIds.flatMap((skillId) =>
       canonicalBuiltinSkills.get(skillId)?.metadata.tools ?? []

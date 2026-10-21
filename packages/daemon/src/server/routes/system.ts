@@ -209,13 +209,6 @@ async function mapWithBoundedConcurrency<T, R>(
   return results
 }
 
-/**
- * Project recent JPAD publication receipts from durable session journals.
- * Only a successful result from the matching built-in mutation tool is
- * accepted; arbitrary plugin metadata and model-authored output cannot forge
- * a publication. Content, workspace ids, URLs, ETags, and credentials are not
- * returned by this operator surface.
- */
 export async function buildAssistantJpadPublicationEvidence(input: {
   sessions: Pick<ISessionStore, 'list' | 'getEvents'> | null | undefined
   limit?: number
@@ -233,10 +226,6 @@ export async function buildAssistantJpadPublicationEvidence(input: {
 
   let sessionItems: SessionMeta[]
   try {
-    // This operator surface promises recent evidence, not an unbounded
-    // historical text search. A query against an encrypted store must decrypt
-    // every journal before filtering and then this function would read the
-    // matching journals again. Bound the authoritative window first instead.
     sessionItems = (await input.sessions.list({
       page: 1,
       perPage: sessionScanLimit,
@@ -245,10 +234,6 @@ export async function buildAssistantJpadPublicationEvidence(input: {
     return { status: 'unavailable', items: [] }
   }
 
-  // Session journals are independent durable evidence sources. Read a small,
-  // bounded number concurrently while preserving list order in the result
-  // array; a large or unavailable journal must not serialize every other
-  // readiness item behind it or erase successful sibling evidence.
   const sessionEvidence = await mapWithBoundedConcurrency(
     sessionItems,
     ASSISTANT_JPAD_SESSION_READ_CONCURRENCY,
@@ -310,13 +295,6 @@ export async function buildAssistantJpadPublicationEvidence(input: {
   }
 }
 
-/**
- * Join persisted scheduler execution, notification, relay-acceptance, and
- * channel-delivery evidence by the run id generated at execution start.
- * Deliberately return no output text, notification body/title, target, or
- * channel id: this authenticated readiness surface needs correlation state,
- * not user content or destination metadata.
- */
 export function buildAssistantSchedulerRunCorrelations(input: {
   jobStore: Pick<JobStore, 'list' | 'listRecentRuns'> | null | undefined
   notifications: NotificationItem[]
@@ -382,10 +360,7 @@ export function buildAssistantSchedulerRunCorrelations(input: {
 }
 
 interface ScopeFile {
-  /** Stable per-install user scope id. Generated on first read, then
-   *  reused forever. Hex characters only. */
   userId: string
-  /** ISO-8601 timestamp of the initial generation. */
   createdAt: string
 }
 
@@ -413,12 +388,6 @@ async function readScopeFile(scopePath: string): Promise<ScopeFile | null> {
   }
 }
 
-/**
- * Publish a fully-written scope file without replacing a winner created by a
- * concurrent daemon process. A hard link is the commit point: the temporary
- * file remains invisible at `scopePath` until its contents have been flushed,
- * and `link` fails with EEXIST instead of overwriting an existing identity.
- */
 async function createScopeFile(scopePath: string): Promise<ScopeFile> {
   const fresh: ScopeFile = {
     userId: randomUUID().replace(/-/g, ''),
@@ -452,15 +421,6 @@ async function createScopeFile(scopePath: string): Promise<ScopeFile> {
   }
 }
 
-/**
- * Read or generate the per-install scope identity file.
- *
- * Surfaces (web/desktop) call GET /api/v1/system/scope on boot and
- * attach the returned `userId` as `X-Memory-Scope-User-Id` so memory
- * reads and writes are isolated per install. The id is a random UUID;
- * we deliberately do NOT derive it from the OS username/host so the
- * shipped artifacts never carry that information.
- */
 async function readOrCreateScopeFile(dataDir: string): Promise<ScopeFile> {
   const scopePath = resolve(join(dataDir, 'scope.json'))
   const existingLoad = scopeFileLoads.get(scopePath)
@@ -573,20 +533,6 @@ export async function buildAssistantRuntimeStatus(
   }
 }
 
-/**
- * System routes — graceful daemon control surface.
- *
- *   POST /api/v1/system/shutdown
- *     Triggers the same teardown path as SIGTERM. Auth-required (master
- *     token), so a hostile origin cannot DoS the daemon by looping the
- *     endpoint.
- *
- *   GET  /api/v1/system/clients
- *     Snapshot of active WS/SSE connections plus the idle window. Used by
- *     the desktop tray ("3 connected") and by the idle reaper. Returns
- *     `count: 0` when the registry isn't wired (e.g. a hand-built test
- *     Fastify instance).
- */
 export async function systemRoutes(app: FastifyInstance) {
   app.get('/system/clients', async () => {
     const registry = app.connectionRegistry
@@ -594,9 +540,6 @@ export async function systemRoutes(app: FastifyInstance) {
     return { data: registry.snapshot() }
   })
 
-  // Authenticated, non-secret readiness snapshot for assistant surfaces.
-  // Keep this separate from unauthenticated /health: even boolean credential
-  // presence and operator-selected integrations are private configuration.
   app.get('/system/assistant', async (request, reply) => {
     const runtime = app.runtime
     if (!runtime) {
@@ -614,10 +557,6 @@ export async function systemRoutes(app: FastifyInstance) {
     }
   })
 
-  // GET /api/v1/system/scope — return the daemon's per-install memory
-  // scope id. Surfaces (web/desktop) attach it as X-Memory-Scope-User-Id
-  // on every memory call so the daemon can isolate reads/writes by user.
-  // First call lazily generates ~/.sepilotd/scope.json.
   app.get('/system/scope', async (_request, reply) => {
     const runtime = app.runtime
     if (!runtime) {
@@ -647,14 +586,9 @@ export async function systemRoutes(app: FastifyInstance) {
       })
     }
 
-    // Reply *before* tearing down the HTTP server. We schedule the actual
-    // shutdown on next tick so the response bytes flush; otherwise the caller
-    // sees ECONNRESET and can't tell whether the daemon honored the request.
     reply.send({ data: { status: 'shutting-down' } })
     setImmediate(() => {
       void controller.shutdown('HTTP /system/shutdown').catch(() => {
-        // performShutdown swallows component errors; if it throws here it's
-        // catastrophic and the OS will reap us soon enough.
       })
     })
   })

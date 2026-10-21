@@ -3,13 +3,6 @@ import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
 const YAHOO_CHART_BASE = 'https://query1.finance.yahoo.com/v8/finance/chart'
 const STALE_QUOTE_MS = 4 * 24 * 60 * 60 * 1000
 
-// Hard timeout for the upstream fetch. Without this the Telegram
-// channel pipeline (which calls market.quote without an abort
-// signal in the context) holds its `activeChannelRuns` slot for up
-// to ACTIVE_CHANNEL_RUN_STALE_MS (30 min) when Yahoo doesn't
-// respond, blocking every follow-up Telegram message in the same
-// chat. 10s matches the 10s timeout used by other outbound
-// daemon HTTP calls (outbound-webhook).
 const QUOTE_FETCH_TIMEOUT_MS = 10_000
 
 const KNOWN_SYMBOLS = new Map<string, string>([
@@ -150,9 +143,6 @@ export function createMarketQuoteTool(): ToolDefinitionRuntime {
       const symbol = normalizeSymbol(rawSymbol, market)
       const url = `${YAHOO_CHART_BASE}/${encodeURIComponent(symbol)}?range=1d&interval=1m`
 
-      // Combine the caller's abort signal (if any) with our own
-      // timeout so the fetch can never hang past QUOTE_FETCH_TIMEOUT_MS,
-      // even when the channel pipeline calls without a context.
       const timeoutSignal = AbortSignal.timeout(QUOTE_FETCH_TIMEOUT_MS)
       const fetchSignal = context?.signal
         ? AbortSignal.any([context.signal, timeoutSignal])
@@ -229,11 +219,6 @@ export function createMarketQuoteTool(): ToolDefinitionRuntime {
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        // Either signal aborting (caller cancel OR our internal
-        // timeout) classifies as TIMEOUT_TRANSIENT so the agent's
-        // retry policy treats it as worth one more try at a
-        // different upstream, instead of marking the symbol
-        // permanently broken.
         const aborted = context?.signal?.aborted || timeoutSignal.aborted
         return {
           output: `Quote fetch error: ${message}`,

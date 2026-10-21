@@ -71,7 +71,7 @@ export class GitSource implements SkillSource {
         try {
           const s = await stat(candidate)
           if (s.isDirectory()) roots.push(candidate)
-        } catch { /* fall through */ }
+        } catch {}
       }
       return roots.length ? roots : [root]
     }
@@ -94,10 +94,10 @@ export class GitSource implements SkillSource {
         return
       }
       for (const e of entries) {
-        if (e.isSymbolicLink()) continue // Refuse to follow symlinks
+        if (e.isSymbolicLink()) continue
         const full = join(dir, e.name)
         const rel = relative(rootResolved, resolve(full))
-        if (rel.startsWith('..') || rel.startsWith(`..${sep}`)) continue // Outside root
+        if (rel.startsWith('..') || rel.startsWith(`..${sep}`)) continue
         if (e.isDirectory()) {
           await walk(full)
         } else if (e.isFile() && e.name === 'SKILL.md') {

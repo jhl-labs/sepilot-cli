@@ -1,4 +1,3 @@
-/** A tool prerequisite that only the user can satisfy; retrying cannot repair it. */
 export class UserActionRequiredError extends Error {
   override name = 'UserActionRequiredError'
 

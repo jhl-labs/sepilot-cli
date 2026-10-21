@@ -1,8 +1,3 @@
-// Shared shape for the "live stream slot" useChat keeps while an agent
-// run is in flight. Pulled out of useChat.ts so abort-outcome and other
-// stream-related helpers can refer to the same type without importing
-// the giant hook file.
-
 import type { Dispatch, MutableRefObject } from 'react'
 import {
   getDaemonChatRunAbortMeta,
@@ -21,22 +16,9 @@ export interface LiveStreamSlot {
   agentState: SurfaceAgentState
   messages: SurfaceMessage[]
   controller: ReturnType<typeof createStreamEventController>
-  /** Structured stop cause once the daemon's terminal frame arrived. */
   stopReason?: RunStopReason | null
 }
 
-/**
- * Translate a daemon-chat abort error into the surface-side cleanup it
- * implies: mark the live stream as done, fill in fallback assistant
- * content if the model never produced any, sync the surface messages,
- * and emit the user-facing abort detail message. Returns true when the
- * error was actually a recognised abort (so the caller can swallow it
- * instead of bubbling it to error reporting). Returns false for any
- * other error so the caller routes it through the normal error path.
- *
- * Free function: the live stream ref and dispatcher are passed in so
- * the helper can be unit-tested without rendering useChat.
- */
 export function handleAbortOutcome(opts: {
   error: unknown
   liveStreamRef: MutableRefObject<LiveStreamSlot | null>
@@ -65,12 +47,6 @@ export function handleAbortOutcome(opts: {
   return true
 }
 
-/**
- * Build the initial surface-message list a fresh live stream starts
- * with: every existing cli message converted to a surface message,
- * optionally a freshly-emitted user turn, and a placeholder assistant
- * message at the tail. Pure: no refs touched, no dispatch fired.
- */
 export function buildInitialLiveStreamMessages(opts: {
   storedMessages: Message[]
   assistantId: string
@@ -95,14 +71,6 @@ export function buildInitialLiveStreamMessages(opts: {
   ]
 }
 
-/**
- * Build the four-setter bindings object the stream controller writes
- * back through. setMessages and setAgentState only fire when the live
- * stream slot still points at the same assistantId — preventing a
- * late-arriving event from a superseded run from clobbering the
- * current one. setActivities / setStatus / setError go straight to
- * the dispatcher.
- */
 export function createLiveStreamBindings(opts: {
   assistantId: string
   liveStreamRef: MutableRefObject<LiveStreamSlot | null>

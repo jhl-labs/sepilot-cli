@@ -9,16 +9,15 @@ import { withOptionalToolNameAllowlist } from '../../../tools/role-filter.js'
 export interface ReviewerGraphOptions {
   enableDebate?: boolean
   preserveProtocolOutput?: boolean
-  /** The caller must run its own authoritative quality-conclusion gate. */
   outcomeReviewOwner?: N.AgentNodeOptions['outcomeReviewOwner']
+  completionGateOwner?: N.AgentNodeOptions['completionGateOwner']
+  structuredConclusion?: boolean
 }
 
 export function buildReviewerGraph(
   rawDeps: Deps,
   options: ReviewerGraphOptions = {},
 ): AgentGraph {
-  // The review contract applies to every entry point, including coder/cowork
-  // subgraphs. Registry metadata alone does not constrain the executor.
   const deps = {
     ...rawDeps,
     tools: withOptionalToolNameAllowlist(rawDeps.tools, rawDeps.tools.list()
@@ -26,9 +25,6 @@ export function buildReviewerGraph(
       .map((tool) => tool.name)),
   }
   const debateEnabled = options.enableDebate === true
-  // Debate produces a synthesized resolution that still needs the normal
-  // reporter. Direct protocol preservation applies only to the non-debate
-  // reviewer used as an internal quality phase.
   const preserveProtocolOutput = options.preserveProtocolOutput === true && !debateEnabled
   const graph = new AgentGraph()
     .setStart('context_manager')
@@ -36,11 +32,14 @@ export function buildReviewerGraph(
     .addNode('open_edit_checkpoint', openEditCheckpointNode('reviewer-agent'), {
       lifecycleState: 'thinking',
     })
-    .addNode('agent', N.agent({
+    .addNode('agent', options.structuredConclusion && preserveProtocolOutput
+      ? N.structuredReviewStep(deps)
+      : N.agent({
       ...deps,
       systemPrompt: (deps.systemPrompt ?? '') + '\n\nYou are a code reviewer. Read the code carefully, identify bugs, security issues, performance problems, and style violations. Be specific with line references.',
     }, {
       outcomeReviewOwner: preserveProtocolOutput ? options.outcomeReviewOwner : 'node',
+      completionGateOwner: preserveProtocolOutput ? options.completionGateOwner : 'node',
     }), { lifecycleState: 'thinking' })
     .addNode('tools', N.toolExecutor(deps), {
       lifecycleState: 'acting',

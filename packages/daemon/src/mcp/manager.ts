@@ -50,8 +50,8 @@ interface ManagedMcpServer {
   client?: McpClientLike
   toolRegistry?: ToolRegistry
   promptsRegistry?: McpPromptsRegistry
-  toolNames: string[]      // registered (enabled) tools
-  allToolNames: string[]   // all tools from server (pre-filter)
+  toolNames: string[]
+  allToolNames: string[]
   toolManifest?: McpToolManifest
   expectedToolManifest?: McpToolManifest
   manifestChanged: boolean
@@ -88,12 +88,6 @@ type McpToolManifestWriter = {
 }
 
 export interface McpConfigureOptions {
-  /**
-   * The caller owns a larger atomic config transaction and will persist the
-   * mutated server config after this connection succeeds. This prevents the
-   * manager from racing that transaction by independently reading the old
-   * config file while establishing a first-use manifest baseline.
-   */
   deferInitialToolManifestPersistence?: boolean
 }
 
@@ -128,7 +122,6 @@ export class McpManager {
       durationMs,
       status,
     })).catch(() => {
-      // audit must not break tool execution
     })
     const entry = this.metrics.get(server) ?? emptyEntry()
     recordCallInto(entry, tool, durationMs, status)
@@ -192,7 +185,6 @@ export class McpManager {
       server: state.config.name,
       ...alert,
     })).catch(() => {
-      // audit must not break MCP lifecycle
     })
   }
 
@@ -428,14 +420,12 @@ export class McpManager {
       state.allToolNames = allToolNames
 
       if (client instanceof McpClient) {
-        // Register resource tools (universal list/templates/read)
         const resourceTools = createResourceTools(client, config.name)
         const enabledResourceTools = this.enabledToolsForConfig(config, resourceTools)
         for (const tool of enabledResourceTools) toolRegistry.register(tool)
         state.toolNames.push(...enabledResourceTools.map((t) => t.name))
         state.allToolNames.push(...resourceTools.map((t) => t.name))
 
-        // Populate prompts registry
         if (promptsRegistry) {
           const prompts = await client.discoverPrompts()
           promptsRegistry.set(config.name, prompts)
@@ -451,7 +441,6 @@ export class McpManager {
       try {
         await client.disconnect()
       } catch {
-        // Ignore cleanup failures for a server that never finished starting.
       }
       throw error
     }
@@ -528,7 +517,6 @@ export class McpManager {
   handleDisconnect(name: string): void {
     const server = this.servers.get(name)
     if (!server?.toolRegistry) return
-    // Reset any previous loop before starting a new one
     this.reconnectControllers.get(name)?.abort()
     const controller = new AbortController()
     this.reconnectControllers.set(name, controller)
@@ -553,18 +541,15 @@ export class McpManager {
     try {
       await sleepWithAbort(backoffFor(attempt), signal)
     } catch {
-      return // aborted
+      return
     }
     if (signal.aborted) return
-    // Detach our controller so connectServer -> disconnectServer doesn't abort us.
     const ours = this.reconnectControllers.get(name)
     if (ours) this.reconnectControllers.delete(name)
     try {
       await this.connectServer(server.config, server.toolRegistry!, server.promptsRegistry)
-      // Success — controller already removed above, nothing more to do.
     } catch {
       if (signal.aborted) return
-      // Restore controller so subsequent configureServers/disconnectServer can abort us.
       if (ours) this.reconnectControllers.set(name, ours)
       await this.reconnectLoop(server, signal, attempt + 1)
     }

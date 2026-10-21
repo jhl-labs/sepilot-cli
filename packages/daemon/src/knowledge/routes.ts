@@ -85,13 +85,11 @@ export async function registerPersonalKnowledgeRoutes(app: FastifyInstance) {
     },
   })
 
-  // Single bounded auxiliary operation per daemon profile; no overlapping costly extraction jobs.
   let busy = false
   let pendingActivityId: string | null = null
   let closing = false
   let background: Promise<void> | undefined
   const shutdown = new AbortController()
-  // A crash cannot leave the persisted review inbox permanently in 'running'.
   if (repo.review().status === 'running') repo.saveReview({ status: 'idle' })
   function scheduleOrganization(parentId?: string) {
     if (!repo.review().autoOrganize || closing) return
@@ -409,7 +407,6 @@ export async function registerPersonalKnowledgeRoutes(app: FastifyInstance) {
                   const session = await runtime.sessions.get(input.id)
                   if (!session) knowledgeError('대화를 찾을 수 없습니다.', 404)
                   const events = await runtime.sessions.getEvents(input.id)
-                  // Whole recent messages only; label original event offsets so evidence remains traceable.
                   const messages: string[] = []
                   const roles = new Set<string>()
                   let used = 0
@@ -463,7 +460,6 @@ export async function registerPersonalKnowledgeRoutes(app: FastifyInstance) {
                 activity.patch(activityId, {
                   targets: [{ id: `${source.kind}:${source.id}`, title: source.title }],
                 })
-                // Memory/manual captures are explicitly supplied snapshots, not server-verified provenance.
                 if (!extract)
                   return repo.capture(source, [
                     {

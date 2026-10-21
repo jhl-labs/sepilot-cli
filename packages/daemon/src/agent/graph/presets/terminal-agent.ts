@@ -28,10 +28,6 @@ export const TERMINAL_AGENT_TOOL_ALLOWLIST = [
 export function buildTerminalAgentGraph(deps: Deps) {
   return buildFocusedLoopGraph(deps, {
     systemPrompt: terminalAgentPrompt,
-    // Command-driven scope: foreground shell, audited host observation, managed
-    // background processes, plus read-only file/code inspection.
-    // No fs.write/apply_patch/browser — the registry description's "tighter
-    // shell discipline" is now an actual tool boundary, not just prose.
     toolAllowlist: TERMINAL_AGENT_TOOL_ALLOWLIST,
   })
 }

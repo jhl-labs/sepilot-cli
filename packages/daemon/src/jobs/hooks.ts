@@ -2,7 +2,6 @@ import type { HookPayload } from '@sepilotd/core'
 import type { JobsRepo } from './repo.js'
 import type { JobRunner } from './runner.js'
 
-/** Post hooks are observations: admission/execution failures are separate job evidence. */
 export function createBackgroundHooks(deps: {
   repo: JobsRepo
   runner: JobRunner
@@ -22,8 +21,6 @@ export function createBackgroundHooks(deps: {
       throw new Error('Background hooks cannot gate pre events')
     const job = deps.repo.create({ kind: 'hook', total: 1, concurrency: 1 })
     const sessionId = typeof payload.data.sessionId === 'string' ? payload.data.sessionId : null
-    // Never persist input: it may contain prompts, tool arguments, or credentials.
-    // Restart recovery fails interrupted commands instead of replaying uncertain effects.
     deps.repo.insertItems(job.id, [
       { idx: 0, sessionId, request: { handlerId, event: payload.event } },
     ])
@@ -55,7 +52,6 @@ export function createBackgroundHooks(deps: {
         if (sessionId && final) deps.onFinished?.(job.id, sessionId, final.status)
       })
       .catch(() => {
-        /* runner retains failure */
       })
   }
 }

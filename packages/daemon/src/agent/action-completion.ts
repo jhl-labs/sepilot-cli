@@ -39,9 +39,6 @@ export interface ActionCompletionEvaluation {
 const FILE_MUTATION_TOOL_NAMES = new Set(['apply_patch', 'fs.append', 'fs.edit', 'fs.write'])
 const FILE_READ_TOOL_NAMES = new Set([
   'fs.read',
-  // A structured Office slide read is the authoritative content read for a
-  // presentation. Requiring an additional fs.read after this succeeds makes
-  // the completion guard retry a binary PPTX through the wrong abstraction.
   'office.read_slide',
 ])
 const FILE_INVENTORY_TOOL_NAMES = new Set(['fs.list'])
@@ -224,12 +221,6 @@ function isExplicitFileMutationRequest(input: string): boolean {
     return false
   }
   if (EXPLICIT_FILE_ACTION_PATTERN.test(directive)) return true
-  // Broad nouns such as "project" and broad intent words such as
-  // "development" can coexist in an inspection sentence without authorizing
-  // a mutation (for example, a review of development activity). When there is
-  // no concrete file path, require an actual imperative/action shape above.
-  // A named path retains the wider intent detector for natural requests whose
-  // wording does not fit the compact imperative grammar.
   if (!hasExplicitPath) return false
   return !ACTION_META_QUESTION_PATTERN.test(directive) && !/[?？]\s*$/u.test(directive)
 }
@@ -246,11 +237,6 @@ function isExplicitCommandExecutionRequest(input: string): boolean {
   )
 }
 
-/**
- * A single, explicitly named managed-process observation is its own evidence
- * class. It is neither a shell command nor a file read, even when the user
- * also says “do not edit files” and asks to “read the logs”.
- */
 export function inputRequestsFocusedSingleProcessObservation(input: string): boolean {
   const matches = input.match(PROCESS_OBSERVATION_TOOL_PATTERN) ?? []
   return matches.length === 1
@@ -267,13 +253,6 @@ export interface FocusedProcessObservationCall {
   arguments: Record<string, unknown>
 }
 
-/**
- * Extracts an executable single-process observation only when the request
- * contains every required identity field. This lets provider-neutral runtimes
- * honor exact one-call contracts without depending on a model to reproduce a
- * UUID. Compound workflows and API/how-to prose are rejected by the focused
- * boundary above and remain model-driven.
- */
 export function extractFocusedProcessObservationCall(
   input: string,
 ): FocusedProcessObservationCall | undefined {
@@ -324,9 +303,6 @@ function isExplicitFileReadRequest(input: string): boolean {
     return false
   }
 
-  // Keep general how-to questions informational even if they mention reading
-  // a file/document. Direct imperatives and polite requests still require
-  // grounded workspace evidence.
   if (
     ACTION_META_QUESTION_PATTERN.test(directive) &&
     !/\b(?:can|could|would)\s+you\b|(?:읽어|확인해|살펴|검토해|분석해|요약해|열어)\s*(?:줘|주세요|봐|줄래)?/iu.test(
@@ -360,21 +336,7 @@ function isExplicitFileInventoryRequest(input: string): boolean {
   )
 }
 
-/**
- * Tool names are dotted (`system.info`, `memory.search`), which is exactly the
- * shape the file-target pattern reads as `name.ext`. Naming the tool you want
- * used — "system.info 도구로 측정해서 보고해줘" — therefore looked like a
- * request to touch a file called `system.info`, and the completion gate then
- * blocked a pure reporting turn for having produced no file. Blank the tool
- * names out before matching: a token that IS an available tool is not a path.
- */
 function withoutToolNames(input: string, availableToolNames: readonly string[] | undefined): string {
-  // A user can explicitly prohibit a tool that is intentionally absent from
-  // this run's scoped tool list (for example, `fs.*` or `terminal.run` in a
-  // process-only workflow). Those references remain tool identifiers, not
-  // filenames. Strip the stable built-in tool namespace grammar before the
-  // exact available-name pass so capability scoping cannot change intent
-  // classification. Ordinary artifacts such as README.md stay untouched.
   let text = input.replace(
     STRUCTURED_TOOL_REFERENCE_PATTERN,
     (reference) => TOOL_SHAPED_ARTIFACT_SUFFIX_PATTERN.test(reference)
@@ -382,7 +344,6 @@ function withoutToolNames(input: string, availableToolNames: readonly string[] |
       : ' 도구 ',
   )
   if (!availableToolNames?.length) return text
-  // Longest first so `memory.documents.search` is not left as `.search`.
   for (const name of [...availableToolNames].sort((a, b) => b.length - a.length)) {
     if (!name.includes('.')) continue
     text = text.split(name).join(' 도구 ')
@@ -390,11 +351,6 @@ function withoutToolNames(input: string, availableToolNames: readonly string[] |
   return text
 }
 
-/**
- * A bare integration hostname has the same dotted shape as a filename. Mask
- * only host-shaped tokens with nearby network/search context, leaving real
- * dotted files (including multi-dot test files) available to the file guard.
- */
 function withoutNetworkHostReferences(input: string): string {
   return input.replace(
     BARE_NETWORK_HOST_PATTERN,
@@ -412,15 +368,8 @@ export function requiredActionEvidenceKinds(
   input: string,
   availableToolNames?: readonly string[],
 ): ActionEvidenceKind[] {
-  // Capability scoping already removes bounded file-mutation prohibitions.
-  // Applying the older mutation-only stripper first can leave malformed
-  // fragments (for example, `process.read ... 사용하지 말고`) that later look
-  // like affirmative observation requests.
   const positiveInput = inputPositiveCapabilityScope(input)
   const constrainedProcessStart = extractConstrainedProcessStart(positiveInput)
-  // Exact argv/process contracts are command actions. Their structural fields
-  // (`network.mode`, `network.ports`, executable paths) look file-shaped to a
-  // generic path detector but do not authorize or require file mutation.
   if (
     extractFocusedProcessStart(positiveInput)
     || extractFocusedTerminalCommand(positiveInput)
@@ -448,10 +397,6 @@ export function requiredActionEvidenceKinds(
   )
   const kinds: ActionEvidenceKind[] = []
   if (inputRequestsProcessObservation(positiveInput)) kinds.push('process-observation')
-  // A structured process.start embedded in a wider workflow still requires
-  // command evidence. It must not disappear merely because a later
-  // process.read/browser step prevents the narrower focused extractor from
-  // owning the whole turn.
   if (constrainedProcessStart) kinds.push('command')
   const pathlessFileMutationForbidden = inputExplicitlyForbidsFileMutation(input)
     && !EXPLICIT_FILE_PATH_TARGET_PATTERN.test(text)
@@ -519,19 +464,11 @@ function unresolvedPreviousActionKinds(
   return requiredKinds.filter((kind) => !successfulKinds.has(kind))
 }
 
-/**
- * Resolves the minimum action evidence required for the current turn. Terse
- * result follow-ups inherit only still-missing kinds from the immediately
- * preceding action request. For owned/recent artifact lookups, file inventory
- * is minimum workspace grounding; it does not by itself prove authorship or
- * recency, which remains the model's responsibility to qualify.
- */
 export function requiredActionEvidenceKindsForTurn(options: {
   messages: readonly Message[]
   userInput: string
   availableToolNames?: readonly string[]
   additionalRequiredKinds?: readonly ActionEvidenceKind[]
-  /** Semantic contract review owns actions when wording inference is disabled. */
   inferActionsFromWording?: boolean
 }): ActionEvidenceKind[] {
   if (options.inferActionsFromWording === false) return [...new Set(options.additionalRequiredKinds ?? [])]
@@ -553,12 +490,6 @@ export function evaluateActionCompletion(options: {
   content: string
   userInput: string
   availableToolNames?: readonly string[]
-  /**
-   * Trusted runtime tools eligible for generic command evidence. Callers build
-   * this from an operational run contract and/or canonical tool-security
-   * metadata, so this guard does not need every plugin or integration name.
-   * Specific file/browser/process classes still require their canonical tools.
-   */
   commandEvidenceToolNames?: readonly string[]
   additionalRequiredKinds?: readonly ActionEvidenceKind[]
   inferActionsFromWording?: boolean

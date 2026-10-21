@@ -1,15 +1,3 @@
-// Three pieces of daemon-connection state App.tsx kept inline:
-//
-// - version — the daemon's reported version string (header badge)
-// - connectionStatus — 'connecting' | 'connected' | 'error', drives
-//   the splash screen / header dot
-// - connectionError — the message to show under the splash on
-//   connection failure
-//
-// All three are populated together by the bootstrap/heartbeat effects;
-// bundling them keeps App.tsx from declaring three useStates in a row
-// and signals that they always travel together.
-
 import { useState } from 'react'
 
 type DaemonConnectionStatus = 'connecting' | 'connected' | 'error'

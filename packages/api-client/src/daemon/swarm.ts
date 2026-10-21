@@ -17,10 +17,6 @@ export interface CreateRunInput {
   autonomy?: 'readonly' | 'accept-edits' | 'workspace-write' | 'supervised' | 'autonomous'
   autoApproveAgents?: boolean
   warmPool?: SwarmAgentName[]
-  /**
-   * Spawn the warm pool but do not start the supervisor loop. The run stays
-   * alive until cancelled and can be driven directly through attach/sendKeys.
-   */
   noSupervisor?: boolean
 }
 
@@ -76,10 +72,6 @@ export interface DriveAgentResult {
 export interface SwarmClient {
   createRun(input: CreateRunInput): Promise<{ runId: string }>
   list(status?: SwarmRunStatus): Promise<SwarmRun[]>
-  /**
-   * Recent runs (active and completed) reconstructed from the jsonl event
-   * log. Newest first. `limit` defaults to 50, max 200.
-   */
   history(limit?: number): Promise<SwarmRun[]>
   get(runId: string): Promise<SwarmRun>
   cancel(runId: string): Promise<{ status: 'cancelled' }>
@@ -213,7 +205,6 @@ export function createSwarmClient(opts: SwarmClientOpts): SwarmClient {
           try {
             yield JSON.parse(dataLine.slice(6)) as SwarmEvent
           } catch {
-            /* ignore parse */
           }
         }
       }

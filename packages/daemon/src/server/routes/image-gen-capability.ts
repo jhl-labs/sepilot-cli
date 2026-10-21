@@ -152,7 +152,6 @@ export async function registerImageGenCapabilityRoutes(
             try {
               trackedSocket.close()
             } catch {
-              // Ignore close failures.
             }
           }
         }

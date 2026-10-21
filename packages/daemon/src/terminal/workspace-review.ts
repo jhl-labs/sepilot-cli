@@ -45,7 +45,6 @@ export async function readWorkspaceReview(session: DesktopAgentSession) {
       })
       return { text: result.stdout, error: null as string | null }
     } catch (error) {
-      // Do not return partial stdout as complete evidence.
       const detail = error as { code?: string | number; stderr?: string }
       return { text: '', error: detail.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
         ? 'Output exceeds the review limit. Inspect this workspace on its host.'

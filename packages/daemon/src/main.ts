@@ -1,9 +1,5 @@
 import { startDaemonRuntime } from './bootstrap.js'
 
-/**
- * Foreground daemon entry. `argv` is the list *after* the program name and
- * after any `__daemon` dispatch token (i.e. what the daemon itself should see).
- */
 export async function runDaemonMain(argv: string[] = process.argv.slice(2)): Promise<void> {
   const sub = argv[0]
 

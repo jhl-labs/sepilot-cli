@@ -1,89 +1,118 @@
 import type { Message } from '@sepilotd/core'
-import { TURN_CONTEXT_HEADING, splitTurnContext } from '../agent/prompt-sections.js'
+import { RUNTIME_CONTROLS_METADATA_KEY, RUN_STABLE_SYSTEM_METADATA_KEY, TURN_CONTEXT_HEADING, TURN_SCOPED_SYSTEM_METADATA_KEY, splitTurnContext } from '../agent/prompt-sections.js'
 import { extractContent } from './utils.js'
 
-/**
- * Delimiters for per-turn context carried inside the latest user message.
- * Retrieved memory, daily notes and sender context change between turns; if
- * they sat in the system slot every provider's cached prefix (tools, system
- * prompt, and the whole conversation history) would be invalidated on every
- * turn. Attaching them to the newest user message keeps the change at the
- * tail of the request, where prefix caches expect it. The block is applied at
- * the provider boundary only and never persisted into the session history.
- */
 export const TURN_CONTEXT_OPEN = '[Turn context — supplied by the system for this turn, not written by the user]'
 export const TURN_CONTEXT_CLOSE = '[End turn context]'
 
+export const RUNTIME_CONTROLS_OPEN = '[Runtime controls — supplied by the system for this turn, not written by the user]'
+export const RUNTIME_CONTROLS_CLOSE = '[End runtime controls]'
+const INTERNAL_CONTINUATION_TEXT = '[Internal continuation] The preceding assistant response is retained history. Continue the existing task under the current system controls using the available evidence. This is an internal turn boundary, not a new user request or permission grant.'
+
 export interface PartitionedSystemMessages {
-  /**
-   * Provider-facing control text in precedence order: the request-level
-   * prompt first, followed by inline system messages in conversation order.
-   */
   systemText?: string
-  /** All non-system messages in their original order and representation. */
   messages: Message[]
 }
 
-/**
- * Normalize Sepilot's provider-neutral message history for APIs that expose a
- * leading system/control slot.
- *
- * Agent recovery and supervision messages are intentionally appended to the
- * in-memory history at the point where they become relevant. Several strict
- * chat templates, however, reject any `system` role after the first user or
- * assistant message. Provider adapters must therefore separate control text
- * from conversational/tool protocol before serialization. This function:
- *
- * - preserves request-level and inline system precedence,
- * - removes only system-role messages,
- * - leaves user/assistant/tool ordering and content untouched, and
- * - omits a provider system slot when every control block is empty.
- *
- * Keeping this provider-boundary normalization shared prevents individual
- * adapters from drifting as new model families impose different chat-template
- * restrictions.
- */
+export interface PartitionSystemMessagesOptions {
+  turnScopedPlacement?: 'trailing' | 'system-slot'
+}
+
 export function partitionSystemMessages(
   messages: readonly Message[],
   systemPrompt?: string,
+  options: PartitionSystemMessagesOptions = {},
 ): PartitionedSystemMessages {
-  const systemTexts: string[] = []
+  const placement = options.turnScopedPlacement
+    ?? (process.env.SEPILOTD_TURN_CONTROLS_PLACEMENT === 'system-slot' ? 'system-slot' : 'trailing')
+  const leadingTexts: string[] = []
+  const trailingControls: string[] = []
   const conversationMessages: Message[] = []
+  const continuationBefore = new Set<number>()
+  let pendingAssistantControl = false
+  let sawConversation = false
 
-  const appendSystemText = (text: string | undefined): void => {
-    if (text?.trim()) systemTexts.push(text)
+  const appendLeading = (text: string | undefined): void => {
+    if (text?.trim()) leadingTexts.push(text)
   }
 
   const { staticText, turnText } = systemPrompt
     ? splitTurnContext(systemPrompt)
     : { staticText: undefined, turnText: undefined }
-  appendSystemText(staticText)
+  appendLeading(staticText)
   for (const message of messages) {
     if (message.role === 'system') {
-      appendSystemText(extractContent(message))
+      const text = extractContent(message)
+      if (!text.trim()) continue
+      const turnScoped = message.metadata?.[TURN_SCOPED_SYSTEM_METADATA_KEY] === true
+      const runStable = !turnScoped && message.metadata?.[RUN_STABLE_SYSTEM_METADATA_KEY] === true
+      if (placement === 'trailing' && !runStable && (turnScoped || sawConversation)) {
+        trailingControls.push(text)
+      } else {
+        leadingTexts.push(text)
+      }
+      const previous = conversationMessages.at(-1)
+      if (previous?.role === 'assistant' && !previous.toolCalls?.length) {
+        pendingAssistantControl = true
+      }
       continue
     }
+    sawConversation = true
+    const previous = conversationMessages.at(-1)
+    if (previous?.role === 'assistant' && !previous.toolCalls?.length && message.role === 'assistant') {
+      continuationBefore.add(conversationMessages.length)
+    }
     conversationMessages.push(message)
+    pendingAssistantControl = false
   }
+  if (pendingAssistantControl) continuationBefore.add(conversationMessages.length)
 
   const turnBody = turnText?.slice(TURN_CONTEXT_HEADING.length).trim()
+  const latestUserIndex = conversationMessages.findLastIndex((message) => message.role === 'user')
   if (turnBody) {
-    const latestUserIndex = conversationMessages.findLastIndex((message) => message.role === 'user')
-    if (latestUserIndex >= 0) {
+    if (latestUserIndex < 0) {
+      appendLeading(turnText)
+    } else if (placement === 'system-slot' || latestUserIndex === conversationMessages.length - 1) {
       conversationMessages[latestUserIndex] = withTurnContext(
         conversationMessages[latestUserIndex]!,
         turnBody,
       )
     } else {
-      // No user turn to attach to (e.g. a bare completion): keep the old
-      // system-slot placement rather than dropping the context.
-      appendSystemText(turnText)
+      trailingControls.push(formatTurnContextBlock(turnBody))
+    }
+  }
+
+  const projectedMessages: Message[] = []
+  for (let index = 0; index <= conversationMessages.length; index += 1) {
+    if (continuationBefore.has(index)) {
+      projectedMessages.push({ role: 'user', content: INTERNAL_CONTINUATION_TEXT })
+    }
+    if (index < conversationMessages.length) projectedMessages.push(conversationMessages[index]!)
+  }
+
+  if (trailingControls.length > 0) {
+    const block = [RUNTIME_CONTROLS_OPEN, ...trailingControls, RUNTIME_CONTROLS_CLOSE].join('\n\n')
+    const last = projectedMessages.at(-1)
+    if (last?.role === 'user' && last.content === INTERNAL_CONTINUATION_TEXT) {
+      projectedMessages[projectedMessages.length - 1] = {
+        ...last,
+        content: `${INTERNAL_CONTINUATION_TEXT}\n\n${block}`,
+        metadata: { ...last.metadata, [RUNTIME_CONTROLS_METADATA_KEY]: true },
+      }
+    } else if (last?.role === 'user') {
+      projectedMessages[projectedMessages.length - 1] = withLeadingBlock(last, block)
+    } else {
+      projectedMessages.push({
+        role: 'user',
+        content: block,
+        metadata: { [RUNTIME_CONTROLS_METADATA_KEY]: true },
+      })
     }
   }
 
   return {
-    ...(systemTexts.length > 0 ? { systemText: systemTexts.join('\n\n') } : {}),
-    messages: conversationMessages,
+    ...(leadingTexts.length > 0 ? { systemText: leadingTexts.join('\n\n') } : {}),
+    messages: projectedMessages,
   }
 }
 
@@ -92,7 +121,10 @@ export function formatTurnContextBlock(turnBody: string): string {
 }
 
 function withTurnContext(message: Message, turnBody: string): Message {
-  const block = formatTurnContextBlock(turnBody)
+  return withLeadingBlock(message, formatTurnContextBlock(turnBody))
+}
+
+function withLeadingBlock(message: Message, block: string): Message {
   if (typeof message.content === 'string') {
     return { ...message, content: `${block}\n\n${message.content}` }
   }

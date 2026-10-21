@@ -5,21 +5,6 @@ import {
   verify as cryptoVerify,
 } from 'node:crypto'
 
-/**
- * Device-authenticated delegation assertions.
- *
- * Delegation rides over a shared comment transport (a Gateway "delegation"
- * ticket) that every paired device can read and write. Without authentication
- * any device can forge a `[claim]`/`[status]`/`[cancel]` comment addressed with
- * another device's free-text name and hijack or spoof a task (PLAN_021 D1).
- *
- * The fix: a device signs its claim/status assertions with its own ed25519
- * private key (the local `~/.sepilotd/security/device.key`), and consumers
- * verify the signature against the paired device's public key held in the
- * DevicePairingRegistry. A device only holds its own private key, so it can
- * never mint a valid assertion for a device id it does not own.
- */
-
 export type DelegationAssertionKind =
   | 'claim'
   | 'claim_release'
@@ -30,17 +15,13 @@ export type DelegationAssertionKind =
 export interface DelegationAssertionFields {
   kind: DelegationAssertionKind
   delegationId: string
-  /** Authenticated device id of the writer (the key that signs). */
   deviceId: string
   claimId?: string
-  /** Kind-specific discriminator: status value, question id, etc. */
   detail?: string
 }
 
 const PAYLOAD_PREFIX = 'sepilotd-delegation'
 
-// Canonical, unambiguous payload. All fields are pipe-joined and empty-string
-// filled so a missing claimId can never collide with a present one.
 export function buildDelegationAssertionPayload(
   fields: DelegationAssertionFields,
 ): string {
@@ -55,13 +36,11 @@ export function buildDelegationAssertionPayload(
 }
 
 export interface DelegationSigner {
-  /** Authenticated device id embedded into every assertion this signer writes. */
   readonly deviceId: string
   sign(payload: string): string
 }
 
 export interface DelegationKeyResolver {
-  /** Paired device public key (spki PEM), or null when the id is unknown. */
   getPublicKey(deviceId: string): string | null
 }
 
@@ -100,11 +79,6 @@ export interface SignedDelegationMarkerFields {
   signature?: string
 }
 
-/**
- * Verify a parsed, signed delegation assertion against the resolver's paired
- * key. Returns false (fail-closed) when the device id/signature is missing, the
- * device is unknown, or the signature does not verify.
- */
 export function verifyDelegationAssertion(
   resolver: DelegationKeyResolver,
   fields: DelegationAssertionFields,

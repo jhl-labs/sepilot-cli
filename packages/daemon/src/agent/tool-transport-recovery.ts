@@ -43,12 +43,6 @@ function normalizeReason(value: string, limit = 260): string {
     : normalized
 }
 
-/**
- * Detect a provider rejecting the native function-calling request shape.
- * Matching requires both a tool-transport concept and an explicit
- * unavailable/invalid signal so ordinary tool execution errors do not change
- * transports.
- */
 export function detectNativeToolTransportRejection(
   error: unknown,
 ): ToolTransportRecovery | null {
@@ -79,9 +73,6 @@ export function detectNativeToolTransportRejection(
   }
 }
 
-/** A successful native turn with neither visible text nor tool calls is not a
- * usable protocol result. Reasoning-only output also qualifies: private
- * reasoning cannot complete the user turn or execute an action. */
 export function detectEmptyNativeToolResponse(
   response: ChatResponse,
 ): ToolTransportRecovery | null {

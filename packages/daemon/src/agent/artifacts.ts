@@ -1,10 +1,3 @@
-/**
- * Artifact extraction from assistant responses.
- *
- * Parses code blocks, HTML blocks, and document blocks from LLM output,
- * returning structured artifacts that clients can render in separate panels.
- */
-
 import { createHash } from 'node:crypto'
 
 export interface Artifact {
@@ -60,18 +53,6 @@ function createArtifact(
   }
 }
 
-/**
- * Extract artifacts from assistant response content.
- *
- * Detects:
- * - Code blocks with language tags (```lang ... ```)
- * - HTML artifacts (```html with full page structure)
- * - Mermaid diagrams (```mermaid)
- * - SVG content (```svg)
- *
- * Small inline code snippets are kept inline unless the model clearly marked
- * them as a typed, multi-line artifact.
- */
 export function extractArtifacts(
   content: string,
   context: ArtifactExtractionContext = {},
@@ -83,7 +64,6 @@ export function extractArtifacts(
     const trimmedCode = code.trim()
     const lineCount = trimmedCode.split('\n').length
 
-    // Keep small inline snippets
     if (shouldKeepInline(lang, trimmedCode, lineCount)) {
       return match
     }
@@ -132,8 +112,6 @@ function shouldKeepInline(
   if (isFullDocument(lang, code)) return false
   if (lineCount >= 4) return false
 
-  // Language-tagged multi-line blocks are usually deliberate outputs that the
-  // desktop should surface in the artifact gallery even when they are short.
   if (lang && lineCount > 1) return false
 
   return true
@@ -165,14 +143,12 @@ function inferTitle(
   lang: string | undefined,
   code: string,
 ): string | undefined {
-  // Try to find a title comment at the top
   const firstLine = code.split('\n')[0]
   const commentMatch = firstLine.match(
     /^(?:\/\/|#|<!--)\s*(.+?)(?:-->)?$/,
   )
   if (commentMatch) return commentMatch[1].trim()
 
-  // For HTML, try <title>
   const titleMatch = code.match(/<title>([^<]+)<\/title>/i)
   if (titleMatch) return titleMatch[1].trim()
 

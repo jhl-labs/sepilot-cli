@@ -74,9 +74,6 @@ function configureStartupProviderNetwork(network: SepilotdConfig['network']): vo
     const degradedReason = error.code === 'NETWORK_CA_INVALID'
       ? CUSTOM_CA_UNAVAILABLE_DEGRADED_REASON
       : NETWORK_PROXY_UNAVAILABLE_DEGRADED_REASON
-    // A persisted CA path or environment proxy can become invalid between
-    // launches. Keep only the daemon control plane reachable so Settings can
-    // repair it. Direct fallback could bypass an enterprise egress boundary.
     log.warn(
       'Provider network policy is unavailable; provider egress is blocked until Settings repairs it',
       { code: error.code, degradedReason },
@@ -116,10 +113,6 @@ export function resolveDaemonDataDir(dataDir = process.env.SEPILOTD_DATA_DIR): s
   return dataDir ?? join(homedir(), '.sepilotd')
 }
 
-// Validate a numeric SEPILOTD_* env knob against a range, warning (not
-// silently defaulting) when the value is out of range or non-numeric so an
-// operator typo like SEPILOTD_PORT=999999 is visible instead of quietly
-// falling back to the default.
 export function resolveNumericEnv(
   name: string,
   raw: string | undefined,
@@ -220,8 +213,6 @@ async function ensureDefaultDaemonDataDir(
     options.configPath,
     YAML.stringify({
       version: 1,
-      // Host-neutral: deriving the device name from the OS user or hostname
-      // would leak host identity into a config artifact.
       device: { id: randomUUID(), name: DEFAULT_DEVICE_NAME, role: 'desktop' },
       daemon: {
         port: options.port,
@@ -256,12 +247,6 @@ function degradedConfig(): SepilotdConfig {
   })
 }
 
-/**
- * A config.yaml without a `device:` block gets a freshly generated identity
- * from the schema default. Persist it so the identity is stable across
- * restarts instead of changing on every boot. Best-effort: a read-only config
- * file must not block startup, it only means the id is re-generated next time.
- */
 async function persistGeneratedDeviceIdentity(
   configPath: string,
   yamlText: string,
@@ -329,10 +314,6 @@ export async function loadStartupConfig(
     }
   }
 
-  // Cluster/systemd operators can supply a complete Mattermost channel from
-  // runtime secrets without ever writing those credentials to config.yaml.
-  // A degraded config boot stays control-plane-only and deliberately skips
-  // outbound channel activation.
   if (!configLoadFailed) {
     config = applyRuntimeGatewayEnvironment(
       applyRuntimeChannelEnvironment(config),
@@ -373,23 +354,14 @@ export async function startDaemonRuntime(
     options,
   )
 
-  // Env override allows container/systemd deployments to change bind
-  // without mutating ~/.sepilotd/config.yaml. config.yaml is still
-  // the primary source — env only wins when set.
   const envPort = Number(process.env.SEPILOTD_PORT)
   const port =
     options.port ?? (Number.isFinite(envPort) && envPort > 0 ? envPort : config.daemon.port)
   const host = options.host ?? (process.env.SEPILOTD_HOST?.trim() || config.daemon.host)
 
-  // Single instance check. Allow a short retry window so a freshly-spawned
-  // daemon can wait out a predecessor that is still completing graceful
-  // shutdown — common when a watcher (tsup --watch) restarts the process.
   const pidAcquireRetries = (() => {
     const raw = Number(process.env.SEPILOTD_PID_ACQUIRE_RETRIES)
     if (Number.isFinite(raw) && raw >= 0) return Math.floor(raw)
-    // The default must outlast a predecessor's graceful-shutdown deadline,
-    // otherwise an immediate restart races a daemon that is still draining and
-    // fails with "already running". Keep one extra second of slack.
     return Math.ceil((resolveShutdownDeadlineMs() + 1_000) / 500)
   })()
   const pidPath = join(dataDir, 'sepilotd.pid')
@@ -405,14 +377,10 @@ export async function startDaemonRuntime(
   let releaseStorage: (() => void) | undefined
 
   try {
-    // Domain repositories historically ignored dataDir and resolved through
-    // SEPILOTD_HOME. Prepare a consistent snapshot before any of them opens,
-    // then install a process-scoped canonical root for embedded and standalone
-    // boot paths alike. An explicit SEPILOTD_HOME remains an operator-owned
-    // compatibility override and bypasses automatic migration.
     const storage = await prepareDaemonStorage({
       dataDir,
       profileExisted,
+      importLegacyState: process.env.SEPILOTD_IMPORT_LEGACY_STATE?.trim() === '1',
     })
     releaseStorage = configureDaemonStorage({
       dataDir: storage.dataDir,
@@ -424,15 +392,8 @@ export async function startDaemonRuntime(
       rollbackAvailable: Boolean(storage.rollbackRoot),
     })
 
-    // loadStartupConfig has already loaded the daemon-managed .env and parsed
-    // canonical network config. Configure here (rather than in main.ts) so
-    // standalone and desktop-embedded boot paths apply the same policy.
     configureStartupProviderNetwork(config.network)
 
-    // Load auth token
-    // Guarantee a presentable credential exists before auth is wired up: a
-    // fresh data dir must never boot into a state where every request is
-    // rejected and no token exists for the operator to present.
     const authToken = await ensureDaemonAuthToken(dataDir)
     const authTokenResolver = authToken
       ? createFileDaemonAuthTokenResolver(daemonAuthTokenPath(dataDir), { initialToken: authToken })
@@ -445,10 +406,6 @@ export async function startDaemonRuntime(
         process.env.SEPILOTD_ALLOW_UNAUTHENTICATED_EXTERNAL === 'true',
     })
 
-    // Setup file logging — config drives rotation; env vars stay as
-    // emergency overrides for headless deployments without a Settings UI.
-    // Falls back to schema defaults when the loaded config is partial (mocked
-    // configs in tests, or future migrations that haven't filled this in yet).
     const loggingConfig: LoggingConfig = config.logging ?? loggingSchema.parse({})
     await setLogFile(join(dataDir, 'logs', 'daemon.log'), loggingConfig.app)
     await setAgentTraceLogFile(
@@ -467,10 +424,8 @@ export async function startDaemonRuntime(
     })
     log.info('Tools registered', { tools: runtime.toolRegistry.list().map((t) => t.name) })
 
-    // Start server
     const app = await createApp({ port, host, runtime, authToken, authTokenResolver })
 
-    // Setup graceful shutdown
     const lifecycle = new LifecycleManager(app, runtime, {
       exitAfterShutdown: options.exitOnShutdown ?? true,
       afterShutdown: async () => {
@@ -479,10 +434,6 @@ export async function startDaemonRuntime(
         await releasePid()
       },
     })
-    // Expose the same shutdown path to the HTTP /system/shutdown endpoint so
-    // remote clients (desktop tray "Shutdown daemon", `sepilot daemon stop`
-    // when the PID file is gone, idle reaper) trigger the identical teardown
-    // sequence without having to fake a process signal.
     const shutdownController = {
       shutdown: (reason: string) => lifecycle.shutdown(reason),
     }
@@ -499,21 +450,11 @@ export async function startDaemonRuntime(
 
     if (options.setupSignalHandlers ?? true) {
       lifecycle.setupSignalHandlers()
-      // Route crashes through the same graceful teardown as signals so a
-      // fatal error still drains HTTP, checkpoints/closes DBs, and flushes
-      // swarm state instead of Node's abrupt default exit(1).
       lifecycle.setupCrashHandlers()
     }
 
-    // Optional self-shutdown: when SEPILOTD_IDLE_SHUTDOWN_MS is set, the daemon
-    // tears itself down once both the WS connection count is zero AND no HTTP
-    // traffic has hit it for the configured window. Default 0 (disabled), so
-    // nothing changes for users that prefer a long-lived daemon.
     const idleMs = resolveIdleShutdownMs()
     if (idleMs > 0 && app.connectionRegistry) {
-      // A connectionless daemon can still be doing work: an active/queued
-      // agent run, a scheduled job, or a swarm run. The reaper must observe
-      // all of these before shutting down, or it kills background work.
       const isBusy = (): boolean => {
         const runStats = runtime.runLimiter?.getStats()
         if (runStats && (runStats.active > 0 || runStats.queued > 0)) return true
@@ -525,11 +466,6 @@ export async function startDaemonRuntime(
       log.info('Idle reaper armed', { idleMs })
     }
 
-    // Embedded desktop mode normally shuts down through the returned handle.
-    // For standalone mode, LifecycleManager's signal handlers run the same
-    // releasePid hook via afterShutdown before exiting. This last-resort hook
-    // must be synchronous: on 'exit' the event loop is stopped, so an async
-    // unlink would never run and would leave a stale PID file behind.
     process.on('exit', () => {
       pidManager.releaseSync()
     })

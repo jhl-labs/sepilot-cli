@@ -38,7 +38,6 @@ export interface ProviderSetupDraft {
   headers?: Record<string, string>
   model: string
   models?: string[]
-  /** Previous configured id when endpoint discovery uniquely reconciled an alias. */
   modelAliasSource?: string
 }
 
@@ -51,12 +50,6 @@ export function isValidProviderEnvVarName(value: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value.trim())
 }
 
-/**
- * Choose the daemon-managed environment variable used when the operator
- * enters an API key directly. The key value itself is deliberately not
- * interpreted or validated; only this generated storage reference must obey
- * environment-variable naming rules.
- */
 export function managedProviderApiKeyEnvVar(options: {
   providerId: string
   preset: ProviderWizardPreset
@@ -227,12 +220,6 @@ function partsStartWith(candidate: string[], prefix: string[]): boolean {
     && prefix.every((part, index) => candidate[index] === part)
 }
 
-/**
- * Reconcile a model selected for one endpoint with the exact ids advertised by
- * another endpoint. Exact ids win. A separator-only alias or a unique prefix
- * may be upgraded to the advertised id, but ambiguous and unrelated matches
- * deliberately preserve the user's value for explicit correction.
- */
 export function reconcileProviderModelDiscovery(options: {
   currentModel: string
   discoveredModels: string[]
@@ -539,21 +526,6 @@ export function buildProviderDeleteUpdate(options: {
   }
 }
 
-/**
- * Build the SYSTEM_MESSAGE body for a successful provider save. The
- * message has three independent axes:
- *
- *   - mode: 'edit' (Updated provider X) vs 'new' (Added provider X)
- *   - secretUpdate: whether the daemon stored a fresh API key in
- *     the managed .env file
- *   - applyToCurrentSession: whether the operator opted to switch
- *     this session onto the new provider/model immediately, in
- *     which case the message also reports whether the session
- *     was already on the same provider/model pair.
- *
- * Pulled out of saveProviderSetup so each branch is unit-testable
- * without mocking out the entire wizard's HTTP/state choreography.
- */
 export function buildProviderSetupSuccessMessage(opts: {
   mode: 'edit' | 'new'
   draft: Pick<ProviderSetupDraft, 'providerId' | 'apiKeyEnvVar' | 'model'>
@@ -597,16 +569,6 @@ export function buildProviderSetupSuccessMessage(opts: {
   ].filter((line): line is string => line !== null).join('\n')
 }
 
-/**
- * Decide which provider/model the operator's current session should
- * be promoted to as the daemon default after `deletedProviderId` is
- * removed. The rule is "only override the daemon's automatic
- * fallback when the user is deleting the daemon default *and* their
- * current session has already moved off it" — preserving the user's
- * implicit choice instead of letting the deletion silently re-route
- * the daemon to a provider they walked away from. Pulled out so the
- * delete-prepare and delete-confirm paths in App.tsx don't drift.
- */
 export function derivePreferredProviderFallback(opts: {
   deletedProviderId: string
   daemonDefaultProviderId: string | null

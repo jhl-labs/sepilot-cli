@@ -36,7 +36,6 @@ interface InputBoxProps {
   maxEditorRows?: number
   isStreaming: boolean
   streamLabel?: string | null
-  /** Messages queued while the agent is streaming; shows a chip when > 0. */
   queuedCount?: number
   blockedReason?: string | null
   blockedHint?: string | null
@@ -728,7 +727,6 @@ export function InputBox({
       return
     }
 
-    // Ctrl+J for newline
     if (input === 'j' && key.ctrl) {
       const current = valueRef.current
       const cursor = cursorOffsetRef.current
@@ -749,8 +747,6 @@ export function InputBox({
       return
     }
 
-    // A leading `!` is a real input mode, not merely a visual prefix. Escape
-    // leaves shell mode without submitting anything and returns to chat.
     if (key.escape && valueRef.current.startsWith('!')) {
       resetHistoryNavigation()
       resetComposition()
@@ -759,11 +755,6 @@ export function InputBox({
       return
     }
 
-    // While actively browsing input history (historyIndexRef.current >= 0)
-    // arrow up/down keep navigating history even when the recalled entry
-    // opens the command palette (e.g. `/health`) or attachment autocomplete
-    // (e.g. `@src/foo.ts`); otherwise the user gets stuck on the first
-    // recalled slash/@ command and cannot reach older entries.
     const historyNavActive = historyIndexRef.current >= 0
 
     if (paletteOpen && !historyNavActive && key.upArrow) {
@@ -834,10 +825,6 @@ export function InputBox({
       return
     }
 
-    // Readline-style word/line editing. These MUST precede the single-char
-    // arrow and backspace handlers below, otherwise a modified arrow/backspace
-    // (Ctrl+←, Alt+Backspace, ...) would be consumed as a plain cursor move or
-    // one-char delete. Alt/Option surfaces as key.meta in ink.
     const moveCursorTo = (nextOffset: number): void => {
       resetComposition()
       const minimumOffset = valueRef.current.startsWith('!') ? 1 : 0
@@ -849,7 +836,6 @@ export function InputBox({
       setCursorOffset(safeOffset)
     }
 
-    // Word-wise motion: Ctrl/Alt+←→ and emacs Alt+B / Alt+F.
     if ((key.leftArrow && (key.ctrl || key.meta)) || (key.meta && !key.ctrl && input === 'b')) {
       moveCursorTo(wordLeftOffset(valueRef.current, cursorOffsetRef.current))
       return
@@ -859,7 +845,6 @@ export function InputBox({
       return
     }
 
-    // Delete word left: Ctrl+W, Alt/Ctrl+Backspace. Delete word right: Alt+D.
     if (
       (input === 'w' && key.ctrl) ||
       ((key.backspace || key.delete) && (key.meta || key.ctrl))
@@ -888,7 +873,6 @@ export function InputBox({
       return
     }
 
-    // Kill to line start (Ctrl+U) / line end (Ctrl+K).
     if (input === 'u' && key.ctrl) {
       resetHistoryNavigation()
       resetComposition()
@@ -933,8 +917,6 @@ export function InputBox({
       return
     }
 
-    // Ink 5 reports the DEL byte (0x7f), emitted by Backspace in most Linux
-    // terminals, as `key.delete`; treat both flags as backward deletion.
     if (key.backspace || key.delete) {
       const cursor = cursorOffsetRef.current
       if (cursor > 0) {
@@ -947,9 +929,6 @@ export function InputBox({
       return
     }
 
-    // Arrow up starts history navigation only from an empty composer. Once
-    // browsing, the recalled text itself is non-empty, so keep arrows bound
-    // to history until the user edits the value or returns to the draft.
     if (key.upArrow && (!valueRef.current || historyIndexRef.current >= 0)) {
       if (history.length > 0) {
         const currentIndex = historyIndexRef.current

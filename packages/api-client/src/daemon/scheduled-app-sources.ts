@@ -1,4 +1,3 @@
-/** Durable identities only: app contents and credentials never belong in a job link. */
 export interface ScheduledAppSource {
   appId: string
   collection?: string
@@ -38,8 +37,6 @@ export function scheduledAppSourcesFromMetadata(
 ): ScheduledAppSource[] {
   const profile = metadata?.scheduledAppSources
   if (profile === undefined) {
-    // Existing Desktop-created reminders already carry these canonical ids.
-    // Project them into the common query contract without duplicating jobs.
     const source = metadata?.source
     if (!source || typeof source !== 'object' || Array.isArray(source)) return []
     const legacy = source as Record<string, unknown>
@@ -64,7 +61,6 @@ export function withScheduledAppSources(
   return { ...metadata, scheduledAppSources: { version: 1, refs: normalizeScheduledAppSources(value) } }
 }
 
-/** A broad app/collection query includes linked descendants, never title matches. */
 export function scheduledAppSourceMatches(ref: ScheduledAppSource, query: ScheduledAppSource): boolean {
   return ref.appId === query.appId
     && (query.collection === undefined || ref.collection === query.collection)

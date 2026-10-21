@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import { createLogger } from '../logger.js'
+import { redactUrlForLog } from './log-url.js'
 import { skipOverride } from './skip-override.js'
 
 const logger = createLogger('http')
@@ -12,10 +13,10 @@ export async function requestLoggerPlugin(app: FastifyInstance) {
     const status = reply.statusCode
     const requestId = request.requestId ?? '-'
 
-    if (url === '/api/v1/health') return // Skip health spam
+    if (url === '/api/v1/health') return
 
     const level = status >= 500 ? 'error' : status >= 400 ? 'warn' : 'info'
-    logger[level](`${method} ${url} ${status} ${duration}ms`, { requestId })
+    logger[level](`${method} ${redactUrlForLog(url)} ${status} ${duration}ms`, { requestId })
   })
 }
 

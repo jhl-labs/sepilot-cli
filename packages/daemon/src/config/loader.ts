@@ -5,12 +5,6 @@ import { migrateConfig } from './config-migrate.js'
 const ENV_VAR_RE = /\$\{([^}]+)\}/g
 const WHOLE_ENV_VAR_RE = /^\$\{([^}]+)\}$/
 
-/**
- * Text-level `${VAR}` substitution. Retained for compatibility; unresolved
- * vars collapse to an empty string. Prefer `parseConfig`, which substitutes
- * at the parsed-object level (safe for secrets containing YAML metacharacters)
- * and drops whole-value unresolved fields instead of injecting ''.
- */
 export function substituteEnvVars(
   text: string,
   env: Record<string, string | undefined> = process.env,
@@ -23,16 +17,6 @@ interface UnresolvedEnvRef {
   name: string
 }
 
-/**
- * Recursively substitute `${VAR}` references inside a parsed config value.
- *
- * - A string that is exactly one unresolved `${VAR}` is dropped (returns
- *   undefined) so an optional URL/field becomes *unset* rather than an empty
- *   string that fails `.url()` and throws the whole config into degraded mode.
- * - A string with inline `${VAR}` mixed with other text substitutes '' for an
- *   unresolved var (can't drop a partial value) and records a diagnostic.
- * - Object keys / array elements whose value resolves to undefined are omitted.
- */
 function deepSubstituteEnv(
   value: unknown,
   env: Record<string, string | undefined>,
@@ -86,18 +70,11 @@ export function parseConfig(
   const raw = YAML.parse(yamlText)
   const unresolved: UnresolvedEnvRef[] = []
   const substituted = deepSubstituteEnv(raw, env, unresolved, '')
-  // Version-migrate before schema validation so a config written by an older
-  // daemon (or with a missing version marker) is carried forward instead of
-  // failing the pinned `version` literal. Rethrows the migration's own clear
-  // error for a downgrade (config from a newer daemon).
   const migrated = migrateConfig(substituted)
   try {
     return configSchema.parse(migrated)
   } catch (error) {
     if (unresolved.length > 0) {
-      // Turn a confusing downstream schema error (e.g. `.url()` on a blank
-      // string) into a targeted per-field diagnostic naming the missing env
-      // var and the config path that referenced it.
       const details = unresolved
         .map((ref) => `  - ${ref.path}: unresolved \${${ref.name}} (set ${ref.name} in the environment or daemon-managed env file)`)
         .join('\n')

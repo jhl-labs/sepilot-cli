@@ -1,4 +1,3 @@
-// packages/daemon/src/tools/scheduler.ts
 import { createHash } from 'node:crypto'
 import type { ManualJobRunOptions, ManualJobRunResult } from '@sepilotd/core'
 import {
@@ -17,7 +16,7 @@ import {
 } from '@sepilotd/api-client'
 import { redactSensitive } from '../memory/sensitive.js'
 import { deliveryRouteError, type SchedulerDeliveryRoute } from '../scheduler/delivery-route.js'
-import { parseWhen, formatWhen, SchedulerParseError } from '../scheduler/time-parser.js'
+import { parseWhen, parseEveryInterval, formatWhen, SchedulerParseError } from '../scheduler/time-parser.js'
 import type { JobStore, JobRun, ScheduledJob } from '../scheduler/job-store.js'
 import { projectStoredJobRunOutcome } from '../scheduler/agent-outcome.js'
 import { schedulerSessionIdForJob } from '../scheduler/session-id.js'
@@ -30,21 +29,10 @@ const failure = (output: string, durationMs: number, code?: string): ToolResult 
 
 export interface SchedulerToolDeps {
   store: JobStore
-  /** Optional: enables `schedule_run_now` to fire a job immediately (recorded in run history). */
   triggerSchedulerJob?: (id: string, options?: ManualJobRunOptions) => Promise<ManualJobRunResult>
-  /** Default IANA timezone applied when `schedule_create` doesn't specify one. */
   defaultTimezone?: string
-  /**
-   * Pre-authorise the tool calls a job's future runs will make, scoped to that
-   * job alone. Wired to ApprovalRegistry.grantSessionAutoApproval. Only invoked
-   * when the caller passes `unattended: true`, which the surface must obtain
-   * from the user. This authority is independent of whether the scheduler fires
-   * the job; without it, only a policy-gated tool call may stall on approval.
-   */
   grantUnattendedApproval?: (schedulerSessionId: string) => void
-  /** Drop that pre-authorisation when a job is cancelled. */
   revokeUnattendedApproval?: (schedulerSessionId: string) => void
-  /** Validate selected skills against the live registry and autonomy ceiling. */
   validateSkillRefs?: (refs: readonly ScheduledAgentSkillRef[]) => Promise<void>
 }
 
@@ -139,6 +127,7 @@ function serializeJob(job: ScheduledJob): Record<string, unknown> {
     skillRefs,
     skillProfileStatus,
     source_refs: sourceRefs,
+    interval_mode: (job.metadata?.schedulerInterval as { mode?: string } | undefined)?.mode ?? 'fixed-delay',
     missed_policy: misfirePolicy?.policy ?? 'skip',
     max_lateness_ms: misfirePolicy?.policy === 'run_once' ? misfirePolicy.maxLatenessMs : null,
     missed: schedulerMissedEvidence(job),
@@ -161,6 +150,12 @@ const maxLatenessSchema = {
 
 function assistantMetadata(input: Record<string, unknown>, existing?: Record<string, unknown> | null): Record<string, unknown> {
   let metadata = { ...existing }
+  if (input.interval_mode !== undefined) {
+    if (input.interval_mode !== 'fixed-rate' && input.interval_mode !== 'fixed-delay') throw new Error('invalid interval_mode')
+    const previous = existing?.schedulerInterval as { mode?: string; anchor?: number } | undefined
+    metadata.schedulerInterval = { version: 1, mode: input.interval_mode,
+      anchor: previous?.mode === input.interval_mode && Number.isFinite(previous.anchor) ? previous.anchor : 0 }
+  }
   if (input.source_refs !== undefined) metadata = withScheduledAppSources(metadata, input.source_refs)
   if (input.missed_policy !== undefined || input.max_lateness_ms !== undefined) {
     const previous = schedulerMisfirePolicyFromMetadata(metadata)
@@ -333,6 +328,7 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinitionRun
         name: { type: 'string', description: 'Optional human-readable name' },
         request_key: { type: 'string', minLength: 1, maxLength: 128, description: 'Stable unique key for this logical creation in the current conversation. Reuse exactly on a retry to avoid duplicate jobs; use schedule_update for changes. A repeated key returns the original job, including its current paused/cancelled/completed state.' },
         source_refs: sourceRefsSchema,
+        interval_mode: { type: 'string', enum: ['fixed-delay', 'fixed-rate'], description: 'For @every intervals only: fixed-delay (default) waits after completion; fixed-rate keeps the creation anchor, skips elapsed slots and never overlaps. Use cron for wall-clock times.' },
         missed_policy: missedPolicySchema,
         max_lateness_ms: maxLatenessSchema,
         timezone: { type: 'string', description: 'IANA timezone for cron interpretation (e.g. "Asia/Seoul"); omit for the daemon default' },
@@ -456,6 +452,10 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinitionRun
         if (parsed.kind !== 'oneshot' && (input.missed_policy !== undefined || input.max_lateness_ms !== undefined)) {
           return failure('missed_policy applies only to one-shot tasks', Date.now() - start, 'INVALID_INPUT_PERMANENT')
         }
+        if (linkedMetadata.schedulerInterval) {
+          if (parsed.kind !== 'recurring' || !parseEveryInterval(parsed.cron)) return failure('interval_mode requires an @every interval', Date.now() - start, 'INVALID_INPUT_PERMANENT')
+          linkedMetadata.schedulerInterval = { ...(linkedMetadata.schedulerInterval as object), anchor: parsed.nextRunAt - parseEveryInterval(parsed.cron)! }
+        }
         const job = store.create({
           name: String(input.name ?? instruction.slice(0, 60)),
           kind: parsed.kind,
@@ -482,9 +482,6 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinitionRun
         if (unattended) {
           deps.grantUnattendedApproval?.(schedulerSessionIdForJob(job.id))
         }
-        // Whether the user was actually asked is the thing that matters here.
-        // An omitted field means the supervision question is still open, which
-        // is materially different from the user having declined it.
         const approvalDecisionPending = input.unattended === undefined
         return success(JSON.stringify({
           id: job.id, name: safeSchedulerEvidenceText(job.name), kind: job.kind,
@@ -511,11 +508,6 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinitionRun
             formatWhen(job) +
             '").'
             + (approvalDecisionPending
-              // A scheduled run fires with nobody watching, so an unresolved
-              // supervision question is not a detail to omit: without standing
-              // approval the first policy-gated call stalls until it times out,
-              // and the user only learns of it from a failed job. Ending the
-              // turn silently here is what produced exactly that.
               ? ' Then, in the same reply, tell the user this job has no standing approval,'
                 + ' so any tool call needing approval will stall while the job runs unattended,'
                 + ' and ask whether to grant approval scoped to this job.'
@@ -698,9 +690,6 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinitionRun
       const resolved = resolveScopedJob(store, String(input.id ?? ''), context as ToolExecutionContext | undefined)
       if ('error' in resolved) return failure(resolved.error, Date.now() - start, 'NOT_FOUND_PERMANENT')
       store.cancel(resolved.job.id)
-      // A cancelled job must not leave its pre-authorisation behind: the
-      // session id is derived from the job id, so a later job could not reuse
-      // it, but the grant should still not outlive what it was granted for.
       deps.revokeUnattendedApproval?.(schedulerSessionIdForJob(resolved.job.id))
       return success(JSON.stringify({
         ok: true,
@@ -760,6 +749,7 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinitionRun
         id: { type: 'string', description: 'Full job id or at least 4-character id prefix from schedule_list' },
         name: { type: 'string', minLength: 1, description: 'Optional replacement human-readable name; omitted preserves the current name' },
         source_refs: sourceRefsSchema,
+        interval_mode: { type: 'string', enum: ['fixed-delay', 'fixed-rate'], description: 'For @every intervals only: fixed-delay (default) waits after completion; fixed-rate keeps the creation anchor, skips elapsed slots and never overlaps. Use cron for wall-clock times.' },
         missed_policy: missedPolicySchema,
         max_lateness_ms: maxLatenessSchema,
         when: { type: 'string', description: 'Optional replacement schedule expression with the same kind as the existing job' },
@@ -832,7 +822,7 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinitionRun
       const retryBackoffMs = numOpt(input.retry_backoff_ms, 1000)
       const hasNotificationPriority = input.notification_priority !== undefined
       const hasSkillRefs = input.skill_refs !== undefined
-      const hasAssistantContract = input.source_refs !== undefined || input.missed_policy !== undefined || input.max_lateness_ms !== undefined
+      const hasAssistantContract = input.interval_mode !== undefined || input.source_refs !== undefined || input.missed_policy !== undefined || input.max_lateness_ms !== undefined
       let linkedMetadata: Record<string, unknown> | undefined
       if (hasAssistantContract) {
         try {
@@ -948,6 +938,13 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinitionRun
         }
       }
 
+      if (nextMetadata?.schedulerInterval) {
+        const cron = parsed?.kind === 'recurring' ? parsed.cron : job.cron
+        if (job.kind !== 'recurring' || !cron || !parseEveryInterval(cron)) return failure('interval_mode requires an @every interval', Date.now() - start, 'INVALID_INPUT_PERMANENT')
+        const cadence = nextMetadata.schedulerInterval as { anchor?: number }
+        if (parsed?.kind === 'recurring' || !cadence.anchor) nextMetadata.schedulerInterval = { ...cadence,
+          anchor: (parsed?.kind === 'recurring' ? parsed.nextRunAt : job.nextRunAt) - parseEveryInterval(cron)! }
+      }
       let updated: ScheduledJob | null
       const preserveRunState = !hasWhen && !hasInstruction && !hasTimezone
       if (job.kind === 'recurring') {
@@ -1035,8 +1032,6 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinitionRun
         try {
           const result = await triggerSchedulerJob(resolved.job.id, { waitForCompletion: false })
           if (!result.started) {
-            // Reporting ok for a run that never started would let the agent
-            // tell the user the task ran.
             return failure(
               `job is not runnable (enabled: ${store.get(resolved.job.id)?.enabled === true}, status: ${store.get(resolved.job.id)?.status ?? 'unknown'}); manual run was not started`,
               Date.now() - start,

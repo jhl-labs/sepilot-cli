@@ -35,13 +35,9 @@ const DEFAULT_CPU_LIMIT = '1.0'
 const DEFAULT_PIDS_LIMIT = 100
 const WORKSPACE_TARGET = '/workspace'
 
-// Identifying label stamped on every sandbox container so a boot-time reaper can
-// find and remove orphans left by a crashed daemon (bwrap avoids this with
-// --die-with-parent; Docker containers outlive the daemon process).
 export const SANDBOX_CONTAINER_LABEL = 'com.sepilot.sandbox'
 export const SANDBOX_CONTAINER_LABEL_VALUE = '1'
 
-/** Minimal dockerode surface the reaper needs (so it can be unit-tested). */
 export interface DockerReapApi {
   listContainers(options: {
     all?: boolean
@@ -50,12 +46,6 @@ export interface DockerReapApi {
   getContainer(id: string): { remove(options: { force: boolean }): Promise<unknown> }
 }
 
-/**
- * Remove every container tagged with the sandbox label. Called at daemon boot to
- * reap orphans from a previous (possibly crashed) run. Best-effort: an
- * unreachable Docker daemon or a container that vanished mid-sweep is ignored.
- * Returns the number of containers removed.
- */
 export async function reapOrphanedSandboxContainers(docker: DockerReapApi): Promise<number> {
   let containers: Array<{ Id: string }>
   try {
@@ -72,7 +62,6 @@ export async function reapOrphanedSandboxContainers(docker: DockerReapApi): Prom
       await docker.getContainer(info.Id).remove({ force: true })
       removed += 1
     } catch {
-      /* already gone or not removable — skip */
     }
   }
   return removed
@@ -135,10 +124,6 @@ export class DockerTerminalRunner implements TerminalRunner {
     }
   }
 
-  /**
-   * Reap sandbox containers orphaned by a previous daemon run. Best-effort;
-   * intended to be called once at startup.
-   */
   reapOrphans(): Promise<number> {
     return reapOrphanedSandboxContainers(this.docker as unknown as DockerReapApi)
   }

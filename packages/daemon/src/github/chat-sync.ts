@@ -283,7 +283,6 @@ async function readExistingEnvelope(path: string): Promise<EncryptedSessionEnvel
       return parsed as EncryptedSessionEnvelope
     }
   } catch {
-    // Missing or invalid existing envelopes are overwritten by the next export.
   }
   return null
 }
@@ -300,7 +299,6 @@ async function readExistingManifest(path: string): Promise<ChatSyncManifest | nu
       return parsed as ChatSyncManifest
     }
   } catch {
-    // Missing or invalid manifests are replaced below.
   }
   return null
 }

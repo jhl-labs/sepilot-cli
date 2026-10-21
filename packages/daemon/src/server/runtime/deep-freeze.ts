@@ -1,7 +1,3 @@
-/**
- * Recursively freeze an object so any mutation throws in strict mode.
- * Skips non-enumerable properties and prototype chains.
- */
 export function deepFreeze<T>(obj: T): Readonly<T> {
   if (obj === null || typeof obj !== 'object') return obj
 

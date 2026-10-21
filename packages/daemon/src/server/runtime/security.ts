@@ -5,6 +5,7 @@ import { randomBytes } from 'node:crypto'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import YAML from 'yaml'
 import type { SepilotdConfig } from '../../config/schema.js'
+import { normalizeResourceAccessPolicy } from '../../security/resource-access.js'
 import { ChannelAcl } from '../../security/channel-acl.js'
 import { EncryptionManager } from '../../security/encryption.js'
 import {
@@ -18,6 +19,7 @@ const POLICY_MODES = new Set<ToolPolicyMode>(['autonomous', 'supervised', 'ask',
 type LoadedPolicyRule = Partial<PolicyRule>
 
 interface LoadedPolicyConfig {
+  access?: PolicyConfig['access']
   version?: number
   defaults?: Partial<PolicyConfig['defaults']>
   tools?: Record<string, LoadedPolicyRule>
@@ -125,6 +127,7 @@ function normalizePolicyConfig(raw: unknown, source: string): LoadedPolicyConfig
   }
 
   return {
+    access: value.access === undefined ? undefined : normalizeResourceAccessPolicy(value.access),
     version,
     defaults: normalizedDefaults,
     tools,
@@ -188,6 +191,7 @@ function mergePolicyConfig(base: PolicyConfig, override: LoadedPolicyConfig): Po
     : base.elevated
 
   return {
+    access: override.access ?? base.access,
     version: override.version ?? base.version,
     defaults,
     tools,
@@ -203,18 +207,12 @@ function isEnoent(error: unknown): boolean {
   return isNodeError(error, 'ENOENT')
 }
 
-/**
- * Write the built-in default policy to `policyPath` and return it. Writing is
- * best-effort: if the directory is read-only the daemon still boots on the
- * in-memory default rather than refusing to start.
- */
 function materializeDefaultPolicyFile(policyPath: string): PolicyConfig {
   const policy = createDefaultPolicy()
   try {
     mkdirSync(dirname(policyPath), { recursive: true, mode: 0o700 })
     writeFileSync(policyPath, YAML.stringify(policy), { mode: 0o600, flag: 'wx' })
   } catch {
-    // Already created by a racing boot, or the directory is not writable.
   }
   return policy
 }
@@ -224,19 +222,17 @@ export function resolveToolPolicyPath(config: SepilotdConfig, dataDir: string): 
   return isAbsolute(policyPath) ? policyPath : resolve(dataDir, 'security', policyPath)
 }
 
-export function loadPolicyConfig(config: SepilotdConfig, dataDir: string): PolicyConfig {
+export function loadPolicyConfig(
+  config: SepilotdConfig,
+  dataDir: string,
+  options: { requireExisting?: boolean } = {},
+): PolicyConfig {
   const policyPath = resolveToolPolicyPath(config, dataDir)
   let rawText: string
   try {
     rawText = readFileSync(policyPath, 'utf8')
   } catch (error) {
-    // A data dir that has never been initialised simply has no policy file
-    // yet. That is a provisioning gap, not an operator error: materialize the
-    // built-in default policy so first boot succeeds without manual file
-    // surgery. Every other read failure (permissions, IO, a directory in the
-    // way) still fails loudly — silently defaulting there would quietly widen
-    // the tool policy the operator believes is in force.
-    if (!isEnoent(error)) {
+    if (!isEnoent(error) || options.requireExisting) {
       throw new Error(
         `Could not load tool policy at ${policyPath}: ${
           error instanceof Error ? error.message : String(error)
@@ -263,7 +259,25 @@ export function loadPolicyConfig(config: SepilotdConfig, dataDir: string): Polic
 }
 
 export function buildPolicyEngine(config: SepilotdConfig, dataDir: string): PolicyEngine {
-  return new PolicyEngine(withOperatorValidationAllowPatterns(loadPolicyConfig(config, dataDir)))
+  return new PolicyEngine(
+    {
+      ...withOperatorValidationAllowPatterns(loadPolicyConfig(config, dataDir)),
+      browserSites: config.security.browser.sites,
+    },
+    dataDir,
+  )
+}
+
+export function prepareToolPolicyUpdate(previous: SepilotdConfig, next: SepilotdConfig, dataDir: string) {
+  if (previous.security.toolPolicy === next.security.toolPolicy) return undefined
+  return {
+    ...withOperatorValidationAllowPatterns(loadPolicyConfig(next, dataDir, { requireExisting: true })),
+    browserSites: next.security.browser.sites,
+  }
+}
+
+export function applyBrowserSitePolicy(engine: PolicyEngine, next: SepilotdConfig): void {
+  engine.updateBrowserSites(next.security.browser.sites)
 }
 
 export function buildChannelAcl(config: SepilotdConfig, autonomy: AutonomyLevel): ChannelAcl {
@@ -317,20 +331,7 @@ export async function buildEncryption(
 
   if (!config.memory.encryption) return encryption
 
-  // The operator explicitly opted in to memory encryption. The
-  // previous implementation swallowed every loadKey failure and
-  // returned an EncryptionManager with `key=null`, which means
-  // every downstream `encrypt`/`encryptFile` call would throw at
-  // use time AND, worse, any plaintext fall-back path in callers
-  // would silently persist sensitive memory state to disk in
-  // plaintext. Refuse to start instead — the operator can either
-  // generate the key (`sepilotd init` or manual openssl rand 32)
-  // or set `memory.encryption=false`.
   const keyPath = `${dataDir}/security/data.key`
-  // First boot into an empty data dir: generate the key instead of refusing to
-  // start. Only a *missing* key is auto-provisioned — an existing but invalid
-  // key still fails loudly, because regenerating it would permanently destroy
-  // access to memory that was already encrypted under the previous key.
   try {
     await mkdir(dirname(keyPath), { recursive: true, mode: 0o700 })
     await writeFile(keyPath, randomBytes(32), { mode: 0o600, flag: 'wx' })

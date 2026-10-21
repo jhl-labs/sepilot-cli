@@ -12,26 +12,49 @@ export interface CustomAgentRecord {
   allowedTools?: string[]
   deniedTools?: string[]
   isolation?: 'worktree'
+  maxIterations?: number
   issues?: string[]
+  warnings?: string[]
 }
+
+const SUPPORTED_AGENT_KEYS = new Set([
+  'name',
+  'description',
+  'mode',
+  'model',
+  'allowed_tools',
+  'denied_tools',
+  'tools',
+  'disallowedTools',
+  'color',
+  'isolation',
+  'max_iterations',
+  'maxIterations',
+])
+
+const UNSUPPORTED_POLICY_KEYS = new Set([
+  'hooks',
+  'permissionMode',
+  'permission_mode',
+  'permissions',
+  'background',
+  'mcpServers',
+  'mcp_servers',
+  'sandbox',
+])
+
+export const CUSTOM_AGENT_MAX_ITERATIONS_CAP = 50
 
 export function compileCustomAgents(defs: CustomDef[]): CustomAgentRecord[] {
   return defs.map((d) => {
     const issues = d.error ? [d.error] : []
-    const supported = new Set([
-      'name',
-      'description',
-      'mode',
-      'model',
-      'allowed_tools',
-      'denied_tools',
-      'tools',
-      'disallowedTools',
-      'color',
-      'isolation',
-    ])
-    for (const key of Object.keys(d.data))
-      if (!supported.has(key)) issues.push(`Unsupported agent setting: ${key}`)
+    const warnings: string[] = []
+    for (const key of Object.keys(d.data)) {
+      if (SUPPORTED_AGENT_KEYS.has(key)) continue
+      if (UNSUPPORTED_POLICY_KEYS.has(key)) issues.push(`Unsupported agent setting: ${key}`)
+      else warnings.push(`Ignored unknown agent setting: ${key}`)
+    }
+    const maxIterations = iterationBudget(d.data.max_iterations, d.data.maxIterations, issues)
     const allowedTools = toolNames(d.data.allowed_tools, d.data.tools, 'tools', issues)
     const deniedTools = toolNames(
       d.data.denied_tools,
@@ -53,13 +76,13 @@ export function compileCustomAgents(defs: CustomDef[]): CustomAgentRecord[] {
       allowedTools,
       deniedTools,
       ...(d.data.isolation === 'worktree' ? { isolation: 'worktree' as const } : {}),
+      ...(maxIterations !== undefined ? { maxIterations } : {}),
       ...(issues.length ? { issues } : {}),
+      ...(warnings.length ? { warnings } : {}),
     }
   })
 }
 
-// Only exact semantic equivalents are imported. Argument matchers and unknown
-// foreign names must never silently weaken a deny rule.
 const TOOL_ALIASES: Record<string, string> = {
   Read: 'fs.read',
   Write: 'fs.write',
@@ -98,6 +121,20 @@ function toolNames(
     if (!/^[a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+)*$/.test(name))
       issues.push(`Unsupported ${field} rule syntax; use exact Sepilot tool names`)
   return [...new Set(names)]
+}
+
+function iterationBudget(native: unknown, imported: unknown, issues: string[]): number | undefined {
+  if (native !== undefined && imported !== undefined) {
+    issues.push('Conflicting max_iterations and maxIterations settings')
+    return undefined
+  }
+  const value = native ?? imported
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    issues.push('max_iterations must be a positive integer')
+    return undefined
+  }
+  return Math.min(value, CUSTOM_AGENT_MAX_ITERATIONS_CAP)
 }
 
 export function assertCustomAgentUsable(record: CustomAgentRecord): void {

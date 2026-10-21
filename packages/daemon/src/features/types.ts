@@ -5,48 +5,39 @@ import type { GatewayClient } from '../gateway/client.js'
 import type { FileSkillRegistry } from '../skills/registry.js'
 import type { TaskDelegator } from '../agent/delegator.js'
 import type { SemanticMemoryStore } from '../memory/types.js'
+import type { UsageTracker } from '../memory/usage-tracker.js'
 import type { DreamingEngine } from '../memory/dreaming.js'
+import type { RuntimeServices } from '../server/runtime/types.js'
+import type { SchedulerRunFinished } from '../event-routing/producers/scheduler.js'
 
 export interface FeatureToolDeps {
   config: SepilotdConfig
   dataDir?: string
   gatewayClient: GatewayClient
   skillRegistry: FileSkillRegistry
-  /** True only for loopback URLs exposed within this session/workspace capability. */
   isManagedLoopbackUrl?: (
     sessionId: string | undefined,
     rawUrl: string,
     workspaceRoot?: string,
   ) => boolean
-  /** Unix bridge socket for an accessible managed-loopback URL, when available. */
   managedLoopbackSocketForUrl?: (
     sessionId: string | undefined,
     rawUrl: string,
     workspaceRoot?: string,
   ) => string | null
-  /** delegation feature만 사용; tools.ts가 생성해 주입 */
   delegator?: TaskDelegator
 }
 
 export type FeatureToolRegistrar = (registry: ToolRegistry, deps: FeatureToolDeps) => void
 
-/**
- * Deps for the second-pass tool/service registrations done inside
- * `buildRuntime` (after the storage layer exists). These entries re-register
- * feature tools with richer wiring than the `buildToolRegistry` pass — e.g.
- * the delegation tool with session-event append, apps tools with the semantic
- * index, and the a2a/acp runtime services. Kept separate from
- * `FeatureToolDeps` so the earlier `buildToolRegistry` pass need not supply
- * sessions/semanticIndex.
- */
 export interface FeatureRuntimeToolDeps {
   dataDir: string
   delegator: TaskDelegator
   semanticIndex: SemanticMemoryStore
   sessions: ISessionStore
   deviceName: string
-  /** Only supplied for the late acp registration (after dreaming is built). */
   dreaming?: DreamingEngine
+  usageTracker?: UsageTracker
 }
 
 export type FeatureRuntimeToolRegistrar = (
@@ -56,4 +47,22 @@ export type FeatureRuntimeToolRegistrar = (
 
 export interface FeatureRouteDeps {
   prefix: string
+}
+
+export type FeatureEventRoutingRuntime = Pick<
+  RuntimeServices,
+  | 'config'
+  | 'channels'
+  | 'hookRegistry'
+  | 'sessions'
+  | 'toolRegistry'
+  | 'eventRouting'
+  | 'eventRoutingLlmRunner'
+  | 'eventRoutingProducers'
+>
+
+export type FeatureEventRoutingStopRuntime = Partial<Pick<RuntimeServices, 'eventRouting' | 'eventRoutingProducers' | 'toolRegistry'>>
+
+export interface FeatureEventRoutingHooks {
+  onSchedulerRunFinished?: (finished: SchedulerRunFinished) => void
 }

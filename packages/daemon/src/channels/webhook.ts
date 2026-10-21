@@ -1,6 +1,7 @@
 import type { IChannel, ChannelType, ChannelTarget, ChannelMessage, ChannelStatus, IncomingMessage, Disposable } from '@sepilotd/core'
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import { isIP } from 'node:net'
+import { deriveWebhookEventType } from '../event-routing/inbound.js'
 
 export interface WebhookEndpointConfig {
   enabled?: boolean
@@ -9,10 +10,19 @@ export interface WebhookEndpointConfig {
   secretValue: string
   allowedIps?: string[]
   allowedEvents?: string[]
-  /** Opt-in replay protection; defaults to off for back-compat. */
   requireTimestamp?: boolean
   timestampHeader?: string
   timestampMaxSkewSeconds?: number
+  mode?: 'chat' | 'route'
+  auth?: 'hmac' | 'token'
+  eventTypeHeader?: string
+  deliveryIdHeader?: string
+}
+
+export interface VerifiedWebhookRequest {
+  endpoint: WebhookEndpointConfig
+  normalizedPath: string
+  eventType: string
 }
 
 export interface WebhookChannelConfig {
@@ -202,6 +212,12 @@ function matchesAllowedIp(remoteIp: string | undefined, allowedEntry: string): b
   return bytesInCidr(candidate, network, prefixLength)
 }
 
+function constantTimeEquals(actual: string, expected: string): boolean {
+  const a = Buffer.from(actual, 'utf8')
+  const b = Buffer.from(expected, 'utf8')
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
 function signatureMatches(headerValue: string, expectedHex: string): boolean {
   const expected = Buffer.from(expectedHex, 'hex')
   const candidates = headerValue
@@ -281,10 +297,77 @@ export class WebhookChannel implements IChannel {
   }
 
   async sendMessage(_target: ChannelTarget, _msg: ChannelMessage): Promise<void> {
-    // Webhooks are receive-only by nature
   }
 
-  /** Process incoming webhook request */
+  verifyRequest(
+    path: string,
+    body: Record<string, unknown>,
+    headers: Record<string, string>,
+    ip?: string,
+    rawBody?: string,
+  ): VerifiedWebhookRequest | null {
+    const normalizedPath = normalizeWebhookEndpointPath(path)
+    const endpoint = this.config.endpoints.find((entry) =>
+      entry.enabled !== false
+      && normalizeWebhookEndpointPath(entry.path) === normalizedPath,
+    )
+    if (!endpoint) return null
+    if (!this.isEndpointVerificationReady(endpoint)) return null
+
+    if (endpoint.allowedIps?.length && !endpoint.allowedIps.some(allowed => matchesAllowedIp(ip, allowed))) {
+      return null
+    }
+
+    const presented = headers[endpoint.secretHeader.toLowerCase()]
+    if (!presented) return null
+
+    let boundTimestamp: string | undefined
+    if (endpoint.requireTimestamp) {
+      const headerName = (endpoint.timestampHeader ?? 'x-webhook-timestamp').toLowerCase()
+      const tsValue = headers[headerName]
+      if (typeof tsValue !== 'string' || !tsValue.trim()) return null
+      const tsNum = Number(tsValue)
+      if (!Number.isFinite(tsNum) || tsNum <= 0) return null
+      const tsMs = tsNum < 1e12 ? tsNum * 1000 : tsNum
+      const skewSeconds = endpoint.timestampMaxSkewSeconds ?? 300
+      if (Math.abs(Date.now() - tsMs) / 1000 > skewSeconds) return null
+      boundTimestamp = tsValue
+    }
+
+    if (endpoint.auth === 'token') {
+      const token = presented.replace(/^bearer\s+/i, '')
+      if (!constantTimeEquals(token, endpoint.secretValue)) return null
+    } else {
+      const signedBody = rawBody ?? JSON.stringify(body)
+      const signingPayload = boundTimestamp !== undefined ? `${boundTimestamp}.${signedBody}` : signedBody
+      const expected = createHmac('sha256', endpoint.secretValue).update(signingPayload).digest('hex')
+      if (!signatureMatches(presented, expected)) return null
+    }
+
+    const eventType = deriveWebhookEventType(endpoint, headers, body)
+    if (endpoint.allowedEvents?.length && !endpoint.allowedEvents.includes(eventType)) return null
+    return { endpoint, normalizedPath, eventType }
+  }
+
+  async dispatchVerified(
+    verified: VerifiedWebhookRequest,
+    body: Record<string, unknown>,
+    headers: Record<string, string>,
+  ): Promise<void> {
+    const msg: IncomingMessage = {
+      channelType: 'webhook',
+      channelId: verified.normalizedPath,
+      messageId: headers['x-delivery'] ?? headers['x-request-id'] ?? Date.now().toString(),
+      text: typeof body === 'string' ? body : JSON.stringify(body),
+      sender: { id: 'webhook', name: verified.normalizedPath, type: 'bot' },
+      timestamp: new Date().toISOString(),
+      raw: body,
+    }
+    for (const h of this.handlers) {
+      try { await h(msg) } catch {}
+    }
+  }
+
   async handleWebhook(
     path: string,
     body: Record<string, unknown>,
@@ -292,70 +375,10 @@ export class WebhookChannel implements IChannel {
     ip?: string,
     rawBody?: string,
   ): Promise<boolean> {
-    const normalizedPath = normalizeWebhookEndpointPath(path)
-    const endpoint = this.config.endpoints.find((entry) =>
-      entry.enabled !== false
-      && normalizeWebhookEndpointPath(entry.path) === normalizedPath,
-    )
-    if (!endpoint) return false
-    if (!this.isEndpointVerificationReady(endpoint)) return false
-
-    // Verify IP allowlist
-    if (endpoint.allowedIps?.length && !endpoint.allowedIps.some(allowed => matchesAllowedIp(ip, allowed))) {
-      return false
-    }
-
-    // Opt-in replay protection: when the endpoint declares
-    // `requireTimestamp`, refuse deliveries older than the configured skew
-    // window AND bind the timestamp into the signed payload. Skew alone is
-    // ineffective because a replayer can simply resend a captured body with a
-    // fresh timestamp; binding the timestamp into the HMAC forces the sender
-    // to sign `${timestamp}.${rawBody}`, so a replay with a new timestamp no
-    // longer matches the captured signature.
-    let boundTimestamp: string | undefined
-    if (endpoint.requireTimestamp) {
-      const headerName = (endpoint.timestampHeader ?? 'x-webhook-timestamp').toLowerCase()
-      const tsValue = headers[headerName]
-      if (typeof tsValue !== 'string' || !tsValue.trim()) return false
-      const tsNum = Number(tsValue)
-      if (!Number.isFinite(tsNum) || tsNum <= 0) return false
-      // Accept either seconds or millis since epoch.
-      const tsMs = tsNum < 1e12 ? tsNum * 1000 : tsNum
-      const skewSeconds = endpoint.timestampMaxSkewSeconds ?? 300
-      const ageSeconds = Math.abs(Date.now() - tsMs) / 1000
-      if (ageSeconds > skewSeconds) return false
-      boundTimestamp = tsValue
-    }
-
-    // Verify HMAC signature
-    const signature = headers[endpoint.secretHeader.toLowerCase()]
-    if (!signature) return false
-    const signedBody = rawBody ?? JSON.stringify(body)
-    const signingPayload = boundTimestamp !== undefined
-      ? `${boundTimestamp}.${signedBody}`
-      : signedBody
-    const expected = createHmac('sha256', endpoint.secretValue)
-      .update(signingPayload)
-      .digest('hex')
-    if (!signatureMatches(signature, expected)) return false
-
-    // Check event type
-    const eventType = headers['x-github-event'] ?? headers['x-webhook-event'] ?? (body.type as string) ?? 'unknown'
-    if (endpoint.allowedEvents?.length && !endpoint.allowedEvents.includes(eventType)) return false
-
-    const msg: IncomingMessage = {
-      channelType: 'webhook',
-      channelId: normalizedPath,
-      messageId: headers['x-delivery'] ?? headers['x-request-id'] ?? Date.now().toString(),
-      text: typeof body === 'string' ? body : JSON.stringify(body),
-      sender: { id: 'webhook', name: normalizedPath, type: 'bot' },
-      timestamp: new Date().toISOString(),
-      raw: body,
-    }
-
-    for (const h of this.handlers) {
-      try { await h(msg) } catch { /* handler errors are silently ignored */ }
-    }
+    const verified = this.verifyRequest(path, body, headers, ip, rawBody)
+    if (!verified) return false
+    if (verified.endpoint.mode === 'route') return false
+    await this.dispatchVerified(verified, body, headers)
     return true
   }
 

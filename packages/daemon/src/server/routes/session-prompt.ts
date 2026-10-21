@@ -15,12 +15,6 @@ export async function sessionPromptRoutes(app: FastifyInstance) {
     Params: { id: string }
     Querystring: { turn?: string }
   }>('/sessions/:id/prompt', async (request, reply) => {
-    // This endpoint returns the fully assembled system prompt and session
-    // history. Extension session access must not implicitly grant access to
-    // daemon-wide instructions or legacy global memory embedded in that
-    // prompt. An unauthenticated loopback daemon has no authContext and keeps
-    // the existing local-operator behavior; authenticated extensions fail
-    // closed here.
     if (request.authContext?.kind === 'extension') {
       return reply.status(403).send({
         error: {

@@ -22,8 +22,12 @@ export const chatAutonomySchema = z.enum([
   'autonomous',
 ])
 
+export const CHAT_TOOL_NAMES_MAX = 128
+
 export const chatRequestSchema = z.object({
   message: z.string(),
+  deadlineAt: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  completionRequest: z.string().trim().min(1).max(100_000).optional(),
   sessionId: safeIdSchema.optional(),
   messageId: z.string().trim().min(1).max(256).optional(),
   lastEventId: z.string().trim().min(1).max(256).optional(),
@@ -31,36 +35,13 @@ export const chatRequestSchema = z.object({
   provider: z.string().optional(),
   tags: z.array(z.string().trim().min(1).max(64)).max(16).optional(),
   persona: z.string().optional(),
-  /**
-   * Multi-persona panel mode. When non-empty and `mode === 'persona-panel'`,
-   * each id becomes a panelist that answers the same user turn in sequence.
-   * Capped at 6 to keep latency / token cost predictable.
-   */
+  bot: z.string().trim().min(1).max(64).optional(),
+  bots: z.array(z.string().trim().min(1).max(64)).max(6).optional(),
   personaIds: z.array(z.string().min(1)).max(6).optional(),
-  /**
-   * `sequential` is the deterministic multi-perspective contract: every
-   * resolved persona answers exactly once in request order while seeing the
-   * transcript accumulated so far. `moderated` retains the facilitated
-   * meeting workflow with dynamic floor selection.
-   */
   panelStrategy: z.enum(['sequential', 'moderated']).optional(),
   thinkingLevel: z.enum(['auto', 'off', 'low', 'medium', 'high', 'max']).optional(),
   maxTokens: z.number().int().positive().max(2_000_000).optional(),
-  /**
-   * Agent-loop iteration cap for this turn. One iteration is one LLM round
-   * (which may emit one or more parallel tool calls). Defaults to the
-   * `SEPILOTD_CHAT_MAX_ITERATIONS` env (or 50 if unset). Multi-pass skills
-   * such as `software-architect` reverse-engineering a non-trivial codebase
-   * routinely need more; the upper bound is `500` to leave room while
-   * keeping a stop-the-bleeding hard cap on runaway loops.
-   */
   maxIterations: z.number().int().min(1).max(500).optional(),
-  /**
-   * Treat `maxIterations` as an exact hard cap: no automatic continuation
-   * cycles and no contract-derived floor. Off by default — a client-supplied
-   * `maxIterations` is a requested budget, and interactive surfaces keep the
-   * repair/continuation headroom. Benches and automation opt in explicitly.
-   */
   hardMaxIterations: z.boolean().optional(),
   temperature: z.number().min(0).max(2).optional(),
   mode: z.string().trim().min(1).optional(),
@@ -71,47 +52,25 @@ export const chatRequestSchema = z.object({
   cwd: z.string().optional(),
   workspaceRoot: z.string().optional(),
   skillRefs: z.array(chatSkillRefSchema).optional(),
-  /**
-   * Optional per-request tool allowlist. Omit to expose the normal direct-API
-   * registry; pass [] when the caller needs a tool-free model turn.
-   */
-  toolNames: z.array(z.string().trim().min(1).max(128)).max(128).optional(),
-  // Composer-level toggles surfaced by the desktop chat shell. `ragEnabled`
-  // controls document retrieval for this turn; image generation remains a
-  // forwarded intent for routes that know how to use it.
+  toolNames: z.array(z.string().trim().min(1).max(128)).max(CHAT_TOOL_NAMES_MAX).optional(),
+  memoryPolicy: z.object({ read: z.boolean().optional(), write: z.boolean().optional() }).strict().optional(),
   ragEnabled: z.boolean().optional(),
   imageGenEnabled: z.boolean().optional(),
-  /**
-   * Streaming-only opt-in. Omit it to keep the historical buffered text_delta
-   * contract used by CLI, mobile, Telegram, and existing API consumers. `live`
-   * streams only final-answer text that has passed the answer-protocol gate.
-   */
   textDeltaMode: z.enum(['buffered', 'live']).optional(),
   inputTrustLevel: z.enum(['trusted', 'untrusted']).optional(),
-  /**
-   * Explicit per-turn autonomy selection. Independent channel/policy ceilings
-   * still apply after this local session value is resolved.
-   * This lets automation choose readonly and an interactive authenticated
-   * client choose workspace-write without changing the configured default.
-   */
+  localContext: z.enum(['default', 'none']).optional(),
   autonomy: chatAutonomySchema.optional(),
-  /**
-   * Per-turn HITL guard. Policy-allowed side effects still require a fresh
-   * approval; read-only tools and hard policy denials are unchanged.
-   */
   requireToolApproval: z.boolean().optional(),
-  /**
-   * Per-request kill switch for the IntentRouter. An explicit concrete mode
-   * is always authoritative; auto/omitted mode lets the router choose while
-   * persona and skill values remain routing hints. Pass `{enabled: false}`
-   * to use the body's `mode`/`persona`/`skillRefs` verbatim for this turn.
-   */
   intentRouting: z.object({
     enabled: z.boolean().optional(),
   }).optional(),
 })
 
 export type ChatBody = z.infer<typeof chatRequestSchema>
+
+export function excludesLocalContext(body: { localContext?: unknown }): boolean {
+  return body.localContext === 'none'
+}
 
 const desktopExternalAgentModes = new Set([
   'external-claude',
@@ -128,7 +87,6 @@ export function resolveChatMaxIterations(body: Pick<ChatBody, 'maxIterations'>):
   return resolveAgentMaxIterations(body)
 }
 
-/** Hard cap only when the request says so; `maxIterations` alone never hardens the run. */
 export function resolveChatHardMaxIterations(
   body: Pick<ChatBody, 'hardMaxIterations'>,
 ): boolean {

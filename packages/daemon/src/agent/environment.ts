@@ -11,7 +11,6 @@ export interface EnvironmentInfo {
   gitBranch?: string
   today: string
   timeZone?: string
-  /** Clock snapshot when this turn's environment was collected, not a tool observation time. */
   capturedAt?: string
   localTime?: string
 }
@@ -20,7 +19,6 @@ export interface GatherEnvironmentOptions {
   cwd?: string
   workspaceRoot?: string
   now?: Date
-  /** IANA timezone override for deterministic callers/tests. Defaults to the host timezone. */
   timeZone?: string
 }
 

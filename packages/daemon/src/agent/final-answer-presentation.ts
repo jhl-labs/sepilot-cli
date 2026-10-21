@@ -94,13 +94,6 @@ function hasCanonicalPhaseUsageItemAfter(lines: readonly string[], headingIndex:
   return false
 }
 
-/**
- * Removes daemon-owned completion protocols from text after those protocols
- * have already driven their internal gates. Matching is structural and is
- * limited to criterion ids from the active run contract. Fenced examples are
- * left untouched so a user asking about the protocol can still receive code or
- * documentation that contains the same tokens.
- */
 export function sanitizeFinalAnswerPresentation(
   value: string,
   options: SanitizeFinalAnswerOptions = {},
@@ -207,7 +200,6 @@ function extractJsonObject(value: string): Record<string, unknown> | null {
   }
 }
 
-/** Parse the finalizer's bounded, user-facing JSON envelope. */
 export function parseStructuredFinalReport(value: string): StructuredFinalReport | null {
   const parsed = extractJsonObject(value)
   if (!parsed) return null
@@ -216,20 +208,11 @@ export function parseStructuredFinalReport(value: string): StructuredFinalReport
   return {
     outcome,
     details: asShortStringList(parsed.details, 2),
-    // A completed task can require more than one distinct check (for example
-    // formatting, tests, and a build). Keep this bounded, but do not silently
-    // discard requested validation evidence merely because the reporter
-    // returned more than one successful check.
     validation: asShortStringList(parsed.validation, 3),
     remainingRisks: asShortStringList(parsed.remainingRisks, 1),
   }
 }
 
-/**
- * Distinguishes a failed structured-reporter envelope from a legitimate
- * natural-language provider fallback. A malformed/truncated envelope must
- * never be rendered directly in chat.
- */
 export function isStructuredFinalReportEnvelopeLike(value: string): boolean {
   const trimmed = value.trimStart()
   return trimmed.startsWith('{')
@@ -239,19 +222,8 @@ export function isStructuredFinalReportEnvelopeLike(value: string): boolean {
 
 const MAX_REPORTED_ARTIFACT_PATHS = 3
 
-/**
- * Minimal locale-aware wording for a daemon-generated partial-result notice.
- * The rejected draft is deliberately not published here — it can claim success
- * the gate could not confirm — but it is retained with the session, so say
- * where the work went instead of leaving the user at a dead end.
- */
 export function completionBudgetExhaustedMessage(
   userInput: string,
-  /**
-   * Files this run actually wrote, as recorded by the executor. These are
-   * observed facts rather than model claims, so naming them adds no unverified
-   * assertion — it only tells the user where the run's output already is.
-   */
   writtenArtifactPaths: readonly string[] = [],
 ): string {
   const korean = /[\u3131-\u318e\uac00-\ud7a3]/u.test(userInput)
@@ -269,11 +241,6 @@ export function completionBudgetExhaustedMessage(
     : `${base} Files this run actually wrote: ${list} (their contents are unverified too).`
 }
 
-/**
- * Renders a compact answer without exposing the reporter's internal field
- * names. Each list entry must therefore be self-contained in the user's
- * language; the prompt enforces that contract.
- */
 export function renderStructuredFinalReport(report: StructuredFinalReport): string {
   const items = [
     ...report.details,

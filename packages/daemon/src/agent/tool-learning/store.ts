@@ -17,11 +17,6 @@ interface InternalRecord {
 
 const RECENT_ERRORS_LIMIT = 3
 
-/**
- * Outcome of one tool execution. Carries identity and timing only — never the
- * tool output, which can hold user content and has no place in operational
- * telemetry.
- */
 export interface ToolOutcomeObservation {
   sessionId: string
   tool: string
@@ -32,11 +27,6 @@ export interface ToolOutcomeObservation {
 export class ToolStatsStore {
   private readonly bySession = new Map<string, Map<string, InternalRecord>>()
 
-  /**
-   * Every tool execution already converges on `record`, so an observer here
-   * sees the complete outcome stream without threading a second dependency
-   * through the router/engine/graph layers.
-   */
   constructor(private readonly onOutcome?: (outcome: ToolOutcomeObservation) => void) {}
 
   record(
@@ -72,8 +62,6 @@ export class ToolStatsStore {
     }
     record.durationSumMs += result.durationMs ?? 0
 
-    // Telemetry is best-effort: a failing observer must never turn a completed
-    // tool execution into a failed one.
     try {
       this.onOutcome?.({
         sessionId,
@@ -82,7 +70,6 @@ export class ToolStatsStore {
         durationMs: result.durationMs ?? 0,
       })
     } catch {
-      // ignored
     }
   }
 

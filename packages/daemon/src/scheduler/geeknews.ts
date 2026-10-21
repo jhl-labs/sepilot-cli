@@ -224,8 +224,6 @@ async function emitStatus(
   try {
     await deps.onStatus?.(message)
   } catch {
-    // Chat progress is best-effort. The scheduler run itself should not fail
-    // because a desktop session disappeared while the background job was running.
   }
   deps.signal?.throwIfAborted()
 }

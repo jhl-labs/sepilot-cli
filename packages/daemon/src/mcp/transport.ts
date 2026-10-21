@@ -5,10 +5,13 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import type { SecretVault } from '../security/secret-vault.js'
 import { resolveSecretPlaceholders } from './secret-resolver.js'
 import type { McpServerProvenance, McpToolManifest } from './security.js'
+import { getDispatcherCompatibleFetch } from '../providers/http-timeout.js'
 
 type McpServerSecurityConfig = {
   provenance?: McpServerProvenance
   toolManifest?: McpToolManifest
+  toolSecurity?: Record<string, 'observe' | 'external-write'>
+  toolCapabilities?: Record<string, import('@sepilotd/core').AgentExecutionCapability[]>
 }
 
 export type StdioMcpServerConfig = McpServerSecurityConfig & {
@@ -47,11 +50,6 @@ export type McpServerConfig =
   | SseMcpServerConfig
   | HttpMcpServerConfig
 
-// Variables the spawned MCP child needs to function (PATH lookup, locale,
-// terminal sizing, package-manager caches). Everything else from the daemon
-// env is *excluded* by default, so provider API keys, signing tokens, and
-// SMTP creds do not silently leak to every MCP server. Operators include
-// explicit env entries via the server config when a server needs more.
 const MCP_ENV_ALLOWLIST = new Set([
   'PATH',
   'HOME',
@@ -74,15 +72,12 @@ const MCP_ENV_ALLOWLIST = new Set([
   'NPM_CONFIG_USERCONFIG',
   'NPM_CONFIG_CACHE',
   'PYTHONPATH',
-  'SystemRoot',     // Windows
-  'WINDIR',         // Windows
-  'APPDATA',        // Windows
-  'LOCALAPPDATA',   // Windows
-  'PROGRAMFILES',   // Windows
-  'USERPROFILE',    // Windows
-  // Corporate proxy + CA bundle (HTTP transport-level, not secret-bearing).
-  // Without these, MCP children behind a corporate proxy / private CA cannot
-  // reach the network they were already reaching when run outside the daemon.
+  'SystemRoot',
+  'WINDIR',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'PROGRAMFILES',
+  'USERPROFILE',
   'HTTP_PROXY',
   'HTTPS_PROXY',
   'NO_PROXY',
@@ -104,9 +99,6 @@ function pickAllowedDaemonEnv(): Record<string, string> {
     const value = process.env[key]
     if (typeof value === 'string') out[key] = value
   }
-  // Pass through SEPILOTD_MCP_* explicitly — these are MCP-side knobs the
-  // operator put there on purpose. Never pass other SEPILOTD_* (they may
-  // include tokens, secret paths, audit destinations).
   for (const [k, v] of Object.entries(process.env)) {
     if (k.startsWith('SEPILOTD_MCP_') && typeof v === 'string') out[k] = v
   }
@@ -116,9 +108,6 @@ function pickAllowedDaemonEnv(): Record<string, string> {
 export function createMcpTransport(config: McpServerConfig, vault?: SecretVault | null): Transport {
   switch (config.transport) {
     case 'stdio': {
-      // Scrub the daemon's env (allowlist) before merging the
-      // server-specific entries; without this, every MCP child inherits
-      // provider keys, gateway tokens, encryption keys, etc.
       const baseEnv = pickAllowedDaemonEnv()
       const resolvedEnv = Object.fromEntries(
         Object.entries({ ...baseEnv, ...config.env }).map(
@@ -133,7 +122,7 @@ export function createMcpTransport(config: McpServerConfig, vault?: SecretVault 
           ([k, v]) => [k, resolveSecretPlaceholders(v, vault ?? null)]
         )
       )
-      return new SSEClientTransport(new URL(config.url), { requestInit: { headers: resolvedHeaders } })
+      return new SSEClientTransport(new URL(config.url), { fetch: getDispatcherCompatibleFetch(), requestInit: { headers: resolvedHeaders } })
     }
     case 'http': {
       const resolvedHeaders = Object.fromEntries(
@@ -141,7 +130,7 @@ export function createMcpTransport(config: McpServerConfig, vault?: SecretVault 
           ([k, v]) => [k, resolveSecretPlaceholders(v, vault ?? null)]
         )
       )
-      return new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers: resolvedHeaders } })
+      return new StreamableHTTPClientTransport(new URL(config.url), { fetch: getDispatcherCompatibleFetch(), requestInit: { headers: resolvedHeaders } })
     }
   }
 }

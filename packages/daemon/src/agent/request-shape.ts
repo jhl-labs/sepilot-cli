@@ -1,8 +1,3 @@
-/**
- * Small deterministic request-shape checks shared by routing and contract
- * generation. They describe ordinary user intent, not a graph or benchmark.
- */
-
 import type {
   AgentRequestedProcessStart,
   AgentRequestedTerminalCommand,
@@ -16,8 +11,6 @@ const REPOSITORY_SUMMARY_ACTION_RE =
 const REPOSITORY_SUBSTANTIVE_REVIEW_ACTION_RE =
   /\b(?:analy[sz]e|review|inspect|audit|assess|evaluate|investigate)\b|(?:분석|리뷰|검토|점검|감사|평가|조사)(?:해|해줘|해주세요|해봐|하자|할래|해라|하세요)?/iu
 
-// Korean mutation words require an imperative/continuative ending so the noun
-// phrase "최근 수정한 내용" is not mistaken for the command "수정해줘".
 const EXPLICIT_REPOSITORY_MUTATION_RE =
   /\b(?:apply|cherry-pick|revert|reset|rebase|squash|merge|fix|modify|edit|update|implement|write|create|delete|remove)\b|(?:고쳐|바꿔|적용해|되돌려|삭제해|지워|구현해|작성해|생성해|수정해|변경해|개선해|병합해|리베이스해|스쿼시해)(?:\s*(?:줘|주세요|봐|라|요))?/iu
 const ENGLISH_NEGATED_REPOSITORY_MUTATION_CLAUSE_RE =
@@ -123,13 +116,6 @@ function withoutNegatedRepositoryMutationClauses(message: string): string {
     .replace(ENGLISH_WITHOUT_REPOSITORY_MUTATION_CLAUSE_RE, ' ')
 }
 
-/**
- * A bounded, read-only summary of recent repository state. Users naturally
- * say "최근 수정 사항" or "latest changes" when they want commit/diff/status
- * evidence, so this intentionally covers more than the literal word commit.
- * Substantive review verbs are excluded: code review, risk analysis, and audit
- * require source/context inspection beyond a mechanically truncated Git diff.
- */
 export function isFocusedRepositoryChangeLookup(message: string): boolean {
   if (!message.trim() || !REPOSITORY_CHANGE_TOPIC_RE.test(message)) return false
   if (EXPLICIT_REPOSITORY_MUTATION_RE.test(
@@ -141,12 +127,6 @@ export function isFocusedRepositoryChangeLookup(message: string): boolean {
     || /(?:몇\s*개|\b\d+\b|\?|？)/u.test(message)
 }
 
-/**
- * A read-only assessment of recent changes that needs both Git evidence and
- * source context. This is deliberately separate from the summary fast path:
- * it enables a compact review-oriented read tool profile without exposing
- * mutation tools or the entire general-purpose catalog.
- */
 export function isSubstantiveRepositoryChangeReview(message: string): boolean {
   if (!message.trim() || !REPOSITORY_CHANGE_TOPIC_RE.test(message)) return false
   if (EXPLICIT_REPOSITORY_MUTATION_RE.test(
@@ -156,27 +136,18 @@ export function isSubstantiveRepositoryChangeReview(message: string): boolean {
   return REPOSITORY_SUBSTANTIVE_REVIEW_ACTION_RE.test(message)
 }
 
-/** Whether a focused lookup asks about changed content rather than only commit metadata. */
 export function focusedRepositoryLookupNeedsDiff(message: string): boolean {
   return isFocusedRepositoryChangeLookup(message) && REPOSITORY_DIFF_TOPIC_RE.test(message)
 }
 
-/**
- * An explicit per-turn prohibition on tool use. This is intentionally narrow:
- * "do not modify files" still permits read-only evidence tools, while "do not
- * use tools" removes the tool surface and disables evidence-recovery calls.
- */
 export function explicitlyForbidsToolUse(message: string): boolean {
   const normalized = message.trim().replace(SCOPED_OTHER_TOOL_PROHIBITION_RE, '')
   return EXPLICIT_NO_TOOL_RE.test(normalized)
 }
 
-/** A user-requested single CLI invocation that needs no unrelated tool catalog. */
 export function isFocusedTerminalCommandExecution(message: string): boolean {
   const normalized = message.trim()
   if (!normalized || normalized.length > 700) return false
-  // An explicit managed-process surface carries lifecycle semantics that a
-  // foreground terminal call cannot preserve.
   if (EXPLICIT_MANAGED_PROCESS_SURFACE_RE.test(normalized)) return false
   const structuredCommand = extractStructuredProcessCommand(normalized)
   const explicitToolSurfaces = normalized.match(EXPLICIT_TOOL_SURFACE_RE) ?? []
@@ -195,14 +166,6 @@ export function isFocusedTerminalCommandExecution(message: string): boolean {
     )
 }
 
-/**
- * Whether a request positively asks for terminal command execution, including
- * a multi-observation workflow that cannot be reduced to one exact argv.
- *
- * This is deliberately only a capability-shape signal. It does not extract an
- * executable, choose a tool trajectory, or grant mutation authority. Callers
- * must independently establish the workspace-mutation boundary.
- */
 export function inputRequestsTerminalCommandExecution(message: string): boolean {
   const normalized = message.trim()
   if (!normalized || explicitlyForbidsToolUse(normalized)) return false
@@ -241,12 +204,6 @@ function isFocusedManagedProcessStart(message: string): boolean {
     && !hasAdditionalToolStep
     && !EXPLICIT_REPOSITORY_MUTATION_RE.test(positiveMutationScope)
     && (
-      // Supplying process.start's executable + JSON argv is itself an exact,
-      // single-tool authority grant. Requiring the user to additionally say
-      // “once” made ordinary structured invocations fall through to semantic
-      // planning, even though there was nothing for a model to infer. An
-      // explicitly named second tool keeps multi-step workflows on the normal
-      // graph instead of silently dropping later steps.
       Boolean(structuredCommand)
       || (
         SINGLE_COMMAND_SCOPE_RE.test(normalized)
@@ -287,9 +244,6 @@ function splitLiteralTerminalArgv(command: string): string[] | undefined {
       tokenStarted = true
       continue
     }
-    // terminal.run is argv based. Shell operators or substitutions cannot be
-    // represented without changing their meaning, so leave those requests on
-    // the normal model-driven path instead of pretending they are exact.
     if ('|;&><`$(){}'.includes(char)) return undefined
     if (/\s/u.test(char)) {
       if (tokenStarted) {
@@ -307,12 +261,6 @@ function splitLiteralTerminalArgv(command: string): string[] | undefined {
   return words.length > 0 ? words : undefined
 }
 
-/**
- * Extract an argv-safe command only from the conservative focused-command
- * shape above. Inline code supports arbitrary executable names; unquoted
- * prose keeps the existing common-CLI boundary so phrases such as "run tests
- * once" are not misread as an executable named `tests`.
- */
 function extractFocusedCommandArgv(message: string): AgentRequestedTerminalCommand | undefined {
   const inline = message.match(/`([^`\n]{1,300})`/u)?.[1]?.trim()
   const named = inline ? undefined : message.match(NAMED_TERMINAL_COMMAND_RE)?.[0]?.trim()
@@ -320,16 +268,10 @@ function extractFocusedCommandArgv(message: string): AgentRequestedTerminalComma
   if (!literal) return undefined
 
   if (!inline) {
-    // The command matcher intentionally accepts ordinary prose so users do
-    // not have to use backticks. A punctuation mark followed by whitespace is
-    // nevertheless a structural sentence boundary; version numbers, URLs,
-    // dotted filenames, and decimal values have no whitespace after the dot.
     const sentenceBoundary = literal.search(/[.!?。！？](?=\s+\S)/u)
     if (sentenceBoundary >= 0) literal = literal.slice(0, sentenceBoundary).trim()
     const trailingScope = literal.search(TERMINAL_COMMAND_TRAILING_SCOPE_RE)
     if (trailingScope >= 0) literal = literal.slice(0, trailingScope).trim()
-    // Korean focus particles can attach directly to the final argv token:
-    // "npm test만 한 번 실행" means the literal command is `npm test`.
     literal = literal.replace(/([^\s])(?:만|을|를)$/u, '$1')
   }
 
@@ -384,12 +326,6 @@ function extractJsonStringArrayAfter(
   return undefined
 }
 
-/**
- * Parse the explicit structured shape shown by the process.start tool itself.
- * This avoids asking a model to reconstruct argv when the user already supplied
- * executable and args fields, while deliberately accepting only JSON strings
- * (not shell expressions or JavaScript-like values).
- */
 function extractStructuredProcessCommand(
   message: string,
 ): AgentRequestedTerminalCommand | undefined {
@@ -528,7 +464,6 @@ function extractStructuredProcessStart(
   }
 }
 
-/** Extract a structurally bounded process.start request without model inference. */
 export function extractFocusedProcessStart(
   message: string,
 ): AgentRequestedProcessStart | undefined {
@@ -536,12 +471,6 @@ export function extractFocusedProcessStart(
   return extractStructuredProcessStart(message)
 }
 
-/**
- * Preserve exact structured launch options inside a broader process workflow.
- * The caller may still need process.read, browser validation, or another
- * explicitly requested step, so this is a constraint rather than permission
- * to collapse the whole turn to one deterministic process.start call.
- */
 export function extractConstrainedProcessStart(
   message: string,
 ): AgentRequestedProcessStart | undefined {
@@ -557,18 +486,10 @@ export function extractConstrainedProcessStart(
   return extractStructuredProcessStart(normalized)
 }
 
-/** Whether a focused command asks for the observed stdout/stderr without interpretation. */
 export function requestsRawTerminalCommandOutput(message: string): boolean {
   return isFocusedTerminalCommandExecution(message) && RAW_COMMAND_OUTPUT_RE.test(message)
 }
 
-/**
- * A small code-and-test task with an explicit filesystem boundary. This is
- * intentionally narrower than generic mutation intent: broad repository work,
- * UI work, migrations, and refactors still need the multi-phase coder graph.
- * The direct loop is materially cheaper for a self-contained source/test pair
- * and still retains normal write approvals and terminal policy enforcement.
- */
 export function isFocusedBoundedCodingTask(message: string): boolean {
   const normalized = message.trim()
   if (!normalized || normalized.length > 800) return false
@@ -579,12 +500,6 @@ export function isFocusedBoundedCodingTask(message: string): boolean {
   return EXPLICIT_REPOSITORY_MUTATION_RE.test(normalized)
 }
 
-/**
- * A tightly scoped, single-file literal substitution. These edits fit the
- * ordinary tool loop: read once, show an approval diff, edit, read back, and
- * answer. Sending them through the multi-phase coder graph invents contracts,
- * compiler checks, and recovery loops that outweigh the requested change.
- */
 export function isFocusedSingleFileReplacement(message: string): boolean {
   const normalized = message.trim()
   if (!normalized || normalized.length > 500) return false

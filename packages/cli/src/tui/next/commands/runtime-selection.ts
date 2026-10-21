@@ -89,6 +89,60 @@ export async function runModelCommand(args: string, deps: ModelCommandDeps): Pro
   deps.select(match.match.providerId, match.match.modelId)
 }
 
+export const AUTO_BOT_ENTRY: DaemonAgentDescriptor = {
+  id: 'auto',
+  name: 'Auto',
+  description: 'Executive assistant: the router hands each turn to the bot that fits it.',
+}
+
+export const ENGINE_OVERRIDE_ENTRY: DaemonAgentDescriptor = {
+  id: '__engine__',
+  name: 'Advanced: force an execution engine',
+  description: 'Override the engine (instant, react, coder, …) instead of letting the bot choose.',
+}
+
+export interface BotCommandDeps {
+  bots: DaemonAgentDescriptor[]
+  currentBot: string | null
+  fetchBots(): Promise<DaemonAgentDescriptor[]>
+  openPicker(): void
+  select(bot: string | null): void
+  setError(message: string): void
+  showNotice(message: string): void
+}
+
+export async function runBotCommand(args: string, deps: BotCommandDeps): Promise<void> {
+  const value = args.trim()
+  if (!value) {
+    deps.openPicker()
+    return
+  }
+  if (value === 'current' || value === 'info') {
+    deps.showNotice(deps.currentBot ? `Pinned bot: ${deps.currentBot}` : 'No bot pinned: the router picks a bot per turn.')
+    return
+  }
+  if (value === 'auto' || value === 'off' || value === 'none') {
+    deps.select(null)
+    return
+  }
+  let bots: DaemonAgentDescriptor[]
+  try {
+    bots = await deps.fetchBots()
+  } catch {
+    bots = deps.bots
+  }
+  const match = findModeMatch(bots.filter((bot) => bot.id !== ENGINE_OVERRIDE_ENTRY.id), deps.currentBot ?? 'auto', value)
+  if (match.ambiguousMatches.length > 0) {
+    deps.setError(`Multiple bots match "${value}": ${match.ambiguousMatches.map((bot) => bot.id).join(', ')}`)
+    return
+  }
+  if (!match.match) {
+    deps.setError(`Unknown bot: ${value}. Type /bot to browse.`)
+    return
+  }
+  deps.select(match.match.id === 'auto' ? null : match.match.id)
+}
+
 export interface ModeCommandDeps {
   agents: DaemonAgentDescriptor[]
   fallbacks: DaemonAgentDescriptor[]

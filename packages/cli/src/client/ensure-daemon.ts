@@ -25,19 +25,10 @@ const MIN_DAEMON_READY_TIMEOUT_MS = 5_000
 const MAX_DAEMON_READY_TIMEOUT_MS = 300_000
 
 interface EnsureDaemonOptions {
-  /** Override the daemon URL (matches the `--url` flag). */
   url?: string
-  /**
-   * Disable auto-spawn entirely. CI scripts that prefer a hard fail set
-   * this to `false`. Defaults to `true`. The env var `SEPILOT_NO_AUTO_START=1`
-   * also forces it off and beats the explicit option.
-   */
   autoStart?: boolean
-  /** When true, suppress the user-facing "starting daemon..." chatter. */
   quiet?: boolean
-  /** Prefer in-process daemon startup. Background sidecar startup is the default. */
   preferEmbedded?: boolean
-  /** Abort daemon startup/waiting, for example when the TUI receives Ctrl+C before rendering. */
   signal?: AbortSignal
 }
 
@@ -116,25 +107,6 @@ async function waitForLaunchedDaemon(
   )
 }
 
-/**
- * Make sure a sepilotd daemon is reachable for this CLI invocation.
- *
- * 1. Health-probe the configured base URL. If the daemon already runs
- *    (perhaps started by a prior `sepilot daemon start`, the desktop tray,
- *    or a peer CLI in another shell), simply return — we share, don't
- *    re-spawn.
- * 2. Otherwise, take the cross-process spawn lock and start a detached
- *    background daemon. Detached so this CLI invocation exiting (e.g.
- *    `sepilot ask` finishing the one-shot prompt) does not kill the daemon
- *    out from under any sibling surfaces.
- * 3. Embedded daemon startup is available as an explicit opt-in for hosts
- *    that manage process lifetime themselves.
- * 4. If another peer is already inside the spawn-lock window, fall through
- *    to health-polling and pick up their daemon when it boots.
- *
- * Throws if every option above fails — e.g. binary not found, ready timeout
- * exceeded, or `--no-auto-start` was set explicitly.
- */
 export async function ensureDaemon(
   client: DaemonClient,
   options: EnsureDaemonOptions = {},
@@ -148,7 +120,6 @@ export async function ensureDaemon(
     return existingDaemon
   } catch (error) {
     if (isAbortError(error)) throw error
-    /* daemon not reachable; fall through to auto-spawn */
   }
   throwIfAborted(options.signal)
 
@@ -172,8 +143,6 @@ export async function ensureDaemon(
   const readyTimeoutMs = resolveDaemonReadyTimeoutMs()
 
   if (!lock) {
-    // A peer (desktop tray or another CLI) is mid-spawn. Wait for their
-    // daemon instead of forking a second one that will lose the PID race.
     const ready = await raceAbort(
       waitForDaemonReady(healthUrl, { timeoutMs: readyTimeoutMs }),
       options.signal,
@@ -187,8 +156,6 @@ export async function ensureDaemon(
   }
 
   try {
-    // Re-check inside the lock — the previous holder may have just finished
-    // booting a daemon for us.
     throwIfAborted(options.signal)
     try {
       await raceAbort(
@@ -198,7 +165,6 @@ export async function ensureDaemon(
       return existingDaemon
     } catch (error) {
       if (isAbortError(error)) throw error
-      /* still need to spawn */
     }
 
     const preferEmbedded = options.preferEmbedded === true
@@ -227,10 +193,6 @@ export async function ensureDaemon(
       if (embeddedStarted) return existingDaemon
     }
 
-    // Single-file bundle: re-enter this executable as the daemon. The daemon
-    // bootstrap reads SEPILOTD_HOST / SEPILOTD_PORT / SEPILOTD_DATA_DIR from
-    // the environment (it does not parse listen/data argv), so pass them that
-    // way to guarantee the spawned daemon listens where this client expects.
     const standaloneInvocation = resolveStandaloneDaemonInvocation()
     if (standaloneInvocation) {
       const childEnvOverrides: Record<string, string> = {

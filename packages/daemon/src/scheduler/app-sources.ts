@@ -1,7 +1,6 @@
 import { scheduledAppSourcesFromMetadata, schedulerMisfirePolicyFromMetadata } from '@sepilotd/api-client'
 import type { ScheduledJob } from './job-store.js'
 
-/** Same contract for channel and headless runs, within their existing tool/approval boundary. */
 export function scheduledInstructionWithSources(job: ScheduledJob, now = Date.now()): string {
   const refs = scheduledAppSourcesFromMetadata(job.metadata)
   const recovery = schedulerMisfirePolicyFromMetadata(job.metadata)

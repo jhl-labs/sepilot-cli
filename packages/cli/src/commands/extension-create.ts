@@ -76,10 +76,6 @@ async function planExtensionScaffold(
   }
 
   const workspaceRoot = await resolveWorkspaceRoot(cwd)
-  // --workspace and --dir are conceptually contradictory: --workspace
-  // forces monorepo placement (packages/<name>), --dir picks an
-  // explicit standalone path. Silently ignoring --dir under
-  // --workspace caused real confusion — surface it instead.
   if (options.workspace && options.dir) {
     throw new Error('--workspace and --dir cannot be combined; pick one')
   }
@@ -256,7 +252,6 @@ async function resolveWorkspaceRoot(startDir: string): Promise<string | null> {
       await access(join(current, 'pnpm-workspace.yaml'))
       return current
     } catch {
-      // keep walking upward
     }
 
     const parent = resolve(current, '..')

@@ -69,12 +69,6 @@ export function findDuplicateToolCallGroups(toolCalls: ToolCall[]): DuplicateToo
   return [...groups.values()].filter((group) => group.count > 1)
 }
 
-/**
- * Calls in one assistant response are planned against the same pre-execution
- * state. An exact structural duplicate therefore cannot intentionally depend
- * on the first result; retain the first call and drop later copies before any
- * side effect occurs.
- */
 export function deduplicateToolCalls(toolCalls: ToolCall[]): DeduplicatedToolCalls {
   const seen = new Set<string>()
   const retained: ToolCall[] = []

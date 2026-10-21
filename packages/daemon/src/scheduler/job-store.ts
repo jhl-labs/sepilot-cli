@@ -1,4 +1,3 @@
-// packages/daemon/src/scheduler/job-store.ts
 import { randomUUID } from 'node:crypto'
 import type { SqliteDatabase } from '../db/sqlite.js'
 import type {
@@ -18,7 +17,6 @@ import { projectStoredJobRunOutcome } from './agent-outcome.js'
 export type { JobKind, JobCreatedBy, ScheduledJob, JobRun, JobRunStatus } from '@sepilotd/core'
 export type { ScheduledJobStatus as JobStatus } from '@sepilotd/core'
 
-/** Only an enabled pending job currently owns a future scheduler claim. */
 export function hasPendingScheduledRun(
   job: Pick<ScheduledJob, 'enabled' | 'nextRunAt' | 'status'>,
 ): boolean {
@@ -47,7 +45,6 @@ export interface NewJobInput {
   enabled: boolean
   createdBy: JobCreatedBy
   maxAttempts?: number
-  /** Pre-approve this job's own runs; persisted so it survives a restart. */
   unattended?: boolean
   retryBackoffMs?: number
   metadata?: Record<string, unknown> | null
@@ -68,7 +65,6 @@ export interface UpdateRecurringJobInput {
   maxAttempts?: number
   retryBackoffMs?: number
   metadata?: Record<string, unknown> | null
-  /** Preserve current execution status/error counters for control-plane-only edits. */
   preserveRunState?: boolean
 }
 
@@ -86,7 +82,6 @@ export interface UpdateOneShotJobInput {
   maxAttempts?: number
   retryBackoffMs?: number
   metadata?: Record<string, unknown> | null
-  /** Preserve current execution status/error counters for control-plane-only edits. */
   preserveRunState?: boolean
 }
 
@@ -100,11 +95,6 @@ export interface RecordRunFinishOpts {
   durationMs?: number
   error?: string | null
   outputExcerpt?: string | null
-  /**
-   * Structured termination cause. Persisted so run history can separate a
-   * deliberate, resumable budget stop from a hard failure without parsing the
-   * human-readable error text.
-   */
   stopReason?: RunStopReason
 }
 
@@ -119,20 +109,10 @@ export interface JobStore {
   list(filter?: { status?: JobStatus[]; channelTarget?: string }): ScheduledJob[]
   get(id: string): ScheduledJob | null
   create(input: NewJobInput): ScheduledJob
-  /** Set a terminal/transient status. For 'failed', records lastError; for 'completed'/'cancelled' clears it and disables the job. */
   updateStatus(id: string, status: JobStatus, opts?: UpdateStatusOpts): void
-  /** Advance a recurring job to its next fire after a successful run: status=pending, attempt=0, lastError cleared. */
   updateNextRun(id: string, nextRunAt: number, lastRunAt: number): void
-  /** Advance a recurring job to its next fire after exhausting retries: status=pending, attempt=0, lastError kept. */
   rescheduleAfterFailure(id: string, nextRunAt: number, lastRunAt: number, lastError: string): void
-  /** Hold a failed attempt for retry: status=pending, attempt=N, next_run_at=backoff target, lastError kept. */
   markRetry(id: string, nextRunAt: number, attempt: number, lastError: string): void
-  /**
-   * Finish one in-flight run as a graceful-shutdown interruption and release
-   * its job back to pending without consuming retry/failure state. Returns
-   * false when the run was already terminal, so a late shutdown cannot
-   * overwrite a real executor outcome.
-   */
   releaseInterruptedRun(
     jobId: string,
     runId: string,
@@ -140,35 +120,22 @@ export interface JobStore {
     reason: string,
     finishedAt?: number,
   ): boolean
-  /** Re-arm a recurring job that was left in a terminal state: status=pending, attempt=0, next_run_at advanced. Keeps lastError/lastRunAt for visibility. */
   reanchorRecurring(id: string, nextRunAt: number): void
-  /** Point a recurring job at a new cron and re-arm it: cron updated, status=pending, attempt=0, next_run_at advanced. */
   updateRecurringSchedule(id: string, cron: string, nextRunAt: number): void
-  /** Update a recurring job definition without losing run history. */
   updateRecurringJob(input: UpdateRecurringJobInput): ScheduledJob | null
-  /** Update a one-shot job definition without losing run history. */
   updateOneShotJob(input: UpdateOneShotJobInput): ScheduledJob | null
-  /** Update only the structured metadata payload. */
   updateMetadata(id: string, metadata: Record<string, unknown> | null): ScheduledJob | null
   cancel(id: string): void
   delete(id: string): void
   setEnabled(id: string, enabled: boolean): void
-  /**
-   * Mark a job as running without a human present, so its tool calls skip
-   * approval prompts nobody would answer. Persisted, unlike the grant itself.
-   */
   setUnattended(id: string, unattended: boolean): void
-  /** Claim an enabled pending job for execution. Returns false when paused or already claimed. */
   tryLockForRun(id: string): boolean
   pickReady(now: number, limit: number): ScheduledJob[]
   gc(olderThanMs: number): number
   cleanupStaleRunning(staleMs: number, activeJobIds?: readonly string[]): number
-  // run history
   recordRunStart(jobId: string, attempt: number, startedAt?: number): string
-  /** Link one run to its immutable agent evidence journal before execution. */
   linkRunAgentSession(jobId: string, runId: string, agentSessionId: string): boolean
   recordRunFinish(runId: string, status: JobRunStatus, opts?: RecordRunFinishOpts): void
-  /** Return one run only when both sides of its durable composite identity match. */
   getRun(jobId: string, runId: string): JobRun | null
   listRuns(jobId: string, limit?: number): JobRun[]
   listRecentRuns(limit?: number): JobRun[]
@@ -362,8 +329,6 @@ function ensureSchema(db: SqliteDatabase): void {
   addColumn('created_at', `created_at INTEGER NOT NULL DEFAULT 0`)
   addColumn('updated_at', `updated_at INTEGER NOT NULL DEFAULT 0`)
   addColumn('created_by', `created_by TEXT NOT NULL DEFAULT 'internal'`)
-  // Persisted so an unattended job survives a daemon restart: the in-memory
-  // approval grant does not, and a job outlives the process that created it.
   addColumn('unattended', `unattended INTEGER NOT NULL DEFAULT 0`)
 
   db.prepare(
@@ -404,8 +369,6 @@ function ensureSchema(db: SqliteDatabase): void {
   if (!runCols.has('agent_session_id')) {
     db.prepare(`ALTER TABLE scheduler_job_runs ADD COLUMN agent_session_id TEXT`).run()
   }
-  // Structured termination cause. Rows written before this stay null and fall
-  // back to the error-text probe in projectStoredJobRunOutcome.
   if (!runCols.has('stop_kind')) {
     db.prepare(`ALTER TABLE scheduler_job_runs ADD COLUMN stop_kind TEXT`).run()
   }
@@ -430,8 +393,6 @@ function ensureSchema(db: SqliteDatabase): void {
   ).run()
 }
 
-// Columns in the canonical `scheduler_jobs` shape, used when rebuilding a
-// legacy table. Order is irrelevant — the copy lists names on both sides.
 const SCHEDULER_JOBS_COLUMNS = [
   'id', 'name', 'cron', 'command', 'last_run_at', 'next_run_at', 'enabled',
   'kind', 'run_at', 'timezone', 'instruction', 'channel_type', 'channel_target',
@@ -440,17 +401,6 @@ const SCHEDULER_JOBS_COLUMNS = [
   'unattended',
 ] as const
 
-/**
- * Early `scheduler_jobs` revisions declared `cron TEXT NOT NULL` (every job was
- * a cron job). One-shot jobs pass `cron = null`, which the stale constraint
- * rejects — and `CREATE TABLE IF NOT EXISTS` never rewrites an existing table,
- * so the daemon was stuck failing every `schedule_create "in 3 minutes"` with
- * `NOT NULL constraint failed: scheduler_jobs.cron`. SQLite can't drop a column
- * constraint in place, so rebuild the table when we detect the legacy shape.
- *
- * Must run after the `ADD COLUMN` migrations above, so every canonical column
- * exists on the legacy table before we copy it across.
- */
 function relaxLegacyCronNotNull(db: SqliteDatabase): void {
   const cronCol = (db.prepare(`PRAGMA table_info(scheduler_jobs)`).all() as Array<{
     name: string
@@ -593,9 +543,6 @@ export function createJobStore(): JobStore {
         ).run(completedAt, completedAt, reason, runId, jobId)
         if (run.changes !== 1) return false
 
-        // A concurrent pause leaves enabled=0 while status is still running;
-        // releasing the claim must preserve that authority. A concurrent
-        // cancel/terminal edit has already changed status, so leave it intact.
         db.prepare(
           `UPDATE scheduler_jobs
            SET next_run_at = ?, status = 'pending', updated_at = ?
@@ -807,7 +754,6 @@ export function createJobStore(): JobStore {
       return tx(cutoff)
     },
     cleanupStaleRunning(staleMs, activeJobIds = []) {
-      // Age identifies abandoned work only when no live executor owns the job.
       const placeholders = activeJobIds.map(() => '?').join(', ')
       const excludeRuns = activeJobIds.length ? ` AND job_id NOT IN (${placeholders})` : ''
       const excludeJobs = activeJobIds.length ? ` AND id NOT IN (${placeholders})` : ''

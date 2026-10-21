@@ -61,7 +61,6 @@ async function githubJson<T>(
       const parsed = JSON.parse(text) as { message?: string }
       message = parsed.message ?? message
     } catch {
-      /* keep raw text */
     }
     throw new GitHubGistError(message || `GitHub Gist request failed (${response.status})`, response.status)
   }

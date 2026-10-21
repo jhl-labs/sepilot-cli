@@ -6,6 +6,11 @@ import type { JsonRpcFraming, JsonRpcMessage } from './rpc.js'
 import { triggerDreamingSessionEnd, type DreamingEngine } from '../memory/dreaming.js'
 import { formatRunContractForPrompt } from '../agent/task-contract.js'
 
+export interface ExternalAgentRuntime {
+  acp: ExternalAcpAgentDispatcher
+  cli: import('../external-cli/dispatcher.js').ExternalCliDispatcher
+}
+
 export const EXTERNAL_ACP_AGENT_NAMES = ['opencode', 'codex'] as const
 export type ExternalAcpAgentName = typeof EXTERNAL_ACP_AGENT_NAMES[number]
 
@@ -63,16 +68,10 @@ interface ExternalAcpAgentPreset {
 const AGENT_PRESETS: Record<ExternalAcpAgentName, ExternalAcpAgentPreset> = {
   opencode: {
     command: 'opencode',
-    // OpenCode 1.18+ emits newline-delimited JSON on its stdio ACP transport.
-    // Keep external-agent launches aligned with the proven LLM provider path;
-    // the legacy Content-Length reader waits forever for a header that never arrives.
     args: ['--pure', 'acp'],
     framing: 'ndjson',
   },
   codex: {
-    // Codex CLI does not currently expose a native `codex acp` command.
-    // Use a stdio ACP adapter by default, while allowing operators to point
-    // at another adapter such as `acp-adapter --adapter codex`.
     command: 'codex-acp',
     args: [],
     framing: 'ndjson',
@@ -296,7 +295,6 @@ function cancelExternalSession(client: AcpClient, externalSessionId: string): vo
   try {
     client.cancel(externalSessionId)
   } catch {
-    /* Best-effort cleanup; the process is still stopped in the caller's finally block. */
   }
 }
 

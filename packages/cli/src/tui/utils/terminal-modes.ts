@@ -1,11 +1,3 @@
-// Alternate screen plus mouse reporting modes used by the TUI.
-//
-// 1002 captures button-drag reports in terminals that require it before they
-// translate touchpad/touch scroll gestures into application events. 1007 asks
-// xterm-compatible terminals to route wheel gestures to the alternate screen
-// application instead of host scrollback. 2004 wraps paste payloads so the
-// composer can summarize them without losing the original text. Unsupported
-// modes are ignored.
 export const TUI_ENTER_SEQUENCE = [
   '\x1b[?1049h',
   '\x1b[H',

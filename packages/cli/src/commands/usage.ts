@@ -19,7 +19,6 @@ export async function usageDailyCommand(options: { url?: string; days?: string }
   output(data, (d) => {
     if (!d?.length) return 'No usage data.'
     const headers = ['Date', 'Provider', 'Model', 'Input', 'Output', 'Cost']
-    // Header widths must match data column widths so the table aligns.
     const widths = [10, 10, 15, 8, 8, 10] as const
     const formatCell = (text: string, width: number, align: 'left' | 'right' = 'left') =>
       align === 'right' ? text.padStart(width) : text.padEnd(width)

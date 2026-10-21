@@ -167,8 +167,6 @@ export const memoryMaintenanceResultSchema = z.object({
   status: memoryLifecycleStatusSchema,
 })
 
-// Querystring helpers — Fastify delivers `?tags=a&tags=b` as an array, but
-// `?tags=a` as a single string. Accept either and normalize to string[].
 const csvOrArray = z.union([z.string(), z.array(z.string())])
   .transform((value) => {
     if (Array.isArray(value)) {

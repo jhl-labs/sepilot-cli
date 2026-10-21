@@ -45,9 +45,6 @@ export const MAX_WIKI_FOLDER_DEPTH = 32
 
 export const WikiPortableNode = z
   .object({
-    // Portable backups must be able to round-trip every value accepted by
-    // the canonical Wiki API. The request body limit, node-count limit, and
-    // total backup byte limit provide the resource bounds here.
     id: z.string().min(1),
     parentId: z.string().min(1).nullable(),
     title: z.string().min(1),
@@ -165,7 +162,6 @@ export interface WikiImportConflict {
 }
 
 export interface WikiImportPreview {
-  /** Digest of both the import source and the current Wiki revision. */
   previewToken: string
   strategy: WikiImportStrategy
   sourceType: 'backup' | 'markdown' | 'folder'

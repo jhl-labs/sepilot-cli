@@ -16,12 +16,6 @@ const RUN_AUTO_APPROVAL_TTL_MS = 60 * 60_000
 const APPROVAL_TIMEOUT_FLOOR_MS = 60_000
 export const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60_000
 
-/**
- * Thrown to the waiting run when an approval prompt reaches its parking
- * delay. It is deliberately an `AbortError` so every engine treats it like
- * the abort-without-cancel path: the run unwinds, releases its lease, and
- * leaves the pending approval and its checkpoint standing for a later answer.
- */
 export class ApprovalParkedError extends Error {
   readonly name = 'AbortError'
   readonly code = 'APPROVAL_PARKED'
@@ -47,13 +41,7 @@ export interface PendingApproval {
   tool: string
   input: Record<string, unknown>
   requestedAt: string
-  /** When the prompt parks its run (nobody answered in time). Informational after `state: 'parked'`. */
   expiresAt: string
-  /**
-   * `live`: a run is blocked on this prompt right now. `parked`: the parking
-   * delay elapsed, the run was unwound, and answering resumes it from its
-   * checkpoint. `stale`: reconstructed from session history after a restart.
-   */
   state: 'live' | 'stale' | 'parked'
   parkedAt?: string
   resumeAvailable?: boolean
@@ -69,7 +57,6 @@ interface PendingApprovalEntry extends PendingApproval {
 
 export interface ApprovalRegistryHooks {
   onPending?: (approval: PendingApproval) => void
-  /** The parking delay elapsed: the request is still open, the run is paused. */
   onTimeout?: (approval: PendingApproval) => void
 }
 
@@ -85,13 +72,6 @@ interface BroadApprovalDecision {
 export interface RespondOptions {
   scope?: ApprovalScope
   approvedBy?: string
-  /**
-   * Optional user-provided rule. When the WebToolCard's "Edit pattern…"
-   * field is used, the user types a broader/narrower glob than what
-   * describeRuleFor would derive. Persist it verbatim so the user's
-   * intent survives — otherwise upsert via decisions.remember collapses
-   * the pattern back to the derived shape and silently loses the edit.
-   */
   rule?: ApprovalRule
 }
 
@@ -112,20 +92,8 @@ export class ApprovalRegistry {
     requestId?: string
     runId?: string
     timeoutMs?: number
-    /** Skip remembered run/session/always decisions and open a fresh prompt. */
     forcePrompt?: boolean
-    /**
-     * Abort the wait — not the request. The pending entry and its saved
-     * checkpoint stay, so whoever comes back can still answer; only this run
-     * stops occupying the session while nobody is there to reply.
-     */
     signal?: AbortSignal
-    /**
-     * Called when the parking delay elapses. A caller that owns the run's
-     * stop path (stream routes) uses it to abort the run through `signal`;
-     * without it the wait rejects with `ApprovalParkedError` so headless runs
-     * still unwind instead of blocking forever.
-     */
     onParked?: (approval: PendingApproval) => void
   }): ApprovalDecision | Promise<ApprovalDecision> {
     const {
@@ -150,10 +118,6 @@ export class ApprovalRegistry {
     )
 
     return new Promise<ApprovalDecision>((resolve, reject) => {
-      // The run is going away — stop waiting, but leave the request standing.
-      // Rejecting unwinds the run before it reaches the tool-result path that
-      // deletes the approval checkpoint, which is what makes a later
-      // `/approvals/resume` possible at all.
       if (signal?.aborted) {
         reject(signal.reason instanceof Error ? signal.reason : new Error('Approval wait aborted'))
         return
@@ -165,9 +129,6 @@ export class ApprovalRegistry {
       }
       signal?.addEventListener('abort', onAbort, { once: true })
 
-      // Parking, not denial. The request stays answerable and the checkpoint
-      // written before this wait stays on disk; only the run stops occupying
-      // the session. `timeoutMs <= 0` means wait indefinitely.
       const timeout = timeoutMs > 0
         ? setTimeout(() => this.park(requestId), timeoutMs)
         : null
@@ -215,16 +176,11 @@ export class ApprovalRegistry {
     entry.reject(new ApprovalParkedError(entry.requestId, entry.tool, entry.sessionId))
   }
 
-  /** The parked approval for a request, if the registry still holds one. */
   getParked(requestId: string): PendingApproval | undefined {
     const entry = this.pending.get(requestId)
     return entry && entry.state === 'parked' ? toPendingApproval(entry) : undefined
   }
 
-  /**
-   * Drop a parked entry without journaling a decision — for callers that
-   * resume the run from its checkpoint and record the decision themselves.
-   */
   releaseParked(requestId: string): PendingApproval | undefined {
     const entry = this.pending.get(requestId)
     if (!entry || entry.state !== 'parked') return undefined
@@ -232,38 +188,6 @@ export class ApprovalRegistry {
     return toPendingApproval(entry)
   }
 
-  /**
-   * Pre-authorise every tool call a future session will make.
-   *
-   * Exists for scheduled jobs. A job fires when nobody is at the screen, so any
-   * tool its run needs that requires approval simply times out — the job stays
-   * enabled and never accomplishes anything. Autonomy alone cannot fix that:
-   * the policy check is `mode === 'supervised' || (autonomy === 'supervised' && …)`,
-   * so a tool whose *policy* mode is supervised (fs.write, terminal.run) still
-   * prompts no matter how the run's autonomy is set. An auto-approval short
-   * circuits ahead of that check, which is why this is the mechanism that works.
-   *
-   * Scope is exactly one job: the scheduler runs each job under the stable
-   * session id `scheduler-<jobId>`, so keying on that grants nothing outside
-   * that job's own runs. Contrast `always`, which the approval dialog already
-   * offers — that is a global tool+pattern rule and would open the tool in
-   * every conversation.
-   *
-   * Caller must have explicit user consent; nothing here asks.
-   *
-   * LIMITATION — does not survive a daemon restart. `sessionAutoApprovals` is
-   * in-memory, while scheduled jobs outlive restarts, so an unattended job
-   * reverts to stalling on its first approval prompt after one. The durable
-   * store cannot hold this as-is: `matchesRule` refuses to match across tools,
-   * so a blanket "any tool for this job" has no single-row representation, and
-   * the tools a job will need are unknown when it is created.
-   *
-   * The fix is to make it a property of the job (a persisted `unattended`
-   * column) and have the scheduler executor re-establish this grant before each
-   * run of a job that carries it. That keeps the durable flag where it belongs
-   * — on the job, visible and toggleable — and leaves this method as the
-   * per-run mechanism it already is.
-   */
   grantSessionAutoApproval(sessionId: string, approvedBy = 'user'): void {
     this.sessionAutoApprovals.set(sessionId, {
       sessionId,
@@ -274,7 +198,6 @@ export class ApprovalRegistry {
     })
   }
 
-  /** Drop a pre-authorisation — used when the job it belonged to is removed. */
   revokeSessionAutoApproval(sessionId: string): void {
     this.sessionAutoApprovals.delete(sessionId)
   }
@@ -387,11 +310,6 @@ export class ApprovalRegistry {
         scope,
       })
     } catch (appendError) {
-      // The auto-denial timer is already cleared, so leaving the entry
-      // pending would park the paused tool execution forever. Fail safe the
-      // same way the durability rule below demands: no durable consent
-      // record, no side effect — release the execution as a denial and let
-      // the caller see the journaling failure.
       this.pending.delete(requestId)
       entry.resolve({
         decision: 'denied',
@@ -401,9 +319,6 @@ export class ApprovalRegistry {
       throw appendError
     }
 
-    // Only enable future reuse after the consent event is durable. Generated
-    // rules are exact-input hashes; a human-edited wildcard remains visible
-    // verbatim so surfaces can explain precisely what may short-circuit.
     let rule: ApprovalRule | undefined
     if (decision.decision !== 'feedback') {
       rule = this.rememberBroadApproval(entry, decision, scope)
@@ -434,9 +349,6 @@ export class ApprovalRegistry {
       }
     }
 
-    // The durable approval evidence must exist before the paused execution is
-    // released. Otherwise a session-store failure can run a side effect with
-    // no corresponding consent record.
     this.pending.delete(requestId)
     entry.resolve(decision)
 
@@ -508,15 +420,6 @@ export class ApprovalRegistry {
   }
 }
 
-/**
- * The single pending-decision bound. After this delay an unanswered approval
- * parks its run (checkpoint kept, lease released, answer resumes it).
- *
- * `SEPILOTD_APPROVAL_TIMEOUT_MS` is the knob (default 10 min, floor 60 s).
- * `SEPILOTD_PENDING_DECISION_TIMEOUT_MS` is the legacy stream-backstop name;
- * when set it overrides, and `0` there keeps its old meaning of "wait
- * indefinitely" (returns 0: no parking timer).
- */
 export function resolveApprovalTimeoutMs(): number {
   const legacy = process.env.SEPILOTD_PENDING_DECISION_TIMEOUT_MS
   if (legacy !== undefined && legacy.trim() !== '') {
@@ -545,18 +448,7 @@ function toPendingApproval(entry: PendingApprovalEntry): PendingApproval {
 
 export interface ApprovalRespondResult {
   resolved: boolean
-  /**
-   * Set when the response enables a future auto-decision. For
-   * session/always and run this is the exact-by-default tool rule;
-   * session-all returns its explicit broad synthetic rule. Undefined for
-   * once-scope, feedback, or unknown requestIds.
-   */
   rule?: ApprovalRule
-  /**
-   * Set when the answered request had already parked its run. The caller
-   * owns resuming that run from its approval checkpoint; the decision is
-   * journaled here, so the resume must not record it again.
-   */
   parked?: PendingApproval
 }
 
@@ -579,8 +471,6 @@ function normalizeApprovalDecision(
     approved: decision === 'approved',
     note: input.note,
     ...(input.timedOut !== undefined ? { timedOut: input.timedOut } : {}),
-    // "deny & stop" is only meaningful on a denial; never let it ride along
-    // with an approval or feedback decision.
     ...(decision === 'denied' && input.stop !== undefined ? { stop: input.stop } : {}),
   }
 }
@@ -594,9 +484,6 @@ function broadApprovalRule(scope: AutoApprovalScope): ApprovalRule {
     case 'session-all':
       return { tool: '*', pattern: 'all tools in this session' }
     case 'run':
-      // Run-scoped approvals are invocation-pattern scoped and are created in
-      // rememberBroadApproval. This fallback is unreachable but remains
-      // fail-closed for exhaustive callers.
       return { tool: '__invalid__', pattern: '__invalid__' }
     default:
       return { tool: '*', pattern: 'remembered broad approval' }

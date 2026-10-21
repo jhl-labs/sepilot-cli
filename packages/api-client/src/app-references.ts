@@ -1,6 +1,5 @@
 import type { SepilotReadableAppSummary } from './apps.js'
 
-// These are explicit product namespaces, never natural-language synonyms.
 const RESERVED = new Set(['app', 'skill', 'wiki', 'task'])
 const SHORT_NAME = /^[a-z][a-z0-9_-]{0,63}$/u
 
@@ -19,12 +18,10 @@ function referenceProse(input: string): string {
   return input.replace(literal, text => ' '.repeat(text.length))
 }
 
-/** Let a composer search partial names without activating inside quoted/code content. */
 export function isAppReferencePosition(input: string, offset: number): boolean {
   return referenceProse(input)[offset] === '$' && (offset === 0 || /[\s([{]/u.test(input[offset - 1]!))
 }
 
-/** Parse explicit syntax only. Quoted examples, code and escaped dollars are data. */
 export function parseAppReferences(input: string): string[] {
   const prose = referenceProse(input)
   const references = new Set<string>()
@@ -42,7 +39,6 @@ export interface ResolvedAppReference {
   appIds: string[]
 }
 
-/** Exact catalog identity resolution; never guess a target from request wording. */
 export function resolveAppReferences(input: string, apps: readonly SepilotReadableAppSummary[]): ResolvedAppReference[] {
   return parseAppReferences(input).map(reference => {
     const appIds = apps.filter(app => reference === canonicalAppReference(app.id)

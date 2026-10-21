@@ -31,38 +31,11 @@ function isDurableRunContract(message: Message): boolean {
     && textContent(message).trimStart().startsWith('[Durable run contract]')
 }
 
-/**
- * Once the runtime has closed tool access, the full discovery prompt (tool
- * manuals, skills, environment guidance, and old observations) is counter-
- * productive and expensive. Keep only the active request, its tool evidence,
- * small supervisor constraints, and a bounded conversation tail needed to
- * resolve references to the previous turn.
- *
- * A tool-free request must not retain native assistant/tool protocol messages.
- * Some compatible providers use those historical message shapes (or their
- * prompt-transport serialization) as a signal to keep generating tool calls,
- * even when the current request exposes no tools. Flatten completed protocol
- * units into explicitly untrusted evidence before dispatching the final
- * synthesis. Ordinary tool-capable turns keep the native protocol unchanged.
- */
 export function buildBoundedFinalSynthesisContext(
   messages: readonly Message[],
   options: {
     preserveLatestAssistantDraft?: boolean
-    /**
-     * Tool evidence that must win context fitting over newer ancillary reads.
-     * Preferred evidence units are moved to the end of the bounded
-     * conversation because the context fitter retains recent units first
-     * under pressure.
-     */
     preferredToolNames?: readonly string[]
-    /**
-     * Exact successful observation calls that must remain recent even when
-     * several actions share one generic tool name (for example many
-     * `terminal.run` probes). This is stronger and more precise than the tool
-     * name hint, and keeps contract evidence ahead of later ancillary reads
-     * when the final request is fitted to the model context window.
-     */
     preferredToolCallIds?: readonly string[]
   } = {},
 ): Message[] {
@@ -87,8 +60,6 @@ export function buildBoundedFinalSynthesisContext(
       if ((message.toolCalls?.length ?? 0) === 0) {
         return start + relativeIndex === latestPlainAssistantIndex ? [message] : []
       }
-      // Progress prose beside tool calls often tells a weak model to keep
-      // investigating. The tool protocol itself is the evidence we need.
       return [{ ...message, content: '' }]
     }
     return [message]
@@ -168,7 +139,6 @@ function flattenToolProtocolAsEvidence(messages: readonly Message[]): Message[] 
   })
 }
 
-/** Retain invocation identity without copying unbounded inline file bodies. */
 function boundedToolArguments(args: ToolCall['arguments']): string {
   const serialized = JSON.stringify(args, (_key, value: unknown) =>
     typeof value === 'string' && value.length > 512

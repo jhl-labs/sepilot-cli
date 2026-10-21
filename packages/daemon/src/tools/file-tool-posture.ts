@@ -1,19 +1,9 @@
 import type { ToolExecutionPosture } from '@sepilotd/core'
 
 export interface FileToolPostureOptions {
-  /** Daemon `security.sandbox` mode the tool registry was built with. */
   sandboxMode?: 'local' | 'docker' | 'bubblewrap'
 }
 
-/**
- * Honest execution posture for host-side file tools when the daemon is
- * configured with a `terminal.run`-only sandbox (`docker` or
- * `bubblewrap`). Those sandboxes isolate command execution only —
- * fs.write/fs.edit/fs.append/apply_patch still write directly to the
- * host filesystem. Without this note a run looks fully sandboxed while
- * file writes are not, which is a false sense of safety. Returns
- * undefined for local mode (nothing was claimed, so nothing to correct).
- */
 export function buildFileToolPosture(
   options: FileToolPostureOptions | undefined,
   cwd: string | undefined,

@@ -1,3 +1,4 @@
+import { eventsAllowedForMemory } from './turn-policy.js'
 import { personaMemoryTags } from './persona-scope.js'
 import { maintainJournals } from './journal-lifecycle.js'
 import { dirname } from 'node:path'
@@ -39,17 +40,11 @@ const log = createLogger('dreaming')
 
 export interface DreamingConfig {
   enabled: boolean
-  intervalMs: number  // Default: 6 hours
-  maxMemoriesPerRun: number  // Default: 100
-  similarityThreshold: number  // Default: 0.8
-  /** Memories whose content is at least this many characters become candidates
-   *  for compression during dreaming. Default 800. */
+  intervalMs: number
+  maxMemoriesPerRun: number
+  similarityThreshold: number
   compressionMinChars?: number
-  /** Approximate target length for the compressed summary. Default 240. */
   compressionTargetChars?: number
-  /** How long a permanent provider/model configuration error pauses LLM-backed
-   *  dreaming work. The in-memory circuit resets when the provider binding
-   *  changes or the daemon restarts. Default: 24 hours. */
   permanentErrorCooldownMs?: number
 }
 
@@ -136,16 +131,6 @@ class DreamingPermanentProviderError extends Error {
   }
 }
 
-/**
- * DreamingEngine: Automatic memory consolidation and reconstruction.
- *
- * Triggered on session end and periodically via cron.
- * Performs:
- * 1. Knowledge extraction from recent sessions
- * 2. Duplicate memory detection and merging
- * 3. Importance recalculation
- * 4. Stale memory cleanup
- */
 export class DreamingEngine {
   private config: DreamingConfig
   private provider: ILLMProvider | null = null
@@ -189,16 +174,10 @@ export class DreamingEngine {
     }
   }
 
-  /**
-   * Wire the project-scoped state board (P022-T8). When a conversation turn
-   * carries a `scope:project:<hash>` tag, durable extracted learnings are also
-   * appended to that project's named-block state file (autonomous write-back).
-   */
   setProjectState(store: ProjectStateStore): void {
     this.projectState = store
   }
 
-  /** Route automatic journal writes to the same owner bucket as chat tools. */
   setFileMemoryRegistry(registry: ScopedFileMemoryRegistry): void {
     this.fileMemoryRegistry = registry
   }
@@ -391,7 +370,7 @@ export class DreamingEngine {
 
     try {
       const memoryScopeTags = await this.resolveMemoryScopeTags(sessionId, scopeTags)
-      const events = eventsAfterMemoryReset(await this.sessions.getEvents(sessionId), await this.memoryStore.getMemoryResetAt?.(memoryScopeTags))
+      const events = eventsAllowedForMemory(eventsAfterMemoryReset(await this.sessions.getEvents(sessionId), await this.memoryStore.getMemoryResetAt?.(memoryScopeTags)))
       const turnId = this.getLatestCompletedTurn(events)?.assistant.id
       const noted = await this.captureLightTurn(
         sessionId,
@@ -437,10 +416,6 @@ export class DreamingEngine {
     }
   }
 
-  /**
-   * Process a single session after it ends.
-   * Extracts knowledge and triggers dedup.
-   */
   onSessionEnd(sessionId: string, source: DreamingTurnSource = 'channel', scopeTags?: string[]): Promise<number> {
     const task = this.processSessionEnd(sessionId, source, scopeTags)
     this.trackBackgroundTask(task)
@@ -456,7 +431,7 @@ export class DreamingEngine {
 
     try {
       const memoryScopeTags = await this.resolveMemoryScopeTags(sessionId, scopeTags)
-      const events = eventsAfterMemoryReset(await this.sessions.getEvents(sessionId), await this.memoryStore.getMemoryResetAt?.(memoryScopeTags))
+      const events = eventsAllowedForMemory(eventsAfterMemoryReset(await this.sessions.getEvents(sessionId), await this.memoryStore.getMemoryResetAt?.(memoryScopeTags)))
       const turnId = this.getLatestCompletedTurn(events)?.assistant.id
       const noted = await this.captureLightTurn(
         sessionId,
@@ -536,8 +511,6 @@ export class DreamingEngine {
 
     for (const candidate of candidates.slice(0, MAX_RAG_PROMOTIONS_PER_TURN)) {
       try {
-        // The candidate content embeds a raw conversation/document snippet; scrub
-        // secrets/PII before it lands in the durable index (auto-learn path).
         await this.memoryStore.add({
           id: candidate.memoryId,
           content: redactSensitive(candidate.content).redacted,
@@ -642,16 +615,10 @@ export class DreamingEngine {
 
   private lastRunSnapshot?: DreamingLastRunSnapshot
 
-  /** Read-only access to the most recent consolidate() invocation, for
-   *  the /memory/dreaming/last HTTP endpoint and operator tooling. */
   getLastRun(): DreamingLastRunSnapshot | undefined {
     return this.lastRunSnapshot
   }
 
-  /**
-   * Full dreaming cycle: consolidate all memories.
-   * Runs periodically via cron.
-   */
   async consolidate(now: Date = new Date()): Promise<DreamingResult> {
     if (this.running || this.resettingMemory) {
       return { merged: 0, removed: 0, updated: 0, skipped: true }
@@ -671,7 +638,6 @@ export class DreamingEngine {
         return result
       }
 
-      // Summarize today's light-stage notes into a REM section before deeper consolidation.
       await this.fileMemoryRegistry?.discover?.()
       const buckets = this.fileMemoryRegistry
         ? [this.fileMemoryRegistry.global(), ...this.fileMemoryRegistry.list()
@@ -713,21 +679,13 @@ export class DreamingEngine {
       result.updated += await this.refreshMemoryGraph()
       result.updated += await this.maintainMemoryGraph()
 
-      // Step 1: Deduplicate similar memories
       const deduped = await this.deduplicateMemories()
       result.merged = deduped.merged
       result.removed = deduped.removed
 
-      // Step 1b: Mark contradictory memories as superseded by the freshest
-      // matching entry. The older entry is preserved with a `superseded-by:<id>`
-      // tag so memory.audit can still surface it; memory.search filters
-      // superseded entries by default.
       const reconciled = await this.applyContradictionResolution()
       result.updated += reconciled
 
-      // Step 1c: Compress overly long memories. The agent (or a verbose
-      // earlier turn) sometimes saves multi-paragraph blobs; we replace them
-      // with a tight summary while archiving the original.
       const compressed = await this.compressLongMemories()
       result.updated += compressed
 
@@ -735,18 +693,12 @@ export class DreamingEngine {
         await maintainJournals(dirname(bucket.getMemoryPath()), { now, apply: true })
       }
 
-      // Step 1d: Suggest tags for untagged or thinly-tagged memories so
-      // memory.search can find them later by topic. We never overwrite
-      // user-supplied or scope-management tags; only `auto:<topic>` tags
-      // are added.
       const tagged = await this.autoTagThinlyTaggedMemories()
       result.updated += tagged
 
-      // Step 2: Recalculate importance scores
       const updated = await this.recalculateImportance()
       result.updated += updated
 
-      // Step 3: Clean stale memories (older than 90 days with low importance)
       const cleaned = await this.cleanStaleMemories()
       result.removed += cleaned
 
@@ -775,19 +727,13 @@ export class DreamingEngine {
     return result
   }
 
-  /**
-   * Find and merge duplicate/highly similar memories.
-   * Uses FTS5 to find candidates, then LLM to judge similarity.
-   */
   private async deduplicateMemories(): Promise<{ merged: number; removed: number }> {
     let merged = 0
     let removed = 0
 
-    // Get all memories (limited batch)
     const allMemories = await this.getAllMemories(this.config.maxMemoriesPerRun)
     if (allMemories.length < 2) return { merged, removed }
 
-    // Group by overlapping keywords
     const processed = new Set<string>()
 
     for (const memory of allMemories) {
@@ -797,14 +743,8 @@ export class DreamingEngine {
 
       if (duplicates.length === 0) continue
 
-      // Use LLM to determine which are true duplicates
       const mergeResult = await this.mergeWithLLM(memory, duplicates)
       if (mergeResult) {
-        // Fold duplicates into the kept memory in ONE transaction: the old
-        // delete-then-re-add path reset pin/importance/access/created_at to
-        // schema defaults and could hard-delete a pinned duplicate. mergeMemories
-        // preserves the kept metadata, refuses to delete pinned duplicates, and
-        // is crash-safe (a failure can't leave the kept memory deleted).
         const outcome = await this.memoryStore.mergeMemories({
           keepId: memory.id,
           content: mergeResult.content,
@@ -1048,8 +988,6 @@ export class DreamingEngine {
 
     this.semanticExtractionInFlightTurns.add(extractionKey)
     try {
-      // When the turn is project-scoped, mirror durable learnings into the
-      // project state board (P022-T8) as they are saved.
       const projectHash = parseScopeFromTags(scopeTags).projectHash
       const projectLearnings: string[] = []
       const onSaved = this.projectState && projectHash
@@ -1239,8 +1177,6 @@ ${(lightSection ?? '').slice(0, 4000)}`,
           if (!content.trim() || content.length > 1200 || looksSensitive(content)) continue
           if (scopeTags !== undefined) {
             const id = `journal-fact-${createHash('sha256').update(JSON.stringify([scopeTags, section, content])).digest('hex').slice(0, 32)}`
-            // Index first: an inferred fact rejected by a retraction must never
-            // be restored into the always-visible file projection.
             await this.memoryStore.add({ id, content, source: 'conversation',
               tags: attachScopeTags(['journal-promotion'], scopeTags),
               evidence: { kind: 'semantic', origin: 'inferred', observedAt: now.toISOString(), status: 'active',
@@ -1424,17 +1360,6 @@ Return ONLY valid JSON.`
     }
   }
 
-  /**
-   * Walk recent memories looking for contradiction sets (e.g. "I prefer X" vs.
-   * "I prefer Y"). The LLM picks the winning entry and we tag the others with
-   * `superseded-by:<winnerId>` so they stay in the audit trail but stop
-   * polluting search/auto-retrieve. Returns the number of memories newly
-   * marked superseded.
-   */
-  /** Public read-only contradiction scan. Walks the same eligible-memory
-   *  set as the dreaming consolidation pass but does NOT supersede anything;
-   *  callers (memory.conflicts.find tool, dashboards) decide what to do
-   *  with the returned pairs. Returns at most maxPairs verdicts. */
   async findRecentContradictions(
     options: { maxPairs?: number } = {},
   ): Promise<Array<{
@@ -1480,9 +1405,6 @@ Return ONLY valid JSON.`
       handled.add(memory.id)
       if (!verdict) continue
 
-      // Only report a resolution whose winner + losers are memories we actually
-      // asked about (guards against a hallucinated winnerId; mirrors the apply
-      // path so preview and apply agree).
       const candidateIds = new Set<string>([memory.id, ...candidates.map((c) => c.id)])
       const winnerId = verdict.winnerId
       if (!candidateIds.has(winnerId)) continue
@@ -1491,7 +1413,6 @@ Return ONLY valid JSON.`
       )
       if (supersededIds.length === 0) continue
 
-      // Track ids we've already declared as losers so we don't pair-test them.
       for (const id of supersededIds) handled.add(id)
       found.push({
         winnerId,
@@ -1530,11 +1451,6 @@ Return ONLY valid JSON.`
         continue
       }
 
-      // The winner must be one of the memories we actually asked about. An LLM
-      // that returns a hallucinated / non-existent winnerId would otherwise tag
-      // real memories `superseded-by:<ghost>`, hiding a correct memory behind an
-      // id that resolves to nothing. Skip the whole set when it fails to
-      // validate rather than trusting an unverifiable resolution.
       const candidateIds = new Set<string>([memory.id, ...candidates.map((entry) => entry.id)])
       const winnerId = verdict.winnerId
       if (!candidateIds.has(winnerId)) {
@@ -1552,8 +1468,6 @@ Return ONLY valid JSON.`
       for (const loserId of losers) {
         const target = recent.find((entry) => entry.id === loserId)
         if (!target) continue
-        // Never supersede a pinned memory — the user explicitly protected it,
-        // so an LLM contradiction verdict must not hide it.
         if (isPinningStore(this.memoryStore) && (await this.memoryStore.isPinned(loserId))) {
           handled.add(loserId)
           continue
@@ -1636,13 +1550,6 @@ Return strict JSON ONLY:
     }
   }
 
-  /**
-   * Compress overly long memories into tight summaries. The original is
-   * preserved with `archived` + `archived-by:<newId>` tags (memory.search
-   * hides archived entries by default); a new entry containing the LLM
-   * summary takes its scope tags and importance-relevant tags so it can
-   * stand in. Returns the count of memories newly compressed.
-   */
   private async compressLongMemories(): Promise<number> {
     if (!this.provider) return 0
 
@@ -1704,11 +1611,6 @@ Return strict JSON ONLY:
     return compressed
   }
 
-  /** Public entry point for memory.summarize. Asks the LLM to compress
-   *  several memory bodies into a single summary following the caller's
-   *  instruction. Returns null when no provider is configured or the LLM
-   *  call fails. The caller is responsible for picking which memories
-   *  belong to the batch (via ids/tags) and respecting scope. */
   async summarizeMemories(
     contents: string[],
     options: { instruction?: string; targetChars?: number } = {},
@@ -1755,7 +1657,6 @@ ${content.slice(0, 6000)}`
         ? response.message.content.trim()
         : ''
       if (!text) return null
-      // Cap to keep summaries from sneaking past the original length.
       return text.length > content.length - 32 ? text.slice(0, content.length - 32) : text
     } catch (err) {
       rethrowPermanentDreamingProviderError(err)
@@ -1764,13 +1665,6 @@ ${content.slice(0, 6000)}`
     }
   }
 
-  /**
-   * Suggest auto:* tags for memories that arrived with too few semantic tags.
-   * Filters out scope/system tags before counting, only writes new
-   * `auto:<topic>` tags, and skips memories that already carry an `auto:*`
-   * tag (we don't re-tag in steady state). Returns the number of memories
-   * newly tagged.
-   */
   private async autoTagThinlyTaggedMemories(): Promise<number> {
     if (!this.provider) return 0
 
@@ -1780,12 +1674,9 @@ ${content.slice(0, 6000)}`
     const candidates = recent.filter((memory) => {
       if (!memory.content || memory.content.length < 40) return false
       const tags = (memory.tags ?? []).map((tag) => tag.toLowerCase())
-      // Skip lifecycle-managed memories.
       if (tags.some((tag) => tag === 'archived' || tag.startsWith('archived-by:'))) return false
       if (tags.some((tag) => tag === 'superseded' || tag.startsWith('superseded-by:'))) return false
-      // Already auto-tagged in a prior dreaming cycle — leave it alone.
       if (tags.some((tag) => tag.startsWith('auto:'))) return false
-      // Count semantic tags (anything that's not a scope/system label).
       const semanticTagCount = tags.filter((tag) =>
         !tag.startsWith('scope:')
         && !tag.startsWith('superseded')
@@ -1825,10 +1716,6 @@ ${content.slice(0, 6000)}`
     return tagged
   }
 
-  /** Public entry point for memory.tag.suggest. Returns the same auto-tag
-   *  candidates the dreaming pass would attach (without the `auto:` prefix —
-   *  callers decide how to namespace). Empty array if no provider configured
-   *  or the LLM call failed. */
   async suggestTags(content: string): Promise<string[]> {
     try {
       return await this.suggestTagsWithLLM(content)
@@ -1873,9 +1760,6 @@ Return strict JSON ONLY:
     }
   }
 
-  /**
-   * Recalculate importance scores based on access patterns and content quality.
-   */
   private async recalculateImportance(): Promise<number> {
     try {
       return await this.memoryStore.recalculateImportanceScores()
@@ -1884,9 +1768,6 @@ Return strict JSON ONLY:
     }
   }
 
-  /**
-   * Remove memories older than 90 days with very low importance.
-   */
   private async cleanStaleMemories(): Promise<number> {
     try {
       return await this.memoryStore.pruneStaleConversationMemories({
@@ -1988,12 +1869,6 @@ function isSupersededRecord(memory: MemoryRecord | MemoryEntry): boolean {
     || tag.toLowerCase().startsWith('superseded-by:')) ?? false
 }
 
-/**
- * Return the stable ownership boundary used by daemon-wide consolidation.
- * Session/project tags are intentionally lower priority than durable user,
- * channel, and group ownership, but still isolate records that have no wider
- * owner. Unscoped legacy records only consolidate with other legacy records.
- */
 function stableMemoryOwner(tags: string[] | undefined): string {
   const scopeTags = (tags ?? [])
     .map((tag) => tag.trim().toLowerCase())

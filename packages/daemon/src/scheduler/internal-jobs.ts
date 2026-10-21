@@ -15,9 +15,6 @@ export interface InternalJobDeps {
     maxImportance: number
     dryRun: boolean
   }
-  // Periodic retention sweep for the observability + notification stores, which
-  // otherwise grow unbounded (pruneExpired was only ever triggered manually and
-  // notifications had no delete path at all).
   retention?: {
     prune(): Promise<void> | void
   }
@@ -65,8 +62,6 @@ function notificationInputFromJob(job: ScheduledJob, runId?: string): {
   const body = stringValue(notification.body)
   const url = stringValue(notification.url)
   return {
-    // A job can fire repeatedly. Deduplicate the same run, never all future
-    // occurrences of the job (including reminders that were already read).
     id: runId
       ? `scheduled-notification-${createHash('sha256').update(JSON.stringify([job.id, stringValue(notification.id), runId])).digest('hex')}`
       : stringValue(notification.id) || job.id,
@@ -86,13 +81,6 @@ function stringValue(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-/**
- * Builds the self-contained instruction for the opt-in user-profile
- * refresh run. It runs headless (no channel) so it must spell out which
- * tools to use — there is no system-prompt guidance in that context.
- * LLM-driven only: the agent does the reflection and decides what to
- * keep/drop; no regex/heuristic extraction here.
- */
 export function userProfileRefreshInstruction(section: string): string {
   return [
     `You are running an unattended maintenance pass to refresh the "${section}" section of long-term memory (MEMORY.md).`,
@@ -105,12 +93,6 @@ export function userProfileRefreshInstruction(section: string): string {
   ].join('\n')
 }
 
-/**
- * Builds the self-contained instruction for the opt-in proactive digest
- * run. Channel-bound, so the agent's reply is delivered to the chat by
- * the scheduler executor's dispatch step. LLM-driven; the agent decides
- * what (if anything) is worth surfacing.
- */
 export function proactiveDigestInstruction(): string {
   return [
     'You are sending an unprompted, proactive check-in to the user. Keep it short and skippable — a glance, not a report.',
@@ -186,11 +168,6 @@ interface InternalRecurringJobSpec {
   channelTarget?: string | null
 }
 
-/**
- * Reconcile scheduler rows to the configured internal-task state. Internal
- * jobs are configuration-owned: disabling an option cancels a stale row,
- * while re-enabling it reuses the same row and run history.
- */
 function reconcileInternalRecurringJob(store: JobStore, spec: InternalRecurringJobSpec): void {
   const matches = store.list().filter(
     (job) => job.createdBy === 'internal' && job.name === spec.name,
@@ -258,7 +235,6 @@ function reconcileInternalRecurringJob(store: JobStore, spec: InternalRecurringJ
       enabled: true,
     })
   } catch {
-    // Keep the last known-good definition when a configured schedule is invalid.
   }
 }
 

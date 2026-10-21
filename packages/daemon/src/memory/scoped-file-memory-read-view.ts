@@ -6,16 +6,6 @@ import type {
 import type { ScopedFileMemoryRegistry } from './scoped-file-memory.js'
 import { canReadLegacyGlobalMemory } from './scope.js'
 
-/**
- * Resolve the read view used by chat prompts and scoped memory UIs.
- *
- * Trusted first-party scoped callers may layer the legacy global MEMORY.md as
- * read-only context when the server grants that capability. Other scoped
- * callers see only their own bucket. Daily notes always come from the scoped
- * bucket because they contain automatic conversation digests. The returned
- * view must not be used as a write target; writes should resolve the scoped
- * bucket directly through ScopedFileMemoryRegistry.
- */
 export function resolveScopedFileMemoryReadView(
   legacyGlobal: FileMemory | undefined,
   fileMemoryRegistry: ScopedFileMemoryRegistry | undefined,

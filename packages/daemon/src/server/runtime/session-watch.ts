@@ -117,13 +117,14 @@ export class SessionWatchBroker {
       try {
         listener(change)
       } catch {
-        // Watch listeners must not affect session persistence.
       }
     }
   }
 }
 
 export class WatchedSessionStore implements ISessionStore {
+  getToolResult?: ISessionStore['getToolResult']
+  updateTitleIfUnchanged?: ISessionStore['updateTitleIfUnchanged']
   replaceEvents?: (sessionId: string, events: SessionEvent[]) => Promise<void>
   updateMeta?: (
     sessionId: string,
@@ -145,6 +146,17 @@ export class WatchedSessionStore implements ISessionStore {
     private readonly inner: ISessionStore,
     private readonly broker: SessionWatchBroker,
   ) {
+    if (inner.getToolResult) {
+      this.getToolResult = (sessionId, toolCallId, options) =>
+        inner.getToolResult!(sessionId, toolCallId, options)
+    }
+    if (inner.updateTitleIfUnchanged) {
+      this.updateTitleIfUnchanged = async (sessionId, title, expected) => {
+        const session = await inner.updateTitleIfUnchanged!(sessionId, title, expected)
+        if (session) this.broker.emit({ type: 'metadata_updated', sessionId, session })
+        return session
+      }
+    }
     if (inner.replaceEvents) {
       this.replaceEvents = async (sessionId, events) => {
         await inner.replaceEvents!(sessionId, events)

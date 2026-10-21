@@ -1,8 +1,3 @@
-// Lightweight markdown heading outline. doc.outline tool과
-// doc.replace_section / doc.insert_after_section의 range 계산용.
-//
-// 의도적으로 의존성 없음. headings만 추적하면 충분 (코드 블록 fenced 안의 # 제외).
-
 import type { DocOutlineEntry } from '@sepilotd/core'
 
 const HEADING_RE = /^(#{1,6})\s+(.+?)\s*$/
@@ -31,7 +26,7 @@ export function parseOutline(content: string): DocOutlineEntry[] {
   const lineStarts: number[] = []
   for (let i = 0; i < lines.length; i++) {
     lineStarts.push(offset)
-    offset += lines[i].length + 1 // +1 newline (마지막 newline은 정확치 않지만 outline 용도엔 OK)
+    offset += lines[i].length + 1
   }
 
   for (let i = 0; i < lines.length; i++) {
@@ -55,7 +50,6 @@ export function parseOutline(content: string): DocOutlineEntry[] {
     const h = headings[i]
     let end = content.length
     for (let j = i + 1; j < headings.length; j++) {
-      // 다음 같은 또는 상위 레벨 heading 직전까지가 section 끝
       if (headings[j].level <= h.level) {
         end = headings[j].lineStart
         break
@@ -72,7 +66,6 @@ export function parseOutline(content: string): DocOutlineEntry[] {
   return entries
 }
 
-/** title 매칭(완전일치 → case-insensitive) 또는 index로 outline entry 찾기 */
 export function findSection(
   outline: DocOutlineEntry[],
   selector: string | number,

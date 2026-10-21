@@ -1,19 +1,6 @@
 import { signatureOf } from './stuck-tool-repeat.js'
 import type { AgentState } from './graph/types.js'
 
-/**
- * Failed-attempt pre-execution guard: before re-running a tool call whose
- * structural signature (tool + stable-serialized args, shared with the
- * stuck-tool-repeat detector) was already recorded as failed this run, block
- * it and hand the model the recorded failure reason so it takes a different
- * approach instead of burning iterations on a known-bad action.
- *
- * Complementary to the stuck-repeat guard: that one catches "same call
- * repeating right now"; this one catches "retrying an approach that already
- * failed earlier". Blocking is bounded (MAX_FAILED_ATTEMPT_BLOCKS) — if the
- * model insists past the budget the call runs anyway with a warning, so the
- * guard can never deadlock a run.
- */
 export const MAX_FAILED_ATTEMPT_BLOCKS = 2
 
 function toSignatureInput(toolCall: { name: string; arguments?: unknown }): {
@@ -43,15 +30,6 @@ export function recordFailedAttempt(
   list.push({ signature, tool: toolCall.name, reason, ts: now() })
 }
 
-/**
- * Remove a stale failure after the structurally-identical action succeeds.
- *
- * Tool failures are observations about one execution, not permanent facts
- * about an invocation. A retry can legitimately recover after a source edit,
- * a restarted service, an approval, or a transient network failure. Keeping
- * the old row after a successful retry makes the guard contradict the newest
- * tool result and can drive the model back into the action it just completed.
- */
 export function clearFailedAttempt(
   state: Pick<AgentState, 'failedAttempts'>,
   toolCall: { name: string; arguments?: unknown },
@@ -100,13 +78,6 @@ function isSuccessfulExternalTerminalAction(
   )
 }
 
-/**
- * Evaluate a recorded failure against the current run state. A compiler,
- * test, HTTP probe, or other exact action is no longer the same attempt after
- * a successful source/environment mutation. Permit that first post-mutation
- * retry; if it fails again, recordFailedAttempt refreshes the timestamp and
- * the ordinary bounded guard applies again.
- */
 export function checkFailedAttemptAfterRecovery(
   toolCall: { name: string; arguments?: unknown },
   state: Pick<AgentState, 'failedAttempts' | 'toolCallHistory'>,
@@ -120,10 +91,10 @@ export function checkFailedAttemptAfterRecovery(
     && entry.ts >= hit.ts
     && (
       RECOVERY_MUTATION_TOOL_NAMES.has(entry.tool)
-      // An external terminal action can repair the execution environment
-      // without changing workspace files (for example by populating a package
-      // cache). It invalidates an earlier terminal failure, but not a failed
-      // file edit or another capability's structural failure.
+      || (entry.securityEffect === 'dynamic'
+        && entry.executionObserved === true
+        && !entry.blocked
+        && entry.input.actionPurpose === 'mutate')
       || (hit.tool === 'terminal.run' && isSuccessfulExternalTerminalAction(entry))
     )
   ))
@@ -132,9 +103,6 @@ export function checkFailedAttemptAfterRecovery(
     : { blocked: true, reason: hit.reason }
 }
 
-/**
- * Structured tool-result text returned instead of executing a blocked call.
- */
 export function buildFailedAttemptBlockOutput(reason: string): string {
   return [
     '[Failed-attempt guard] This exact tool call (same tool, same arguments) already failed earlier in this run and was not executed again.',
@@ -143,10 +111,6 @@ export function buildFailedAttemptBlockOutput(reason: string): string {
   ].join('\n')
 }
 
-/**
- * Warning injected alongside the real result when the block budget is
- * exhausted and a previously-failed call is executed anyway.
- */
 export function buildFailedAttemptWarning(reason: string): string {
   return `[Failed-attempt guard] Warning: this call was already recorded as failed earlier in this run (${reason}). Executing anyway because the block budget is exhausted.`
 }

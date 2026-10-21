@@ -341,8 +341,6 @@ export function deriveInlinePanelVisibility(
     && !showUsageDashboardPanel
     && !inlinePanelBlocked
   )
-  // CLI artifact browsing is on-demand via /artifacts to keep the shell footer
-  // focused on the current run rather than previously saved outputs.
   const showArtifactPanel = false
   const showToolActivityPanel = (
     (options.toolCallCount > 0 || options.isStreaming)

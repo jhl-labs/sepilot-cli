@@ -1,3 +1,4 @@
+import { resolveTurnMemoryPolicy, memoryToolAllowed } from '../memory/turn-policy.js'
 import { remoteBrowserBridge } from '../tools/browser-remote.js'
 import { withSelectedBrowserTarget } from '../tools/browser-target.js'
 import { resolvePersonaMemoryScope } from '../memory/persona-scope.js'
@@ -16,14 +17,15 @@ import { resolveRequestedAutonomy } from '../security/autonomy.js'
 import { createAgentOutputTracker } from '../agent/event-output.js'
 import {
   formatContextCompactionNotice,
-  loadAutoCompactedSessionContext,
+  loadAutoCompactedSessionContextWithinBudget,
+  loadLatestRoutedPersona,
   loadLatestRunContract,
   resolveSessionContextMaxMessages,
 } from '../agent/auto-compaction.js'
 import { applyPreUserPromptHook } from '../agent/turn-hooks.js'
-import { fallbackSessionTitle, updateSessionTitleFromFirstTurn } from '../agent/session-title.js'
+import { fallbackSessionTitle } from '../agent/session-title.js'
 import { triggerDreamingTurn } from '../memory/dreaming.js'
-import { buildSystemPrompt } from '../agent/system-prompt.js'
+import { buildDeferredSystemPrompt } from '../agent/system-prompt.js'
 import { applyWritingDocFallback, snapshotWritingDocStart } from '../agent/doc/writing-fallback.js'
 import { collectAgentsMd, formatAgentsMdSection } from '../memory/agents-md.js'
 import {
@@ -48,6 +50,7 @@ import {
   chatAttachmentSchema,
   chatAutonomySchema,
   chatRequestSchema,
+  excludesLocalContext,
   resolveChatMaxIterations,
   type ChatBody,
 } from './routes/chat-schema.js'
@@ -58,7 +61,7 @@ import { InvalidCwdError, invalidCwdResponse, resolveChatRequestWorkspace } from
 import { resolveWsClientIdentity } from './runtime/ws-client-identity.js'
 import { createQuestionRequester } from '../tools/question.js'
 import {
-  withContextualToolExposure, withAuthorizedToolExposure,
+  withContextualToolExposure, withTurnToolAuthority,
   withDirectApiMemoryToolset,
   withSwarmToolsForSession,
   withWritingDocTools,
@@ -94,11 +97,24 @@ import {
   logIntentRouterDecision,
   resolveIntentRouterModel,
   INTENT_ROUTER_CIRCUIT_BREAKER,
+  routingLeavesMemoryIntentUnresolved,
 } from './routes/chat-intent.js'
+import {
+  applyRoleBotRequestDefaults,
+  applyRoutedRoleBot,
+  keepContinuingRoleBot,
+  roleBotLongTermInjectKb,
+  roleBotModeRouterOptions,
+  withRoleBotPersonas,
+  routerPersonaCandidates,
+  roleBotSkillRefs,
+} from './chat-bots.js'
 import {
   resolveImageGeneratorAutoSkillContent,
   resolveOfficeAutoSkillContent,
   resolveSkillRefsContent,
+  filterLoadableSkillRefs,
+  buildSkillsLoaded,
   shouldDeferPptxAttachmentText,
   SkillNotFoundError,
   SkillUnavailableError,
@@ -110,8 +126,10 @@ import {
 } from './chat-personas.js'
 import { createLogger } from '../logger.js'
 import { stopReasonProviderError, stopReasonUserAbort } from '../agent/stop-reason.js'
+import { DEFAULT_LIVE_VIEW_STILLS, createLiveViewTap } from '../views/live-view-event-tap.js'
+import { liveViewRegistry } from '../views/live-view-registry.js'
 
-const DROPPABLE_AGENT_WS_EVENTS = new Set(['text_delta', 'thinking'])
+const DROPPABLE_AGENT_WS_EVENTS = new Set(['text_delta', 'thinking', 'view_still'])
 const DEFAULT_WS_HEARTBEAT_MS = 30_000
 const logger = createLogger('server.ws')
 
@@ -227,10 +245,6 @@ export async function wsRoutes(app: FastifyInstance) {
       authContext,
       runtime.devicePairingRegistry,
     )
-    // Require an authenticated (non-anonymous) client whenever ANY auth is
-    // configured — a master token OR an extension token store. Keying only off
-    // app.authToken meant that deleting/failing-to-read the master token on an
-    // extension-only deployment silently reopened anonymous WS chat.
     const requiresAuthenticatedClient =
       Boolean(app.authTokenRequired || app.authToken) || Boolean(runtime.extensionTokenStore)
     const unauthorizedMessage = !identityResolution.ok
@@ -373,28 +387,33 @@ export async function wsRoutes(app: FastifyInstance) {
             projectId,
             cwd,
           } = msg
-          // Session identity metadata has the same contract on WS and HTTP/SSE.
-          // Dropping tags here disconnects persistent assistant entry points.
           const sessionTags = chatRequestSchema.shape.tags.safeParse(msg.tags)
+          const completionRequest = chatRequestSchema.shape.completionRequest.safeParse(msg.completionRequest)
+          if (!completionRequest.success) {
+            safeSend(JSON.stringify({ type: 'error', error: {
+              code: 'BAD_REQUEST', message: 'Invalid completion request',
+            } }))
+            return
+          }
           if (!sessionTags.success) {
             safeSend(JSON.stringify({ type: 'error', error: {
               code: 'BAD_REQUEST', message: 'Invalid session tags',
             } }))
             return
           }
-          const requestedPersona =
+          let requestedPersona =
             typeof rawPersona === 'string' && rawPersona.trim() ? rawPersona.trim() : undefined
-          const requestedPersonaIds = Array.isArray(msg.personaIds)
+          let requestedPersonaIds = Array.isArray(msg.personaIds)
             ? msg.personaIds
                 .filter((id: unknown): id is string => typeof id === 'string' && Boolean(id.trim()))
                 .map((id: string) => id.trim())
                 .slice(0, 6)
             : undefined
-          const panelStrategy: ChatBody['panelStrategy'] =
+          let panelStrategy: ChatBody['panelStrategy'] =
             msg.panelStrategy === 'sequential' || msg.panelStrategy === 'moderated'
               ? msg.panelStrategy
               : undefined
-          const skillRefs: ChatBody['skillRefs'] = Array.isArray(msg.skillRefs)
+          let skillRefs: ChatBody['skillRefs'] = Array.isArray(msg.skillRefs)
             ? msg.skillRefs
                 .filter(
                   (ref: unknown): ref is { name: string } =>
@@ -411,14 +430,13 @@ export async function wsRoutes(app: FastifyInstance) {
               && typeof msg.intentRouting.enabled === 'boolean'
               ? { enabled: msg.intentRouting.enabled }
               : undefined
-          const requestedMaxIterations =
+          let requestedMaxIterations =
             typeof msg.maxIterations === 'number'
             && Number.isInteger(msg.maxIterations)
             && msg.maxIterations >= 1
             && msg.maxIterations <= 500
               ? msg.maxIterations
               : undefined
-          // A requested budget is not a hard cap; only an explicit flag hardens it.
           const requestedHardMaxIterations = msg.hardMaxIterations === true
           const temperature =
             typeof msg.temperature === 'number'
@@ -426,7 +444,7 @@ export async function wsRoutes(app: FastifyInstance) {
             && msg.temperature <= 2
               ? msg.temperature
               : undefined
-          const ragEnabled =
+          let ragEnabled =
             typeof msg.ragEnabled === 'boolean' ? msg.ragEnabled : undefined
           const textDeltaMode =
             msg.textDeltaMode === 'live'
@@ -434,7 +452,30 @@ export async function wsRoutes(app: FastifyInstance) {
               : msg.textDeltaMode === 'buffered'
                 ? 'buffered'
                 : undefined
-          const requestMode = typeof msg.mode === 'string' ? (msg.mode as AgentMode) : undefined
+          let requestMode = typeof msg.mode === 'string' ? (msg.mode as AgentMode) : undefined
+          const roleBotRequest = applyRoleBotRequestDefaults({
+            bot: typeof msg.bot === 'string' ? msg.bot : undefined,
+            bots: Array.isArray(msg.bots) ? msg.bots.filter((id: unknown): id is string => typeof id === 'string') : undefined,
+            persona: requestedPersona,
+            personaIds: requestedPersonaIds,
+            panelStrategy,
+            mode: requestMode,
+            skillRefs,
+            maxIterations: requestedMaxIterations,
+            ragEnabled,
+          }, runtime.roleBots)
+          if (roleBotRequest.error) {
+            safeSend(JSON.stringify({ type: 'error', error: { code: roleBotRequest.error.code, message: roleBotRequest.error.message } }))
+            return
+          }
+          const explicitRoleBot = roleBotRequest.bot
+          requestedPersona = roleBotRequest.body.persona
+          requestedPersonaIds = roleBotRequest.body.personaIds ? [...roleBotRequest.body.personaIds] : undefined
+          panelStrategy = roleBotRequest.body.panelStrategy as ChatBody['panelStrategy']
+          requestMode = roleBotRequest.body.mode as AgentMode | undefined
+          skillRefs = roleBotRequest.body.skillRefs ? [...roleBotRequest.body.skillRefs] : undefined
+          requestedMaxIterations = roleBotRequest.body.maxIterations
+          ragEnabled = roleBotRequest.body.ragEnabled
           if (isExtensionWritingModeDenied(authContext, requestMode)) {
             safeSend(
               JSON.stringify({
@@ -456,8 +497,6 @@ export async function wsRoutes(app: FastifyInstance) {
             : undefined
           const requireToolApproval = msg.requireToolApproval === true
           const userMessage = typeof message === 'string' ? message : ''
-          // Validate client-supplied attachments through the same zod schema
-          // the HTTP routes use; malformed entries are dropped and surfaced.
           const wsSkippedAttachments: Array<{
             source: 'path' | 'url' | 'unknown'
             reason: string
@@ -519,10 +558,6 @@ export async function wsRoutes(app: FastifyInstance) {
           }
 
           const requestedAutonomy = chatAutonomySchema.safeParse(msg.autonomy)
-          // Match HTTP/SSE semantics: a valid per-turn selection wins over the
-          // configured default in either direction; the real ceiling is
-          // enforced by ACLs and the tool policy, not by clamping here. An
-          // unrecognized level falls back to the configured default.
           const autonomyResolution = resolveRequestedAutonomy(
             runtime.autonomy,
             requestedAutonomy.success ? requestedAutonomy.data : undefined,
@@ -543,8 +578,6 @@ export async function wsRoutes(app: FastifyInstance) {
             return
           }
 
-          // Claim the session before the first workspace/session read. This
-          // serializes turns with workspace PATCH across HTTP, SSE, and WS.
           const sessionLease = runtime.sessionBusy
             ? await runtime.sessionBusy.acquireLeaseWithGrace(sessionId)
             : undefined
@@ -596,7 +629,9 @@ export async function wsRoutes(app: FastifyInstance) {
             (await runtime.customDefs
               ?.agentsForCwd(requestCwd, requestWorkspaceRoot)
               .catch(() => [])) ?? []
-          const persistedPersonas = createPersonaRepo().list()
+          const storedPersonas = createPersonaRepo().list()
+          const userDefinedPersonaIds = new Set([...storedPersonas.map((persona) => persona.id), ...customAgents.map((agent) => agent.id)])
+          const persistedPersonas = withRoleBotPersonas(storedPersonas, runtime.roleBots)
           const personaSelection = resolveChatPersonaSelection(
             { persona: requestedPersona, personaIds: requestedPersonaIds },
             existingSession,
@@ -659,9 +694,6 @@ export async function wsRoutes(app: FastifyInstance) {
           const provider = selection.provider
           const selectedModel = selection.model
 
-          // Validate caller-selected skills before taking a run slot or
-          // creating/journaling a session. Post-routing refs are resolved again
-          // below because the intent router may augment the selection.
           const declaredSkillToolNames = new Set<string>()
           const autoLoadedSkillToolNames = new Set<string>()
           const loadedExecutionSkillIds = new Set<string>()
@@ -720,10 +752,6 @@ export async function wsRoutes(app: FastifyInstance) {
             let modeRouter: AgentModeRouter | null = null
             let agentInput = userMessage
             try {
-              // pre:user:prompt — fires on the WS path too (was HTTP-only), so
-              // switching transport can no longer bypass moderation/redaction.
-              // A handler may abort the turn or rewrite the prompt before it is
-              // journaled or fed to the agent.
               const promptGate = await applyPreUserPromptHook(userMessage, {
                 hookRegistry: runtime.hookRegistry,
                 sessionId,
@@ -742,7 +770,7 @@ export async function wsRoutes(app: FastifyInstance) {
                 return
               }
               const finalPrompt = promptGate.prompt
-              const previousContext = await loadAutoCompactedSessionContext({
+              const previousContext = await loadAutoCompactedSessionContextWithinBudget({
                 sessionStore: runtime.sessions,
                 sessionId,
                 provider,
@@ -834,8 +862,6 @@ export async function wsRoutes(app: FastifyInstance) {
                   }),
                 )
               }
-              // Surface skipped attachments (schema-invalid, oversized,
-              // wrong-type, or out-of-root) instead of dropping them silently.
               if (wsSkippedAttachments.length > 0) {
                 safeSend(
                   JSON.stringify({
@@ -873,7 +899,11 @@ export async function wsRoutes(app: FastifyInstance) {
                       model: routerModel,
                       graphRegistry: runtime.graphRegistry,
                       skillRegistry: runtime.skillRegistry,
-                      personaList: () => resolvePersonaCatalog(customAgents, persistedPersonas),
+                      personaList: () => routerPersonaCandidates(
+                        resolvePersonaCatalog(customAgents, persistedPersonas),
+                        runtime.roleBots,
+                        userDefinedPersonaIds,
+                      ),
                       currentAutonomy: effectiveAutonomy,
                       cwd: requestCwd,
                       workspaceRoot: requestWorkspaceRoot,
@@ -895,8 +925,6 @@ export async function wsRoutes(app: FastifyInstance) {
                 }
               }
 
-              // Session-bound solo personas and explicit panels are deliberate
-              // user choices. Intent routing must never replace either.
               const panelLocked =
                 requestMode === 'persona-panel'
                 && (personaSelection.personaIds?.length ?? 0) > 0
@@ -905,7 +933,7 @@ export async function wsRoutes(app: FastifyInstance) {
                 ? { enabled: false }
                 : intentRouting
               const routingMode = requestMode
-              const routing = await applyIntentRouting({
+              const initialRouting = await applyIntentRouting({
                 defaultMode: runtime.config.agent.mode,
                 router: intentRouter,
                 graphRegistry: runtime.graphRegistry,
@@ -919,6 +947,15 @@ export async function wsRoutes(app: FastifyInstance) {
                 },
                 isMultimodal: hasMultimodalContent,
               })
+              const continuingRouting = initialRouting.decision.contractRelation === 'continue'
+                ? keepContinuingRoleBot(
+                    initialRouting,
+                    await loadLatestRoutedPersona(runtime.sessions, sessionId).catch(() => undefined),
+                    runtime.roleBots,
+                  )
+                : initialRouting
+              const { routing, bot: routedRoleBot } = applyRoutedRoleBot(continuingRouting, runtime.roleBots)
+              const turnRoleBot = explicitRoleBot ?? routedRoleBot
 
               logIntentRouterDecision(
                 logger,
@@ -932,11 +969,13 @@ export async function wsRoutes(app: FastifyInstance) {
                 sessionId,
                 routerCfg?.model,
               )
-              await runtime.sessions.appendEvent(sessionId, {
+              const memoryPolicy = resolveTurnMemoryPolicy(msg.memoryPolicy, routing.decision.memoryPolicy, routingLeavesMemoryIntentUnresolved(routing.decision))
+        await runtime.sessions.appendEvent(sessionId, {
                 type: 'router_decision',
                 id: randomUUID(),
                 timestamp: new Date().toISOString(),
                 decision: {
+            memoryPolicy,
                   mode: routing.decision.mode,
                   persona: routing.decision.persona,
                   skillIds: routing.decision.skillIds,
@@ -948,7 +987,13 @@ export async function wsRoutes(app: FastifyInstance) {
                 },
               })
 
+              const botSkillRefs = await filterLoadableSkillRefs(
+                roleBotSkillRefs(turnRoleBot, routing.effectiveSkillRefs),
+                runtime.skillRegistry, requestCwd, effectiveAutonomy, requestWorkspaceRoot,
+                routing.effectiveSkillRefs.length,
+              )
               let skillPrefix = ''
+              let botSkillPrefix = ''
               try {
                 skillPrefix = await resolveSkillRefsContent(
                   routing.effectiveSkillRefs,
@@ -960,7 +1005,17 @@ export async function wsRoutes(app: FastifyInstance) {
                   requestWorkspaceRoot,
                   loadedExecutionSkillIds,
                 )
-                skillPrefix += resolveInitialExecutionMode(routing, runtime.config.agent.mode) === 'instant' ? '' : await resolveOfficeAutoSkillContent(
+                botSkillPrefix = await resolveSkillRefsContent(
+                  botSkillRefs,
+                  runtime.skillRegistry,
+                  runtime.toolRegistry,
+                  requestCwd,
+                  effectiveAutonomy,
+                  autoLoadedSkillToolNames,
+                  requestWorkspaceRoot,
+                  loadedExecutionSkillIds,
+                )
+                skillPrefix += resolveInitialExecutionMode(routing, runtime.config.agent.mode, false, surfaceLabel ?? undefined) === 'instant' ? '' : await resolveOfficeAutoSkillContent(
                   officeAutoIntentText,
                   routing.effectiveSkillRefs,
                   runtime.skillRegistry,
@@ -972,6 +1027,7 @@ export async function wsRoutes(app: FastifyInstance) {
                   previousMessages,
                   loadedExecutionSkillIds,
                   finalPrompt,
+                  turnRoleBot ? turnRoleBot.skills ?? [] : undefined,
                 )
                 skillPrefix += await resolveImageGeneratorAutoSkillContent(
                   finalPrompt,
@@ -1011,15 +1067,16 @@ export async function wsRoutes(app: FastifyInstance) {
               )
               const agentsFiles = await collectAgentsMd({
                 cwd: requestCwd,
+                includeUserLevel: !excludesLocalContext(msg),
                 boundaryRoot: requestWorkspaceRoot,
               })
               const agentsMemory = formatAgentsMdSection(agentsFiles) ?? undefined
-              const relevantKnowledgeContext = await buildChatKnowledgeContext({
+              const relevantKnowledgeContext = memoryPolicy.read && memoryPolicy.automaticRead !== false ? await buildChatKnowledgeContext({
                 registry: app.chatKnowledgeProviders,
                 message: finalPrompt,
                 previousMessages,
-                allowLocalKnowledge: authContext?.kind !== 'extension',
-              })
+                allowLocalKnowledge: authContext?.kind !== 'extension' && !excludesLocalContext(msg),
+              }) : undefined
               const directApiToolRegistry = withWritingDocTools(
                 withSwarmToolsForSession(
                   withDirectApiMemoryToolset(
@@ -1028,21 +1085,24 @@ export async function wsRoutes(app: FastifyInstance) {
                   ),
                   sessionId,
                 ),
-                // The same expression the doc.* tools resolve with.
                 writingDocId ?? getDocRegistry().getActiveId(),
               )
               const activeRemoteBrowser = remoteBrowserBridge(runtime.toolRegistry).list().some(connection => connection.sessionId === sessionId)
-              const initialMode = resolveInitialExecutionMode(routing, runtime.config.agent.mode, activeRemoteBrowser)
-              const authorizedToolRegistry = withSelectedBrowserTarget(withAuthorizedToolExposure(directApiToolRegistry, {
-                explicitToolNames: toolNames, declaredSkillToolNames,
+              const initialMode = resolveInitialExecutionMode(routing, runtime.config.agent.mode, activeRemoteBrowser, surfaceLabel ?? undefined)
+              const turnToolAuthority = withTurnToolAuthority(directApiToolRegistry, {
+                explicitToolNames: (toolNames ?? directApiToolRegistry.list().map(tool => tool.name)).filter((name: string) => memoryToolAllowed(name, memoryPolicy)), declaredSkillToolNames,
                 personaAllowedTools: personaObj?.allowedTools, personaDeniedTools: personaObj?.deniedTools,
-              }), activeRemoteBrowser)
+              })
+              const delegationToolRegistry = withSelectedBrowserTarget(turnToolAuthority.delegation, activeRemoteBrowser)
+              const authorizedToolRegistry = withSelectedBrowserTarget(turnToolAuthority.own, activeRemoteBrowser)
               const agentToolRegistry = withContextualToolExposure(authorizedToolRegistry, {
                 surface: surfaceLabel,
                 semanticRouting: true,
                 activeRemoteBrowser,
                 selectedGroups: routing.decision.toolGroups,
+                botToolGroups: turnRoleBot?.toolGroups,
                 routedMode: initialMode,
+                routingConfidence: routing.decision.confidence,
                 routingFallback: routing.decision.fallback,
                 activeWritingDocument: Boolean(writingDocId ?? getDocRegistry().getActiveId()),
                 swarmSession: sessionId.startsWith('swarm_'),
@@ -1058,16 +1118,18 @@ export async function wsRoutes(app: FastifyInstance) {
                 ),
               })
               const closedToolSurface = toolNames !== undefined || declaredSkillToolNames.size > 0
-              const baseSystemPrompt = await buildSystemPrompt({
+              const { prompt: baseSystemPrompt, systemToolGuidance } = await buildDeferredSystemPrompt({
                 config: runtime.config,
                 profile: initialMode === 'instant' ? 'instant' : 'agent',
+                longTermInjectKb: roleBotLongTermInjectKb(turnRoleBot),
+                skillInventory: turnRoleBot ? (turnRoleBot.skills ?? []) : undefined,
                 tools: agentToolRegistry,
                 skills: runtime.skillRegistry,
-                fileMemory: resolveScopedFileMemoryReadView(
+                fileMemory: !excludesLocalContext(msg) && memoryPolicy.read && memoryPolicy.automaticRead !== false ? resolveScopedFileMemoryReadView(
                   runtime.fileMemory,
                   runtime.fileMemoryRegistry,
                   scopeTags,
-                ),
+                ) : undefined,
                 agentsMemory,
                 relevantMemoryContext: relevantKnowledgeContext,
                 customInstructions: personaObj?.systemPromptAddition,
@@ -1082,6 +1144,7 @@ export async function wsRoutes(app: FastifyInstance) {
                 buildShellModePrefix(effectiveMode),
                 buildWritingDocPrefix(effectiveMode, writingDocId, requestWorkspaceRoot),
                 skillPrefix,
+                botSkillPrefix,
                 baseSystemPrompt,
               ].join('')
               const writingDocStart = snapshotWritingDocStart(
@@ -1116,19 +1179,22 @@ export async function wsRoutes(app: FastifyInstance) {
               )
 
               modeRouter = new AgentModeRouter({
+                systemToolGuidance,
                 provider,
                 tools: agentToolRegistry,
                 authorizedTools: authorizedToolRegistry,
+                delegationTools: delegationToolRegistry,
                 activeRemoteBrowser,
                 policy: runtime.policyEngine,
                 autonomy: effectiveAutonomy,
                 auxiliaryLlmBudget,
-                semanticIndex: runtime.semanticIndex,
+                semanticIndex: excludesLocalContext(msg) ? undefined : runtime.semanticIndex,
                 systemPrompt,
                 previousMessages,
                 maxIterations: resolveChatMaxIterations({
-                  maxIterations: requestedMaxIterations,
+                  maxIterations: requestedMaxIterations ?? turnRoleBot?.maxIterations,
                 }),
+                ...roleBotModeRouterOptions(turnRoleBot),
                 hardMaxIterations: requestedHardMaxIterations,
                 auditLogger: runtime.auditLogger,
                 usageTracker: runtime.usageTracker,
@@ -1138,7 +1204,7 @@ export async function wsRoutes(app: FastifyInstance) {
                 thinkingLevel,
                 maxTokens: typeof maxTokens === 'number' ? maxTokens : undefined,
                 temperature,
-                ragEnabled,
+                ragEnabled: ragEnabled ?? turnRoleBot?.documents,
                 panelPersonas: resolvedPanelPersonas,
                 panelStrategy,
                 llmCache: runtime.llmCache,
@@ -1162,6 +1228,20 @@ export async function wsRoutes(app: FastifyInstance) {
                 reviewToollessFinals: true,
               })
               activeRouters.add(modeRouter)
+              if (closed) {
+                activeRouters.delete(modeRouter)
+                await modeRouter.stop().catch(() => {})
+                await persistAgentSessionEvent(runtime.sessions, sessionId, {
+                  type: 'done',
+                  usage: { inputTokens: 0, outputTokens: 0 },
+                  stopReason: {
+                    ...stopReasonUserAbort(),
+                    summary: 'Run cancelled: the client disconnected before it started.',
+                    detail: { layer: 'websocket_disconnect' },
+                  },
+                })
+                return
+              }
 
               safeSend(JSON.stringify({ type: 'chat.session', sessionId }))
               safeSend(
@@ -1172,6 +1252,13 @@ export async function wsRoutes(app: FastifyInstance) {
                   decision: routing.decision,
                 }),
               )
+              const skillsLoaded = buildSkillsLoaded({
+                strictPrefix: skillPrefix,
+                callerSkillNames: (skillRefs ?? []).map((ref) => ref.name),
+                botPrefix: botSkillPrefix,
+                autoPrefix: '',
+              })
+              if (skillsLoaded) safeSend(JSON.stringify({ type: 'agent.skills_loaded', sessionId, skills: skillsLoaded }))
               if (compactionNotice) {
                 safeSend(JSON.stringify({
                   type: 'agent.thinking',
@@ -1192,12 +1279,6 @@ export async function wsRoutes(app: FastifyInstance) {
                 }))
                 await persistAgentSessionEvent(runtime.sessions, sessionId, deltaEvent)
               }
-              // WS chat had no inactivity watchdog: a hung agent loop kept the
-              // run lease (and the shared session-busy slot) forever,
-              // with the client just staring at silence. Mirror the SSE/channel
-              // watchdog — if no agent event arrives within the configured
-              // window, stop the run and emit a structured AGENT_INACTIVITY
-              // frame that says *what* stalled.
               const inactivityProbe = createAgentInactivityProbe()
               const inactivityMs = resolveAgentInactivityMs()
               let inactivityTripped = false
@@ -1207,8 +1288,6 @@ export async function wsRoutes(app: FastifyInstance) {
                   if (closed || inactivityTripped) return
                   const pending = inactivityProbe.pendingDecision()
                   if (pending) {
-                    // Blocked on a human decision — not a stall. Only the
-                    // separate decision bound may end the run here.
                     const decisionTimeoutMs = resolvePendingDecisionTimeoutMs()
                     if (decisionTimeoutMs > 0 && Date.now() - pending.since > decisionTimeoutMs) {
                       inactivityTripped = true
@@ -1236,8 +1315,13 @@ export async function wsRoutes(app: FastifyInstance) {
                 safeSend(JSON.stringify({ ...event, type: `agent.${event.type}`, sessionId }))
                 await persistAgentSessionEvent(runtime.sessions, sessionId, event)
               }
+              const liveViewTap = createLiveViewTap({
+                views: liveViewRegistry(runtime.toolRegistry),
+                sessionId,
+                stills: runtime.config.views?.stills ?? DEFAULT_LIVE_VIEW_STILLS,
+              })
               try {
-                for await (const event of modeRouter.run(
+                for await (const event of liveViewTap.wrap(modeRouter.run(
                   agentInput,
                   {
                     sessionId,
@@ -1260,23 +1344,28 @@ export async function wsRoutes(app: FastifyInstance) {
                     systemPrompt,
                     previousMessages,
                     toolAllowlist: authorizedToolRegistry.list().map((tool) => tool.name),
+                    delegationToolAllowlist: delegationToolRegistry.list().map((tool) => tool.name),
                     ...resolveSkillExecutionContext(
                       loadedExecutionSkillIds,
                       new Set([...declaredSkillToolNames, ...autoLoadedSkillToolNames]),
                     ),
                     runContract: previousRunContract,
                     runContractScope: 'previous-turn',
+                    completionRequest: completionRequest.data,
+                    memoryPolicy,
                     memoryQuery: finalPrompt,
                     scopeTags,
                     writingDocId: effectiveMode === 'writing' ? writingDocId : undefined,
                     requireToolApproval,
+                    ...(surfaceLabel ? { surface: surfaceLabel } : {}),
+                    ...(turnRoleBot?.id ? { roleBotId: turnRoleBot.id } : {}),
+                    ...(toolNames !== undefined ? { requestedToolNames: toolNames } : {}),
+                    requestAuthorityComplete: true,
                   },
                   effectiveMode,
-                )) {
+                ))) {
                   if (closed) {
                     void modeRouter.stop().catch(() => {})
-                    // Drain the cancelled iterator so its terminal status and
-                    // received usage survive the transport disappearing.
                   }
                   if (isSubstantiveAgentActivity(event)) {
                     lastAgentEventAt = Date.now()
@@ -1286,10 +1375,6 @@ export async function wsRoutes(app: FastifyInstance) {
                   outputTracker.consume(event)
                   if (event.type === 'error') {
                     providerError = event.error
-                    // Classify after the iterator closes so successful tool
-                    // evidence can produce a terminal, transparent
-                    // INCOMPLETE instead of an error frame followed by a
-                    // message that WebSocket clients may discard.
                     continue
                   }
                   if (event.type === 'done') {
@@ -1304,9 +1389,6 @@ export async function wsRoutes(app: FastifyInstance) {
                     continue
                   }
                   if (event.type === 'message') {
-                    // Hold the raw engine message until writing-mode fallback
-                    // and all final post-processing have produced the same
-                    // canonical content used by persistence and replay.
                     continue
                   }
 
@@ -1352,9 +1434,6 @@ export async function wsRoutes(app: FastifyInstance) {
                   await persistAgentSessionEvent(runtime.sessions, sessionId, recoveryEvent)
 
                   if (!retainedEvidenceIncomplete) {
-                    // A terminal provider error still closes a durable run.
-                    // Clients may close on the error frame, so journal its
-                    // outcome before sending it and releasing the run lease.
                     await persistAgentSessionEvent(runtime.sessions, sessionId, {
                       type: 'done',
                       usage: { inputTokens: 0, outputTokens: 0 },
@@ -1383,6 +1462,8 @@ export async function wsRoutes(app: FastifyInstance) {
                 }
 
                 if (!closed) {
+                  const canEnrichCompletion = !finalProviderError && terminalDoneEvent
+                    && (!terminalDoneEvent.stopReason || terminalDoneEvent.stopReason.kind === 'completed')
                   const finalContent = retainedEvidenceIncomplete ?? outputTracker.finalContent()
                   let assistantChatContent = finalContent
                   if (finalContent) {
@@ -1405,20 +1486,24 @@ export async function wsRoutes(app: FastifyInstance) {
                       }),
                     )
                     await persistAgentSessionEvent(runtime.sessions, sessionId, chatMessage)
+                    const liveViewRecords = liveViewTap.records()
                     await runtime.sessions.appendEvent(sessionId, {
                       type: 'assistant_message',
                       id: randomUUID(),
                       timestamp: new Date().toISOString(),
                       content: assistantChatContent,
+                      ...(liveViewRecords.length > 0 ? { views: liveViewRecords } : {}),
                     })
-                    await updateSessionTitleFromFirstTurn({
-                      sessions: runtime.sessions,
-                      session,
-                      provider,
-                      model: selectedModel,
-                      firstMessage: finalPrompt,
-                      assistantReply: assistantChatContent,
-                    })
+                    if (canEnrichCompletion) {
+                      app.sessionTitleUpdates?.schedule({
+                        sessions: runtime.sessions,
+                        session,
+                        provider,
+                        model: selectedModel,
+                        firstMessage: finalPrompt,
+                        assistantReply: assistantChatContent,
+                      })
+                    }
                   }
 
                   const artifacts = await extractAndStoreArtifacts(
@@ -1461,8 +1546,8 @@ export async function wsRoutes(app: FastifyInstance) {
                     terminalPersisted = true
                   }
 
-                  if (finalContent) {
-                    triggerDreamingTurn(runtime.dreaming, sessionId, 'ws', scopeTags)
+                  if (finalContent && canEnrichCompletion) {
+                    if (!excludesLocalContext(msg)) triggerDreamingTurn(runtime.dreaming, sessionId, 'ws', scopeTags)
                   }
                 }
               } catch (err) {
@@ -1485,10 +1570,6 @@ export async function wsRoutes(app: FastifyInstance) {
                 }
               } finally {
                 clearInterval(inactivityTimer)
-                // UI cancellation closes the socket. Journaling a terminal
-                // event belongs to the run, even when no client can receive it.
-                // Persist before releasing the session lease so a resumed turn
-                // cannot interleave with this cancellation record.
                 if (closed && !terminalPersisted) {
                   await persistAgentSessionEvent(runtime.sessions, sessionId, terminalDoneEvent ?? {
                     type: 'done',

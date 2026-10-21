@@ -34,9 +34,8 @@ export class SecretVault {
         const parsed = JSON.parse(json) as Record<string, string>
         this.secrets = new Map(Object.entries(parsed))
         return
-      } catch { /* file doesn't exist or decrypt failed — start fresh */ }
+      } catch {}
     }
-    // Plaintext fallback
     try {
       const data = await readFile(this.plainPath, 'utf-8')
       const parsed = JSON.parse(data) as Record<string, string>
@@ -44,7 +43,7 @@ export class SecretVault {
       if (!this.encryption.isEnabled()) {
         log.warn('Secrets loaded from plaintext — encryption key not configured')
       }
-    } catch { /* no file — empty */ }
+    } catch {}
   }
 
   async set(key: string, value: string): Promise<void> {

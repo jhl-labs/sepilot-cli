@@ -17,7 +17,6 @@ export interface DiscordInteractionResponse {
   type: number
 }
 
-/** Discord interaction tokens are valid for 15 minutes; refuse to edit later. */
 const DISCORD_INTERACTION_TTL_MS = 14 * 60 * 1000
 
 export class DiscordChannel implements IChannel {
@@ -26,10 +25,6 @@ export class DiscordChannel implements IChannel {
   private config: DiscordChannelConfig
   private status: ChannelStatus = 'disconnected'
   private handlers: Array<(msg: IncomingMessage) => Promise<void>> = []
-  // Pending deferred interactions keyed by channelId. When a reply is later
-  // dispatched for that channel we edit the deferred `@original` response
-  // (resolving the permanent "thinking…") instead of posting a stray channel
-  // message that leaves the interaction unresolved.
   private pendingInteractions = new Map<string, { token: string; createdAt: number }>()
 
   constructor(config: DiscordChannelConfig) {
@@ -38,7 +33,6 @@ export class DiscordChannel implements IChannel {
 
   private rememberInteraction(channelId: string, token: string): void {
     const now = Date.now()
-    // Opportunistic cleanup of expired tokens.
     for (const [key, entry] of this.pendingInteractions) {
       if (now - entry.createdAt > DISCORD_INTERACTION_TTL_MS) {
         this.pendingInteractions.delete(key)
@@ -55,21 +49,15 @@ export class DiscordChannel implements IChannel {
     return entry.token
   }
 
-  /** Resolve a rejected deferred interaction with a best-effort notice. */
   private async resolveInteractionRejection(token: string): Promise<void> {
     try {
       await this.editInteractionOriginal(
         token,
         'You are not authorized to use this command here.',
       )
-    } catch { /* best-effort */ }
+    } catch {}
   }
 
-  /**
-   * Edit the deferred interaction's original response (first chunk) and post
-   * any remaining chunks as follow-up messages. The interaction token itself
-   * authorizes these webhook calls, so no bot token is attached.
-   */
   private async editInteractionOriginal(token: string, text: string): Promise<void> {
     const chunks = splitChannelMessage(text, { limit: DISCORD_MESSAGE_CHAR_LIMIT })
     const base = `https://discord.com/api/v10/webhooks/${this.config.applicationId}/${token}`
@@ -119,8 +107,6 @@ export class DiscordChannel implements IChannel {
   }
 
   async sendMessage(target: ChannelTarget, msg: ChannelMessage): Promise<void> {
-    // If this channel has a pending deferred slash-command interaction, resolve
-    // it by editing @original instead of posting an unrelated channel message.
     const interactionToken = this.takeFreshInteractionToken(target.id)
     if (interactionToken) {
       await this.editInteractionOriginal(interactionToken, msg.text)
@@ -196,12 +182,9 @@ export class DiscordChannel implements IChannel {
     }
   }
 
-  /** Process incoming Discord interaction (called by webhook route) */
   async handleInteraction(body: Record<string, unknown>): Promise<DiscordInteractionResponse> {
-    // PING → PONG
     if (body.type === 1) return { type: 1 }
 
-    // APPLICATION_COMMAND
     if (body.type === 2) {
       const data = body.data as Record<string, unknown> | undefined
       const options = data?.options as Array<{ value: string }> | undefined
@@ -213,11 +196,6 @@ export class DiscordChannel implements IChannel {
       const userId = (memberUser?.id as string) ?? (user?.id as string) ?? ''
       const interactionToken = typeof body.token === 'string' ? body.token : undefined
 
-      // The webhook route has already replied to Discord with a deferred
-      // response (type 5); this handler runs asynchronously. Remember the
-      // interaction token so the eventual reply edits @original. For rejected
-      // interactions, resolve @original immediately so it does not hang on
-      // "thinking…" forever.
       if (this.config.allowedGuilds?.length && (!guildId || !this.config.allowedGuilds.includes(guildId))) {
         if (interactionToken) await this.resolveInteractionRejection(interactionToken)
         return { type: 5 }
@@ -252,9 +230,9 @@ export class DiscordChannel implements IChannel {
         },
       }
       for (const h of this.handlers) {
-        try { await h(msg) } catch { /* handler errors are silently ignored */ }
+        try { await h(msg) } catch {}
       }
-      return { type: 5 } // DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+      return { type: 5 }
     }
 
     return { type: 1 }

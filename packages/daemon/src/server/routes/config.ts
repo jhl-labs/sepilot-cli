@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import '../fastify-types.js'
 import type { SepilotdConfig } from '../../config/schema.js'
+import { DEFAULT_EVENT_ROUTING_CONFIG, redactEventRoutingConfig } from '../../event-routing/config-schema.js'
 import { isRuntimeManagedChannel } from '../../config/runtime-channel-env.js'
 import { resolveChannelPipelineHealthConfig } from '../runtime/channel-pipeline-health.js'
 import { resolveWebhookSecurityHealthConfig } from '../runtime/webhook-security-health.js'
@@ -67,12 +68,6 @@ export async function configRoutes(app: FastifyInstance) {
     )
   const redactOptionalSecret = (value: string | undefined) =>
     value ? '***redacted***' : undefined
-  // Both callers below already narrow `value` to non-undefined via
-  // the surrounding ternary, so redactMemoryAuth is typed strictly:
-  // the previous `T | undefined => T | undefined` shape forced
-  // every spread of the result to widen back into a possibly-
-  // undefined object, which broke the strict response type for
-  // memory.rag.rerank.
   const redactMemoryAuth = <T extends { auth?: { password?: string } }>(
     value: T,
   ): T => {
@@ -147,7 +142,6 @@ export async function configRoutes(app: FastifyInstance) {
   registerConfigObservabilityRoutes(app)
   registerConfigSecurityWebhookRoutes(app)
 
-  // GET /config — get current config (redact sensitive fields)
   app.get('/config', async (_request, reply) => {
     if (!runtime) return reply.status(503).send({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Runtime not initialized' } })
     const providers = runtime.config.providers.map(p => ({
@@ -209,9 +203,20 @@ export async function configRoutes(app: FastifyInstance) {
         providers,
         channels,
         hooks,
+        eventRouting: redactEventRoutingConfig(runtime.config.eventRouting ?? DEFAULT_EVENT_ROUTING_CONFIG),
+        ...(runtime.config.share
+          ? {
+              share: {
+                ...runtime.config.share,
+                public: {
+                  ...runtime.config.share.public,
+                  secret: redactOptionalSecret(runtime.config.share.public.secret) ?? '',
+                },
+              },
+            }
+          : {}),
         mcp,
         memory: redactMemoryConfig(runtime.config.memory),
-        // Older persisted snapshots predate this section entirely.
         ...(runtime.config.webSearch
           ? {
               webSearch: {
@@ -224,7 +229,6 @@ export async function configRoutes(app: FastifyInstance) {
     }
   })
 
-  // PUT /config — update runtime config values
   app.put<{ Body: ConfigUpdateBody }>('/config', {
     preValidation: zodRequestValidation({
       body: {
@@ -269,11 +273,6 @@ export async function configRoutes(app: FastifyInstance) {
         const previousWebhookSecurityPolicy = requestedWebhookSecurityPolicy
           ? resolveWebhookSecurityPolicy(runtime.config)
           : null
-        // Snapshot pre-mutation validation errors so the gate below only
-        // rejects errors THIS request introduces. A pre-existing latent
-        // incoherence (e.g. a stale embeddingProvider) must not block an
-        // unrelated field update or prevent the user from fixing config
-        // through the API.
         const preValidationErrors = new Set(validateConfig(runtime.config).errors)
         const updatedKeys = new Set<ConfigUpdateKey>()
         const updatedValues: Partial<Record<ConfigUpdateKey, unknown>> = {}
@@ -298,16 +297,6 @@ export async function configRoutes(app: FastifyInstance) {
           }
         }
 
-        // Cross-field validation on the post-mutation config, mirroring the
-        // full settings-json replace path. Granular PUT applies fields
-        // independently, so an individually-valid field can still leave the
-        // config incoherent (e.g. vectorBackend=qdrant with no qdrant.url,
-        // an embeddingProvider that is not configured, a dangling
-        // defaultProvider). Persisting that would fail on the next boot.
-        // Only errors this request newly introduces are rejected — see the
-        // preValidationErrors snapshot above. Throwing here rolls back the
-        // in-memory config via the mutation service before anything is
-        // written to disk.
         if (updatedKeys.size > 0) {
           const validation = validateConfig(runtime.config)
           const newErrors = validation.errors.filter(

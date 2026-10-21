@@ -1,10 +1,9 @@
-// packages/daemon/src/scheduler/engine.ts
 import { isApprovalParkedError } from '../server/runtime/approvals.js'
 import { nextRetryAt, DEFAULT_RETRY_POLICY, type RunStopReason, type TokenUsage } from '@sepilotd/core'
 import { schedulerMisfirePolicyFromMetadata } from '@sepilotd/api-client'
 import { createLogger } from '../logger.js'
 import type { JobStore, ScheduledJob } from './job-store.js'
-import { nextRecurringRun, SchedulerParseError } from './time-parser.js'
+import { nextScheduledRun, SchedulerParseError } from './time-parser.js'
 
 const log = createLogger('scheduler:engine')
 const ZERO_USAGE: TokenUsage = { inputTokens: 0, outputTokens: 0 }
@@ -12,27 +11,18 @@ const ZERO_USAGE: TokenUsage = { inputTokens: 0, outputTokens: 0 }
 export interface JobExecutionResult {
   output?: string
   usage?: TokenUsage | null
-  /** Explicit task-level outcome. Omitted means complete for backward compatibility. */
   outcome?: 'complete' | 'incomplete'
-  /** Bounded user-safe reason when outcome is incomplete. */
   failureReason?: string
-  /**
-   * Structured termination cause from the agent's done event. Lets run history
-   * separate "stopped at a deliberate budget with resumable state" from a hard
-   * failure instead of leaving both as an opaque error string.
-   */
   stopReason?: RunStopReason
 }
 
 export interface JobExecutionContext {
   runId: string
-  /** Aborted when bounded graceful shutdown has to release this run. */
   signal?: AbortSignal
-  /** Suppress scheduler-owned delivery while preserving a real execution. */
   suppressDelivery?: boolean
+  forceReport?: boolean
 }
 
-/** Executor returns output text (for run-history excerpts) and optional token usage. */
 export type JobExecutor = (
   job: ScheduledJob,
   context?: JobExecutionContext,
@@ -41,22 +31,16 @@ export type JobExecutor = (
 export interface SchedulerEngineOptions {
   store: JobStore
   executor: JobExecutor
-  /** Live manual runs share the store but execute outside this engine. */
   activeManualJobIds?: () => readonly string[]
   tickMs?: number
   maxConcurrent?: number
   missedGraceMs?: number
   staleRunningMs?: number
   gcAfterDays?: number
-  /** Upper bound for a single retry backoff wait (default 1h). */
   maxBackoffMs?: number
-  /** Default IANA timezone for cron jobs that don't carry their own. */
   defaultTimezone?: string
-  /** Auto-disable a recurring job after this many consecutive failed fires (default 5). */
   maxConsecutiveFailures?: number
-  /** Global automatic-run kill switch. Manual runs are handled by the runtime trigger path. */
   enabled?: () => boolean
-  /** Daily automatic-run token budget. Undefined means unlimited. */
   dailyTokenBudget?: () => number | null | undefined
   onEvent?: (event: SchedulerEngineEvent) => void
 }
@@ -164,7 +148,6 @@ export class SchedulerEngine {
     this.defaultTimezone = opts.defaultTimezone
   }
 
-  /** Number of jobs currently executing. Used by the idle reaper work-check. */
   get activeRunCount(): number {
     return this.activeRuns.size
   }
@@ -216,12 +199,6 @@ export class SchedulerEngine {
     this.staleTimer = null
   }
 
-  /**
-   * Stop admission, then give already-claimed jobs a bounded window to finish.
-   * Anything still running at the boundary is explicitly persisted and
-   * released for retry before its executor is aborted. Late executor results
-   * are ignored, so they cannot overwrite the interruption evidence.
-   */
   shutdown(graceMs = 10_000): Promise<SchedulerShutdownResult> {
     if (this.shutdownPromise) return this.shutdownPromise
     this.stop()
@@ -359,21 +336,13 @@ export class SchedulerEngine {
     }
   }
 
-  /**
-   * A recurring job is meant to keep firing on its cron forever. If one ended
-   * up `failed` (executor threw and retries were exhausted, a bad cron once
-   * threw during advance, an old daemon left it that way, …) it would sit
-   * dead because `pickReady` only takes `pending` jobs. On startup, re-arm any
-   * still-enabled recurring job at its next cron occurrence; `lastError` is
-   * kept so the prior failure is still visible via `schedule_runs` / list.
-   */
   private reanchorFailedRecurring(): void {
     const now = Date.now()
     let rearmed = 0
     for (const job of this.opts.store.list({ status: ['failed'] })) {
       if (job.kind !== 'recurring' || !job.enabled || !job.cron) continue
       try {
-        const next = nextRecurringRun(job.cron, now, this.timezoneFor(job))
+        const next = nextScheduledRun(job.cron, now, this.timezoneFor(job), job.metadata)
         this.opts.store.reanchorRecurring(job.id, next)
         rearmed++
       } catch (err) {
@@ -418,7 +387,6 @@ export class SchedulerEngine {
 
   private runJob(job: ScheduledJob): void {
     const startedAt = Date.now()
-    // job.attempt is 0 on a fresh fire; the executing attempt is attempt+1 (1-indexed).
     const attemptNo = job.attempt + 1
     const runId = this.opts.store.recordRunStart(job.id, attemptNo, startedAt)
     const controller = new AbortController()
@@ -459,8 +427,6 @@ export class SchedulerEngine {
         })
         this.recordSchedulerUsage(usage)
         if (this.opts.store.get(job.id)?.status !== 'running') {
-          // Preserve a cancellation or re-armed definition made during execution.
-          // The exact run above still retains its real completion evidence.
         } else if (job.kind === 'oneshot') {
           this.opts.store.updateStatus(job.id, 'completed', { lastRunAt: startedAt })
         } else {
@@ -472,11 +438,6 @@ export class SchedulerEngine {
         if (activeRun.interrupted) return
         const reason = err instanceof Error ? err.message : String(err)
         if (isApprovalParkedError(err)) {
-          // Paused for a human decision, not failed: release the run like a
-          // shutdown interruption so the attempt and consecutive-failure
-          // counters stay untouched and the job returns to pending. Answering
-          // the approval resumes the checkpointed run; the retry fires only if
-          // nobody does.
           const retryAt = Date.now() + this.maxBackoffMs
           activeRun.interrupted = true
           if (this.opts.store.releaseInterruptedRun(job.id, runId, retryAt, reason)) {
@@ -557,7 +518,6 @@ export class SchedulerEngine {
     log.error(`job ${input.job.id} failed permanently (attempt ${input.attemptNo}/${input.job.maxAttempts}): ${input.reason}`)
   }
 
-  /** Move a recurring job to its next scheduled fire. `error` non-null = the just-finished fire failed. */
   private advanceRecurring(
     job: ScheduledJob,
     runId: string,
@@ -569,7 +529,7 @@ export class SchedulerEngine {
       return
     }
     try {
-      const next = nextRecurringRun(job.cron, Date.now(), this.timezoneFor(job))
+      const next = nextScheduledRun(job.cron, Date.now(), this.timezoneFor(job), job.metadata)
       if (error) {
         this.opts.store.rescheduleAfterFailure(job.id, next, startedAt, error)
         this.maybeAutoDisableRecurring(job.id, runId, error)

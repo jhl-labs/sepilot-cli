@@ -123,9 +123,6 @@ export async function* runUserFacingTextCall(params: {
 
   const content = cleanUserFacingText(protocolText)
   if (content) {
-    // User-facing graph calls are fail-closed: publish one validated delta
-    // only after the provider completed normally and the whole response
-    // passed protocol-envelope inspection.
     yield { type: 'text_delta', text: content }
   }
 

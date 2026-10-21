@@ -17,8 +17,6 @@ export function buildDeepThinkingGraph(deps: Deps): AgentGraph {
     .addNode('context_manager', N.contextManager(deps), {
       lifecycleState: 'thinking',
     })
-    // Keep the long-task fan-out hook that existing deployments expect, but
-    // route it into a real deep deliberation pass instead of a generic loop.
     .addNode('auto_decompose', N.autoDecompose(deps), {
       lifecycleState: 'thinking',
     })
@@ -78,8 +76,6 @@ export function buildDeepThinkingGraph(deps: Deps): AgentGraph {
     )
     .addConditionalEdge(
       'deep_answer_verifier',
-      // A `revise` verdict with no corrected answer routes back to the agent for
-      // one bounded revision pass instead of shipping the known-bad answer.
       (s: AgentState) => s.deepAnswerReviseRequested ? 'agent' : 'reporter',
       ['agent', 'reporter'],
     )

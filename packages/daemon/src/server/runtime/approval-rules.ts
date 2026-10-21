@@ -43,6 +43,16 @@ function browserUrlPattern(input: Record<string, unknown>): string {
   }
 }
 
+function remoteBrowserOriginPattern(input: Record<string, unknown>): string {
+  const url =
+    input.action === 'navigate'
+      ? input.url
+      : typeof input.expectedUrl === 'string'
+        ? input.expectedUrl
+        : input.url
+  return browserUrlPattern({ url })
+}
+
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize)
   if (value && typeof value === 'object') {
@@ -76,6 +86,8 @@ function legacyPatternFor(tool: string, input: Record<string, unknown>): string 
     case 'browser.evaluate':
     case 'browser.extract':
       return browserUrlPattern(input)
+    case 'browser.remote_action':
+      return remoteBrowserOriginPattern(input)
     default:
       return null
   }
@@ -85,10 +97,10 @@ export function describeRuleFor(
   tool: string,
   input: Record<string, unknown>,
 ): ApprovalRule {
-  // Generated remembered rules are exact by default. Operators can still edit
-  // a rule into a reviewed wildcard, and legacy executable/directory/origin
-  // patterns remain matchable below, but one click must never silently widen
-  // into "every call of this tool".
+  if (tool === 'browser.remote_action') {
+    const pattern = remoteBrowserOriginPattern(input)
+    if (pattern !== '*') return { tool, pattern }
+  }
   return { tool, pattern: exactPattern(input) }
 }
 

@@ -3,6 +3,7 @@ import {
   isDaemonConfigUpdateKey,
   type DaemonConfigUpdateKey,
 } from '@sepilotd/api-client'
+import { eventRoutingConfigSchema, restoreDestinationSecrets, type EventDestinationInput } from '../../event-routing/config-schema.js'
 import {
   channelPipelineConfigSchema,
   channelPipelineHealthConfigSchema,
@@ -258,10 +259,6 @@ function restoreMemoryConfigSecrets(
     }
   }
   if (key === 'memory.customApi' && value && typeof value === 'object' && !Array.isArray(value)) {
-    // Cast strips the `| undefined` from the schema type because we
-    // already narrowed `value` non-null in the if-guard above.
-    // Without the strip, restoreMemoryAuthSecrets sees its T as a
-    // possibly-undefined object and rejects the spread.
     const next = value as NonNullable<SepilotdConfig['memory']['customApi']>
     return {
       ...restoreMemoryAuthSecrets(next, existingMemory.customApi),
@@ -385,9 +382,6 @@ export function applyConfigUpdate(
       if (!parsed.success) {
         return false
       }
-      // Persisting a granular update can replay it onto a legacy raw YAML
-      // snapshot that predates this top-level section and has not gone through
-      // configSchema defaults. Materialize the section before assignment.
       config.webSearch = {
         ...(config.webSearch ?? { trustedDomains: [] }),
         trustedDomains: parsed.data,
@@ -400,9 +394,6 @@ export function applyConfigUpdate(
         return false
       }
       const existing = config.webSearch ?? { trustedDomains: [], provider: 'auto' as const }
-      // `***redacted***` is what a settings form gets back from GET /config;
-      // treating it as a literal key would overwrite the stored credential
-      // with a placeholder the moment anyone saved the form.
       const apiKey = restoreRedactedString(parsed.data.apiKey, existing.apiKey) || undefined
       config.webSearch = {
         ...existing,
@@ -418,10 +409,6 @@ export function applyConfigUpdate(
         if (!parsed.success) {
           return false
         }
-        // Preserve existing secrets when the update payload contains the
-        // `***redacted***` placeholder that the desktop UI inherits from
-        // GET /config responses. Without this, saving any channel field
-        // would clobber every other secret in that channel.
         config.channels = restoreChannelConfigSecrets(config.channels, parsed.data)
         return true
       }
@@ -717,10 +704,6 @@ export function applyConfigUpdate(
       return false
     case 'hooks.commandHooks':
       if (Array.isArray(value)) {
-        // Validate every command hook before persisting. An unvalidated shell
-        // hook (bad event, empty command, out-of-range timeout) would survive
-        // the API write and then throw on the next startup config parse,
-        // bricking boot. Reject the whole mutation if any item is invalid.
         const validated: SepilotdConfig['hooks']['commandHooks'] = []
         for (const item of value) {
           const parsed = commandHookSchema.safeParse(item)
@@ -733,6 +716,25 @@ export function applyConfigUpdate(
         return true
       }
       return false
+    case 'eventRouting': {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+      const incoming = value as { destinations?: unknown }
+      const existingDestinations = config.eventRouting?.destinations ?? []
+      const restoredDestinations = Array.isArray(incoming.destinations)
+        ? incoming.destinations.map((destination) => {
+            if (!destination || typeof destination !== 'object' || Array.isArray(destination)) return destination
+            const id = (destination as { id?: unknown }).id
+            const existing = typeof id === 'string'
+              ? existingDestinations.find((candidate) => candidate.id === id)
+              : undefined
+            return restoreDestinationSecrets(existing, destination as EventDestinationInput)
+          })
+        : incoming.destinations
+      const parsed = eventRoutingConfigSchema.safeParse({ ...value, destinations: restoredDestinations })
+      if (!parsed.success) return false
+      config.eventRouting = parsed.data
+      return true
+    }
     case 'security.webhooks':
       if (value && typeof value === 'object' && !Array.isArray(value)) {
         const current = config.security.webhooks ?? webhookSecurityPolicyConfigSchema.parse({})
@@ -822,7 +824,6 @@ export function getConfigUpdateValue(config: SepilotdConfig, key: ConfigUpdateKe
       return {
         provider: config.webSearch?.provider ?? 'auto',
         endpoint: config.webSearch?.endpoint,
-        // Never echo the credential back through an audit/diff path.
         apiKey: config.webSearch?.apiKey ? '***redacted***' : undefined,
       }
     case 'channels':
@@ -848,6 +849,8 @@ export function getConfigUpdateValue(config: SepilotdConfig, key: ConfigUpdateKe
       return config.hooks.outboundWebhooks
     case 'hooks.commandHooks':
       return config.hooks.commandHooks
+    case 'eventRouting':
+      return config.eventRouting
     case 'security.webhooks':
       return config.security.webhooks
     case 'security.skillSources':

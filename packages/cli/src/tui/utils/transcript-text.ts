@@ -1,9 +1,3 @@
-/**
- * Render the conversation as a single plain-text block for Ctrl+O terminal
- * scrollback export and for clipboard export.
- * Structural message shape so this stays decoupled from the exact `Message`
- * type the caller holds.
- */
 export interface CopyableMessage {
   role: string
   content?: string
@@ -26,20 +20,8 @@ function roleHeader(message: CopyableMessage): string {
   }
 }
 
-// Roles that are part of the user-visible conversation. Excludes:
-//   - `system`  : CLI-local notices ("Compacted session", "Theme → …",
-//                 /help output, error banners, planner self-critique notes,
-//                 [Compressed history] from semantic compression). The dump
-//                 must not lead with the multi-KB system prompt either.
-//   - `context` : auto-injected memory/RAG citations (already shown as
-//                 footnotes in the surface; including them again would
-//                 bloat the dump with content the user didn't write).
-//   - `todo`    : surface-only artifact for the planner todo panel.
 const COPYABLE_ROLES = new Set(['user', 'assistant', 'tool'])
 
-// Collapse runs of 3+ newlines to a paragraph break. The system prompt and
-// long assistant outputs accumulate stretches of blank lines when paragraphs
-// are joined; left as-is they pad the scrollable viewport with empty rows.
 function normaliseBlankRuns(value: string): string {
   return value.replace(/\n{3,}/g, '\n\n')
 }

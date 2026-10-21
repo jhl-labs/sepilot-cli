@@ -160,14 +160,9 @@ export const skillStoreOpenApiOverrides: OpenApiOverrideMap = {
   },
 }
 
-/**
- * Skill Marketplace API routes.
- * Matches the SkillStoreClient API contract.
- */
 export async function skillStoreRoutes(app: FastifyInstance) {
   const runtime = app.runtime
 
-  // Search skills
   app.get<{ Querystring: SkillStoreSearchQuery }>('/skill-store/search', {
     schema: fastifySchemaFromZod({ querystring: skillStoreSearchQuerySchema }),
   }, async (request, reply) => {
@@ -179,7 +174,6 @@ export async function skillStoreRoutes(app: FastifyInstance) {
     return { data: results }
   })
 
-  // List skills (paginated)
   app.get<{ Querystring: SkillStoreListQuery }>('/skill-store', {
     schema: fastifySchemaFromZod({ querystring: skillStoreListQuerySchema }),
   }, async (request, reply) => {
@@ -190,7 +184,6 @@ export async function skillStoreRoutes(app: FastifyInstance) {
     return result
   })
 
-  // Get single skill
   app.get<{ Params: SkillStoreIdParams }>('/skill-store/:id', {
     schema: fastifySchemaFromZod({ params: skillStoreIdParamsSchema }),
   }, async (request, reply) => {
@@ -201,7 +194,6 @@ export async function skillStoreRoutes(app: FastifyInstance) {
     return { data: skill }
   })
 
-  // Publish skill
   app.post<{ Body: PublishSkillBody }>('/skill-store', {
     preValidation: zodRequestValidation({
       body: {
@@ -217,7 +209,6 @@ export async function skillStoreRoutes(app: FastifyInstance) {
     return { data: { id } }
   })
 
-  // Rate skill
   app.post<{ Params: SkillStoreIdParams; Body: RateSkillBody }>('/skill-store/:id/rate', {
     schema: fastifySchemaFromZod({
       params: skillStoreIdParamsSchema,
@@ -237,7 +228,6 @@ export async function skillStoreRoutes(app: FastifyInstance) {
     return { success: true }
   })
 
-  // Delete skill
   app.delete<{ Params: SkillStoreIdParams }>('/skill-store/:id', {
     schema: fastifySchemaFromZod({ params: skillStoreIdParamsSchema }),
   }, async (request, reply) => {

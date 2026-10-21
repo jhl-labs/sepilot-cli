@@ -118,9 +118,6 @@ function createChildState(
     shouldStop: false,
     taskType,
     toolCallHistory: [...(parent.toolCallHistory ?? [])],
-    // Transport-flip capability facts must reach the specialist subgraph so a
-    // known-bad-native model does not re-detect the flip (and repeatedly fail
-    // native) inside every specialist. Structural capability, not model-name.
     preferPromptReact: parent.preferPromptReact,
     emptyNativeTurnsCount: parent.emptyNativeTurnsCount,
     contentOnlyNativeTurnsCount: parent.contentOnlyNativeTurnsCount,
@@ -222,16 +219,11 @@ function mapSpecialistStateOut(parent: AgentState, child: AgentState): AgentStat
   parent.backtrackReason = child.backtrackReason
   parent.coworkArtifactRetryCount = child.coworkArtifactRetryCount
   parent.iteration = child.iteration
-  // A user-owned prerequisite closes the whole turn, not just the specialist.
-  // Preserve its structured outcome so the outer done event cannot claim success.
   parent.userActionRequired = child.userActionRequired
   parent.approvalDenied = child.approvalDenied
   if (child.userActionRequired || child.approvalDenied) parent.stopReason = child.stopReason
   parent.shouldStop = Boolean(child.userActionRequired || child.approvalDenied)
   parent.toolCallHistory = [...(child.toolCallHistory ?? [])].slice(-200)
-  // Carry the observed transport-flip back to the parent so a flip detected
-  // inside the specialist persists for the rest of the parent run (and, via
-  // session persistence, subsequent turns).
   parent.preferPromptReact = child.preferPromptReact
   parent.emptyNativeTurnsCount = child.emptyNativeTurnsCount
   parent.contentOnlyNativeTurnsCount = child.contentOnlyNativeTurnsCount
@@ -269,16 +261,10 @@ function buildSimpleGraph(deps: Deps): AgentGraph {
       ['tools', 'reporter'],
     )
     .addEdge('tools', 'reflection')
-    // Tool results are evidence, not the user-facing answer. Give the model a
-    // bounded follow-up turn to synthesize them instead of sending reporter's
-    // generic "tool work completed without a final answer" fallback.
     .addEdge('reflection', 'iteration_guard')
     .addEdge('reporter', '__end__')
 }
 
-// Generalist / simple specialists get Reflexion critiques too (errors AND
-// low-yield). Previously only the coder/research paths passed critiqueDeps, so
-// a generalist run that stalled on unhelpful results never revised strategy.
 function buildIterativeSpecialistGraph(deps: Deps, specialistSystemPrompt: string): AgentGraph {
   return new AgentGraph()
     .setStart('memory_retriever')
@@ -334,12 +320,6 @@ function buildCreativeGraph(deps: Deps): AgentGraph {
 }
 
 export interface EnhancedGraphOptions {
-  /**
-   * When true, an `auto_decompose` stage runs before triage. With
-   * `SEPILOTD_AUTO_DECOMPOSE=1` and a long enough input, the parent
-   * fans out to subagent.dispatch calls and only then routes the
-   * synthesised result through the specialist subgraph. Off by default.
-   */
   enableAutoDecompose?: boolean
 }
 
@@ -434,7 +414,6 @@ export function buildEnhancedGraph(
     })
     .addNode('reporter', N.reporter({ enableSkillExtraction: true }), { lifecycleState: 'done' })
 
-  // Edges
   if (options.enableAutoDecompose) {
     graph
       .addConditionalEdge(

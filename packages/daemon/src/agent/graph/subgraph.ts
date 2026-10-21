@@ -107,9 +107,6 @@ export function subgraphNode<
       yield forwarded
     }
 
-    // A failed child must not let the parent finalize as success: surface the
-    // terminal status instead of swallowing it. The child already emitted its
-    // error frame, so GraphChildHaltError halts the parent without a duplicate.
     if (childError) {
       throw new GraphChildHaltError(childError)
     }
@@ -176,7 +173,6 @@ export function agentSubgraphNode(
       yield forwarded
     }
 
-    // Propagate a failed child to the parent instead of finalizing as success.
     if (childError) {
       throw new GraphChildHaltError(childError)
     }
@@ -202,8 +198,6 @@ function readAbortSignal(context: unknown): AbortSignal | undefined {
   return undefined
 }
 
-// Cap the child's node budget by the parent's remaining budget so nesting
-// shares one descending budget instead of restarting a full budget per level.
 function withSharedBudget(
   context: unknown,
   runOptions: StateGraphRunOptions | undefined,
@@ -233,6 +227,9 @@ function buildAgentSubgraphContext(
 
   return {
     ...context,
+    modeControl: context.toolSecurityEffectBoundary === 'observe-only'
+      ? undefined
+      : context.modeControl,
     agentSubgraphNodeId: nodeId,
     agentContext: {
       ...context.agentContext,

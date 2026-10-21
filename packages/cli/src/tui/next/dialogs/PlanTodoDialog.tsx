@@ -99,7 +99,7 @@ export function PlanTodoDialog({
   }, [maxOffset])
 
   useInput((input, key) => {
-    if (key.escape || input === 'q') {
+    if (key.escape || key.leftArrow || input === 'q') {
       onClose()
       return
     }
@@ -149,7 +149,7 @@ export function PlanTodoDialog({
         )
       })}
       <Text color={colors.dimText}>
-        {`${offset + 1}-${Math.min(rows.length, offset + visibleRows)}/${rows.length} · ↑↓/PgUp/PgDn · g/G ends · Esc/q/F11 close`}
+        {`${offset + 1}-${Math.min(rows.length, offset + visibleRows)}/${rows.length} · ↑↓/PgUp/PgDn · g/G ends · ←/Esc/q/F11 close`}
       </Text>
     </Box>
   )

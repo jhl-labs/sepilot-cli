@@ -43,10 +43,6 @@ export class PrimaryAgentStore {
     try {
       return new PrimaryAgentStore(filePath, normalizePersistedEntries(JSON.parse(text)))
     } catch (err) {
-      // Corrupt file means every existing session loses its
-      // primary-agent binding silently. Operator gets a log entry
-      // so "session forgot its agent" is correlatable with the
-      // parse failure.
       log.warn('primary agent store unparseable; starting empty', {
         path: filePath,
         error: err instanceof Error ? err.message : String(err),

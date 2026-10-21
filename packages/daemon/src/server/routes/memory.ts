@@ -127,13 +127,6 @@ interface ResolvedMemorySearch<TOptions extends SemanticSearchOptions> {
   searchOptions: TOptions
 }
 
-/**
- * Pull caller scope out of HTTP headers / query params. Surfaces (web,
- * desktop, extension) should send their session-bound user/channel id
- * via the X-Memory-Scope-* headers; the routes then attach scope tags
- * to writes and filter reads to the caller's bucket. When no scope is
- * provided, the caller is treated as global (legacy behavior).
- */
 function readRequestScope(request: FastifyRequest): string[] {
   if (request.authContext?.kind === 'extension') {
     return deriveExtensionMemoryScopeTags(request.authContext.tokenId)
@@ -290,10 +283,6 @@ function matchesMemoryTagFilters(
   return requiredTags.every((tag) => tagSet.has(tag))
 }
 
-// Fetch, then apply post-LIMIT JS filters (scope/superseded/archived/tags),
-// growing the fetch window until at least `requestedLimit` in-scope rows are
-// collected or the underlying source is exhausted. A fixed over-fetch factor
-// silently under-returns whenever many candidates are filtered out.
 async function collectWithGrowingWindow<T>(options: {
   requestedLimit: number
   initialFetch: number
@@ -303,14 +292,13 @@ async function collectWithGrowingWindow<T>(options: {
 }): Promise<T[]> {
   let fetchLimit = Math.max(options.initialFetch, options.requestedLimit)
   let lastRawCount = -1
-  // Bounded by maxFetch; each pass at most doubles the window.
   for (;;) {
     const raw = await options.fetch(fetchLimit)
     const filtered = options.filter(raw)
     if (
       filtered.length >= options.requestedLimit
-      || raw.length < fetchLimit // source exhausted
-      || raw.length === lastRawCount // widening produced no new rows
+      || raw.length < fetchLimit
+      || raw.length === lastRawCount
       || fetchLimit >= options.maxFetch
     ) {
       return filtered.slice(0, options.requestedLimit)
@@ -394,14 +382,8 @@ async function deleteMemoryEntryById(
 export async function memoryRoutes(app: FastifyInstance) {
   const runtime = app.runtime
 
-  // Extension tokens receive a private server-derived memory bucket. Global
-  // inventory, migration, repair, and bulk transfer endpoints remain master
-  // operator capabilities because they reveal or mutate other principals.
   app.addHook('preHandler', async (request, reply) => {
     if (request.authContext?.kind !== 'extension') return
-    // Use Fastify's canonical matched route, not the raw URL. Fastify accepts
-    // encoded segments such as `%73copes` for the static `scopes` route while
-    // request.url preserves the attacker-controlled encoded spelling.
     const path = request.routeOptions.url ?? ''
     const denied = EXTENSION_DENIED_MEMORY_ADMIN_PATHS.some(
       (prefix) => path === prefix || path.startsWith(`${prefix}/`),
@@ -452,7 +434,6 @@ export async function memoryRoutes(app: FastifyInstance) {
     const includeAllScopes = await resolveIncludeAllScopes(runtime, request, reply, query.includeAllScopes, scopeTags)
     if (includeAllScopes === null) return
 
-    // Normalise the action filter into a Set so the post-filter is O(1).
     const actionFilter = (() => {
       if (!query.action) return null
       if (Array.isArray(query.action)) return new Set(query.action)
@@ -475,8 +456,6 @@ export async function memoryRoutes(app: FastifyInstance) {
       })
     }
 
-    // Over-fetch a bit when filters will trim, so we don't return short
-    // pages just because most matches landed outside the post-filter.
     const requestedLimit = query.limit ?? 50
     const willPostFilter = Boolean(actionFilter || query.actor || query.since || query.until)
       || (scopeTags.length > 0 && !includeAllScopes)
@@ -586,8 +565,6 @@ export async function memoryRoutes(app: FastifyInstance) {
     }
   })
 
-  // Resolve the FileMemory bucket the caller's scope writes to. Falls back
-  // to the legacy global bucket when no scope is provided.
   const resolveScopedFileMemory = (request: FastifyRequest) => {
     const scopeTags = readRequestScope(request)
     if (scopeTags.length > 0 && runtime?.fileMemoryRegistry) {
@@ -735,16 +712,12 @@ export async function memoryRoutes(app: FastifyInstance) {
 
     let recent: Awaited<ReturnType<typeof fetchRecent>>
     if (query.sortBy === 'updatedAt') {
-      // A chronological re-sort needs a broad candidate pool, so keep the fixed
-      // large over-fetch and sort the full filtered set before trimming.
       const fetchLimit = Math.min(Math.max(requestedLimit * 4, 200), 5000)
       recent = applyRecentFilters(await fetchRecent(fetchLimit))
       recent = [...recent].sort((left, right) =>
         (Date.parse(right.updatedAt) || 0) - (Date.parse(left.updatedAt) || 0),
       )
     } else if (willPostFilter) {
-      // Grow the fetch window until enough in-scope rows are collected instead
-      // of under-returning after a fixed over-fetch.
       recent = await collectWithGrowingWindow({
         requestedLimit,
         initialFetch: Math.min(Math.max(requestedLimit * 4, 200), 5000),
@@ -1186,7 +1159,6 @@ export async function memoryRoutes(app: FastifyInstance) {
         },
       })
     }
-    // Preserve existing scope tags so callers can't strip ownership.
     const existingScopeTags = (existing.tags ?? []).filter((tag) =>
       tag.toLowerCase().startsWith('scope:'),
     )
@@ -1389,7 +1361,6 @@ export async function memoryRoutes(app: FastifyInstance) {
     }
   })
 
-  // ─── Audit live stream (SSE) ────────────────────────────────────
   app.get('/memory/audit/stream', async (request, reply) => {
     if (!runtime?.semanticIndex || typeof runtime.semanticIndex.subscribeAudit !== 'function') {
       return reply.status(503).send({
@@ -1425,7 +1396,6 @@ export async function memoryRoutes(app: FastifyInstance) {
         reply.raw.write(`event: ${event}\n`)
         reply.raw.write(`data: ${JSON.stringify(data)}\n\n`)
       } catch {
-        // Connection torn down — clean up below.
       }
     }
 
@@ -1447,25 +1417,18 @@ export async function memoryRoutes(app: FastifyInstance) {
         })
       })
 
-    // Periodic keepalive comment so intermediaries / proxies don't drop us.
     const keepalive = setInterval(() => {
-      try { reply.raw.write(': keepalive\n\n') } catch { /* ignore */ }
+      try { reply.raw.write(': keepalive\n\n') } catch {}
     }, 15_000)
     keepalive.unref?.()
 
     request.raw.on('close', () => {
       clearInterval(keepalive)
       unsubscribe()
-      try { reply.raw.end() } catch { /* ignore */ }
+      try { reply.raw.end() } catch {}
     })
   })
 
-  // ─── Scopes (admin) ─────────────────────────────────────────────
-  // POST /api/v1/memory/scopes/:scope/transfer — admin migration.
-  // Moves every semantic memory tagged with the source scope onto the
-  // target scope (re-tagging via UPSERT so ids/embeddings stay), shifts
-  // pending reminders' scope tags, and optionally renames the file
-  // memory bucket directory.
   app.post<{
     Params: { scope: string }
     Body: MemoryScopeTransferBody
@@ -1513,9 +1476,9 @@ export async function memoryRoutes(app: FastifyInstance) {
       })
     }
 
-    const dryRun = body?.dryRun !== false  // default true to be safe
+    const dryRun = body?.dryRun !== false
     const includeFile = body?.includeFile === true
-    const includeReminders = body?.includeReminders !== false  // default true
+    const includeReminders = body?.includeReminders !== false
     const fromGlobal = fromTag === 'global'
     const requestedIds = new Set((body?.ids ?? []).map((id) => id.trim()).filter(Boolean))
     const requestedLimit = typeof body?.limit === 'number' && Number.isFinite(body.limit)
@@ -1531,7 +1494,6 @@ export async function memoryRoutes(app: FastifyInstance) {
       })
     }
 
-    // Stage 1: enumerate semantic memories.
     const all = await runtime.semanticIndex.listRecent(10000)
     const matchedBeforeLimit = all.filter((entry) => {
       if (requestedIds.size > 0 && !requestedIds.has(entry.id)) return false
@@ -1542,7 +1504,6 @@ export async function memoryRoutes(app: FastifyInstance) {
       ? matchedBeforeLimit.slice(0, requestedLimit)
       : matchedBeforeLimit
 
-    // Stage 2: count reminders.
     let pendingReminders: Array<{ id: string; scopeTags: string[]; dueAt: string; content: string; channelType?: string; chatId?: string }> = []
     if (includeReminders && runtime.remindersStore) {
       try {
@@ -1554,11 +1515,9 @@ export async function memoryRoutes(app: FastifyInstance) {
             return reminder.scopeTags?.some((tag) => tag.toLowerCase() === fromTag)
           })
       } catch {
-        // best-effort
       }
     }
 
-    // Determine bucket keys for optional file rename.
     const fromBucketKey = (() => {
       if (fromGlobal) return undefined
       if (fromTag.startsWith('scope:user:')) return `user-${fromTag.slice('scope:user:'.length)}`
@@ -1591,7 +1550,6 @@ export async function memoryRoutes(app: FastifyInstance) {
       }
     }
 
-    // Stage 1 apply: re-tag semantic memories via UPSERT.
     let retaggedSemantic = 0
     for (const entry of matched) {
       const nextTags = Array.from(new Set([
@@ -1625,11 +1583,9 @@ export async function memoryRoutes(app: FastifyInstance) {
         })
         retaggedSemantic += 1
       } catch {
-        // continue
       }
     }
 
-    // Stage 2 apply: re-issue reminders with the target scope (cancel + add).
     let retaggedReminders = 0
     if (includeReminders && runtime.remindersStore) {
       for (const reminder of pendingReminders) {
@@ -1648,18 +1604,15 @@ export async function memoryRoutes(app: FastifyInstance) {
           })
           retaggedReminders += 1
         } catch {
-          // continue
         }
       }
     }
 
-    // Stage 3: optional file bucket rename.
     let fileBucketMoved = false
     if (canMoveFile && runtime.fileMemoryRegistry?.renameScope) {
       try {
         fileBucketMoved = await runtime.fileMemoryRegistry.renameScope(fromBucketKey!, toBucketKey!)
       } catch {
-        // best-effort
       }
     }
 
@@ -1694,9 +1647,6 @@ export async function memoryRoutes(app: FastifyInstance) {
         error: { code: 'INVALID_INPUT', message: 'Scope tag is required.' },
       })
     }
-    // Accept either the full canonical tag (scope:user:42) or shorthand
-    // forms (user:42 / channel:telegram:99). Normalize to the canonical
-    // form for matching.
     const lower = rawScope.toLowerCase()
     const scopeTag = lower.startsWith('scope:') ? lower : `scope:${lower}`
     if (!isMemoryScopeTag(scopeTag)) {
@@ -1709,13 +1659,11 @@ export async function memoryRoutes(app: FastifyInstance) {
       || deleteQuery.confirm === 'true'
       || deleteQuery.confirm === '1'
 
-    // Phase 1: count + (if confirm) delete semantic memories.
     const allMemories = await runtime.semanticIndex.listRecent(10000)
     const matched = allMemories.filter((entry) =>
       entry.tags.some((tag) => tag.toLowerCase() === scopeTag),
     )
 
-    // Phase 2: count reminders.
     let matchedReminders: Array<{ id: string }> = []
     if (runtime.remindersStore) {
       try {
@@ -1726,7 +1674,6 @@ export async function memoryRoutes(app: FastifyInstance) {
             reminder.scopeTags?.some((tag) => tag.toLowerCase() === scopeTag),
           )
       } catch {
-        // best-effort; swallow
       }
     }
 
@@ -1734,11 +1681,6 @@ export async function memoryRoutes(app: FastifyInstance) {
       || deleteQuery.includeFile === 'true'
       || deleteQuery.includeFile === '1'
 
-    // Determine the file-bucket key (user-42 / channel-telegram-99 / group-eng)
-    // from the scope tag for the optional bucket cleanup.
-    // Sanitize the trailing segment so caller-supplied scope tags can never
-    // contain `/`, `\\`, or `..` that would escape the scopes directory in
-    // `ScopedFileMemoryRegistryImpl.{deleteScope,renameScope}`.
     const sanitizeBucketSegment = (value: string): string =>
       value.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '')
     const fileBucketKey = (() => {
@@ -1752,7 +1694,6 @@ export async function memoryRoutes(app: FastifyInstance) {
         const segment = sanitizeBucketSegment(rest)
         return segment ? `channel-${segment}` : undefined
       }
-      // groups don't have their own file bucket today.
       return undefined
     })()
 
@@ -1786,7 +1727,6 @@ export async function memoryRoutes(app: FastifyInstance) {
         })
         deletedSemantic += 1
       } catch {
-        // continue with the rest
       }
     }
     let cancelledReminders = 0
@@ -1796,7 +1736,6 @@ export async function memoryRoutes(app: FastifyInstance) {
           const result = await runtime.remindersStore.cancel(reminder.id, `bulk-delete scope ${scopeTag}`)
           if (result) cancelledReminders += 1
         } catch {
-          // continue
         }
       }
     }
@@ -1805,7 +1744,6 @@ export async function memoryRoutes(app: FastifyInstance) {
       try {
         fileBucketDeleted = await runtime.fileMemoryRegistry.deleteScope(fileBucketKey)
       } catch {
-        // best-effort
       }
     }
 
@@ -1827,11 +1765,9 @@ export async function memoryRoutes(app: FastifyInstance) {
       })
     }
 
-    // Collect file-memory bucket keys.
     const fileScopes = runtime.fileMemoryRegistry?.list().map((entry) => entry.key)
       ?? (runtime.fileMemory ? ['global'] : [])
 
-    // Aggregate semantic memory scope tags.
     const counts: Record<string, number> = {}
     let untagged = 0
     try {
@@ -1849,14 +1785,12 @@ export async function memoryRoutes(app: FastifyInstance) {
         }
       }
     } catch {
-      // semantic store unavailable — return what we have from fileMemoryRegistry.
     }
 
     const semanticScopes = Object.entries(counts)
       .map(([scope, count]) => ({ scope, count }))
       .sort((a, b) => b.count - a.count)
 
-    // Reminders pending per scope (best-effort).
     const reminderCounts: Record<string, number> = {}
     if (runtime.remindersStore) {
       try {
@@ -1870,7 +1804,7 @@ export async function memoryRoutes(app: FastifyInstance) {
             }
           }
         }
-      } catch { /* ignore */ }
+      } catch {}
     }
 
     return {
@@ -1885,7 +1819,6 @@ export async function memoryRoutes(app: FastifyInstance) {
     }
   })
 
-  // ─── Dreaming ───────────────────────────────────────────────────
   app.post('/memory/dreaming/run', async (_request, reply) => {
     if (!runtime?.dreaming) {
       return reply.status(503).send({
@@ -1926,10 +1859,6 @@ export async function memoryRoutes(app: FastifyInstance) {
     return { data: snapshot }
   })
 
-  // ─── Access counter (hot memories + manual touch) ────────────────
-  // GET /api/v1/memory/hot — top-N memories by access_count.
-  // Scope-aware: visible memories only by default. archived/superseded
-  // are filtered out. Use ?includeAllScopes=true for admin overview.
   app.get<{ Querystring: MemoryHotQuery }>(
     '/memory/hot',
     {
@@ -1953,7 +1882,6 @@ export async function memoryRoutes(app: FastifyInstance) {
       const includeAllScopes = await resolveIncludeAllScopes(runtime, request, reply, query.includeAllScopes, scopeTags)
       if (includeAllScopes === null) return
       const limit = Math.max(1, Math.min(query.limit ?? 20, 200))
-      // Over-fetch to compensate for scope/lifecycle filters.
       const fetchLimit = (!includeAllScopes && scopeTags.length > 0) ? Math.min(limit * 4, 500) : limit
       const raw = await runtime.semanticIndex.listHotMemories(fetchLimit)
       const visible = raw
@@ -1975,9 +1903,6 @@ export async function memoryRoutes(app: FastifyInstance) {
     },
   )
 
-  // POST /api/v1/memory/:id/access — manually bump access counter.
-  // Used by surfaces (web/desktop) when a memory is shown to the user
-  // outside a search call (e.g. opened from a saved-list shortcut).
   app.post<{ Params: MemoryEntryIdParams }>(
     '/memory/:id/access',
     {
@@ -1999,8 +1924,6 @@ export async function memoryRoutes(app: FastifyInstance) {
       const params = request.params
       const id = params.id
       const scopeTags = readRequestScope(request)
-      // An access bump changes ranking/retention state, so visibility alone is
-      // insufficient (public/shared memories may be readable but not owned).
       const existing = await runtime.semanticIndex.get(id)
       if (!existing) {
         return reply.status(404).send({
@@ -2020,7 +1943,6 @@ export async function memoryRoutes(app: FastifyInstance) {
     },
   )
 
-  // GET /api/v1/memory/:id/access — peek at the counter without bumping.
   app.get<{ Params: MemoryEntryIdParams }>(
     '/memory/:id/access',
     {
@@ -2058,7 +1980,6 @@ export async function memoryRoutes(app: FastifyInstance) {
     },
   )
 
-  // ─── Health ─────────────────────────────────────────────────────
   app.get('/memory/health', async (_request, reply) => {
     if (!runtime) {
       return reply.status(503).send({
@@ -2121,7 +2042,6 @@ export async function memoryRoutes(app: FastifyInstance) {
     }
   })
 
-  // ─── Reminders ───────────────────────────────────────────────────
   app.get('/memory/reminders', async (request, reply) => {
     if (!runtime?.remindersStore) {
       return reply.status(503).send({
@@ -2195,7 +2115,6 @@ export async function memoryRoutes(app: FastifyInstance) {
     }
   })
 
-  // ─── Export / Import ────────────────────────────────────────────
   app.get<{ Querystring: { includeAllScopes?: string | boolean; includeFile?: string | boolean; includeSemantic?: string | boolean; includeReminders?: string | boolean; createdAfter?: string; createdBefore?: string } }>(
     '/memory/export',
     async (request, reply) => {
@@ -2385,7 +2304,7 @@ export async function memoryRoutes(app: FastifyInstance) {
           let existing: MemoryEntry | null = null
           try {
             existing = await runtime.semanticIndex.get(entry.id)
-          } catch { /* fresh insert */ }
+          } catch {}
           if (existing) {
             if (conflict === 'skip') {
               stats.semanticSkipped += 1
@@ -2480,7 +2399,6 @@ export async function memoryRoutes(app: FastifyInstance) {
         })
       }
       const scopeTags = readRequestScope(request)
-      // Confirm ownership before cancelling.
       if (scopeTags.length > 0) {
         const visible = await runtime.remindersStore.listForScope(scopeTags)
         if (!visible.some((reminder) => reminder.id === id)) {

@@ -4,7 +4,7 @@ import { buildEnhancedGraph } from '../builder.js'
 import { buildCoworkGraph } from '../../cowork/orchestrator.js'
 import { buildBrowserAgentGraph } from './browser-agent.js'
 import { buildComputerUseGraph } from './computer-use.js'
-import { buildWorkspaceCoderGraph, buildCodebaseScoutGraph } from './workspace-agents.js'
+import { buildWorkspaceCoderGraph, buildCodebaseScoutGraph, buildFastCoderGraph } from './workspace-agents.js'
 import { buildDeepThinkingGraph } from './deep-thinking.js'
 import { buildDeepWebResearchGraph } from './deep-web-research.js'
 import { buildEditorAgentGraph } from './editor-agent.js'
@@ -20,7 +20,8 @@ export const builtinGraphBuilders = {
   enhanced: buildEnhancedGraph,
   reviewer: (deps: Parameters<typeof buildReviewerGraph>[0]) =>
     buildReviewerGraph(deps, { enableDebate: true }),
-  coder: buildWorkspaceCoderGraph,
+  coder: buildFastCoderGraph,
+  'deep-coder': buildWorkspaceCoderGraph,
   'codebase-scout': buildCodebaseScoutGraph,
   researcher: buildResearcherGraph,
   cowork: buildCoworkGraph,
@@ -87,13 +88,32 @@ export function registerBuiltinGraphs(registry: GraphAgentRegistry): void {
   registry.register({
     id: 'coder',
     name: 'Coder Agent',
-    description: 'Code implementation, validation, debugging and review. CLI sessions use configured tool policy; strict workspace sessions require a sandbox runner for commands and managed processes.',
+    description: 'Fast default coding loop: reads the relevant code, makes focused edits, runs targeted checks and reports. Bug fixes, small-to-medium features, refactors and test updates. Offers deep-coder when it cannot finish.',
+    builder: buildFastCoderGraph,
+    source: 'builtin',
+    limits: { maxIterations: 24 },
+    capabilities: {
+      artifactWrite: true,
+      autoRoutable: true,
+      nativeMultimodalInput: true,
+      durableRunContract: false,
+      auxiliaryStages: 'none',
+      executionControl: 'model-directed',
+      escalation: { mode: 'deep-coder', bot: 'deep-coder' },
+      executionCapabilities: ['process', 'terminal', 'filesystem-read', 'filesystem-write', 'network'],
+    },
+  })
+
+  registry.register({
+    id: 'deep-coder',
+    name: 'Deep Coder Agent',
+    description: 'Deep multi-phase coding workflow: codebase exploration, planning, implementation, validation and independent review with a completion gate. Explicit selection only, for work the default coder could not finish. CLI sessions use configured tool policy; strict workspace sessions require a sandbox runner for commands and managed processes.',
     builder: buildWorkspaceCoderGraph,
     source: 'builtin',
     limits: { maxIterations: 36 },
     capabilities: {
       artifactWrite: true,
-      autoRoutable: true,
+      autoRoutable: false,
       nativeMultimodalInput: true,
       executionCapabilities: ['process', 'terminal', 'filesystem-read', 'filesystem-write', 'network'],
     },

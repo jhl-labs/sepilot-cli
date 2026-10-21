@@ -20,7 +20,6 @@ export interface MessageAttachment {
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system' | 'tool'
-  /** Presentation-only variant for transient conversation content. */
   variant?: 'thinking'
   content: string
   citations?: DaemonMemoryContextItem[]
@@ -41,7 +40,7 @@ export interface ToolCallState {
   meta?: string
   collapsed: boolean
   approvalRequestId?: string
-  approvalState?: 'live' | 'stale'
+  approvalState?: 'live' | 'stale' | 'parked'
   resumeAvailable?: boolean
   previousContent?: string | null
   editDiff?: string
@@ -77,12 +76,10 @@ export interface ApprovalRequest {
   expiresAt?: string
   phase?: string
   repeatCount?: number
-  state: 'live' | 'stale'
+  state: 'live' | 'stale' | 'parked'
   resumeAvailable?: boolean
   suggestedRule?: { tool: string; pattern: string }
-  /** Unified diff generated before a file-editing tool is approved. */
   previewDiff?: string
-  /** Assistant-text tail explaining why the agent proposed this tool call. */
   context?: string
 }
 
@@ -105,12 +102,15 @@ export interface ChatState {
   model: string
   provider: string
   mode: DaemonAgentMode
+  bot?: string | null
+  routedBot?: string | null
   thinkingLevel: 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max'
+  thinkingLevelChosen?: boolean
   maxTokens: number | null
   autonomy: 'readonly' | 'accept-edits' | 'workspace-write' | 'supervised' | 'autonomous'
   usage: { input: number; output: number; cost: number }
-  /** Latest single provider-request context, distinct from cumulative usage. */
   contextUsage?: DaemonContextUsage | null
+  tokensPerSecond?: number | null
   pendingApproval: ApprovalRequest | null
   pendingQuestions: DaemonPendingQuestion[]
   denialFollowup: { toolName: string; at: number } | null
@@ -118,13 +118,9 @@ export interface ChatState {
   editRollbacks?: EditCheckpointSummary[]
   debateRounds?: DebateRoundSummary[]
   error: string | null
-  /** Current named run phase (implementation/validation/review/finalize), from `phase_change` frames. */
   currentPhase?: string | null
-  /** Actual graph traversal for the latest run, including the currently active node. */
   graphTrace?: GraphTraceEntry[]
-  /** Last structured plan/todo snapshot; retained after completion for F11 inspection. */
   runWorkProgress?: RunWorkProgress | null
-  /** Structured snapshot from the `state_board` stream frame. No text parsing. */
   stateBoardCounts?: RunWorkProgress | null
 }
 

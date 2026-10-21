@@ -34,8 +34,6 @@ import type {
   RunStopReason,
 } from '@sepilotd/core'
 
-// Surface packages can't import from `@sepilotd/core` directly. Re-export
-// the agent-event payload types they need for chat stream wiring here.
 export type {
   AgentAcceptanceCriterion,
   AgentRunContract,
@@ -59,11 +57,6 @@ export type {
   CreateScheduledJobInput as DaemonScheduledTaskInput,
 } from '@sepilotd/core'
 
-/**
- * Response of `GET /api/v1/runs/:sessionId/state` (D4 canonical board endpoint).
- * `source` reports where the board came from: `live` (a run is currently
- * active), `journal` (persisted only), or `none` (no board exists yet).
- */
 export interface DaemonStateBoardResponse {
   board: import('@sepilotd/core').AgentStateBoardSnapshot | null
   source: 'live' | 'journal' | 'none'
@@ -87,7 +80,6 @@ export interface DaemonHealthComponent {
 export interface DaemonHealth {
   status: string
   version: string
-  /** Version of the stable HTTP API contract, independent of product releases. */
   apiVersion?: number
   uptime?: number
   memory?: {
@@ -108,7 +100,6 @@ export interface DaemonNotifyRelayDeliveryReceipt {
   status: DaemonNotifyRelayDeliveryStatus
   messageId: string | null
   httpStatus: number | null
-  /** Safe structured Relay rejection code; absent on older daemons. */
   errorCode?: string | null
   attemptedAt: number
   completedAt: number
@@ -132,7 +123,6 @@ export interface DaemonNotifyRelayProviderDeliveryReceipt {
   lookupStatus: 'observed' | 'rejected' | 'unreachable' | 'invalid_response'
   status: DaemonNotifyRelayMessageStatus | null
   httpStatus: number | null
-  /** Safe structured Relay status-lookup rejection code; absent on older daemons. */
   errorCode?: string | null
   attempt: number
   checkedAt: number
@@ -143,7 +133,6 @@ export interface DaemonLatestNotifyRelayDelivery
   extends DaemonNotifyRelayDeliveryReceipt {
   notificationId: string
   topic: string | null
-  /** Final provider evidence when status reconciliation has run. */
   providerDelivery?: DaemonNotifyRelayProviderDeliveryReceipt | null
 }
 
@@ -157,7 +146,6 @@ export interface DaemonAssistantSchedulerRunCorrelation {
   notifications: Array<{
     id: string
     createdAt: number
-    /** Relay API acceptance evidence, not final provider delivery. */
     relayDelivery: DaemonNotifyRelayDeliveryReceipt | null
     relayProviderDelivery?: DaemonNotifyRelayProviderDeliveryReceipt | null
   }>
@@ -200,7 +188,6 @@ export interface DaemonNotifyRelayOutboxSummary {
   pending: number
   delivering: number
   failed: number
-  /** Relay API handoffs completed; not final provider delivery. */
   delivered: number
   dead: number
   nextAttemptAt: number | null
@@ -225,11 +212,8 @@ export interface DaemonAssistantRuntimeStatus {
     notifyRelay: {
       configured: boolean
       deliveryMode: 'durable_outbox' | 'acceptance_receipts' | 'best_effort_untracked'
-      /** Absent on older daemons; null means no relay attempt has completed yet. */
       latestDelivery?: DaemonLatestNotifyRelayDelivery | null
-      /** Absent on older daemons. Contains counts/timing only, never notification content. */
       outbox?: DaemonNotifyRelayOutboxSummary
-      /** Absent on older daemons. Final provider tracking counts/timing only. */
       providerDelivery?: DaemonNotifyRelayProviderSummary
     }
     jpad: {
@@ -245,16 +229,13 @@ export interface DaemonAssistantRuntimeStatus {
       cliSurfaceEnabled: boolean
     }
   }
-  /** Absent on older daemons. Contains identifiers/status only, never content or destinations. */
   operations?: {
-    /** Exact retained counts for the requesting surface; list responses remain bounded. */
     notifications?: {
       total: number
       unread: number
       listed: number
       truncated: boolean
     }
-    /** Content-free pending interaction counts; avoids a full history-management scan. */
     interactions?: {
       pendingApprovals: {
         total: number
@@ -265,7 +246,6 @@ export interface DaemonAssistantRuntimeStatus {
         orphaned: number
       }
     }
-    /** Non-secret configured/live channel counts. Missing requested types are not implied here. */
     channels?: Array<{
       type: string
       configured: boolean
@@ -275,7 +255,6 @@ export interface DaemonAssistantRuntimeStatus {
       activeCount: number
       status: 'connected' | 'disconnected' | 'connecting' | 'error' | 'not_configured'
     }>
-    /** Aggregate job state only; excludes names, instructions, destinations, and errors. */
     schedulerJobs?: {
       total: number
       enabled: number
@@ -284,10 +263,8 @@ export interface DaemonAssistantRuntimeStatus {
       failed: number
       enabledFailed: number
     }
-    /** Counts/timing only; never scheduled output, destinations, or connector errors. */
     schedulerDeliveryOutbox?: DaemonSchedulerDeliveryOutboxSummary
     schedulerRuns: DaemonAssistantSchedulerRunCorrelation[]
-    /** Built-in JPAD mutation receipts from durable session journals. */
     jpadPublications?: DaemonAssistantJpadPublicationEvidence
   }
   skills: Array<{
@@ -314,7 +291,6 @@ export interface DaemonScheduledTaskUpdateInput {
   channelTarget?: string | null
   replyToMessageId?: string | null
   parentSessionId?: string | null
-  /** Stable skill ids loaded again whenever the scheduled agent executes. Empty clears them. */
   skillRefs?: Array<{ name: string }>
   metadata?: Record<string, unknown> | null
 }
@@ -638,7 +614,6 @@ export interface DaemonChatBackgroundStatusResult extends DaemonChatBackgroundSt
     code?: string
     message: string
   }
-  /** Structured stop cause of the finished run, when the daemon reports one. */
   stopReason?: RunStopReason
   createdAt: string
   updatedAt: string
@@ -675,15 +650,12 @@ export interface DaemonSessionApprovalCounters {
   approvalsRequested: number
   approvalsApproved: number
   approvalsDenied: number
-  /** Tools auto-approved by a remembered session/always rule. */
   autoApprovalsApproved: number
 }
 
 export interface DaemonSessionMeta extends SessionMeta {
   primaryAgentId?: string
-  /** Whether this session currently has an agent run in progress. */
   isRunning?: boolean
-  /** Present only when caller passed metrics=true to /sessions. */
   approvalCounters?: DaemonSessionApprovalCounters
 }
 
@@ -709,7 +681,7 @@ export interface DaemonPendingApproval {
   input: Record<string, unknown>
   requestedAt: string
   expiresAt: string
-  state: 'live' | 'stale'
+  state: 'live' | 'stale' | 'parked'
   resumeAvailable?: boolean
 }
 
@@ -764,9 +736,7 @@ export interface DaemonSessionTraceMetrics {
   approvalApproved: number
   approvalFeedback: number
   approvalDenied: number
-  /** Tools auto-approved by a remembered session/always rule. */
   autoApprovalsApproved: number
-  /** Tools auto-denied by a remembered session/always rule (rare). */
   autoApprovalsDenied: number
   contextCompactions: number
   contextCompactionTokensBefore: number
@@ -1593,10 +1563,6 @@ export interface DaemonSessionDetail extends DaemonSessionMeta {
   resumableRun?: DaemonResumableRun
   resumableRunIssue?: DaemonResumableRunIssue
   delegation?: DaemonSessionDelegation
-  /** Raw checkpoints/rounds/working-memory extracted from persisted session
-   * events — same shapes the live SSE onEditCheckpointResolved /
-   * onDebateRound / onPlannerWorkingMemoryUpdated callbacks send per-turn,
-   * so history replay can feed the same client-side store actions. */
   editRollbacks?: EditCheckpointSummary[]
   debateRounds?: CoreDebateRoundSummary[]
   plannerWorkingMemory?: PlannerWorkingMemory | null
@@ -1650,14 +1616,9 @@ export interface DaemonApprovalResponseResult {
   approved: boolean
   note?: string
   resolved: boolean
-  state: 'live' | 'stale'
-  /**
-   * Set when the respond persisted or enabled a scoped auto decision —
-   * carries the derived rule (tool + pattern, e.g. "ls /tmp/foo *")
-   * the daemon will match future invocations against. Surfaces in
-   * the cli approve success line so operators can predict
-   * short-circuit behaviour without grepping `decisions list`.
-   */
+  state: 'live' | 'stale' | 'parked'
+  resumed?: boolean
+  resumeReason?: string
   rule?: { tool: string; pattern: string }
 }
 
@@ -1668,11 +1629,7 @@ export interface DaemonRememberedApproval {
   approved: boolean
   sessionId?: string
   createdAt: string
-  /** Times this rule short-circuited a tool prompt. Surfaces in
-   * `decisions list` so operators can tell active rules from stale
-   * ones at a glance. */
   hitCount?: number
-  /** ISO timestamp of the most recent match (undefined = never used). */
   lastHitAt?: string
 }
 
@@ -1703,7 +1660,6 @@ export interface DaemonRememberedApprovalDescribeInput {
 
 export interface DaemonConfigProvider {
   id: string
-  /** Built-in or plugin-contributed provider type. */
   type: string
   apiKey?: string
   baseUrl?: string
@@ -1712,6 +1668,7 @@ export interface DaemonConfigProvider {
   default?: boolean
   defaultContextWindow?: number
   defaultMaxOutputTokens?: number
+  disableDefaultPlugins?: boolean
   capabilities?: Partial<ModelInfo['capabilities']>
   modelOverrides?: Array<{
     id: string
@@ -1746,6 +1703,13 @@ export interface DaemonWebhookEndpointConfig {
   secretValue: string
   allowedIps?: string[]
   allowedEvents?: string[]
+  mode?: 'chat' | 'route'
+  auth?: 'hmac' | 'token'
+  eventTypeHeader?: string
+  deliveryIdHeader?: string
+  requireTimestamp?: boolean
+  timestampHeader?: string
+  timestampMaxSkewSeconds?: number
 }
 
 export interface DaemonWebhookEndpointSummary {
@@ -1757,6 +1721,13 @@ export interface DaemonWebhookEndpointSummary {
   hasSecretValue: boolean
   allowedIps: string[]
   allowedEvents: string[]
+  mode?: 'chat' | 'route'
+  auth?: 'hmac' | 'token'
+  eventTypeHeader?: string
+  deliveryIdHeader?: string
+  requireTimestamp?: boolean
+  timestampHeader?: string
+  timestampMaxSkewSeconds?: number
 }
 
 export interface DaemonTelegramChannelConfig {
@@ -1966,7 +1937,6 @@ export interface DaemonQuickQuestion {
 export interface DaemonQuickInputSettings {
   hotkey: string
   prefix: string
-  /** User-defined hotkeys that combine prompt + clipboard into a new chat. */
   quickQuestions?: DaemonQuickQuestion[]
 }
 
@@ -2145,8 +2115,6 @@ export interface DaemonNetworkStatus {
     timeoutMs: 'SEPILOTD_PROVIDER_HTTP_TIMEOUT_MS' | null
     customCaPath: 'SEPILOTD_EXTRA_CA_CERTS' | 'NODE_EXTRA_CA_CERTS' | null
   }
-  /** Present on daemons that distinguish declared environment values which
-   * were rejected and therefore did not override the saved policy. */
   ignoredOverrides?: {
     tlsRejectUnauthorized:
       | 'SEPILOTD_TLS_REJECT_UNAUTHORIZED'
@@ -2346,9 +2314,7 @@ export interface DaemonNotificationItem {
     jobId: string
     runId: string | null
   } | null
-  /** Relay API acceptance evidence, not proof of final provider delivery. */
   relayDelivery?: DaemonNotifyRelayDeliveryReceipt | null
-  /** Relay status evidence; only status=delivered proves provider delivery. */
   relayProviderDelivery?: DaemonNotifyRelayProviderDeliveryReceipt | null
 }
 
@@ -2390,16 +2356,12 @@ export type DaemonNotificationsWatchPayload =
   | DaemonNotificationsWatchItem
   | DaemonNotificationsWatchHeartbeat
 
-/** Full scheduled-job record as exposed by the daemon scheduler capability. */
 export type DaemonSchedulerJob = CoreScheduledJob
 
-/** A single execution record of a scheduled job. */
 export type DaemonSchedulerJobRun = CoreJobRun
 
-/** Terminal evidence returned after an immediate scheduler run request. */
 export type DaemonSchedulerManualRunResult = CoreManualJobRunResult
 
-/** Options for a real manual scheduler execution. */
 export type DaemonSchedulerManualRunOptions = CoreManualJobRunOptions
 
 export interface DaemonSchedulerWatchSnapshot {
@@ -2421,11 +2383,6 @@ export interface DaemonSchedulerNotificationSubscriptions {
   subscribers: string[]
 }
 
-/**
- * Search backend the daemon queries for `web.search`. `auto` uses a keyed
- * provider when its credential is present in the daemon environment and
- * otherwise falls back to keyless DuckDuckGo.
- */
 export type DaemonWebSearchProviderId =
   | 'auto'
   | 'duckduckgo'
@@ -2436,20 +2393,15 @@ export type DaemonWebSearchProviderId =
 
 export interface DaemonWebSearchProviderUpdate {
   provider: DaemonWebSearchProviderId
-  /** Send `***redacted***` to keep the stored key. */
   apiKey?: string
-  /** SearXNG or compatible AI Search instance URL; empty string clears it. */
   endpoint?: string
 }
 
 export interface DaemonSchedulerJobInput {
   id?: string
   name: string
-  /** 5-field cron, cron nickname (@daily …) or interval form (@every 30s). */
   cron?: string
-  /** Natural-language one-shot time such as "in 2 hours" or "tomorrow at 9am". */
   when?: string
-  /** Absolute one-shot fire time as epoch milliseconds. */
   runAt?: number
   instruction?: string
   timezone?: string
@@ -2458,7 +2410,6 @@ export interface DaemonSchedulerJobInput {
   maxAttempts?: number
   retryBackoffMs?: number
   parentSessionId?: string | null
-  /** Stable skill ids loaded again whenever the scheduled agent executes. Empty clears them. */
   skillRefs?: Array<{ name: string }>
   metadata?: Record<string, unknown> | null
 }
@@ -2807,12 +2758,11 @@ export const DAEMON_CONFIG_UPDATE_KEYS = [
   'mcp.client',
   'hooks.outboundWebhooks',
   'hooks.commandHooks',
+  'eventRouting',
   'security.skillSources',
   'security.webhooks',
   'observability.channelPipelineHealth',
   'observability.webhookSecurityHealth',
-  // Vector DB / embedding settings — surfaced in the desktop's
-  // VectorDBSettings tab; daemon stores them under config.memory.*.
   'memory.vectorBackend',
   'memory.embeddingProvider',
   'memory.embeddingModel',
@@ -2840,6 +2790,135 @@ export function isDaemonConfigUpdateKey(value: string): value is DaemonConfigUpd
   return (DAEMON_CONFIG_UPDATE_KEYS as readonly string[]).includes(value)
 }
 
+export type DaemonEventRoutingDestinationInput =
+  | { id: string; kind: 'messenger-webhook'; enabled?: boolean; preset: 'mattermost' | 'slack' | 'discord'; url: string }
+  | { id: string; kind: 'http'; enabled?: boolean; url: string; secret?: string; headers?: Record<string, string> }
+  | { id: string; kind: 'channel'; enabled?: boolean; channelType: string; channelTarget: string }
+  | { id: string; kind: 'notification'; enabled?: boolean; topic?: string }
+
+export interface DaemonEventRoutingRuleInput {
+  id: string
+  enabled?: boolean
+  match: { source: string; types?: string[]; where?: Record<string, string | number | boolean | Array<string | number | boolean>> }
+  process?: { mode: 'passthrough' } | { mode: 'llm'; prompt: string; bot?: string; project?: string; network?: boolean; privilege?: 'readonly' }
+  rateLimitPerMinute?: number
+  deliverOnFailure?: boolean
+  deliver: string[]
+  template?: string
+}
+
+export interface DaemonEventRoutingConfigInput {
+  enabled?: boolean
+  limits?: { maxConcurrentLlmRuns?: number; llmRunTimeoutMs?: number }
+  destinations?: DaemonEventRoutingDestinationInput[]
+  rules?: DaemonEventRoutingRuleInput[]
+}
+
+export type DaemonEventRoutingDestination =
+  | { id: string; kind: 'messenger-webhook'; enabled: boolean; preset: 'mattermost' | 'slack' | 'discord'; url: string }
+  | { id: string; kind: 'http'; enabled: boolean; url: string; secret?: string; headers: Record<string, string> }
+  | { id: string; kind: 'channel'; enabled: boolean; channelType: string; channelTarget: string }
+  | { id: string; kind: 'notification'; enabled: boolean; topic?: string }
+
+export interface DaemonEventRoutingRule {
+  id: string
+  enabled: boolean
+  match: { source: string; types: string[]; where: Record<string, string | number | boolean | Array<string | number | boolean>> }
+  process:
+    | { mode: 'passthrough' }
+    | { mode: 'llm'; prompt: string; bot?: string; project?: string; network: boolean; privilege: 'readonly' }
+  rateLimitPerMinute: number
+  deliverOnFailure: boolean
+  deliver: string[]
+  template?: string
+}
+
+export type DaemonEventRoutingEventStatus = 'received' | 'processing' | 'processed' | 'unmatched' | 'failed'
+
+export interface DaemonEventRoutingEvent {
+  id: string
+  source: string
+  type: string
+  subject: string | null
+  occurredAt: number
+  dedupeKey: string
+  status: DaemonEventRoutingEventStatus
+  matchedRules: string[]
+  attempt: number
+  nextAttemptAt: number | null
+  lastError: string | null
+  createdAt: number
+  updatedAt: number
+}
+
+export interface DaemonEventRoutingEventDetailEvent extends DaemonEventRoutingEvent {
+  payload: Record<string, unknown>
+}
+
+export type DaemonEventRoutingRuleRunStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'throttled' | 'skipped'
+
+export interface DaemonEventRoutingRuleRun {
+  id: string
+  eventId: string
+  ruleId: string
+  status: DaemonEventRoutingRuleRunStatus
+  attempt: number
+  sessionId: string | null
+  resultExcerpt: string | null
+  error: string | null
+  nextAttemptAt: number
+  startedAt: number | null
+  finishedAt: number | null
+  createdAt: number
+  updatedAt: number
+}
+
+export type DaemonEventRoutingDeliveryStatus = 'pending' | 'delivering' | 'delivered' | 'dead'
+
+export interface DaemonEventRoutingDeliverySummaryEvent {
+  id: string
+  source: string
+  type: string
+  subject: string | null
+  occurredAt: number
+}
+
+export interface DaemonEventRoutingDelivery {
+  id: string
+  eventId: string
+  ruleId: string
+  destinationId: string
+  idempotencyKey: string
+  title: string
+  text: string
+  event: DaemonEventRoutingDeliverySummaryEvent
+  status: DaemonEventRoutingDeliveryStatus
+  attempt: number
+  nextAttemptAt: number
+  lastError: string | null
+  replayedFrom: string | null
+  createdAt: number
+  updatedAt: number
+  deliveredAt: number | null
+  ackedAt: number | null
+}
+
+export interface DaemonEventRoutingEventDetail {
+  event: DaemonEventRoutingEventDetailEvent
+  ruleRuns: DaemonEventRoutingRuleRun[]
+  deliveries: DaemonEventRoutingDelivery[]
+}
+
+export type DaemonEventRoutingDryRunResult =
+  | { matched: boolean; text: string | null }
+  | { matched: boolean; text: null; llmMessage: string | null }
+
+export type DaemonEventRoutingDeliveryOutcome = { acked: true }
+
+export type DaemonEventRoutingDestinationTestOutcome =
+  | { ok: true }
+  | { ok: false; retryable: boolean; error: string }
+
 export interface DaemonConfigUpdateInput {
   'agent.mode'?: DaemonAgentMode
   'agent.defaultProvider'?: string
@@ -2864,6 +2943,7 @@ export interface DaemonConfigUpdateInput {
   'mcp.servers'?: DaemonMcpServerConfig[]
   'mcp.client'?: DaemonMcpClientConfig
   'hooks.outboundWebhooks'?: DaemonOutboundWebhookConfig[]
+  eventRouting?: DaemonEventRoutingConfigInput
   'security.skillSources'?: Partial<DaemonSkillSourceSecurityConfig>
   'security.webhooks'?: DaemonWebhookSecurityPolicyConfig
   'observability.channelPipelineHealth'?: Partial<DaemonChannelPipelineHealthConfig>
@@ -2926,7 +3006,6 @@ export interface DaemonConfig {
   webSearch?: {
     trustedDomains: string[]
     provider: DaemonWebSearchProviderId
-    /** Redacted to `***redacted***` in GET /config responses. */
     apiKey?: string
     endpoint?: string
   }
@@ -2960,7 +3039,6 @@ export interface DaemonConfig {
     defaultWorkspaceRoot?: string
   }
   hooks: {
-    /** Inspection metadata only; shell commands may contain secrets and are omitted. */
     commandHooks?: Array<{ event: string; enabled: boolean; async: boolean; timeoutMs: number; toolMatcher?: string }>
     outboundWebhooks: DaemonOutboundWebhookConfig[]
   }
@@ -3270,6 +3348,28 @@ export interface DaemonPersona {
   name: string
   description: string
   systemPromptAddition: string
+}
+
+export type DaemonRoleBotStageTierPolicy = {
+  contractPlanner: boolean
+  outcomeReview: boolean
+  completionGate: boolean
+  recoveryController: boolean
+}
+
+export interface DaemonRoleBot {
+  id: string
+  name: string
+  description: string
+  category: string
+  engine: string
+  stages: DaemonRoleBotStageTierPolicy
+  memory: 'off' | 'ambient' | 'focused'
+  documents: boolean
+  routable: boolean
+  source: 'builtin' | 'user'
+  skills: string[]
+  toolGroups: string[]
 }
 
 export type DaemonSkill = SkillMetadata
@@ -4379,7 +4479,6 @@ export type DaemonTicket = Ticket
 export type DaemonMemoryContextItem = MemoryContextItem
 export type DaemonContextUsage = AgentContextUsage
 
-/** Pending human decision that blocked a run when a timeout frame fired. */
 export interface DaemonPendingDecision {
   kind: 'approval' | 'question'
   id: string
@@ -4387,11 +4486,6 @@ export interface DaemonPendingDecision {
   since: number
 }
 
-/**
- * Daemon error payload. Timeout frames (`AGENT_INACTIVITY`,
- * `APPROVAL_TIMEOUT`, `QUESTION_TIMEOUT`) carry a machine-readable `reason`,
- * the blocking `pendingDecision`, and a structured `stopReason`.
- */
 export type DaemonStreamError = ApiError & {
   reason?: string
   pendingDecision?: DaemonPendingDecision
@@ -4427,12 +4521,6 @@ export interface DaemonChatWarningEvent {
   sessionId?: string
 }
 
-/**
- * Mid-run user steering note was queued onto the live run's graph state
- * (`POST /sessions/:id/steer`). Distinct from `DaemonSteeringConsumedEvent`
- * (below), which fires once the running agent loop has actually picked the
- * note up and surfaced it to the model.
- */
 export interface DaemonSteeringAckEvent {
   type: 'steering_ack'
   noteId: string
@@ -4440,7 +4528,6 @@ export interface DaemonSteeringAckEvent {
   message: string
 }
 
-/** The agent loop consumed a previously-queued steering note. */
 export interface DaemonSteeringConsumedEvent {
   type: 'steering_consumed'
   noteId: string
@@ -4547,9 +4634,7 @@ export interface McpMarketplace {
 export interface McpServerToolsResult {
   enabled: string[]
   disabled: string[]
-  /** Every tool currently advertised by the server, including quarantined tools. */
   advertised?: string[]
-  /** True when no advertised tool is callable until its changed manifest is trusted. */
   quarantined?: boolean
 }
 
