@@ -73,7 +73,7 @@
     "@anthropic-ai/sdk": "0.91.1",
     "@fastify/multipart": "10.0.0",
     "@fastify/websocket": "11.2.0",
-    "@modelcontextprotocol/sdk": "1.29.0",
+    "@modelcontextprotocol/sdk": "1.32.0",
     "@types/better-sqlite3": "7.6.13",
     "@types/dockerode": "4.0.1",
     "@types/node": "22.19.19",

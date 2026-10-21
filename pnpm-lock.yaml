@@ -257,8 +257,8 @@ importers:
         specifier: 11.2.0
         version: 11.2.0
       '@modelcontextprotocol/sdk':
-        specifier: 1.29.0
-        version: 1.29.0(zod@3.25.76)
+        specifier: 1.32.0
+        version: 1.32.0(zod@3.25.76)
       '@types/better-sqlite3':
         specifier: 7.6.13
         version: 7.6.13
@@ -608,8 +608,8 @@ packages:
   '@kwsites/promise-deferred@1.1.1':
     resolution: {integrity: sha512-GaHYm+c0O9MjZRu0ongGBRbinu8gVAMd2UZjji6jVmqKtZluZnptXGWhz1E8j8D2HJ3f/yMxKAUC0b+57wncIw==}
 
-  '@modelcontextprotocol/sdk@1.29.0':
-    resolution: {integrity: sha512-zo37mZA9hJWpULgkRpowewez1y6ML5GsXJPY8FI0tBBCd77HEvza4jDqRKOXgHNn867PVGCyTdzqpz0izu5ZjQ==}
+  '@modelcontextprotocol/sdk@1.32.0':
+    resolution: {integrity: sha512-8BviX/hK4Gd2eL1KdTwm0gfl4d3wdoErW0Jd00h6nomUAtk6IJk5vwQJc6kfWtJTzN5OEV/lgIiJKI8fiDGAlA==}
     engines: {node: '>=18'}
     peerDependencies:
       '@cfworker/json-schema': ^4.1.1
@@ -3028,7 +3028,7 @@ snapshots:
 
   '@kwsites/promise-deferred@1.1.1': {}
 
-  '@modelcontextprotocol/sdk@1.29.0(zod@3.25.76)':
+  '@modelcontextprotocol/sdk@1.32.0(zod@3.25.76)':
     dependencies:
       '@hono/node-server': 1.19.15(hono@4.13.5)
       ajv: 8.18.0
