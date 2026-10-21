@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readdir, unlink } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, readdir } from 'node:fs/promises'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import '../fastify-types.js'
 import {
@@ -8,6 +7,7 @@ import {
   zodRequestValidation,
 } from './utils.js'
 import {
+  deleteProject,
   getProjectsDir,
   loadProject,
   saveProject,
@@ -239,10 +239,7 @@ export async function projectRoutes(app: FastifyInstance) {
 
       const params = request.params
       const dir = getProjectsDir(getRuntimeDataDir(runtime))
-      try {
-        await unlink(join(dir, `${params.id}.json`))
-      } catch {
-      }
+      await deleteProject(dir, params.id)
       return reply.status(204).send()
     },
   )

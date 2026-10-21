@@ -13,9 +13,10 @@ export function canonicalAppReference(id: string): string {
   return `$app:${id}`
 }
 
+const LITERAL_SPAN = /```[^]*?(?:```|$)|~~~[^]*?(?:~~~|$)|(`+)[^]*?(?:\1|$)|(?<![\p{L}\p{N}])"[^"\n]*(?:"|$)|(?<![\p{L}\p{N}])'[^'\n]*(?:'|$)|“[^“”\n]*(?:”|$)|‘[^‘’\n]*(?:’|$)/gu
+
 function referenceProse(input: string): string {
-  const literal = /```[^]*?(?:```|$)|~~~[^]*?(?:~~~|$)|(`+)[^]*?(?:\1|$)|(?<![\p{L}\p{N}])"[^"\n]*(?:"|$)|(?<![\p{L}\p{N}])'[^'\n]*(?:'|$)|“[^”\n]*(?:”|$)|‘[^’\n]*(?:’|$)/gu
-  return input.replace(literal, text => ' '.repeat(text.length))
+  return input.replace(LITERAL_SPAN, text => ' '.repeat(text.length))
 }
 
 export function isAppReferencePosition(input: string, offset: number): boolean {

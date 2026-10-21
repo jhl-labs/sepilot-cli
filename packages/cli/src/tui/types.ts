@@ -10,6 +10,7 @@ import type {
   DaemonContextUsage,
   ProviderWaitState,
 } from '@sepilotd/api-client'
+import type { TurnOutcome } from './utils/turn-outcome.js'
 
 export interface MessageAttachment {
   id?: string
@@ -118,6 +119,7 @@ export interface ChatState {
   editRollbacks?: EditCheckpointSummary[]
   debateRounds?: DebateRoundSummary[]
   error: string | null
+  turnOutcome?: TurnOutcome | null
   currentPhase?: string | null
   graphTrace?: GraphTraceEntry[]
   runWorkProgress?: RunWorkProgress | null

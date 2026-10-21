@@ -52,6 +52,7 @@ export const COMMANDS: CommandDef[] = [
   dialogCommand('skills.open', 'Manage skills', 'skills', ['/skills'], [], 'skills'),
   dialogCommand('memory.open', 'Search memory', 'memory', ['/memory'], [], 'memory'),
   slashCommand('diagnostics.doctor', 'Run diagnostics', 'diagnostics', ['/doctor']),
+  slashCommand('diagnostics.error', 'Show the latest error details', 'diagnostics', ['/error'], [], 'secondary'),
 
   slashCommand('run.skill', 'Run a named skill', 'skills', ['/run'], [], 'secondary'),
   slashCommand('run.steer', 'Steer the active run', 'agent', ['/steer'], [], 'secondary'),

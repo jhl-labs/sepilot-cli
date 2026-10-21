@@ -12,7 +12,7 @@ export function ActivityDialog({ reasoning, messages, isStreaming, width, height
   height: number
   onClose(): void
 }) {
-  const [tab, setTab] = useState<'reasoning' | 'activity'>('reasoning')
+  const [tab, setTab] = useState<'reasoning' | 'activity'>(() => reasoning.trim() ? 'reasoning' : 'activity')
   const [position, setPosition] = useState<number | null>(null)
   const content = useMemo(() => {
     if (tab === 'reasoning') return reasoning || 'No reasoning text received. Tab opens execution activity.'

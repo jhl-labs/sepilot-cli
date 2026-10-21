@@ -1,6 +1,6 @@
 import { isIP } from 'node:net'
 import { devNull, platform } from 'node:os'
-import simpleGit, { type SimpleGit } from 'simple-git'
+import { simpleGit, type SimpleGit } from 'simple-git'
 import { assertPublicUrl, type PublicUrlResolution } from '../../utils/ssrf-guard.js'
 import { SkillSourceUrlNotAllowedError } from '../errors.js'
 import type { SkillSourceUrlPolicy } from '../source-url-policy.js'
@@ -134,6 +134,7 @@ function createTransport(source: string, remote: boolean, config: string[]): Saf
           allowUnsafeConfigPaths: true,
           allowUnsafeProtocolOverride: true,
         },
+        allowEnvironment: ISOLATED_GIT_ENV_KEYS,
       })
       return git.env(isolatedGitEnvironment())
     },
@@ -194,40 +195,32 @@ export function buildPinnedGitConfig(resolution: PublicUrlResolution): string[] 
   return config
 }
 
-function isolatedGitEnvironment(): NodeJS.ProcessEnv {
-  const env = { ...process.env }
+const AMBIENT_GIT_COMMAND_ENV_KEYS = new Set(['editor', 'pager', 'prefix', 'ssh_askpass', 'visual'])
+
+function isolatedGitOverrides(): Record<string, string> {
   const configNullDevice = platform() === 'win32' ? 'NUL' : devNull
-  for (const key of Object.keys(env)) {
-    if (
-      /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/u.test(key) ||
-      [
-        'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-        'GIT_COMMON_DIR',
-        'GIT_CONFIG',
-        'GIT_CONFIG_COUNT',
-        'GIT_CONFIG_PARAMETERS',
-        'GIT_DIR',
-        'GIT_EXEC_PATH',
-        'GIT_OBJECT_DIRECTORY',
-        'GIT_PROXY_COMMAND',
-        'GIT_PAGER',
-        'GIT_SSH',
-        'GIT_SSH_COMMAND',
-        'GIT_SSL_NO_VERIFY',
-        'GIT_WORK_TREE',
-      ].includes(key)
-    ) {
-      delete env[key]
-    }
+  return {
+    GCM_INTERACTIVE: 'Never',
+    GIT_CONFIG_GLOBAL: configNullDevice,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_SYSTEM: configNullDevice,
+    GIT_PROTOCOL_FROM_USER: '0',
+    GIT_TERMINAL_PROMPT: '0',
   }
-  delete env.PAGER
-  env.GCM_INTERACTIVE = 'Never'
-  env.GIT_CONFIG_GLOBAL = configNullDevice
-  env.GIT_CONFIG_NOSYSTEM = '1'
-  env.GIT_CONFIG_SYSTEM = configNullDevice
-  env.GIT_PROTOCOL_FROM_USER = '0'
-  env.GIT_TERMINAL_PROMPT = '0'
-  return env
+}
+
+const ISOLATED_GIT_ENV_KEYS: readonly string[] = Object.keys(isolatedGitOverrides())
+
+export function isolatedGitEnvironment(
+  ambient: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  for (const [key, value] of Object.entries(ambient)) {
+    const normalized = key.toLowerCase()
+    if (normalized.startsWith('git_') || AMBIENT_GIT_COMMAND_ENV_KEYS.has(normalized)) continue
+    env[key] = value
+  }
+  return { ...env, ...isolatedGitOverrides() }
 }
 
 function normalizeHost(host: string): string {

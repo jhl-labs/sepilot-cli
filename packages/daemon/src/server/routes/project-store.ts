@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { assertSafeId } from '../../utils/safe-id.js'
 
@@ -65,4 +65,12 @@ export async function saveProject(
     join(dir, `${safeId}.json`),
     JSON.stringify(project, null, 2),
   )
+}
+
+export async function deleteProject(dir: string, id: string): Promise<void> {
+  const safeId = assertSafeId(id, 'project id')
+  try {
+    await unlink(join(dir, `${safeId}.json`))
+  } catch {
+  }
 }

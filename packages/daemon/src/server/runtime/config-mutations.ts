@@ -23,6 +23,7 @@ import {
 } from '../../config/schema.js'
 import { configChannelsUpdateSchema } from '../../config/channel-update-schema.js'
 import { restoreChannelConfigSecrets } from '../routes/config-channels-internals.js'
+import { isSameCredentialOrigin } from '../../utils/credential-origin.js'
 import { outboundWebhookIdFromUrl } from '../../hooks/outbound-webhook.js'
 
 export type ConfigUpdateKey = DaemonConfigUpdateKey
@@ -30,6 +31,7 @@ export type ConfigUpdateKey = DaemonConfigUpdateKey
 export type ConfigUpdateValues = Partial<Record<ConfigUpdateKey, unknown>>
 
 export { DAEMON_CONFIG_UPDATE_KEYS }
+export { isSameCredentialOrigin }
 
 export function isConfigUpdateKey(value: string): value is ConfigUpdateKey {
   return isDaemonConfigUpdateKey(value)
@@ -85,7 +87,10 @@ export function restoreMcpServerEnv(
   existingServers: SepilotdConfig['mcp']['servers'],
   server: SepilotdConfig['mcp']['servers'][number],
 ): SepilotdConfig['mcp']['servers'][number] {
-  const existingServer = existingServers.find((candidate) => candidate.name === server.name)
+  const namedServer = existingServers.find((candidate) => candidate.name === server.name)
+  const existingServer = namedServer && isSameMcpServerDestination(namedServer, server)
+    ? namedServer
+    : undefined
 
   const restoreRecord = (
     next: Record<string, string> | undefined,
@@ -130,6 +135,16 @@ export function restoreMcpServerEnv(
     ...server,
     headers: restoreRecord(server.headers, existingHeaders),
   }
+}
+
+function isSameMcpServerDestination(
+  existing: SepilotdConfig['mcp']['servers'][number],
+  next: SepilotdConfig['mcp']['servers'][number],
+): boolean {
+  const existingUrl = 'url' in existing ? existing.url : undefined
+  const nextUrl = 'url' in next ? next.url : undefined
+  if (existingUrl === undefined && nextUrl === undefined) return true
+  return isSameCredentialOrigin(existingUrl, nextUrl)
 }
 
 export function restoreMcpServerSecrets(
@@ -222,6 +237,14 @@ function restoreMemorySearchEngineSecrets<T extends SepilotdConfig['memory']['op
   } as T
 }
 
+function sameEndpointEntry<T>(
+  existing: T | undefined,
+  existingEndpoint: string | undefined,
+  nextEndpoint: string | undefined,
+): T | undefined {
+  return isSameCredentialOrigin(existingEndpoint, nextEndpoint) ? existing : undefined
+}
+
 function restoreMemoryConfigSecrets(
   existingMemory: SepilotdConfig['memory'],
   key: ConfigUpdateKey,
@@ -229,15 +252,17 @@ function restoreMemoryConfigSecrets(
 ): unknown {
   if (key === 'memory.qdrant' && value && typeof value === 'object' && !Array.isArray(value)) {
     const next = value as SepilotdConfig['memory']['qdrant']
+    const existing = sameEndpointEntry(existingMemory.qdrant, existingMemory.qdrant?.url, next?.url)
     return {
       ...next,
-      apiKey: restoreRedactedString(next?.apiKey, existingMemory.qdrant?.apiKey),
+      apiKey: restoreRedactedString(next?.apiKey, existing?.apiKey),
     }
   }
   if (key === 'memory.opensearch' && value && typeof value === 'object' && !Array.isArray(value)) {
+    const next = value as SepilotdConfig['memory']['opensearch']
     return restoreMemorySearchEngineSecrets(
-      value as SepilotdConfig['memory']['opensearch'],
-      existingMemory.opensearch,
+      next,
+      sameEndpointEntry(existingMemory.opensearch, existingMemory.opensearch?.url, next?.url),
     )
   }
   if (
@@ -246,35 +271,43 @@ function restoreMemoryConfigSecrets(
     typeof value === 'object' &&
     !Array.isArray(value)
   ) {
+    const next = value as SepilotdConfig['memory']['elasticsearch']
     return restoreMemorySearchEngineSecrets(
-      value as SepilotdConfig['memory']['elasticsearch'],
-      existingMemory.elasticsearch,
+      next,
+      sameEndpointEntry(existingMemory.elasticsearch, existingMemory.elasticsearch?.url, next?.url),
     )
   }
   if (key === 'memory.meilisearch' && value && typeof value === 'object' && !Array.isArray(value)) {
     const next = value as SepilotdConfig['memory']['meilisearch']
+    const existing = sameEndpointEntry(existingMemory.meilisearch, existingMemory.meilisearch?.url, next?.url)
     return {
       ...next,
-      apiKey: restoreRedactedString(next?.apiKey, existingMemory.meilisearch?.apiKey),
+      apiKey: restoreRedactedString(next?.apiKey, existing?.apiKey),
     }
   }
   if (key === 'memory.customApi' && value && typeof value === 'object' && !Array.isArray(value)) {
     const next = value as NonNullable<SepilotdConfig['memory']['customApi']>
+    const existing = sameEndpointEntry(existingMemory.customApi, existingMemory.customApi?.url, next.url)
     return {
-      ...restoreMemoryAuthSecrets(next, existingMemory.customApi),
-      apiKey: restoreRedactedString(next.apiKey, existingMemory.customApi?.apiKey),
-      headers: restoreRecordSecrets(next.headers, existingMemory.customApi?.headers),
+      ...restoreMemoryAuthSecrets(next, existing),
+      apiKey: restoreRedactedString(next.apiKey, existing?.apiKey),
+      headers: restoreRecordSecrets(next.headers, existing?.headers),
     }
   }
   if (key === 'memory.rag' && value && typeof value === 'object' && !Array.isArray(value)) {
     const next = value as SepilotdConfig['memory']['rag']
+    const existingRerank = sameEndpointEntry(
+      existingMemory.rag?.rerank,
+      existingMemory.rag?.rerank?.endpoint,
+      next?.rerank?.endpoint,
+    )
     return {
       ...next,
       rerank: next?.rerank
         ? {
-            ...restoreMemoryAuthSecrets(next.rerank, existingMemory.rag?.rerank),
-            apiKey: restoreRedactedString(next.rerank.apiKey, existingMemory.rag?.rerank?.apiKey),
-            headers: restoreRecordSecrets(next.rerank.headers, existingMemory.rag?.rerank?.headers),
+            ...restoreMemoryAuthSecrets(next.rerank, existingRerank),
+            apiKey: restoreRedactedString(next.rerank.apiKey, existingRerank?.apiKey),
+            headers: restoreRecordSecrets(next.rerank.headers, existingRerank?.headers),
           }
         : next?.rerank,
     }
@@ -394,7 +427,12 @@ export function applyConfigUpdate(
         return false
       }
       const existing = config.webSearch ?? { trustedDomains: [], provider: 'auto' as const }
-      const apiKey = restoreRedactedString(parsed.data.apiKey, existing.apiKey) || undefined
+      const sameDestination = parsed.data.provider === existing.provider
+        && isSameCredentialOrigin(existing.endpoint, parsed.data.endpoint)
+      const apiKey = restoreRedactedString(
+        parsed.data.apiKey,
+        sameDestination ? existing.apiKey : undefined,
+      ) || undefined
       config.webSearch = {
         ...existing,
         provider: parsed.data.provider,

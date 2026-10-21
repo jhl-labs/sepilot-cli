@@ -19,6 +19,7 @@ import {
 } from '@sepilotd/api-client'
 import type { ApprovalRequest, MessageAttachment } from '../types.js'
 import { buildCliChatOptions } from '../../chat-options.js'
+import { terminalTurnOutcome } from '../utils/turn-outcome.js'
 import { isModelStreamWaitingNotice } from '@sepilotd/api-client'
 import type { DaemonClient } from '../../client/http.js'
 import type { DaemonWsClient } from '../../client/ws.js'
@@ -492,6 +493,14 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
 
       const stopReason = payload.type === 'error' ? payload.error?.stopReason
         : payload.type === 'done' ? payload.stopReason : undefined
+      if (payload.type === 'done' || payload.type === 'error') {
+        const outcome = terminalTurnOutcome(payload.type, stopReason, payload.type === 'error' ? payload.error?.code : undefined)
+        if (liveStreamRef.current) liveStreamRef.current.outcome = outcome
+        dispatch({
+          type: 'SET_TURN_OUTCOME',
+          outcome,
+        })
+      }
       const parkedApprovalId = stopReason?.code === 'approval_timeout'
         && stopReason.resumable && stopReason.detail?.layer === 'approval'
         && typeof stopReason.detail.requestId === 'string'
@@ -760,6 +769,7 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
           dispatch({
             type: 'ERROR',
             message: payload.error?.message ?? 'Unknown error',
+            outcome: terminalTurnOutcome('error', payload.error?.stopReason, payload.error?.code),
           })
           break
         default:
@@ -1385,6 +1395,7 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
     if (cancelledController) {
       dispatch({ type: 'SET_STREAM_STATUS', status: 'Cancelling…' })
     } else {
+      dispatch({ type: 'SET_TURN_OUTCOME', outcome: { kind: 'cancelled' } })
       dispatch({ type: 'STREAM_FINALIZED' })
     }
     dispatch({

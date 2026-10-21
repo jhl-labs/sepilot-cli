@@ -162,6 +162,7 @@ import {
   isSubstantiveRepositoryChangeReview,
   inputRequestsTerminalCommandExecution,
 } from './request-shape.js'
+import { trimChars, trimTrailingChars } from '../utils/char-trim.js'
 
 const MAX_SUMMARY_CHARS = 280
 const MAX_CRITERION_CHARS = 360
@@ -1084,9 +1085,7 @@ function inputRequiresNamedBrowserGameUi(input: string): boolean {
   if (!NAMED_BROWSER_GAME_PATTERN.test(input)) return false
   if (NAMED_BROWSER_GAME_NON_UI_PATTERN.test(input)) return false
   if (NAMED_BROWSER_GAME_UI_HINT_PATTERN.test(input)) return true
-  const normalized = input
-    .trim()
-    .replace(/[.!?。！？]+$/u, '')
+  const normalized = trimTrailingChars(input.trim(), '.!?。！？')
     .replace(/\s+/g, ' ')
   return /^(?:build|make|create|implement|develop|code|ship)\s+(?:a\s+|an\s+|the\s+)?(?:2048|wordle|tetris|pong|breakout|minesweeper|tic[-\s]?tac[-\s]?toe|sudoku|flappy\s+bird|space\s+invaders?|memory\s+(?:match|cards?))$/iu.test(normalized)
     || /^(?:만들어\s*줘|구현해\s*줘|개발해\s*줘|코딩해\s*줘)\s*(?:테트리스|워들|퐁|벽돌\s*깨기|지뢰\s*찾기|스도쿠|틱택토|플래피\s*버드|스페이스\s*인베이더|스네이크\s*게임)$/iu.test(normalized)
@@ -1297,10 +1296,8 @@ function truncateText(value: string, max: number): string {
 }
 
 function normalizeNoTouchTarget(value: string): string {
-  const trimmed = value
-    .trim()
-    .replace(/^[`"']|[`"']$/g, '')
-    .replace(/[.,;:]+$/g, '')
+  const unquoted = value.trim().replace(/^[`"']|[`"']$/g, '')
+  const trimmed = trimTrailingChars(unquoted, '.,;:')
     .replace(/(?:은|는|을|를)$/u, '')
     .trim()
   return truncateText(trimmed, 120)
@@ -1424,9 +1421,7 @@ function noTouchOutOfScopeForTarget(target: string): string {
 }
 
 function normalizeArtifactPath(value: string): string {
-  return value
-    .trim()
-    .replace(/[.,;:]+$/g, '')
+  return trimTrailingChars(value.trim(), '.,;:')
     .replace(/\\/g, '/')
     .slice(0, MAX_ARTIFACT_PATH_CHARS)
 }
@@ -2620,21 +2615,23 @@ export function acceptsRunContractAuthority(
 }
 
 function isQuotedFromUserRequest(value: string, userRequest: string): boolean {
-  const normalize = (text: string): string => text
-    .toLowerCase()
-    .replace(/\s+/gu, ' ')
-    .replace(/^[\s"'“”‘’(\[]+|[\s"'“”‘’)\].,;:!?]+$/gu, '')
+  const normalize = (text: string): string => trimChars(
+    text.toLowerCase().replace(/\s+/gu, ' '),
+    ' "\'“”‘’([',
+    ' "\'“”‘’)].,;:!?',
+  )
   const quoted = normalize(value)
   return quoted.length > 0 && normalize(userRequest).includes(quoted)
 }
 
 function extractJsonObject(content: string): Record<string, unknown> | null {
-  const match = content.match(/\{[\s\S]*\}/)
-  if (!match) {
+  const start = content.indexOf('{')
+  const end = content.lastIndexOf('}')
+  if (start < 0 || end < start) {
     return null
   }
   try {
-    const parsed = JSON.parse(match[0]) as unknown
+    const parsed = JSON.parse(content.slice(start, end + 1)) as unknown
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
       ? parsed as Record<string, unknown>
       : null
@@ -2965,9 +2962,7 @@ function normalizeEvidenceRequirements(
 
 function normalizeSectionId(value: unknown, fallback: string): string {
   const raw = typeof value === 'string' ? value.trim().toLowerCase() : ''
-  const normalized = raw
-    .replace(/[^a-z0-9_.-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
+  const normalized = trimChars(raw.replace(/[^a-z0-9_.-]+/g, '-'), '-')
     .slice(0, 64)
   return normalized || fallback
 }

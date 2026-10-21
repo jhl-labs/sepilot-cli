@@ -10,6 +10,7 @@ import {
 import type { Message } from '../types.js'
 import { cliMessageToSurfaceMessage } from '../utils/surface.js'
 import type { ChatAction } from './chat-reducer.js'
+import type { TurnOutcome } from '../utils/turn-outcome.js'
 
 export interface LiveStreamSlot {
   assistantId: string
@@ -17,6 +18,7 @@ export interface LiveStreamSlot {
   messages: SurfaceMessage[]
   controller: ReturnType<typeof createStreamEventController>
   stopReason?: RunStopReason | null
+  outcome?: TurnOutcome
 }
 
 export function handleAbortOutcome(opts: {
@@ -28,6 +30,7 @@ export function handleAbortOutcome(opts: {
   if (!abortMeta) return false
 
   const liveStream = opts.liveStreamRef.current
+  opts.dispatch({ type: 'SET_TURN_OUTCOME', outcome: { kind: abortMeta.kind } })
   if (liveStream) {
     liveStream.agentState = 'done'
     if (!liveStream.controller.getAssistantContent()) {
@@ -127,7 +130,9 @@ export function createLiveStreamBindings(opts: {
     },
     setError: (next) => {
       if (!next) return
-      opts.dispatch({ type: 'ERROR', message: next })
+      const current = isCurrent()
+      if (!current) return
+      opts.dispatch({ type: 'ERROR', message: next, outcome: current.outcome })
     },
     setStopReason: (reason) => {
       const current = isCurrent()

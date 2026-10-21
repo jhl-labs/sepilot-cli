@@ -7,11 +7,7 @@ import { deriveComposerInputPresentation } from '../../utils/composer-mode.js'
 export interface ComposerProps {
   value: string
   cursorOffset?: number
-  leaderArmed: boolean
-  leaderHintText: string
   busy: boolean
-  busyLabel?: string | null
-  activityFrame?: string | null
   activityColor?: string
   width: number
   hardwareCursor?: boolean
@@ -20,11 +16,7 @@ export interface ComposerProps {
 export function Composer({
   value,
   cursorOffset = value.length,
-  leaderArmed,
-  leaderHintText,
   busy,
-  busyLabel = null,
-  activityFrame = null,
   activityColor = colors.primary,
   width,
   hardwareCursor = false,
@@ -52,14 +44,6 @@ export function Composer({
           <Text color={colors.dimText}> Type a local shell command...</Text>
         ) : null}
       </Box>
-      {leaderArmed && leaderHintText ? <Text color={colors.dimText}>{leaderHintText}</Text> : null}
-      {shellMode ? <Text color={colors.warning}>SHELL · Enter:run · Esc:chat · !!:rerun</Text> : null}
-      {!leaderArmed && !shellMode ? <Text color={colors.dimText} wrap="truncate-end">Ctrl+O activity · {value ? "←→ cursor" : "→ tasks"} · /help{busy ? " · Esc stop · Tab follow-up" : " · Ctrl+J newline"}</Text> : null}
-      {busy ? (
-        <Text color={activityColor} bold>
-          {activityFrame ?? '⠋'} {busyLabel ?? 'Working…'}
-        </Text>
-      ) : null}
     </Box>
   )
 }

@@ -143,14 +143,22 @@ function inferTitle(
   lang: string | undefined,
   code: string,
 ): string | undefined {
-  const firstLine = code.split('\n')[0]
-  const commentMatch = firstLine.match(
-    /^(?:\/\/|#|<!--)\s*(.+?)(?:-->)?$/,
-  )
-  if (commentMatch) return commentMatch[1].trim()
+  const commentTitle = leadingCommentTitle(code.split('\n')[0] ?? '')
+  if (commentTitle) return commentTitle
 
   const titleMatch = code.match(/<title>([^<]+)<\/title>/i)
   if (titleMatch) return titleMatch[1].trim()
 
   return lang ? `${lang} snippet` : undefined
+}
+
+const TITLE_COMMENT_PREFIXES = ['//', '#', '<!--'] as const
+const HTML_COMMENT_SUFFIX = '-->'
+
+function leadingCommentTitle(line: string): string | undefined {
+  const prefix = TITLE_COMMENT_PREFIXES.find((candidate) => line.startsWith(candidate))
+  if (!prefix) return undefined
+  let body = line.slice(prefix.length).trimEnd()
+  if (body.endsWith(HTML_COMMENT_SUFFIX)) body = body.slice(0, -HTML_COMMENT_SUFFIX.length)
+  return body.trim() || undefined
 }

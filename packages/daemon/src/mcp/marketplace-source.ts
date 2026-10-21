@@ -1,6 +1,6 @@
 import { mkdir, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import simpleGit from 'simple-git'
+import { simpleGit } from 'simple-git'
 import type {
   McpMarketplaceCatalog,
   McpMarketplace,

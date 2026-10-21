@@ -209,6 +209,7 @@ import {
 import { Composer } from './screens/Composer.js'
 import { Conversation } from './screens/Conversation.js'
 import { StatusLine } from './screens/StatusLine.js'
+import { RunStatusLine } from './screens/RunStatusLine.js'
 import { useActivityAnimation } from './hooks/useActivityAnimation.js'
 import { useFunctionKeys } from './hooks/useFunctionKeys.js'
 import { SETTINGS_ITEMS } from './settings/schema.js'
@@ -451,6 +452,8 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const [configuredPrivilege, setConfiguredPrivilege] = useState<string | null>(null)
   const [recapEnabled, setRecapEnabled] = useState(true)
   const [lastTurnRecap, setLastTurnRecap] = useState<string | null>(null)
+  const [lastTurnSummary, setLastTurnSummary] = useState<{ durationMs: number; toolCalls: number } | null>(null)
+  const lastErrorDetailsRef = useRef<string | null>(null)
   const [showToolDetails, setShowToolDetails] = useState(false)
   const [showThinking, setShowThinking] = useState(true)
   const [userCommands, setUserCommands] = useState<DaemonUserCommandSummary[]>([])
@@ -558,9 +561,21 @@ export function NextApp({ config, runtime }: NextAppProps) {
   }, [])
 
   useEffect(() => {
+    if (statusError ?? state.error) lastErrorDetailsRef.current = statusError ?? state.error
+  }, [statusError, state.error])
+
+  useEffect(() => {
+    if (!state.isStreaming && !state.turnOutcome && !recapSnapshotRef.current) {
+      setLastTurnRecap(null)
+      setLastTurnSummary(null)
+    }
+  }, [state.sessionId, state.turnOutcome, state.isStreaming])
+
+  useEffect(() => {
     if (state.isStreaming) {
       if (!recapSnapshotRef.current) {
         setLastTurnRecap(null)
+        setLastTurnSummary(null)
         recapSnapshotRef.current = {
           startedAt: Date.now(),
           toolCallCount: 0,
@@ -584,6 +599,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
     if (!snapshot || !recapEnabled) return
     const recap = buildTurnRecap(snapshot, turnToolCalls, state.usage, Date.now())
     setLastTurnRecap(recap)
+    setLastTurnSummary({ durationMs: Date.now() - snapshot.startedAt, toolCalls: turnToolCalls.length })
   }, [recapEnabled, state.isStreaming, state.toolCalls, state.usage])
 
   useEffect(() => () => {
@@ -1329,6 +1345,10 @@ export function NextApp({ config, runtime }: NextAppProps) {
         openDialog('info')
         return
       case 'settings.open': openDialog('settings'); return
+      case 'diagnostics.error':
+        setInfo({ title: cliLocale === 'ko' ? '오류 상세' : 'Error details', body: statusError ?? state.error ?? lastErrorDetailsRef.current ?? (cliLocale === 'ko' ? '기록된 오류가 없습니다.' : 'No error recorded.') })
+        openDialog('info')
+        return
       case 'model.pick':
         await runModelCommand(args, {
           providers, currentProvider: state.provider, currentModel: state.model,
@@ -1884,7 +1904,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       case 'session.recap': {
         const action = args.toLowerCase() || 'status'
         if (action === 'status' || action === 'current' || action === 'info') {
-          showNotice(`Recap is ${recapEnabled ? 'on' : 'off'}. Usage: /recap <on|off>`)
+          showNotice([lastTurnRecap, `Recap is ${recapEnabled ? 'on' : 'off'}. Usage: /recap <on|off>`].filter(Boolean).join('\n'))
           return
         }
         if (!['on', 'off'].includes(action)) { setStatusError('Usage: /recap <on|off|status>'); return }
@@ -2266,7 +2286,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       default:
         setStatusError(`No inline handler is registered for ${command.id}.`)
     }
-  }, [answerQuestion, cancelQueuedFollowUps, client, copyText, dispatch, exit, fileRoot, getTokenSpeedStats, inputValue, loadSession, openDialog, openLatestFilePreview, openModelPicker, recapEnabled, rememberQueuedFollowUp, replaceComposerValue, resetTokenSpeedStats, runtime, sendMessage, showNotice, state.autonomy, state.debateRounds, state.editRollbacks, state.isStreaming, state.messages, state.mode, state.model, state.pendingApproval, state.pendingQuestions, state.plannerWorkingMemory, state.provider, state.sessionId, state.thinkingLevel, state.usage.input, state.usage.output, themeId])
+  }, [answerQuestion, cancelQueuedFollowUps, client, copyText, dispatch, exit, fileRoot, getTokenSpeedStats, inputValue, loadSession, openDialog, openLatestFilePreview, openModelPicker, recapEnabled, lastTurnRecap, statusError, state.error, rememberQueuedFollowUp, replaceComposerValue, resetTokenSpeedStats, runtime, sendMessage, showNotice, state.autonomy, state.debateRounds, state.editRollbacks, state.isStreaming, state.messages, state.mode, state.model, state.pendingApproval, state.pendingQuestions, state.plannerWorkingMemory, state.provider, state.sessionId, state.thinkingLevel, state.usage.input, state.usage.output, themeId])
 
   const submitInput = useCallback(async () => {
     const text = composeHangul(replayInlineInputControls(inputValueRef.current)).normalize('NFC').trim()
@@ -2776,9 +2796,9 @@ export function NextApp({ config, runtime }: NextAppProps) {
     || (state.contextUsage == null && conversationContextEstimate != null)
   const humanInputPending = Boolean(state.pendingApproval || pendingQuestion)
   const humanInputLabel = state.pendingApproval
-    ? `approval required · ${state.pendingApproval.toolName}`
+    ? `${cliLocale === 'ko' ? '승인 필요' : 'approval required'} · ${state.pendingApproval.toolName}`
     : pendingQuestion
-      ? 'answer required · respond to continue'
+      ? (cliLocale === 'ko' ? '응답 필요 · 답변하면 계속 진행' : 'answer required · respond to continue')
       : null
   const activityAnimation = useActivityAnimation(state.isStreaming && !humanInputPending)
   const progressLabel = formatInlineAgentProgress({
@@ -2787,7 +2807,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
     counts: state.stateBoardCounts,
   })
   const providerWaitLabel = state.isStreaming && state.providerWait
-    ? `${state.providerWait.auxiliary ? 'reviewing' : 'waiting for model'} ${Math.max(0, Math.floor((Date.now() - state.providerWait.startedAt) / 1000))}s`
+    ? `${state.providerWait.auxiliary ? (cliLocale === 'ko' ? '검토 중' : 'reviewing') : (cliLocale === 'ko' ? '모델 응답 대기' : 'waiting for model')} ${Math.max(0, Math.floor((Date.now() - state.providerWait.startedAt) / 1000))}s`
     : null
   const turnToolCounts = useMemo(() => currentTurnToolCounts(state.messages), [state.messages])
   const runWatchLabel = state.isStreaming && state.streamStartedAt
@@ -3365,10 +3385,25 @@ export function NextApp({ config, runtime }: NextAppProps) {
       {!dialogOpen && state.isStreaming && state.plannerWorkingMemory?.currentStepRationale ? (
         <Text color={colors.info} wrap="truncate-end">Why now · {state.plannerWorkingMemory.currentStepRationale.replace(/\s+/g, ' ')} · /planner details</Text>
       ) : null}
-      {!dialogOpen ? <Composer value={inputValue} cursorOffset={cursorOffset} leaderArmed={leaderState.armed} leaderHintText={leaderHint(keybindings.bindings, titles)} busy={state.isStreaming} busyLabel={interactiveProgressLabel} activityFrame={activityAnimation.frame} activityColor={activityAnimation.color} width={width} hardwareCursor={runtime?.hardwareCursor} /> : null}
-      {!dialogOpen && lastTurnRecap ? (
-        <Text color={colors.dimText}>{lastTurnRecap}</Text>
-      ) : null}
+      {!dialogOpen ? <Composer value={inputValue} cursorOffset={cursorOffset} busy={state.isStreaming} activityColor={activityAnimation.color} width={width} hardwareCursor={runtime?.hardwareCursor} /> : null}
+      <RunStatusLine
+        width={width}
+        locale={cliLocale}
+        busy={state.isStreaming}
+        progressLabel={interactiveProgressLabel}
+        attention={humanInputPending}
+        attentionHint={pendingQuestion ? (cliLocale === 'ko' ? 'Enter 응답' : 'Enter answer') : undefined}
+        dialogOpen={dialogOpen}
+        shellMode={inputValue.startsWith('!')}
+        hasDraft={Boolean(inputValue)}
+        leaderHintText={leaderState.armed ? leaderHint(keybindings.bindings, titles, Math.max(0, width - keybindings.leaderKey.length - 3), cliLocale) : null}
+        leaderKey={keybindings.leaderKey}
+        activityFrame={activityAnimation.frame}
+        elapsedMs={state.streamStartedAt == null ? null : Date.now() - state.streamStartedAt}
+        error={statusError ?? state.error}
+        outcome={statusError ? null : state.turnOutcome}
+        recap={lastTurnSummary}
+      />
       <StatusLine
         model={providerMetadataLoading && state.provider === 'default' && state.model === 'default'
           ? 'Connecting to daemon…'
@@ -3383,10 +3418,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         contextWindow={contextWindow}
         contextEstimated={contextEstimated}
         costLabel={state.usage.cost > 0 ? `$${state.usage.cost.toFixed(4)}` : null}
-        progressLabel={interactiveProgressLabel}
-        attention={humanInputPending}
-        streamStartedAt={humanInputPending ? null : state.streamStartedAt}
-        error={statusError ?? state.error}
+        locale={cliLocale}
         width={width}
       />
     </Box>

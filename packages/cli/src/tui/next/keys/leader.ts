@@ -1,3 +1,6 @@
+import type { CliLocale } from '../../../utils/locale.js'
+import { fitStatusSegments, STATUS_SEPARATOR } from '../runtime/status-layout.js'
+
 export interface LeaderState {
   armed: boolean
   armedAt: number | null
@@ -75,13 +78,29 @@ export function reduceLeaderKey(
 export function leaderHint(
   bindings: Map<string, string>,
   titles: Map<string, string>,
+  width?: number,
+  locale: CliLocale = 'en',
 ): string {
-  const parts: string[] = []
-
-  for (const [key, commandId] of bindings) {
-    const title = titles.get(commandId)
-    if (title) parts.push(`${key} ${title}`)
+  const parts: Array<{ id: string; text: string; priority: number }> = []
+  const seen = new Set<string>()
+  const shortTitles: Record<string, [string, string]> = {
+    'shell.help': ['help', '도움말'],
+    'model.pick': ['model', '모델'],
+    'bot.pick': ['bot', '봇'],
+    'settings.open': ['settings', '설정'],
+    'session.new': ['new', '새 세션'],
+    'session.resume': ['resume', '이어서'],
   }
 
-  return parts.join(' · ')
+  for (const [key, commandId] of bindings) {
+    if (seen.has(commandId)) continue
+    const title = width == null ? titles.get(commandId)
+      : shortTitles[commandId]?.[locale === 'ko' ? 1 : 0] ?? titles.get(commandId)
+    if (title) {
+      seen.add(commandId)
+      parts.push({ id: commandId, text: `${key} ${title}`, priority: commandId === 'shell.help' ? 100 : 50 })
+    }
+  }
+
+  return (width == null ? parts : fitStatusSegments(parts, width)).map(({ text }) => text).join(STATUS_SEPARATOR)
 }

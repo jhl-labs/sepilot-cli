@@ -25,6 +25,7 @@ import {
 } from '../utils/surface.js'
 import type { HydratedSessionState } from '../hooks/useSession.js'
 import { terminalSafeText, terminalSafeValue } from '../../utils/terminal-safe-text.js'
+import type { TurnOutcome } from '../utils/turn-outcome.js'
 
 export type ChatAction =
   | {
@@ -62,7 +63,8 @@ export type ChatAction =
       type: 'SET_ACTIVITIES'
       activities: ActivityItem[] | ((prev: ActivityItem[]) => ActivityItem[])
     }
-  | { type: 'ERROR'; message: string }
+  | { type: 'ERROR'; message: string; outcome?: TurnOutcome }
+  | { type: 'SET_TURN_OUTCOME'; outcome: TurnOutcome }
   | { type: 'STREAM_FINALIZED' }
   | { type: 'SYSTEM_MESSAGE'; content: string }
   | { type: 'APPEND_MESSAGE'; message: Message }
@@ -290,6 +292,7 @@ function reduceChat(state: ChatState, action: ChatAction): ChatState {
         currentMessage: '',
         usage: { input: 0, output: 0, cost: 0 },
         contextUsage: null,
+        turnOutcome: null,
         error: null,
         denialFollowup: null,
         plannerWorkingMemory: null,
@@ -310,6 +313,7 @@ function reduceChat(state: ChatState, action: ChatAction): ChatState {
         currentMessage: '',
         usage: { input: 0, output: 0, cost: 0 },
         contextUsage: null,
+        turnOutcome: null,
         error: null,
         plannerWorkingMemory: null,
         graphTrace: [],
@@ -348,6 +352,7 @@ function reduceChat(state: ChatState, action: ChatAction): ChatState {
         isThinking: false,
         thinkingText: '',
         isHydratingSession: false,
+        turnOutcome: null,
         error: null,
       }
     case 'SET_HYDRATING_SESSION':
@@ -457,10 +462,13 @@ function reduceChat(state: ChatState, action: ChatAction): ChatState {
           ? { ...entry, status: 'interrupted' as const }
           : entry),
       }
+    case 'SET_TURN_OUTCOME':
+      return { ...state, turnOutcome: action.outcome }
     case 'ERROR':
       return {
         ...state,
         error: action.message,
+        turnOutcome: action.outcome ?? { kind: 'error' },
         isStreaming: false,
         streamStatus: null,
         streamStartedAt: null,
