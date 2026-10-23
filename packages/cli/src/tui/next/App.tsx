@@ -182,7 +182,7 @@ import { PlanTodoDialog } from './dialogs/PlanTodoDialog.js'
 import { loadKeybindings, type KeybindingConfig } from './keys/bindings.js'
 import {
   IDLE_LEADER_STATE,
-  leaderHint,
+  leaderHintItems,
   reduceLeaderKey,
   type LeaderState,
 } from './keys/leader.js'
@@ -209,7 +209,7 @@ import {
 import { Composer } from './screens/Composer.js'
 import { Conversation } from './screens/Conversation.js'
 import { StatusLine } from './screens/StatusLine.js'
-import { RunStatusLine } from './screens/RunStatusLine.js'
+import { RunStatusLine, type FooterMetadataState } from './screens/RunStatusLine.js'
 import { useActivityAnimation } from './hooks/useActivityAnimation.js'
 import { useFunctionKeys } from './hooks/useFunctionKeys.js'
 import { SETTINGS_ITEMS } from './settings/schema.js'
@@ -387,7 +387,10 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const [clearedMessageCount, setClearedMessageCount] = useState(0)
   const [providers, setProviders] = useState<DaemonProviderInfo[]>([])
   const [providerDefaults, setProviderDefaults] = useState({ provider: '', model: '' })
-  const [providerMetadataLoading, setProviderMetadataLoading] = useState(true)
+  const metadataGenerationRef = useRef(0)
+  const metadataAppliedGenerationRef = useRef(0)
+  const [metadataState, setMetadataState] = useState<FooterMetadataState>({ status: 'loading' })
+  const metadataError = metadataState.status === 'error' ? metadataState.message : null
   const [modelQuery, setModelQuery] = useState('')
   const [modelIndex, setModelIndex] = useState(0)
   const [modelLoading, setModelLoading] = useState(false)
@@ -561,8 +564,8 @@ export function NextApp({ config, runtime }: NextAppProps) {
   }, [])
 
   useEffect(() => {
-    if (statusError ?? state.error) lastErrorDetailsRef.current = statusError ?? state.error
-  }, [statusError, state.error])
+    if (statusError ?? state.error ?? metadataError) lastErrorDetailsRef.current = statusError ?? state.error ?? metadataError
+  }, [statusError, state.error, metadataError])
 
   useEffect(() => {
     if (!state.isStreaming && !state.turnOutcome && !recapSnapshotRef.current) {
@@ -608,10 +611,13 @@ export function NextApp({ config, runtime }: NextAppProps) {
 
   useEffect(() => {
     let active = true
+    const metadataGeneration = ++metadataGenerationRef.current
     void Promise.all([client.config(), client.providers()])
       .then(([daemonConfig, nextProviders]) => {
-        if (!active) return
+        if (!active || metadataGeneration < metadataAppliedGenerationRef.current) return
         setProviders(nextProviders)
+        metadataAppliedGenerationRef.current = metadataGeneration
+        setMetadataState({ status: 'ready' })
         const defaultProvider = daemonConfig.agent?.defaultProvider ?? ''
         const defaultModel = daemonConfig.agent?.defaultModel ?? ''
         setProviderDefaults({ provider: defaultProvider, model: defaultModel })
@@ -623,10 +629,11 @@ export function NextApp({ config, runtime }: NextAppProps) {
         }
         if (daemonConfig.agent?.thinkingLevel) dispatch({ type: 'SET_THINKING_LEVEL', thinkingLevel: daemonConfig.agent.thinkingLevel, source: 'default' })
       })
-      .catch(() => {
-      })
-      .finally(() => {
-        if (active) setProviderMetadataLoading(false)
+      .catch((error) => {
+        if (active && metadataGeneration >= metadataAppliedGenerationRef.current) {
+          metadataAppliedGenerationRef.current = metadataGeneration
+          setMetadataState({ status: 'error', message: errorMessage(error) })
+        }
       })
     return () => { active = false }
   }, [client, config.model, config.provider, dispatch])
@@ -684,16 +691,19 @@ export function NextApp({ config, runtime }: NextAppProps) {
   useEffect(() => {
     if (dialogs.at(-1) !== 'model') return
     let active = true
+    const metadataGeneration = ++metadataGenerationRef.current
     setModelLoading(true)
     setModelError(null)
     void Promise.all([client.providers(), client.config()])
       .then(([nextProviders, daemonConfig]) => {
-        if (!active) return
+        if (!active || metadataGeneration < metadataAppliedGenerationRef.current) return
         const nextDefaults = {
           provider: daemonConfig.agent?.defaultProvider ?? '',
           model: daemonConfig.agent?.defaultModel ?? '',
         }
         setProviders(nextProviders)
+        metadataAppliedGenerationRef.current = metadataGeneration
+        setMetadataState({ status: 'ready' })
         setProviderDefaults(nextDefaults)
         setModelIndex(preferredModelPickerIndex({
           providers: nextProviders,
@@ -712,12 +722,15 @@ export function NextApp({ config, runtime }: NextAppProps) {
   useEffect(() => {
     if (dialogs.at(-1) !== 'providers') return
     let active = true
+    const metadataGeneration = ++metadataGenerationRef.current
     setProviderManagerLoading(true)
     setProviderManagerError(null)
     void Promise.all([client.providers(), client.config()])
       .then(([nextProviders, daemonConfig]) => {
-        if (!active) return
+        if (!active || metadataGeneration < metadataAppliedGenerationRef.current) return
         setProviders(nextProviders)
+        metadataAppliedGenerationRef.current = metadataGeneration
+        setMetadataState({ status: 'ready' })
         setProviderDefaults({
           provider: daemonConfig.agent?.defaultProvider ?? '',
           model: daemonConfig.agent?.defaultModel ?? '',
@@ -1346,7 +1359,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         return
       case 'settings.open': openDialog('settings'); return
       case 'diagnostics.error':
-        setInfo({ title: cliLocale === 'ko' ? '오류 상세' : 'Error details', body: statusError ?? state.error ?? lastErrorDetailsRef.current ?? (cliLocale === 'ko' ? '기록된 오류가 없습니다.' : 'No error recorded.') })
+        setInfo({ title: cliLocale === 'ko' ? '오류 상세' : 'Error details', body: statusError ?? state.error ?? metadataError ?? lastErrorDetailsRef.current ?? (cliLocale === 'ko' ? '기록된 오류가 없습니다.' : 'No error recorded.') })
         openDialog('info')
         return
       case 'model.pick':
@@ -2286,7 +2299,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       default:
         setStatusError(`No inline handler is registered for ${command.id}.`)
     }
-  }, [answerQuestion, cancelQueuedFollowUps, client, copyText, dispatch, exit, fileRoot, getTokenSpeedStats, inputValue, loadSession, openDialog, openLatestFilePreview, openModelPicker, recapEnabled, lastTurnRecap, statusError, state.error, rememberQueuedFollowUp, replaceComposerValue, resetTokenSpeedStats, runtime, sendMessage, showNotice, state.autonomy, state.debateRounds, state.editRollbacks, state.isStreaming, state.messages, state.mode, state.model, state.pendingApproval, state.pendingQuestions, state.plannerWorkingMemory, state.provider, state.sessionId, state.thinkingLevel, state.usage.input, state.usage.output, themeId])
+  }, [answerQuestion, cancelQueuedFollowUps, client, copyText, dispatch, exit, fileRoot, getTokenSpeedStats, inputValue, loadSession, openDialog, openLatestFilePreview, openModelPicker, recapEnabled, lastTurnRecap, statusError, state.error, metadataError, rememberQueuedFollowUp, replaceComposerValue, resetTokenSpeedStats, runtime, sendMessage, showNotice, state.autonomy, state.debateRounds, state.editRollbacks, state.isStreaming, state.messages, state.mode, state.model, state.pendingApproval, state.pendingQuestions, state.plannerWorkingMemory, state.provider, state.sessionId, state.thinkingLevel, state.usage.input, state.usage.output, themeId])
 
   const submitInput = useCallback(async () => {
     const text = composeHangul(replayInlineInputControls(inputValueRef.current)).normalize('NFC').trim()
@@ -3390,13 +3403,14 @@ export function NextApp({ config, runtime }: NextAppProps) {
         width={width}
         locale={cliLocale}
         busy={state.isStreaming}
+        metadata={metadataState}
         progressLabel={interactiveProgressLabel}
         attention={humanInputPending}
         attentionHint={pendingQuestion ? (cliLocale === 'ko' ? 'Enter 응답' : 'Enter answer') : undefined}
         dialogOpen={dialogOpen}
         shellMode={inputValue.startsWith('!')}
         hasDraft={Boolean(inputValue)}
-        leaderHintText={leaderState.armed ? leaderHint(keybindings.bindings, titles, Math.max(0, width - keybindings.leaderKey.length - 3), cliLocale) : null}
+        leaderHints={leaderState.armed ? leaderHintItems(keybindings.bindings, titles, Math.max(0, width - keybindings.leaderKey.length - 3), cliLocale) : null}
         leaderKey={keybindings.leaderKey}
         activityFrame={activityAnimation.frame}
         elapsedMs={state.streamStartedAt == null ? null : Date.now() - state.streamStartedAt}
@@ -3405,7 +3419,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         recap={lastTurnSummary}
       />
       <StatusLine
-        model={providerMetadataLoading && state.provider === 'default' && state.model === 'default'
+        model={metadataState.status === 'loading' && state.provider === 'default' && state.model === 'default'
           ? 'Connecting to daemon…'
           : `${state.provider}/${state.model}`}
         mode={state.mode}
