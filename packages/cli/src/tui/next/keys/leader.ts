@@ -75,12 +75,12 @@ export function reduceLeaderKey(
     : { state: IDLE_LEADER_STATE, action: 'disarm' }
 }
 
-export function leaderHint(
+export function leaderHintItems(
   bindings: Map<string, string>,
   titles: Map<string, string>,
   width?: number,
   locale: CliLocale = 'en',
-): string {
+): string[] {
   const parts: Array<{ id: string; text: string; priority: number }> = []
   const seen = new Set<string>()
   const shortTitles: Record<string, [string, string]> = {
@@ -102,5 +102,14 @@ export function leaderHint(
     }
   }
 
-  return (width == null ? parts : fitStatusSegments(parts, width)).map(({ text }) => text).join(STATUS_SEPARATOR)
+  return (width == null ? parts : fitStatusSegments(parts, width)).map(({ text }) => text)
+}
+
+export function leaderHint(
+  bindings: Map<string, string>,
+  titles: Map<string, string>,
+  width?: number,
+  locale: CliLocale = 'en',
+): string {
+  return leaderHintItems(bindings, titles, width, locale).join(STATUS_SEPARATOR)
 }

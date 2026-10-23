@@ -4,10 +4,13 @@ import type { CliLocale } from '../../../utils/locale.js'
 import { colors } from '../../theme.js'
 import type { TurnOutcome } from '../../utils/turn-outcome.js'
 import { formatRecapDuration } from '../../utils/turn-recap.js'
-import { fitStatusSegments, STATUS_SEPARATOR, type StatusSegment } from '../runtime/status-layout.js'
+import { fitStatusSegments, STATUS_SEPARATOR, truncateStatusText, type StatusSegment } from '../runtime/status-layout.js'
+
+export type FooterMetadataState = { status: 'loading' | 'ready' } | { status: 'error'; message: string }
 
 export interface RunStatusLineProps {
   width: number
+  metadata?: FooterMetadataState
   locale?: CliLocale
   busy: boolean
   progressLabel?: string | null
@@ -16,7 +19,7 @@ export interface RunStatusLineProps {
   dialogOpen?: boolean
   shellMode?: boolean
   hasDraft?: boolean
-  leaderHintText?: string | null
+  leaderHints?: string[] | null
   leaderKey?: string
   activityFrame?: string | null
   elapsedMs?: number | null
@@ -47,56 +50,80 @@ function outcomeTitle(outcome: TurnOutcome, locale: CliLocale): string {
   }
 }
 
-export function RunStatusLine({
+export function deriveRunStatusPresentation({
   width, locale = 'en', busy, progressLabel, attention = false, attentionHint,
-  dialogOpen = false, shellMode = false, hasDraft = false, leaderHintText,
+  dialogOpen = false, shellMode = false, hasDraft = false, leaderHints,
   leaderKey = 'Ctrl+X', activityFrame, elapsedMs, error, outcome, recap,
+  metadata = { status: 'ready' },
 }: RunStatusLineProps) {
   const ko = locale === 'ko'
+  const owner = attention ? 'human' : dialogOpen ? 'dialog' : leaderHints?.length ? 'leader' : shellMode ? 'shell' : 'chat'
   const segments: StatusSegment[] = []
   let color: string = colors.dimText
   const add = (id: string, text: string, priority: number, minWidth?: number) => segments.push({ id, text, priority, minWidth })
+  const metadataVisible = !busy && !error && !outcome && !recap
   if (attention) {
     color = colors.warning
     add('state', `! ${progressLabel ?? (ko ? '입력 필요' : 'Input required')}`, 100, 1)
-    add('action', attentionHint ?? (ko ? '요청 확인' : 'See request'), 90)
   } else if (error && !outcome) {
     color = colors.error
     add('state', `! ${error}`, 90, 4)
-    add('action', ko ? '/error 상세' : '/error details', 100, 1)
-    if (busy && !dialogOpen) add('stop', ko ? 'Esc 중지' : 'Esc stop', 95)
   } else if (busy) {
     color = colors.info
     add('state', `${activityFrame ?? '⠋'} ${progressLabel || (ko ? '작업 중' : 'Working…')}`, 90, 4)
     if (elapsedMs != null) add('elapsed', formatRecapDuration(elapsedMs), 95)
-    add('action', dialogOpen ? (ko ? 'Esc 돌아가기' : 'Esc back') : (ko ? 'Esc 중지' : 'Esc stop'), 100, 1)
-    if (!dialogOpen) {
-      add('activity', ko ? 'Ctrl+O 활동' : 'Ctrl+O activity', 60)
-      add('followup', ko ? 'Tab 후속 입력' : 'Tab follow-up', 50)
-    }
-  } else if (leaderHintText && !dialogOpen) {
-    add('leader', leaderKey, 100)
-    add('bindings', leaderHintText, 90, 1)
-  } else if (shellMode) {
+  } else if (metadataVisible && metadata.status === 'error') {
+    color = colors.error
+    add('state', ko ? '! 모델 설정 조회 실패' : '! Model settings unavailable', 95, 4)
+  } else if (metadataVisible && metadata.status === 'loading') {
+    add('state', ko ? '모델 설정 조회 중…' : 'Loading model settings…', 95, 4)
+  } else if (owner === 'leader' || owner === 'dialog') {
+  } else if (owner === 'shell') {
     color = colors.warning
     add('state', 'SHELL', 100)
-    add('action', ko ? 'Enter 실행' : 'Enter run', 90)
-    add('back', ko ? 'Esc 대화' : 'Esc chat', 80)
-    add('rerun', ko ? '!! 재실행' : '!! rerun', 20)
   } else if (error || outcome || recap) {
     const kind = error && !outcome ? 'error' : outcome?.kind
     color = kind === 'completed' ? colors.success : kind === 'cancelled' || !kind ? colors.dimText : colors.warning
     const glyph = kind === 'completed' ? '✓' : kind === 'cancelled' ? '⊘' : !kind ? '·' : '!'
     add('state', `${glyph} ${outcome ? outcomeTitle(outcome, locale) : error ? (ko ? '오류' : 'Error') : (ko ? '실행 종료' : 'Run ended')}`, 95, 4)
     if (recap) add('duration', formatRecapDuration(recap.durationMs), 90)
-    add('action', error ? (ko ? '/error 상세' : '/error details') : (ko ? '/recap 상세' : '/recap details'), 100, 1)
     if (recap?.toolCalls) add('tools', `${recap.toolCalls} ${ko ? '도구 호출' : recap.toolCalls === 1 ? 'tool call' : 'tool calls'}`, 40)
-    if (kind === 'error' || kind === 'timeout') add('model', ko ? '/model 변경' : '/model change', 60)
-    else if (!dialogOpen) add('continue', ko ? 'Enter 전송' : 'Enter send', 50)
-  } else if (dialogOpen) {
-    add('state', ko ? 'Esc 돌아가기' : 'Esc back', 100, 1)
   } else {
     add('state', ko ? '준비' : 'Ready', 100)
+  }
+
+  if (owner === 'human') {
+    add('action', attentionHint ?? (ko ? '요청 확인' : 'See request'), 90)
+  } else if (owner === 'dialog') {
+    add('action', ko ? 'Esc 돌아가기' : 'Esc back', 100, 1)
+  } else if (owner === 'leader') {
+    if (busy) add('stop', ko ? 'Esc 중지' : 'Esc stop', 100)
+    add('leader', leaderKey, 99)
+    leaderHints?.forEach((hint, index) => add(`binding-${index}`, hint, 97 - index))
+    for (const segment of segments) {
+      if (segment.id !== 'state') continue
+      segment.text = truncateStatusText(segment.text, Math.max(4, Math.floor(width / 4)))
+      segment.priority = 98
+    }
+  } else if (busy) {
+    add('action', ko ? 'Esc 중지' : 'Esc stop', 100, 1)
+    add('activity', ko ? 'Ctrl+O 활동' : 'Ctrl+O activity', 60)
+    add('followup', ko ? 'Tab 후속 입력' : 'Tab follow-up', 50)
+    if (error) add('details', ko ? '/error 상세' : '/error details', 75)
+  } else if (owner === 'shell') {
+    add('action', ko ? 'Enter 실행' : 'Enter run', 90)
+    add('back', ko ? 'Esc 대화' : 'Esc chat', 80)
+    add('rerun', ko ? '!! 재실행' : '!! rerun', 20)
+  } else if (metadataVisible && metadata.status === 'error') {
+    add('action', ko ? '/model 재시도' : '/model retry', 100)
+    add('details', ko ? '/error 상세' : '/error details', 90)
+  } else if (metadataVisible && metadata.status === 'loading') {
+    add('help', '/help', 90)
+  } else if (error || outcome || recap) {
+    add('action', error ? (ko ? '/error 상세' : '/error details') : (ko ? '/recap 상세' : '/recap details'), 100, 1)
+    if (error || outcome?.kind === 'error' || outcome?.kind === 'timeout') add('model', ko ? '/model 변경' : '/model change', 60)
+    else add('continue', ko ? 'Enter 전송' : 'Enter send', 50)
+  } else {
     add('send', ko ? 'Enter 전송' : 'Enter send', 95)
     add('help', '/help', 90)
     add('newline', ko ? 'Ctrl+J 줄바꿈' : 'Ctrl+J newline', 80)
@@ -106,6 +133,11 @@ export function RunStatusLine({
     add('tasks', hasDraft ? (ko ? '←→ 커서' : '←→ cursor') : (ko ? '→ 작업' : '→ tasks'), 40)
     add('leader', `${leaderKey} ${ko ? '메뉴' : 'menu'}`, 75)
   }
-  const text = fitStatusSegments(segments, width).map(({ text }) => text).join(STATUS_SEPARATOR)
-  return <Box width={width} height={1}><Text color={color} bold={busy || attention || Boolean(error)} wrap="truncate-end">{text}</Text></Box>
+  return { segments, color, bold: busy || attention || Boolean(error) }
+}
+
+export function RunStatusLine(props: RunStatusLineProps) {
+  const { segments, color, bold } = deriveRunStatusPresentation(props)
+  const text = fitStatusSegments(segments, props.width).map(({ text }) => text).join(STATUS_SEPARATOR)
+  return <Box width={props.width} height={1}><Text color={color} bold={bold} wrap="truncate-end">{text}</Text></Box>
 }
