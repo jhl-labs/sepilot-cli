@@ -1,6 +1,6 @@
 {
   "name": "@sepilotd/cli",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "type": "module",
   "license": "LicenseRef-Sepilot-Source-Available-1.0",
   "repository": {
