@@ -4,6 +4,8 @@
 the local daemon that owns sessions, tools, approvals, memory, skills, and MCP
 integrations. The CLI communicates with the daemon through HTTP and WebSocket.
 
+Feature overview: <https://jhl-labs.github.io/sepilot_desktop/>
+
 ## License
 
 This repository is **source-available, not open source** under the
