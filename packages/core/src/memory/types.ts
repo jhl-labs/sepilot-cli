@@ -235,6 +235,7 @@ export interface ProviderAttemptEvent extends BaseEvent {
   provider: string
   model: string
   source: 'request_provider' | 'session' | 'model_router' | 'default_provider'
+  selectionReason?: string
   rank: number
   attempt: number
   status: 'started' | 'failed' | 'succeeded'

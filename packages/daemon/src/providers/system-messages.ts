@@ -12,10 +12,12 @@ const INTERNAL_CONTINUATION_TEXT = '[Internal continuation] The preceding assist
 export interface PartitionedSystemMessages {
   systemText?: string
   messages: Message[]
+  contextComponents?: { turnContext?: string; runtimeControls?: string }
 }
 
 export interface PartitionSystemMessagesOptions {
   turnScopedPlacement?: 'trailing' | 'system-slot'
+  separateTurnControls?: boolean
 }
 
 export function partitionSystemMessages(
@@ -40,9 +42,13 @@ export function partitionSystemMessages(
     ? splitTurnContext(systemPrompt)
     : { staticText: undefined, turnText: undefined }
   appendLeading(staticText)
+  const turnBodies: string[] = []
+  if (turnText) turnBodies.push(turnText.slice(TURN_CONTEXT_HEADING.length).trim())
   for (const message of messages) {
     if (message.role === 'system') {
-      const text = extractContent(message)
+      const split = splitTurnContext(extractContent(message))
+      if (split.turnText) turnBodies.push(split.turnText.slice(TURN_CONTEXT_HEADING.length).trim())
+      const text = split.staticText
       if (!text.trim()) continue
       const turnScoped = message.metadata?.[TURN_SCOPED_SYSTEM_METADATA_KEY] === true
       const runStable = !turnScoped && message.metadata?.[RUN_STABLE_SYSTEM_METADATA_KEY] === true
@@ -67,12 +73,13 @@ export function partitionSystemMessages(
   }
   if (pendingAssistantControl) continuationBefore.add(conversationMessages.length)
 
-  const turnBody = turnText?.slice(TURN_CONTEXT_HEADING.length).trim()
+  const runtimeBody = trailingControls.join('\n\n')
+  const turnBody = turnBodies.filter(Boolean).join('\n\n')
   const latestUserIndex = conversationMessages.findLastIndex((message) => message.role === 'user')
   if (turnBody) {
     if (latestUserIndex < 0) {
-      appendLeading(turnText)
-    } else if (placement === 'system-slot' || latestUserIndex === conversationMessages.length - 1) {
+      appendLeading(formatTurnContextBlock(turnBody))
+    } else if (!options.separateTurnControls && (placement === 'system-slot' || latestUserIndex === conversationMessages.length - 1)) {
       conversationMessages[latestUserIndex] = withTurnContext(
         conversationMessages[latestUserIndex]!,
         turnBody,
@@ -99,7 +106,7 @@ export function partitionSystemMessages(
         content: `${INTERNAL_CONTINUATION_TEXT}\n\n${block}`,
         metadata: { ...last.metadata, [RUNTIME_CONTROLS_METADATA_KEY]: true },
       }
-    } else if (last?.role === 'user') {
+    } else if (last?.role === 'user' && !options.separateTurnControls) {
       projectedMessages[projectedMessages.length - 1] = withLeadingBlock(last, block)
     } else {
       projectedMessages.push({
@@ -113,6 +120,10 @@ export function partitionSystemMessages(
   return {
     ...(leadingTexts.length > 0 ? { systemText: leadingTexts.join('\n\n') } : {}),
     messages: projectedMessages,
+    ...(options.separateTurnControls ? { contextComponents: {
+      ...(turnBody ? { turnContext: formatTurnContextBlock(turnBody) } : {}),
+      ...(runtimeBody ? { runtimeControls: runtimeBody } : {}),
+    } } : {}),
   }
 }
 

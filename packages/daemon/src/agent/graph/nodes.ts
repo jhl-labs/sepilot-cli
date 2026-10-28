@@ -1,3 +1,5 @@
+import { accumulateTokenUsage } from '../../providers/token-usage.js'
+import { fitPromptContext, projectPromptContext, promptCacheScope } from '../prompt-context-history.js'
 import { resolveRunWallClock, runRequestTimeoutMs } from '../progress-signal.js'
 import { userActionRequiredOutput } from '../user-action-required-output.js'
 import { QUALITY_REFERENCE_GUIDANCE } from '../verification-basis.js'
@@ -1368,11 +1370,11 @@ async function buildAgentMessages(
       ),
     ),
   })
-  if (s.memories.length) msgs.push({ role: 'system', content: `[Relevant memories]\n${s.memories.join('\n')}` })
+  if (s.memories.length) msgs.push(turnScopedSystemMessage(`[Relevant memories]\n${s.memories.join('\n')}`))
   const routingBriefMessage = buildRoutingBriefMessage(s)
   const backgroundEvidence = context?.activeRuns?.backgroundEvidence(context.agentContext.sessionId)
   if (backgroundEvidence) msgs.push({ role: 'user', content: backgroundEvidence })
-  if (routingBriefMessage) msgs.push({ role: 'system', content: routingBriefMessage })
+  if (routingBriefMessage) msgs.push(turnScopedSystemMessage(routingBriefMessage))
   const seedContractMessage = formatSeedContract(s.seedContract)
   const consumedSteeringNotes = takeUnconsumedSteeringNotes(s)
   if (consumedSteeringNotes.length > 0) {
@@ -1730,7 +1732,7 @@ function fitGraphMainRequest(
   const contextWindowTokens = state.effectiveContextWindowTokens === undefined
     ? declaredContextWindowTokens
     : Math.min(state.effectiveContextWindowTokens, declaredContextWindowTokens)
-  const fit = fitProviderContext(messages, {
+  const fit = fitPromptContext(messages, {
     preferFullInput: true,
     contextWindowTokens,
     minimumOutputTokens: MAIN_TOOL_TURN_MINIMUM_OUTPUT_TOKENS,
@@ -1798,9 +1800,12 @@ export function recordUsage(
     thinkingTokens?: number
     cacheReadTokens?: number
     cacheCreationTokens?: number
+    inputTokensIncludeCache?: boolean
+    firstTokenMs?: number
+    generationMs?: number
   },
 ): void {
-  if (!deps.usageTracker || (usage.inputTokens === 0 && usage.outputTokens === 0)) {
+  if (!deps.usageTracker || !(usage.inputTokens || usage.outputTokens || usage.cacheReadTokens || usage.cacheCreationTokens)) {
     return
   }
 
@@ -1813,6 +1818,9 @@ export function recordUsage(
     thinkingTokens: usage.thinkingTokens,
     cacheReadTokens: usage.cacheReadTokens,
     cacheWriteTokens: usage.cacheCreationTokens,
+    inputTokensIncludeCache: usage.inputTokensIncludeCache,
+    firstTokenMs: usage.firstTokenMs,
+    durationMs: usage.generationMs,
   })
 }
 
@@ -13215,13 +13223,14 @@ export const nativeToolAgent = (deps: Deps) => async function* (
     deps,
     context,
     s,
-    withSystemToolGuidance(msgs, providerRequestTools.map(tool => tool.name), deps.systemToolGuidance),
+    projectPromptContext(withSystemToolGuidance(msgs, providerRequestTools.map(tool => tool.name), deps.systemToolGuidance), context ? promptCacheScope(context.agentContext.sessionId, deps.provider.id, model) : undefined),
     requestedMaxTokens,
     { tools: providerRequestTools },
   )
   const request: ChatRequest = {
     model,
     messages: requestFit.requestMessages,
+    promptCacheKey: context ? promptCacheScope(context.agentContext.sessionId, deps.provider.id, model) : undefined,
     tools: providerRequestTools,
     ...(restrictToTerminalNetworkRetry
       ? { toolChoice: 'required' as const }
@@ -13264,8 +13273,8 @@ export const nativeToolAgent = (deps: Deps) => async function* (
       : null
   let text = ''
   let thinking = ''
-  let inputTokens = 0
   let outputTokens = 0
+  const turnUsage: import('@sepilotd/core').TokenUsage = { inputTokens: 0, outputTokens: 0 }
   let turnFinishReason: ChatResponse['finishReason'] = 'stop'
   let sawDone = false
   let sawNonTerminalChunk = false
@@ -13327,7 +13336,7 @@ export const nativeToolAgent = (deps: Deps) => async function* (
           }
           break
         case 'usage':
-          inputTokens += chunk.usage.inputTokens
+          accumulateTokenUsage(turnUsage, chunk.usage)
           outputTokens += chunk.usage.outputTokens
           {
             const contextUsage = buildStreamedGraphContextUsage(
@@ -13477,9 +13486,8 @@ export const nativeToolAgent = (deps: Deps) => async function* (
       }
     : undefined
 
-  s.totalUsage.inputTokens += inputTokens
-  s.totalUsage.outputTokens += outputTokens
-  recordUsage(deps, context, model, { inputTokens, outputTokens })
+  accumulateTokenUsage(s.totalUsage, turnUsage)
+  recordUsage(deps, context, model, turnUsage)
 
   await logGraphLlmCall(
     deps,
@@ -13493,7 +13501,7 @@ export const nativeToolAgent = (deps: Deps) => async function* (
         content: normalizedTransportText,
         toolCalls: resolvedToolCalls.length > 0 ? resolvedToolCalls : undefined,
       },
-      usage: { inputTokens, outputTokens },
+      usage: turnUsage,
       finishReason: resolvedToolCalls.length > 0 ? 'tool_use' : turnFinishReason,
     },
     undefined,
@@ -14098,6 +14106,7 @@ export const promptReActAgent = (deps: Deps) => async function* (
   )
   const requestedMaxTokens = artifactCadenceMaxTokens
 
+  const promptUsage: import('@sepilotd/core').TokenUsage = { inputTokens: 0, outputTokens: 0 }
   const runPromptTurn = async function* (
     messages: Message[],
     renderMessages: (messages: Message[]) => Message[],
@@ -14121,13 +14130,14 @@ export const promptReActAgent = (deps: Deps) => async function* (
       deps,
       context,
       s,
-      withSystemToolGuidance(messages, toolFreeFinal ? [] : progressAwareTools.map(tool => tool.name), deps.systemToolGuidance),
+      projectPromptContext(withSystemToolGuidance(messages, toolFreeFinal ? [] : progressAwareTools.map(tool => tool.name), deps.systemToolGuidance), context ? promptCacheScope(context.agentContext.sessionId, deps.provider.id, model) : undefined),
       requestedMaxTokens,
       { renderMessages },
     )
     const request: ChatRequest = {
       model,
       messages: requestFit.requestMessages,
+      promptCacheKey: context ? promptCacheScope(context.agentContext.sessionId, deps.provider.id, model) : undefined,
       thinkingLevel: toolFreeFinal
         || adaptiveTransportRepair
         || (s.lengthContinuationCount ?? 0) > 0
@@ -14169,6 +14179,7 @@ export const promptReActAgent = (deps: Deps) => async function* (
     let thinking = ''
     let inputTokens = 0
     let outputTokens = 0
+    const turnUsage: import('@sepilotd/core').TokenUsage = { inputTokens: 0, outputTokens: 0 }
     let turnFinishReason: ChatResponse['finishReason'] = 'stop'
     let sawDone = false
     let sawNonTerminalChunk = false
@@ -14230,6 +14241,7 @@ export const promptReActAgent = (deps: Deps) => async function* (
             }
             break
           case 'usage':
+            accumulateTokenUsage(turnUsage, chunk.usage)
             inputTokens += chunk.usage.inputTokens
             outputTokens += chunk.usage.outputTokens
             {
@@ -14381,7 +14393,7 @@ export const promptReActAgent = (deps: Deps) => async function* (
           toolCalls: acceptedToolCalls.length > 0 ? acceptedToolCalls : undefined,
         },
         thinking: extractedThinking,
-        usage: { inputTokens, outputTokens },
+        usage: turnUsage,
         finishReason:
           acceptedToolCalls.length > 0 ? 'tool_use' : turnFinishReason,
       },
@@ -14412,6 +14424,8 @@ export const promptReActAgent = (deps: Deps) => async function* (
         && acceptedToolCalls.every((call) => deps.tools.securityDescriptor?.(call.name)?.effect === 'observe'),
       taskComplexity: activeRunContract(s, context)?.reasoningComplexity,
     })
+    accumulateTokenUsage(promptUsage, turnUsage)
+    recordUsage(deps, context, model, turnUsage)
     return {
       rawText: safeRawText,
       textChunks: safeRawText === originalText ? textChunks : [safeRawText],
@@ -14444,8 +14458,6 @@ export const promptReActAgent = (deps: Deps) => async function* (
   let {
     rawText,
     toolCalls: resolvedToolCalls,
-    inputTokens,
-    outputTokens,
     liveTextDeltas,
     finishReason: turnFinishReason,
     rejectedToolCallBatch,
@@ -14483,8 +14495,6 @@ export const promptReActAgent = (deps: Deps) => async function* (
     rawText = repairTurnResult.value.rawText
     resolvedToolCalls = repairTurnResult.value.toolCalls
     toolTurnThinking = repairTurnResult.value.extractedThinking
-    inputTokens += repairTurnResult.value.inputTokens
-    outputTokens += repairTurnResult.value.outputTokens
     liveTextDeltas = repairTurnResult.value.liveTextDeltas
     turnFinishReason = repairTurnResult.value.finishReason
     rejectedToolCallBatch = repairTurnResult.value.rejectedToolCallBatch
@@ -14542,8 +14552,6 @@ export const promptReActAgent = (deps: Deps) => async function* (
     rawText = repairTurnResult.value.rawText
     resolvedToolCalls = repairTurnResult.value.toolCalls
     toolTurnThinking = repairTurnResult.value.extractedThinking
-    inputTokens += repairTurnResult.value.inputTokens
-    outputTokens += repairTurnResult.value.outputTokens
     liveTextDeltas = repairTurnResult.value.liveTextDeltas
     turnFinishReason = repairTurnResult.value.finishReason
     rejectedToolCallBatch = repairTurnResult.value.rejectedToolCallBatch
@@ -14562,12 +14570,12 @@ export const promptReActAgent = (deps: Deps) => async function* (
       }
     : undefined
 
-  s.totalUsage.inputTokens += inputTokens
-  s.totalUsage.outputTokens += outputTokens
-  recordUsage(deps, context, model, { inputTokens, outputTokens })
+  accumulateTokenUsage(s.totalUsage, promptUsage)
 
   s.lastTurnFinishReason = resolvedToolCalls.length > 0 ? 'tool_use' : turnFinishReason
   s.toolCalls = resolvedToolCalls
+  s.lastTurnNeedsProtocolRepair = resolvedToolCalls.length === 0
+    && shouldAttemptPromptReActRepair(rawText)
   if (resolvedToolCalls.length === 0) {
     const currentFinalOutput = stripInternalPlannerBlocks(
       completionGateCanRejectFinal(s, context)
@@ -14686,6 +14694,9 @@ export interface AgentNodeOptions {
   completionGateOwner?: 'node' | 'parent'
 }
 
+const MAX_MODEL_RESPONSE_RECOVERIES = 2
+const MAX_MODEL_DIRECTED_REUSE_ONLY_TURNS = 2
+
 const modelDirectedAgent = (deps: Deps) => async function* (
   s: AgentState,
   context?: GraphExecutionContext,
@@ -14705,6 +14716,8 @@ const modelDirectedAgent = (deps: Deps) => async function* (
   s.output = ''
   s.toolCalls = []
   s.toolResults = []
+  s.modelResponseRecoveryPending = false
+  s.lastTurnNeedsProtocolRepair = false
   const runner = supportsNativeToolUse(deps, context)
     && !(s.preferPromptReact ?? prefersPromptReact(deps, context))
     ? nativeToolAgent(deps) : promptReActAgent(deps)
@@ -14715,8 +14728,31 @@ const modelDirectedAgent = (deps: Deps) => async function* (
     !s.output.trim()
     || s.output === UNUSABLE_PROMPT_TOOL_CALL_OUTPUT
     || s.output === INTERRUPTED_USER_FACING_RESPONSE
+    || s.lastTurnNeedsProtocolRepair
     || s.lastTurnFinishReason !== 'stop'
   )) {
+    if (canExecuteCompletedToolCalls(s.lastTurnFinishReason ?? 'stop')
+      && (s.modelResponseRecoveryCount ?? 0) < MAX_MODEL_RESPONSE_RECOVERIES
+      && s.iteration < s.maxIterations) {
+      s.modelResponseRecoveryCount = (s.modelResponseRecoveryCount ?? 0) + 1
+      s.modelResponseRecoveryPending = true
+      const last = s.messages.at(-1)
+      if (last?.role === 'assistant' && !last.content) {
+        last.content = '[Empty model response; no tool was executed.]'
+      }
+      appendUniqueSystemMessage(s, [
+        '[Model response format recovery]',
+        `The previous reply was empty or unusable under the active response protocol. Recovery ${s.modelResponseRecoveryCount}/${MAX_MODEL_RESPONSE_RECOVERIES}.`,
+        'No tool was executed for that reply. Keep all prior successful tool results and continue the same task; do not restart discovery or repeat covered reads.',
+        'Select a complete call from the currently available tools, or give a complete final answer under the active transport protocol. Do not describe a serialization problem as successful completion.',
+        s.lastRejectedToolCallNames?.length
+          ? `Unavailable selections: ${s.lastRejectedToolCallNames.join(', ')}. Choose only from the supplied tool schemas.` : '',
+      ].filter(Boolean).join(' '), 'model-response-format-recovery', {
+        replacePrefix: '[Model response format recovery]',
+      })
+      s.output = ''
+      return s
+    }
     s.output = 'INCOMPLETE: The model returned no complete usable response. Executed tool results remain in the session.'
   }
   return s
@@ -17394,24 +17430,46 @@ export const toolExecutor = (deps: Deps, options: Pick<AgentNodeOptions, 'execut
     }
   }
 
-  if (options.executionControl !== 'model-directed' && s.toolCalls.length > 0 && typeof (deps.tools as { get?: unknown }).get === 'function') {
+  if (s.toolCalls.length > 0 && typeof (deps.tools as { get?: unknown }).get === 'function') {
     const forcedFailedEditRecoveryReads = s.toolCalls.filter((call) =>
       isFirstSourceRefreshAfterMatchingFailedEdit(s, call),
     )
     const forcedFailedEditRecoveryIds = new Set(
       forcedFailedEditRecoveryReads.map((call) => call.id),
     )
+    let reusableHistory = s.toolCallHistory
+    if (options.executionControl === 'model-directed' && reusableHistory?.length) {
+      const requestedPaths = new Set(s.toolCalls.filter((call) => call.name === 'fs.read' && call.arguments.fresh !== true)
+        .map((call) => typeof call.arguments.path === 'string'
+          ? resolveToolPath(call.arguments.path, graphContext?.agentContext.cwd) : ''))
+      const currentHashes = new Map<string, string | null>()
+      for (const path of requestedPaths) {
+        currentHashes.set(path, path && graphContext?.workspaceMutationTracker
+          ? await graphContext.workspaceMutationTracker.currentReadObservationHash(graphContext.agentContext.sessionId, path)
+          : null)
+      }
+      reusableHistory = reusableHistory.map((entry) => {
+        if (entry.tool !== 'fs.read' || entry.status !== 'success') return entry
+        const path = typeof entry.input.path === 'string'
+          ? resolveToolPath(entry.input.path, graphContext?.agentContext.cwd) : ''
+        return entry.observationContentHash && entry.observationContentHash === currentHashes.get(path)
+          ? entry : { ...entry, status: 'error' as const }
+      })
+    }
     const observationReuse = partitionCallsCoveredByCurrentTurnObservations(
       s.messages,
-      s.toolCalls.filter((call) => !forcedFailedEditRecoveryIds.has(call.id)),
+      s.toolCalls.filter((call) => !forcedFailedEditRecoveryIds.has(call.id)
+        && (options.executionControl !== 'model-directed' || (call.name === 'fs.read'
+          && reusableHistory?.some((entry) => entry.tool === 'fs.read' && entry.status === 'success')))),
       deps.tools,
       {
         cwd: graphContext?.agentContext.cwd,
         workspaceRoot: graphContext?.agentContext.workspaceRoot,
       },
       isPolicyReadOnlyTool,
-      s.toolCallHistory,
+      reusableHistory,
     )
+    if (options.executionControl === 'model-directed') observationReuse.narrowedCalls = []
     if (
       observationReuse.coveredCalls.length > 0
       || observationReuse.narrowedCalls.length > 0
@@ -17420,10 +17478,9 @@ export const toolExecutor = (deps: Deps, options: Pick<AgentNodeOptions, 'execut
         s.messages,
         observationReuse.narrowedCalls,
       )
-      s.toolCalls = [
-        ...forcedFailedEditRecoveryReads,
-        ...observationReuse.executableCalls,
-      ]
+      const coveredIds = new Set(observationReuse.coveredCalls.map(({ requested }) => requested.id))
+      const narrowedById = new Map(observationReuse.narrowedCalls.map(({ requested, replacements }) => [requested.id, replacements]))
+      s.toolCalls = s.toolCalls.flatMap((call) => coveredIds.has(call.id) ? [] : narrowedById.get(call.id) ?? [call])
       const reuseMessage = buildObservationReuseMessage(
         observationReuse.coveredCalls,
         observationReuse.narrowedCalls,
@@ -17468,6 +17525,11 @@ export const toolExecutor = (deps: Deps, options: Pick<AgentNodeOptions, 'execut
           'observation-reuse',
           { replacePrefix: '[Current-turn observation reuse guard]' },
         )
+        if (options.executionControl === 'model-directed' && s.implementationObservationReuseOnlyCount >= MAX_MODEL_DIRECTED_REUSE_ONLY_TURNS) {
+          s.shouldStop = true
+          s.stopReason = stopReasonNoProgress({ layer: 'cycle', budget: MAX_MODEL_DIRECTED_REUSE_ONLY_TURNS, used: s.implementationObservationReuseOnlyCount })
+          s.output = 'INCOMPLETE: Repeated file requests only reused existing evidence without advancing the task. Prior results remain available.'
+        }
         return s
       }
       removeRejectedToolCallsFromLatestAssistantMessage(
@@ -17677,6 +17739,7 @@ export const toolExecutor = (deps: Deps, options: Pick<AgentNodeOptions, 'execut
   const unannouncedToolCalls = s.toolCalls.filter(
     (toolCall) => !announcedActionProgressCallIds.has(toolCall.id),
   )
+  let batchActionRationale: string | undefined
   if (unannouncedToolCalls.length > 0) {
     const activeCallIds = new Set(unannouncedToolCalls.map((toolCall) => toolCall.id))
     const assistantTurn = [...s.messages].reverse().find((message) =>
@@ -17694,6 +17757,7 @@ export const toolExecutor = (deps: Deps, options: Pick<AgentNodeOptions, 'execut
       ? s.pendingActionProgress
       : null
     const actionProgress = pendingActionProgress ?? extractAgentActionProgress(assistantText)
+    batchActionRationale = actionProgress?.summary
     if (actionProgress) {
       yield {
         type: 'action_progress',
@@ -17734,12 +17798,14 @@ export const toolExecutor = (deps: Deps, options: Pick<AgentNodeOptions, 'execut
     delegationToolNames: graphContext?.modeControl?.delegationToolNames,
     messages: s.messages,
     toolCalls: s.toolCalls,
+    actionRationale: batchActionRationale,
     sessionId: graphContext?.agentContext.sessionId ?? '',
     provider: graphContext?.agentContext.provider ?? '',
     model: graphContext?.agentContext.model ?? '',
     tools: deps.tools,
     policy: deps.policy,
     autonomy: deps.autonomy,
+    getAutonomy: () => deps.autonomy,
     primaryAgentId: graphContext?.agentContext.primaryAgentId,
     autoApprove: graphContext?.agentContext.autoApprove,
     requireToolApproval:
@@ -17751,6 +17817,7 @@ export const toolExecutor = (deps: Deps, options: Pick<AgentNodeOptions, 'execut
     evaluateAutoApproval: graphContext?.evaluateAutoApproval,
     cwd: graphContext?.agentContext.cwd,
     workspaceRoot: graphContext?.agentContext.workspaceRoot,
+    workspaceIsolation: graphContext?.agentContext.workspaceIsolation,
     runContract: s.seedContract,
     writingDocId: graphContext?.agentContext.writingDocId,
     scopeTags: graphContext?.agentContext.scopeTags,
@@ -17853,6 +17920,11 @@ export const toolExecutor = (deps: Deps, options: Pick<AgentNodeOptions, 'execut
         const executionObserved =
           event.metadata?.[TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY] === true
         const blocked = blockSourceFromMetadata(event.metadata) !== null
+        const observationCache = event.metadata?.observationCache
+        const observationContentHash = matchedCall.name === 'fs.read'
+          && observationCache && typeof observationCache === 'object'
+          && typeof (observationCache as Record<string, unknown>).contentHash === 'string'
+          ? (observationCache as { contentHash: string }).contentHash : undefined
         const historyEntry = {
           toolCallId: matchedCall.id,
           tool: matchedCall.name,
@@ -17867,6 +17939,7 @@ export const toolExecutor = (deps: Deps, options: Pick<AgentNodeOptions, 'execut
           ...(blocked ? { blocked: true } : {}),
           ts: Date.now(),
           outputFingerprint: createHash('sha256').update(event.output).digest('hex'),
+          ...(observationContentHash ? { observationContentHash } : {}),
           output: matchedCall.name === 'fs.read'
             ? summarizedOutput
             : summarizeToolOutputForEvidence(matchedCall.name, summarizedOutput, 4_000),

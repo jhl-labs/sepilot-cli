@@ -89,6 +89,7 @@ export function keepContinuingRoleBot(
   registry: Pick<RoleBotRegistry, 'get'> | undefined,
 ): IntentRoutingResult {
   if (routing.decision.contractRelation !== 'continue' || !previousBotId) return routing
+  if (!routing.decision.fallback && (routing.decision.confidence === 'medium' || routing.decision.confidence === 'high')) return routing
   if (routing.effectivePersona === previousBotId || !registry?.get(previousBotId)) return routing
   return {
     ...routing,

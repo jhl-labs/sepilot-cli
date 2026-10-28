@@ -22,6 +22,10 @@
       "dependsOn": [
         "^build"
       ],
+      "passThroughEnv": [
+        "SEPILOT_DEBUG",
+        "SEPILOT_TRACE_FULL"
+      ],
       "cache": false,
       "persistent": true
     },

@@ -1,7 +1,15 @@
 import { randomUUID } from 'node:crypto'
 import type { ToolDefinitionRuntime, ToolExecutionContext, ToolResult } from './registry.js'
 import type { ExternalCliDispatcher } from '../external-cli/dispatcher.js'
-import { EXTERNAL_CLI_BACKENDS, EXTERNAL_CLI_PERMISSIONS, isExternalCliBackend, isExternalCliPermission } from '../external-cli/executor.js'
+import { EXTERNAL_CLI_BACKENDS, EXTERNAL_CLI_PERMISSIONS, isExternalCliBackend, isExternalCliPermission, isResumableFailure, type ExternalCliFailureKind } from '../external-cli/executor.js'
+
+const FAILURE_CODES: Record<ExternalCliFailureKind, string> = {
+  stalled: 'EXTERNAL_CLI_STALLED',
+  timeout: 'EXTERNAL_CLI_TIMEOUT',
+  incomplete: 'EXTERNAL_CLI_INCOMPLETE',
+  cancelled: 'EXTERNAL_CLI_CANCELLED',
+  failed: 'EXTERNAL_CLI_FAILED',
+}
 
 export function createExternalCliRunTool(dispatcher: ExternalCliDispatcher): ToolDefinitionRuntime {
   return {
@@ -67,12 +75,15 @@ export function createExternalCliRunTool(dispatcher: ExternalCliDispatcher): Too
           runContract: context?.runContract,
           signal: context?.signal,
         })
-        const head = `[external_cli ${result.backend} permission=${result.permission} session=${result.sessionId} thread=${result.threadId ?? '-'} status=${result.status} tokens=${result.usage.inputTokens}/${result.usage.outputTokens}]`
+        const head = `[external_cli ${result.backend} permission=${result.permission} session=${result.sessionId} thread=${result.threadId ?? '-'} status=${result.status}${result.failure ? ` failure=${result.failure}` : ''} tokens=${result.usage.inputTokens}/${result.usage.outputTokens}]`
+        const resume = isResumableFailure(result.failure) && result.threadId
+          ? `\n\n[resumable] The ${result.backend} turn was interrupted (${result.failure}), not refused: it may have left partial edits. Inspect the workspace, then continue the same session with external_cli.run(agent="${result.backend}", threadId="${result.threadId}") and a short message to finish the remaining steps, instead of starting over.`
+          : ''
         return {
-          output: `${head}\n\n${result.output}`,
+          output: `${head}\n\n${result.output}${resume}`,
           status: result.status === 'failed' ? 'error' : 'success',
           durationMs: Date.now() - startedAt,
-          code: result.status === 'failed' ? 'EXTERNAL_CLI_FAILED' : undefined,
+          code: result.status === 'failed' ? FAILURE_CODES[result.failure ?? 'failed'] : undefined,
         }
       } catch (error) {
         return {

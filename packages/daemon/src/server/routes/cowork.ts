@@ -490,6 +490,7 @@ export async function coworkRoutes(app: FastifyInstance) {
             sessionId,
             toolCall,
             requestId,
+            recheckPolicy: options?.recheckPolicy,
             forcePrompt: options?.forcePrompt,
             signal: options?.signal,
           })

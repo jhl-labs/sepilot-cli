@@ -108,7 +108,8 @@
   },
   "dependencies": {
     "@sepilotd/core": "workspace:*",
-    "ws": "8.21.1"
+    "ws": "8.21.1",
+    "yaml": "2.9.0"
   },
   "devDependencies": {
     "@types/ws": "8.18.1",

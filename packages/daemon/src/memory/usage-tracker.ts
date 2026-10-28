@@ -14,6 +14,8 @@ export interface UsageRecord {
   thinkingTokens?: number
   cacheReadTokens?: number
   cacheWriteTokens?: number
+  inputTokensIncludeCache?: boolean
+  firstTokenMs?: number
   costUsd?: number
   costKnown?: boolean
   durationMs?: number
@@ -130,20 +132,47 @@ export class UsageTracker {
           cacheReadTokens: usage.cacheReadTokens,
           cacheCreationTokens: usage.cacheWriteTokens,
           thinkingTokens: usage.thinkingTokens,
+          inputTokensIncludeCache: usage.inputTokensIncludeCache,
         })
         costKnown = computed.costKnown
         costUsd = computed.costKnown ? computed.costUsd : null as unknown as number
       }
     }
     this.db.prepare(`
-      INSERT INTO usage_records (id, session_id, provider, model, input_tokens, output_tokens, thinking_tokens, cache_read_tokens, cache_write_tokens, cost_usd, cost_known, duration_ms, tool_name)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO usage_records (id, session_id, provider, model, input_tokens, output_tokens, thinking_tokens, cache_read_tokens, cache_write_tokens, cost_usd, cost_known, duration_ms, tool_name, metadata)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(), usage.sessionId, usage.provider, usage.model,
       usage.inputTokens, usage.outputTokens, usage.thinkingTokens ?? 0,
       usage.cacheReadTokens ?? 0, usage.cacheWriteTokens ?? 0,
       costUsd ?? null, costKnown ? 1 : 0, usage.durationMs ?? null, usage.toolName ?? null,
+      JSON.stringify({ inputTokensIncludeCache: usage.inputTokensIncludeCache, firstTokenMs: usage.firstTokenMs,
+        cacheUsageReported: usage.cacheReadTokens !== undefined || usage.cacheWriteTokens !== undefined }),
     )
+  }
+
+  getCacheSummary(sessionId?: string): { reportedRequests: number; cacheReadTokens: number; cacheWriteTokens: number; readHitRatio: number | null; averageFirstTokenMs: number | null } {
+    const row = this.db.prepare(`
+      WITH samples AS (
+        SELECT input_tokens, cache_read_tokens, cache_write_tokens,
+          CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END AS details
+        FROM usage_records ${sessionId === undefined ? '' : 'WHERE session_id = ?'}
+      ), observed AS (
+        SELECT *, json_extract(details, '$.cacheUsageReported') AS measured,
+          json_extract(details, '$.inputTokensIncludeCache') AS inclusive
+        FROM samples
+      )
+      SELECT COALESCE(SUM(CASE WHEN measured = 1 OR cache_read_tokens > 0 OR cache_write_tokens > 0 THEN 1 ELSE 0 END), 0) AS reported,
+        COALESCE(SUM(cache_read_tokens), 0) AS reads, COALESCE(SUM(cache_write_tokens), 0) AS writes,
+        COALESCE(SUM(CASE WHEN measured = 1 THEN cache_read_tokens ELSE 0 END), 0) AS measured_reads,
+        SUM(CASE WHEN measured = 1 THEN input_tokens +
+          CASE WHEN inclusive = 1 THEN 0 ELSE cache_read_tokens + cache_write_tokens END END) AS total,
+        AVG(json_extract(details, '$.firstTokenMs')) AS latency
+      FROM observed
+    `).get(...(sessionId === undefined ? [] : [sessionId])) as { reported: number; reads: number; writes: number; measured_reads: number; total: number | null; latency: number | null }
+    return { reportedRequests: row.reported, cacheReadTokens: row.reads, cacheWriteTokens: row.writes,
+      readHitRatio: row.total === null ? null : row.total > 0 ? row.measured_reads / row.total : 0,
+      averageFirstTokenMs: row.latency }
   }
 
   deleteBySession(sessionId: string): number {

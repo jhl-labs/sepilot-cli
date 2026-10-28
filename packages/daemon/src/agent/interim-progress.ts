@@ -556,10 +556,24 @@ export function buildEmptyFinalFallbackMessage(messages: Message[]): string {
 }
 
 export function buildInvalidFinalResponseMessage(messages: Message[]): string {
+  const latestUser = messages.findLast((message) => message.role === 'user')
+  const korean = latestUser ? /[가-힣]/u.test(extractMessageText(latestUser)) : false
   const recentTools = currentTurnMessages(messages)
     .filter((message) => message.role === 'tool')
     .slice(-MAX_EMPTY_FINAL_TOOL_LINES)
   const hasFailure = recentTools.some((message) => message.metadata?.[TOOL_RESULT_STATUS_METADATA_KEY] === 'error')
+  if (korean) {
+    return [
+      'INCOMPLETE: 모델의 도구 요청을 처리하지 못해 이번 요청을 완료하지 못했습니다.',
+      recentTools.length > 0 ? '이번 요청에서 남아 있는 도구 실행 기록:' : '이번 요청에서는 도구가 실행되지 않았습니다.',
+      ...recentTools.map((message) => `- [${message.metadata?.[TOOL_RESULT_STATUS_METADATA_KEY] ?? 'unknown'}] ${message.name ?? 'tool'}: ${compactFallbackToolLine(extractMessageText(message))}`),
+      hasFailure
+        ? '실패한 도구의 사유를 확인해 주세요. 이미 성공한 작업은 유지되며, 같은 변경을 다시 실행하지 않도록 기록을 확인해야 합니다.'
+        : recentTools.length > 0
+          ? '이미 실행된 작업은 유지됩니다. 이어서 진행하라고 요청하면 기존 기록을 바탕으로 계속할 수 있습니다.'
+          : '이어서 진행하라고 다시 요청해 주세요. 현재 상태를 확인하고 남은 작업을 진행할 수 있습니다.',
+    ].join('\n')
+  }
   return [
     'INCOMPLETE: Request incomplete because the model did not return a valid final response after its tool attempt.',
     recentTools.length > 0 ? 'Retained current-turn tool results:' : '',

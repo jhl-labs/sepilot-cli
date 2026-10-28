@@ -1,6 +1,8 @@
+import { accumulateTokenUsage } from '../providers/token-usage.js'
+import { fitPromptContext, projectPromptContext, promptCacheScope } from './prompt-context-history.js'
 import { repeatedBrowserClickWithoutProgress } from './browser-progress.js'
 import { terminalRunHasReliableSuccessStatus } from './graph/evidence-ledger.js'
-import { RUN_STABLE_SYSTEM_METADATA_KEY } from './prompt-sections.js'
+import { RUN_STABLE_SYSTEM_METADATA_KEY, TURN_SCOPED_SYSTEM_METADATA_KEY } from './prompt-sections.js'
 import { advanceAutomaticObservationBudget, canAutomaticallyDisableThinking, consecutiveExecutionFailures, resolveThinkingLevel, shouldReduceAutomaticThinking, structuredToolFailureCode as structuredToolFailureCodeFromOutput, type ThinkingLevelSource } from '../providers/thinking-policy.js'
 import { userActionRequiredOutput } from './user-action-required-output.js'
 import { workspaceExecutionBlocker } from './workspace-execution.js'
@@ -83,7 +85,6 @@ import {
   DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW,
   emergencyContextRecovery,
   evaluateCurrentTurnToolObservationBudget,
-  fitProviderContext,
   fitControlRequest,
   IrreducibleContextOverflowError,
   semanticCompress,
@@ -1545,21 +1546,7 @@ export class AgentEngine implements IAgentEngine {
           }
           break
         case 'usage':
-          totalUsage.inputTokens += chunk.usage.inputTokens
-          totalUsage.outputTokens += chunk.usage.outputTokens
-          if (chunk.usage.generationMs) {
-            totalUsage.generationMs = (totalUsage.generationMs ?? 0) + chunk.usage.generationMs
-          }
-          if (chunk.usage.thinkingTokens) {
-            totalUsage.thinkingTokens = (totalUsage.thinkingTokens ?? 0) + chunk.usage.thinkingTokens
-          }
-          if (chunk.usage.cacheReadTokens) {
-            totalUsage.cacheReadTokens = (totalUsage.cacheReadTokens ?? 0) + chunk.usage.cacheReadTokens
-          }
-          if (chunk.usage.cacheCreationTokens) {
-            totalUsage.cacheCreationTokens =
-              (totalUsage.cacheCreationTokens ?? 0) + chunk.usage.cacheCreationTokens
-          }
+          accumulateTokenUsage(totalUsage, chunk.usage)
           break
         case 'done':
           sawDone = true
@@ -1803,20 +1790,7 @@ export class AgentEngine implements IAgentEngine {
             }
             break
           case 'usage':
-            usage.inputTokens += chunk.usage.inputTokens
-            usage.outputTokens += chunk.usage.outputTokens
-            if (chunk.usage.generationMs) {
-              usage.generationMs = (usage.generationMs ?? 0) + chunk.usage.generationMs
-            }
-            if (chunk.usage.thinkingTokens) {
-              usage.thinkingTokens = (usage.thinkingTokens ?? 0) + chunk.usage.thinkingTokens
-            }
-            if (chunk.usage.cacheReadTokens) {
-              usage.cacheReadTokens = (usage.cacheReadTokens ?? 0) + chunk.usage.cacheReadTokens
-            }
-            if (chunk.usage.cacheCreationTokens) {
-              usage.cacheCreationTokens = (usage.cacheCreationTokens ?? 0) + chunk.usage.cacheCreationTokens
-            }
+            accumulateTokenUsage(usage, chunk.usage)
             break
           case 'done':
             sawDone = true
@@ -2111,6 +2085,7 @@ export class AgentEngine implements IAgentEngine {
     if (context.memoryPolicy?.read !== false && context.memoryPolicy?.automaticRead !== false && context.relevantMemories?.length) {
       messages.push({
         role: 'system',
+        metadata: { [TURN_SCOPED_SYSTEM_METADATA_KEY]: true },
         content: [
           '[Relevant memories]',
           'These are historical memory or document snippets and may be stale; verify volatile facts before relying on them.',
@@ -2121,7 +2096,7 @@ export class AgentEngine implements IAgentEngine {
     }
     const runContractMessage = formatRunContractForPrompt(context.runContract)
     if (runContractMessage) {
-      messages.push({ role: 'system', content: runContractMessage })
+      messages.push({ role: 'system', content: runContractMessage, metadata: { [TURN_SCOPED_SYSTEM_METADATA_KEY]: true } })
     }
     for (const message of messages) {
       message.metadata = { ...message.metadata, runtimeContext: true }
@@ -2387,6 +2362,9 @@ export class AgentEngine implements IAgentEngine {
       thinkingTokens: usage.thinkingTokens,
       cacheReadTokens: usage.cacheReadTokens,
       cacheWriteTokens: usage.cacheCreationTokens,
+      inputTokensIncludeCache: usage.inputTokensIncludeCache,
+      firstTokenMs: usage.firstTokenMs,
+      durationMs: usage.generationMs,
     })
   }
 
@@ -2461,6 +2439,7 @@ export class AgentEngine implements IAgentEngine {
       tools: this.tools,
       policy: this.policy,
       autonomy: this.autonomy,
+      getAutonomy: () => this.autonomy,
       primaryAgentId: context.primaryAgentId,
       autoApprove: context.autoApprove,
       requireToolApproval: context.requireToolApproval,
@@ -2473,6 +2452,7 @@ export class AgentEngine implements IAgentEngine {
       signal,
       cwd: context.cwd,
       workspaceRoot: context.workspaceRoot,
+      workspaceIsolation: context.workspaceIsolation,
       runContract: context.runContract,
       writingDocId: context.writingDocId,
       scopeTags: context.scopeTags,
@@ -2611,10 +2591,12 @@ export class AgentEngine implements IAgentEngine {
     this.activeRuns?.upsert({ sessionId: context.sessionId, graphId: 'react',
       currentNode: 'agent', iteration: startIteration, maxIterations: this.maxIterations })
     this.activeRuns?.registerLiveState(context.sessionId, liveState)
+    const unregisterPrivilege = this.activeRuns?.registerPrivilegeSetter(context.sessionId, level => this.setAutonomy(level))
     try {
       yield* this.continueRun(withoutSteeringCheckpoint(checkpointMessages), context, totalUsage,
         startIteration, pendingToolExecution, signal)
     } finally {
+      unregisterPrivilege?.()
       if (this.activeRuns?.getLiveState(context.sessionId) === liveState) {
         this.activeRuns.finish(context.sessionId)
       }
@@ -3152,7 +3134,8 @@ export class AgentEngine implements IAgentEngine {
       const isLastIteration = i >= iterationBudget - 1
       const isPenultimateIteration =
         !isLastIteration && i === iterationBudget - 2 && iterationBudget >= 3
-      const skipOutcomeReview = !this.reviewOutcomes || focusedRepositoryLookup
+      const requiredWorkspaceOutcome = context.runContract?.executionIntent?.workspaceMutation === 'required'
+      const skipOutcomeReview = (!this.reviewOutcomes && !requiredWorkspaceOutcome) || focusedRepositoryLookup
         || substantiveRepositoryReview
         || focusedTerminalExecution
         || toolsForbiddenByUser
@@ -3416,12 +3399,14 @@ export class AgentEngine implements IAgentEngine {
         : useBoundedFinalContext ? [] : finalStepTools).map((tool) => tool.name))
       let renderedToolDefinitions = finalStepTools
       requestMessages = withSystemToolGuidance(requestMessages, [...effectiveAllowedToolNames], this.systemToolGuidance)
+      const cacheScope = promptCacheScope(context.sessionId, this.provider.id, context.model)
+      requestMessages = projectPromptContext(requestMessages, cacheScope)
       let contextFit: ProviderContextFitResult | undefined
       try {
         const toolDefinitionsActive = useNativeToolUse
           ? (requestTools?.length ?? 0) > 0
           : !useBoundedFinalContext && renderedToolDefinitions.length > 0
-        contextFit = fitProviderContext(requestMessages, {
+        contextFit = fitPromptContext(requestMessages, {
           contextWindowTokens: contextWindow,
           requestedOutputTokens,
           modelMaxOutputTokens: this.maxTokens === undefined
@@ -3454,7 +3439,7 @@ export class AgentEngine implements IAgentEngine {
             effectiveAllowedToolNames = new Set<string>()
             renderedToolDefinitions = []
             requestMessages = withSystemToolGuidance(requestMessages, [], this.systemToolGuidance)
-            contextFit = fitProviderContext(requestMessages, {
+            contextFit = fitPromptContext(requestMessages, {
               contextWindowTokens: contextWindow,
               requestedOutputTokens,
               modelMaxOutputTokens: this.maxTokens === undefined
@@ -3499,6 +3484,7 @@ export class AgentEngine implements IAgentEngine {
       const request: ChatRequest = {
         model: context.model,
         messages: contextFit.requestMessages,
+        promptCacheKey: cacheScope,
         tools: requestTools,
         thinkingLevel: useBoundedFinalContext
           ? resolveRepairThinkingLevel(modelInfo, this.thinkingLevel)

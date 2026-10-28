@@ -188,6 +188,10 @@ export function createFsReadTool(): ToolDefinitionRuntime {
           description:
             'Prefix each output line with its 1-based file line number (default true). Line numbers are for reference only; never include the leading "NNN<tab>" prefix in fs.edit oldText or apply_patch context lines.',
         },
+        fresh: {
+          type: 'boolean',
+          description: 'Force a new filesystem observation instead of reusing a covered current-turn read. Use when the user asks to read again or an external process may have changed the file. Defaults to false.',
+        },
       },
       required: ['path'],
     },
@@ -253,7 +257,7 @@ export function createFsReadTool(): ToolDefinitionRuntime {
           lineNumbers,
           explicitSlice,
         })
-        const cached = info.size <= MAX_FULL_READ_BYTES
+        const cached = input.fresh !== true && info.size <= MAX_FULL_READ_BYTES
           ? await context?.workspaceMutation?.lookupReadObservation?.(path, viewKey)
           : undefined
         if (cached?.status === 'hit' && cached.observation) {

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import { Box, Text, useInput } from 'ink'
+import wrapAnsi from 'wrap-ansi'
 import type { ApprovalRequest } from '../types.js'
+import type { CliLocale } from '../../utils/locale.js'
 import { colors, symbols } from '../theme.js'
 import { ControlSafeTextInput } from './ControlSafeTextInput.js'
 import { DiffView, UnifiedDiffView } from './DiffView.js'
@@ -17,8 +19,10 @@ import { isReturnKey } from '../utils/key.js'
 interface ApprovalModalProps {
   approval: ApprovalRequest
   height?: number
+  width?: number
   inputActive?: boolean
   compact?: boolean
+  locale?: CliLocale
   onResolve?: (approved: boolean, scope: ApprovalActionScope, note?: string, interrupt?: boolean) => void
   onCommentModeChange?: (active: boolean) => void
   onShowFull?: (text: string) => void
@@ -85,15 +89,56 @@ function boundedLines(text: string, limit: number): { lines: string[]; hidden: n
   return lines.length <= limit ? { lines, hidden: 0 } : { lines: lines.slice(0, limit), hidden: lines.length - limit }
 }
 
+function processStartPreview(input: Record<string, unknown>, locale: CliLocale): string {
+  const ko = locale === 'ko'
+  const network = input.network && typeof input.network === 'object' && !Array.isArray(input.network)
+    ? input.network as Record<string, unknown> : null
+  const networkLabel = network?.mode === 'loopback' ? 'localhost'
+    : network?.mode === 'isolated' ? (ko ? '격리' : 'isolated')
+      : network?.mode ?? (ko ? '기본 정책' : 'default policy')
+  const ports = Array.isArray(network?.ports) ? network.ports.join(', ') : ''
+  const other = Object.fromEntries(Object.entries(input).filter(([key]) => !['executable', 'args', 'command', 'cwd', 'network', 'lifetime', 'reuseId'].includes(key)))
+  const networkOther = network ? Object.fromEntries(Object.entries(network).filter(([key]) => !['mode', 'ports'].includes(key))) : {}
+  return [
+    ...(input.reuseId ? [`${ko ? '기존 서버 재사용' : 'Reuse existing server'}: ${input.reuseId}`] : []),
+    `$ ${terminalCommandLabel(input)}`,
+    `${ko ? '작업 폴더' : 'Folder'}: ${typeof input.cwd === 'string' ? input.cwd : (ko ? '현재 작업 폴더' : 'current workspace')}`,
+    `${ko ? '유지' : 'Lifetime'}: ${input.reuseId ? (ko ? '기존 소유자·수명 유지' : 'original owner and lifetime kept') : input.lifetime === 'session' ? (ko ? '이 대화에 연결' : 'attached to this conversation') : input.lifetime ?? (ko ? '기본 정책' : 'default policy')}`,
+    `${ko ? '네트워크 요청' : 'Network request'}: ${networkLabel}${ports ? ` · TCP ${ports}` : ''}`,
+    ...(Object.keys(networkOther).length > 0 ? [`${ko ? '추가 네트워크 설정' : 'Other network settings'}: ${formatToolInput(networkOther)}`] : []),
+    ...(Object.keys(other).length > 0 ? [`${ko ? '추가 설정' : 'Other settings'}: ${formatToolInput(other)}`] : []),
+  ].join('\n')
+}
+
+function browserEvaluationPreview(input: Record<string, unknown>, locale: CliLocale): string {
+  const ko = locale === 'ko'
+  const other = Object.fromEntries(Object.entries(input).filter(([key]) => !['url', 'script', 'viewportWidth', 'viewportHeight', 'path', 'waitFor', 'waitAfterMs'].includes(key)))
+  return [
+    `${ko ? '주소' : 'URL'}: ${input.url ?? (ko ? '현재 페이지' : 'current page')}`,
+    ...(input.viewportWidth !== undefined || input.viewportHeight !== undefined
+      ? [`${ko ? '화면' : 'Viewport'}: ${input.viewportWidth ?? '?'} × ${input.viewportHeight ?? '?'}`] : []),
+    ...(input.path ? [`${ko ? '캡처' : 'Capture'}: ${input.path}`] : []),
+    ...(input.waitFor ? [`${ko ? '대기 요소' : 'Wait for'}: ${input.waitFor}`] : []),
+    ...(input.waitAfterMs !== undefined ? [`${ko ? '추가 대기' : 'Wait after'}: ${input.waitAfterMs} ms`] : []),
+    ...(Object.keys(other).length > 0 ? [`${ko ? '추가 설정' : 'Other settings'}: ${formatToolInput(other)}`] : []),
+    `${ko ? '스크립트' : 'Script'}:`,
+    String(input.script ?? ''),
+  ].join('\n')
+}
+
 export function ApprovalModal({
   approval,
   height,
+  width,
   inputActive = true,
   compact = false,
+  locale = 'en',
   onResolve,
   onCommentModeChange,
   onShowFull,
 }: ApprovalModalProps) {
+  const ko = locale === 'ko'
+  const actionLabels: Record<string, string> = { once: '이번만', session: '이 대화', run: '이번 작업', always: '항상', deny: '거절' }
   const [selectedActionIndex, setSelectedActionIndex] = useState(0)
   const [commentMode, setCommentMode] = useState(false)
   const [commentDraft, setCommentDraft] = useState('')
@@ -237,11 +282,11 @@ export function ApprovalModal({
     element: commentMode ? (
       <Box key="action" minWidth={0} width="100%">
         <Text color={colors.primary} bold>
-          message{' '}
+          {ko ? '의견' : 'message'}{' '}
         </Text>
         <ControlSafeTextInput
           value={commentDraft}
-          placeholder="tell the agent what to do instead…"
+          placeholder={ko ? '대신 할 일을 알려주세요…' : 'tell the agent what to do instead…'}
           focus={inputActive}
           onChange={setCommentDraft}
           onSubmit={submitComment}
@@ -258,11 +303,11 @@ export function ApprovalModal({
               backgroundColor={selected ? colors.primary : undefined}
               bold={selected}
             >
-              {selected ? '>' : ' '} {action.shortcut} {action.label}{' '}
+              {selected ? '>' : ' '} {action.shortcut} {ko ? actionLabels[action.id] : action.label}{' '}
             </Text>
           )
         })}
-        <Text color={colors.dimText}> {COMMENT_SHORTCUT} message</Text>
+        <Text color={colors.dimText}> {COMMENT_SHORTCUT} {ko ? '의견' : 'message'}</Text>
       </Box>
     ),
   })
@@ -371,15 +416,23 @@ export function ApprovalModal({
     const actionRow = structuralRows.find((row) => row.key === 'action')!
     const actionHintRow = structuralRows.find((row) => row.key === 'action-hint')!
     const reviewText = approvalReviewText(approval)
-    const commandPreview = approval.toolName === 'terminal.run' ? boundedLines(reviewText, COMPACT_COMMAND_LINES) : null
-    const inputPreview = !commandPreview && !approval.previewDiff ? boundedLines(reviewText, COMPACT_INPUT_LINES) : null
+    const fixedRows = 1 + (approval.context ? 1 : 0) + (width !== undefined && width < 80 ? 3 : 1)
+      + 1 + 1 + (approval.state === 'parked' || approval.state === 'stale' ? 1 : 0)
+      + (approval.repeatCount && approval.repeatCount > 1 ? 1 : 0)
+    const previewBudget = height === undefined ? Number.POSITIVE_INFINITY : Math.max(1, availableRows - fixedRows)
+    const preview = (text: string, limit: number) => boundedLines(width === undefined ? text
+      : wrapAnsi(text, Math.max(1, width - 4), { hard: true, trim: false }), Math.min(limit, previewBudget))
+    const commandPreview = approval.toolName === 'terminal.run' ? preview(reviewText, COMPACT_COMMAND_LINES) : null
+    const inputPreview = !commandPreview && !approval.previewDiff
+      ? preview(approval.toolName === 'process.start' ? processStartPreview(approval.input, locale)
+        : approval.toolName === 'browser.evaluate' ? browserEvaluationPreview(approval.input, locale) : reviewText, COMPACT_INPUT_LINES) : null
     const diffLineCount = approval.previewDiff ? approval.previewDiff.split('\n').length : 0
     const compactDiff = approval.previewDiff ? (
-      <UnifiedDiffView diff={approval.previewDiff} maxLines={COMPACT_DIFF_LINES} />
+      <Box flexDirection="column" height={Number.isFinite(previewBudget) ? previewBudget : undefined} overflowY="hidden"><UnifiedDiffView diff={approval.previewDiff} maxLines={Math.min(COMPACT_DIFF_LINES, previewBudget)} /></Box>
     ) : approval.toolName === 'fs.edit' && oldText !== undefined && newText !== undefined ? (
-      <DiffView path={path} previousContent={oldText} nextContent={newText} maxLines={COMPACT_DIFF_LINES} />
+      <Box flexDirection="column" height={Number.isFinite(previewBudget) ? previewBudget : undefined} overflowY="hidden"><DiffView path={path} previousContent={oldText} nextContent={newText} maxLines={Math.min(COMPACT_DIFF_LINES, previewBudget)} /></Box>
     ) : null
-    const hiddenLines = commandPreview?.hidden ?? inputPreview?.hidden ?? Math.max(0, diffLineCount - COMPACT_DIFF_LINES)
+    const hiddenLines = commandPreview?.hidden ?? inputPreview?.hidden ?? Math.max(0, diffLineCount - Math.min(COMPACT_DIFF_LINES, previewBudget))
 
     return (
       <Box
@@ -391,48 +444,48 @@ export function ApprovalModal({
         width="100%"
         minWidth={0}
       >
-        <Text color={colors.warning} bold>
-          Approval required {symbols.separator} {approval.toolName}
+        <Text color={colors.warning} bold wrap="truncate-end">
+          {ko ? '승인 필요' : 'Approval required'} {symbols.separator} {approval.toolName === 'process.start' && ko ? '프로세스 실행' : approval.toolName}
           {approval.state === 'stale' ? ` ${symbols.separator} stale` : ''}
         </Text>
         {approval.context ? (
-          <Text color={colors.dimText} wrap="wrap">
-            why: {approval.context.replace(/\s+/g, ' ')}
+          <Text color={colors.dimText} wrap={width === undefined ? 'wrap' : 'truncate-end'}>
+            {ko ? '이유' : 'why'}: {approval.context.replace(/\s+/g, ' ')}
           </Text>
         ) : null}
         {compactDiff ?? (
           <Box flexDirection="column">
             {(commandPreview ?? inputPreview)!.lines.map((line, index) => (
-              <Text key={index} color={approval.toolName === 'terminal.run' ? colors.info : colors.text} wrap="wrap">
+              <Text key={index} color={approval.toolName === 'terminal.run' ? colors.info : colors.text} wrap={width === undefined ? 'wrap' : 'truncate-end'}>
                 {line}
               </Text>
             ))}
           </Box>
         )}
         {hiddenLines > 0 ? (
-          <Text color={colors.warning}>
-            +{hiddenLines} more lines {symbols.separator} press v to print the full {approval.toolName === 'terminal.run' ? 'command' : approval.previewDiff ? 'diff' : 'input'} above
+          <Text color={colors.warning} wrap="truncate-end">
+            {ko ? `추가 ${hiddenLines}줄 · v 전체 요청 검토` : `+${hiddenLines} more lines ${symbols.separator} press v to review the full ${approval.toolName === 'terminal.run' ? 'command' : approval.previewDiff ? 'diff' : 'input'}`}
           </Text>
         ) : null}
         {approval.state === 'parked' ? (
-          <Text color={colors.dimText}>Still waiting for your decision · choose an option to continue</Text>
+          <Text color={colors.dimText} wrap="truncate-end">Still waiting for your decision · choose an option to continue</Text>
         ) : approval.state === 'stale' ? (
-          <Text color={colors.dimText}>
+          <Text color={colors.dimText} wrap="truncate-end">
             {approval.resumeAvailable
               ? 'Saved checkpoint available for resume'
               : 'Approval starts a fresh recovery run'}
           </Text>
         ) : null}
         {approval.repeatCount && approval.repeatCount > 1 ? (
-          <Text color={colors.warning}>
+          <Text color={colors.warning} wrap="truncate-end">
             Repeated {formatOrdinal(approval.repeatCount)} time {symbols.separator} [r] approves this run
           </Text>
         ) : null}
-        {actionRow.element}
+        <Box height={width === undefined ? undefined : width < 80 ? 3 : 1} overflowY="hidden">{actionRow.element}</Box>
         {commentMode || unknownKeyHint ? (
-          actionHintRow.element
+          <Box height={width === undefined ? undefined : 1} overflowY="hidden">{actionHintRow.element}</Box>
         ) : (
-          <Text color={colors.dimText}>v full {approval.toolName === 'terminal.run' ? 'command' : 'change'} {symbols.separator} n deny, keep going {symbols.separator} Esc stop the run</Text>
+          <Text color={colors.dimText} wrap="truncate-end">{ko ? `v 전체 요청 검토 ${symbols.separator} n 거절하고 계속 ${symbols.separator} Esc 작업 중지` : `v full ${approval.toolName === 'terminal.run' ? 'command' : 'change'} ${symbols.separator} n deny, keep going ${symbols.separator} Esc stop the run`}</Text>
         )}
       </Box>
     )

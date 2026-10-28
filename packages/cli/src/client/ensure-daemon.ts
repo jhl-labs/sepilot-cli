@@ -1,3 +1,5 @@
+import { resolveDaemonReadyTimeoutMs } from './daemon-readiness.js'
+export { resolveDaemonReadyTimeoutMs } from './daemon-readiness.js'
 import {
   resolveDaemonInvocation,
   launchDaemon,
@@ -20,9 +22,6 @@ import {
 } from './daemon-forward-env.js'
 
 const HEALTH_PROBE_TIMEOUT_MS = 2_000
-const DEFAULT_DAEMON_READY_TIMEOUT_MS = 60_000
-const MIN_DAEMON_READY_TIMEOUT_MS = 5_000
-const MAX_DAEMON_READY_TIMEOUT_MS = 300_000
 
 interface EnsureDaemonOptions {
   url?: string
@@ -39,6 +38,32 @@ export interface EnsureDaemonResult {
 }
 
 const existingDaemon: EnsureDaemonResult = { started: false }
+
+async function probeDaemon(client: DaemonClient, signal?: AbortSignal): Promise<void> {
+  const control = { signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS) }
+  try {
+    try {
+      await raceAbort(client.liveness(control), signal)
+    } catch (error) {
+      if ((error as { status?: number })?.status !== 404) throw error
+      await raceAbort(client.health(control), signal)
+    }
+  } catch (error) {
+    if (control.signal.aborted && !signal?.aborted) {
+      throw Object.assign(new Error('Daemon liveness deadline exceeded', { cause: error }), { name: 'TimeoutError' })
+    }
+    throw error
+  }
+}
+
+function throwIfDaemonRespondedOrTimedOut(error: unknown): void {
+  if (isAbortError(error)) throw error
+  if (typeof (error as { status?: unknown } | null)?.status === 'number') throw error
+  const name = (error as { name?: string } | null)?.name
+  if (name === 'TimeoutError' || name === 'ApiTimeoutError') {
+    throw Object.assign(new Error('Daemon liveness check timed out. Check daemon load and connection settings; no replacement process was started.', { cause: error }), { code: 'DAEMON_PROBE_TIMEOUT' })
+  }
+}
 
 function createAbortError(): Error {
   const error = new Error('Daemon startup aborted')
@@ -69,18 +94,6 @@ async function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined
 
 export { buildDaemonChildEnv } from './daemon-forward-env.js'
 
-export function resolveDaemonReadyTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.SEPILOT_DAEMON_READY_MS?.trim()
-  if (!raw) return DEFAULT_DAEMON_READY_TIMEOUT_MS
-  const parsed = Number(raw)
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
-    return DEFAULT_DAEMON_READY_TIMEOUT_MS
-  }
-  return Math.max(
-    MIN_DAEMON_READY_TIMEOUT_MS,
-    Math.min(MAX_DAEMON_READY_TIMEOUT_MS, parsed),
-  )
-}
 
 async function waitForLaunchedDaemon(
   proc: ReturnType<typeof launchDaemon>,
@@ -113,13 +126,10 @@ export async function ensureDaemon(
 ): Promise<EnsureDaemonResult> {
   throwIfAborted(options.signal)
   try {
-    await raceAbort(
-      client.health({ signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS) }),
-      options.signal,
-    )
+    await probeDaemon(client, options.signal)
     return existingDaemon
   } catch (error) {
-    if (isAbortError(error)) throw error
+    throwIfDaemonRespondedOrTimedOut(error)
   }
   throwIfAborted(options.signal)
 
@@ -158,13 +168,10 @@ export async function ensureDaemon(
   try {
     throwIfAborted(options.signal)
     try {
-      await raceAbort(
-        client.health({ signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS) }),
-        options.signal,
-      )
+      await probeDaemon(client, options.signal)
       return existingDaemon
     } catch (error) {
-      if (isAbortError(error)) throw error
+      throwIfDaemonRespondedOrTimedOut(error)
     }
 
     const preferEmbedded = options.preferEmbedded === true

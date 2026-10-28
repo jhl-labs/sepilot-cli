@@ -21,7 +21,7 @@ export interface MessageAttachment {
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system' | 'tool'
-  variant?: 'thinking'
+  variant?: 'thinking' | 'progress'
   content: string
   citations?: DaemonMemoryContextItem[]
   attachments?: MessageAttachment[]
@@ -31,6 +31,7 @@ export interface Message {
 }
 
 export interface ToolCallState {
+  repeatCount?: number
   id: string
   name: string
   arguments: string

@@ -1,3 +1,4 @@
+import { modelRoutingPolicySchema } from '../../providers/model-routing-policy.js'
 import { z } from 'zod'
 import {
   channelPipelineConfigSchema,
@@ -133,6 +134,7 @@ export const webhookEndpointSchema = webhookEndpointConfigSchema
 export const configUpdateRequestSchema = z
   .object({
     'agent.mode': z.string().trim().min(1).optional(),
+    'agent.modelRouting': modelRoutingPolicySchema.optional(),
     'agent.defaultModel': z.string().min(1).optional(),
     'agent.auxModel': z.string().min(1).optional(),
     'agent.defaultProvider': z.string().min(1).optional(),

@@ -6,10 +6,12 @@ import type { UsageTracker } from '../memory/usage-tracker.js'
 import {
   capPermission,
   externalCliPermissionCeiling,
+  ExternalCliRunError,
   permissionForAutonomy,
   runExternalCli,
   type ExternalCliBackend,
   type ExternalCliEvent,
+  type ExternalCliFailureKind,
   type ExternalCliPermission,
   type ExternalCliRunOptions,
 } from './executor.js'
@@ -38,6 +40,7 @@ export interface ExternalCliDispatchResult {
   backend: ExternalCliBackend
   permission: ExternalCliPermission
   status: 'completed' | 'failed'
+  failure?: ExternalCliFailureKind
   usage: { inputTokens: number; outputTokens: number }
   durationMs: number
   error?: string
@@ -95,8 +98,10 @@ export class ExternalCliDispatcher {
     let threadId = input.threadId
     let usage = { inputTokens: 0, outputTokens: 0 }
     let status: ExternalCliDispatchResult['status'] = 'completed'
+    let failure: ExternalCliFailureKind | undefined
     let error: string | undefined
     const partial: string[] = []
+    const spent = { inputTokens: 0, outputTokens: 0 }
     try {
       const result = await run(
         { backend: input.backend, message, cwd, permission, model: input.model, threadId: input.threadId, timeoutMs: input.timeoutMs },
@@ -105,6 +110,7 @@ export class ExternalCliDispatcher {
           ...this.deps.runOptions,
           onEvent: (event) => {
             if (event.type === 'text') partial.push(event.text)
+            if (event.type === 'usage') { spent.inputTokens += event.inputTokens; spent.outputTokens += event.outputTokens }
             input.onEvent?.(event)
           },
         },
@@ -115,6 +121,9 @@ export class ExternalCliDispatcher {
     } catch (caught) {
       status = 'failed'
       error = caught instanceof Error ? caught.message : String(caught)
+      failure = caught instanceof ExternalCliRunError ? caught.kind : 'failed'
+      if (caught instanceof ExternalCliRunError && caught.threadId) threadId = caught.threadId
+      usage = spent
       const soFar = partial.join('').trim()
       output = soFar ? `${soFar}\n\n[${input.backend} error] ${error}` : `[${input.backend} error] ${error}`
     }
@@ -139,7 +148,7 @@ export class ExternalCliDispatcher {
         toolName: 'external_cli.run',
       })
     }
-    return { output, sessionId, threadId, backend: input.backend, permission, status, usage, durationMs, error }
+    return { output, sessionId, threadId, backend: input.backend, permission, status, ...(failure ? { failure } : {}), usage, durationMs, error }
   }
 }
 

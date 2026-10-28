@@ -542,6 +542,7 @@ export async function chatStreamRoutes(app: FastifyInstance) {
 
       const selections = selectChatProviderCandidates({
         runtime,
+        routing: body.modelRouting,
         message,
         requestedProvider: reqProvider,
         requestedModel: model,
@@ -551,7 +552,7 @@ export async function chatStreamRoutes(app: FastifyInstance) {
       })
       const selection = selections[0]
       if (!selection) {
-        const failure = buildProviderSelectionFailure(runtime, reqProvider, model)
+        const failure = buildProviderSelectionFailure(runtime, reqProvider, model, body.modelRouting)
         return reply.status(failure.statusCode).send({ error: failure.error })
       }
       const selectedProvider = selection.provider
@@ -943,6 +944,7 @@ const memoryPolicy = resolveTurnMemoryPolicy(body.memoryPolicy, routing.decision
         const delegationToolRegistry = withSelectedBrowserTarget(turnToolAuthority.delegation, activeRemoteBrowser)
         const authorizedToolRegistry = withSelectedBrowserTarget(turnToolAuthority.own, activeRemoteBrowser)
         const agentToolRegistry = withContextualToolExposure(authorizedToolRegistry, {
+          previousMessages,
           surface: resolveRequestSurface(request),
           semanticRouting: true,
           activeRemoteBrowser,
@@ -1007,6 +1009,7 @@ const memoryPolicy = resolveTurnMemoryPolicy(body.memoryPolicy, routing.decision
             toolCall,
             requestId,
             runId: messageId,
+            recheckPolicy: options?.recheckPolicy,
             forcePrompt: options?.forcePrompt,
             signal: options?.signal,
             onParked: (approval) => {

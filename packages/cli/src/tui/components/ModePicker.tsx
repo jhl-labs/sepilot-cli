@@ -4,7 +4,7 @@ import { Text, useInput } from 'ink'
 import { colors, symbols } from '../theme.js'
 import { isReturnKey } from '../utils/key.js'
 import { calculateVisibleWindow } from '../utils/layout.js'
-import { PickerFrame, PickerRow } from './PickerPrimitives.js'
+import { PickerFrame, PickerRow, pickerMarkerWidth } from './PickerPrimitives.js'
 
 interface ModePickerProps {
   query: string
@@ -112,11 +112,16 @@ export function findModeMatch(
   }
 }
 
-function renderModeRow(item: ModePickerItem, selected: boolean) {
+function modeRowMarker(item: ModePickerItem): string {
+  return item.shortcut ? `${item.shortcut}` : ''
+}
+
+function renderModeRow(item: ModePickerItem, selected: boolean, markerWidth: number) {
   return (
     <PickerRow
       key={item.agent.id}
-      marker={item.shortcut ? `${item.shortcut}` : item.agent.id}
+      marker={modeRowMarker(item)}
+      markerWidth={markerWidth}
       selected={selected}
       current={item.isCurrent}
     >
@@ -149,6 +154,7 @@ export function ModePicker({
     [clampedIndex, maxVisibleItems, ordered.length],
   )
   const visibleItems = ordered.slice(start, end)
+  const markerWidth = pickerMarkerWidth(visibleItems.map(modeRowMarker))
 
   useEffect(() => {
     if (clampedIndex !== selectedIndex) {
@@ -199,7 +205,7 @@ export function ModePicker({
       onQueryChange={onQueryChange}
       footer={<Text color={colors.dimText}>↑/↓ move Enter select Tab select Esc close</Text>}
     >
-      {!loading && !error && visibleItems.map((item, index) => renderModeRow(item, start + index === clampedIndex))}
+      {!loading && !error && visibleItems.map((item, index) => renderModeRow(item, start + index === clampedIndex, markerWidth))}
     </PickerFrame>
   )
 }

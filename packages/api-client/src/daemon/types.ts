@@ -1,4 +1,6 @@
 import type {
+  DecisionQuestion,
+  DecisionResponse,
   ApprovalDecisionStatus,
   AgentRunContract,
   AgentContextUsage,
@@ -68,6 +70,19 @@ export interface ApiEnvelope<T> {
 }
 
 export type DaemonAgentMode = 'react' | 'enhanced' | 'auto' | (string & {})
+
+export interface DaemonModelRoutingHints {
+  taskType?: 'general' | 'simple' | 'complex' | 'code' | 'creative' | 'analysis'
+  preference?: 'configured' | 'lowest-cost'
+  minContextWindow?: number
+  requireToolUse?: boolean
+  maxInputCostPer1k?: number
+  maxOutputCostPer1k?: number
+}
+export interface DaemonModelRoutingPolicy {
+  defaults?: DaemonModelRoutingHints
+  routes?: Array<{ taskType: NonNullable<DaemonModelRoutingHints['taskType']>; preferredModels: string[]; providerId?: string }>
+}
 
 export interface DaemonHealthComponent {
   status: string
@@ -1680,6 +1695,42 @@ export interface DaemonConfigProvider {
   [key: string]: unknown
 }
 
+export interface DaemonConfigDecisionProvider {
+  id: string
+  type: 'ollama' | 'systemone' | 'ai-gateway' | 'openai'
+  apiKey?: string
+  baseUrl?: string
+  headers?: Record<string, string>
+  models: string[]
+  timeoutMs?: number
+  default?: boolean
+}
+
+export interface DaemonDecisionProviderInfo {
+  id: string
+  label: string
+  kind: string
+  models: string[]
+  default: boolean
+}
+
+export interface DaemonDecideRequest {
+  provider?: string
+  model?: string
+  context: string | Record<string, unknown>
+  questions: DecisionQuestion[]
+  timeoutMs?: number
+}
+
+export type DaemonDecideResponse = DecisionResponse
+
+export interface DaemonDecisionTestConnectionResult {
+  ok: boolean
+  latencyMs?: number
+  model?: string
+  reason?: string
+}
+
 export interface DaemonChannelConfig {
   type:
     | 'github-issue'
@@ -2740,6 +2791,7 @@ export const DAEMON_CONFIG_UPDATE_KEYS = [
   'agent.thinkingLevel',
   'agent.disabledTools',
   'agent.graphNodeModelOverrides',
+  'agent.modelRouting',
   'daemon.resumeArtifactRetentionDays',
   'device.name',
   'network',
@@ -2754,6 +2806,7 @@ export const DAEMON_CONFIG_UPDATE_KEYS = [
   'channelPipeline.maxGlobalQueuedRuns',
   'channelPipeline.defaultWorkspaceRoot',
   'providers',
+  'decisionProviders',
   'mcp.servers',
   'mcp.client',
   'hooks.outboundWebhooks',
@@ -2927,6 +2980,7 @@ export interface DaemonConfigUpdateInput {
   'agent.thinkingLevel'?: 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max'
   'agent.disabledTools'?: string[]
   'agent.graphNodeModelOverrides'?: DaemonGraphNodeModelOverrides
+  'agent.modelRouting'?: DaemonModelRoutingPolicy
   'daemon.resumeArtifactRetentionDays'?: number
   'device.name'?: string
   network?: DaemonNetworkConfig
@@ -3010,11 +3064,13 @@ export interface DaemonConfig {
     endpoint?: string
   }
   providers: DaemonConfigProvider[]
+  decisionProviders?: DaemonConfigDecisionProvider[]
   agent: {
     autonomy: 'readonly' | 'accept-edits' | 'workspace-write' | 'supervised' | 'autonomous'
     thinkingLevel: 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max'
     defaultProvider?: string
     defaultModel?: string
+    modelRouting?: DaemonModelRoutingPolicy
     mode: DaemonAgentMode
     intentRouter?: {
       enabled: boolean

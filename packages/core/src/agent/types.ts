@@ -259,6 +259,17 @@ export interface ChatRequest {
   thinkingLevel?: ThinkingLevel
   stopSequences?: string[]
   timeoutMs?: number
+  promptCacheKey?: string
+}
+
+export interface PromptCacheConfig {
+  keyMode?: 'session' | 'prefix'
+  keyNamespace?: string
+  retention?: 'in_memory' | '24h'
+  options?: { mode: 'implicit' | 'explicit'; ttl?: '30m' }
+  cachePrompt?: boolean
+  breakpoint?: 'cache-control' | 'openai'
+  ttl?: '5m' | '1h'
 }
 
 export interface TokenUsage {
@@ -267,6 +278,8 @@ export interface TokenUsage {
   thinkingTokens?: number
   cacheReadTokens?: number
   cacheCreationTokens?: number
+  inputTokensIncludeCache?: boolean
+  firstTokenMs?: number
   estimatedCost?: number
   generationMs?: number
 }
@@ -349,6 +362,7 @@ export interface ModelInfo {
     deepCoderAnalysis?: boolean
   }
   compatibility?: ModelCompatibilityProfile
+  promptCache?: PromptCacheConfig
   inputCostPer1k?: number
   outputCostPer1k?: number
 }

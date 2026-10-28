@@ -1,3 +1,5 @@
+import type { SubagentDispatchInput, SubagentBackgroundDispatchResult } from '@sepilotd/api-client'
+import { buildSubagentRequest, parseSubagentArgs } from '../../utils/subagent-request.js'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type {
@@ -260,13 +262,8 @@ export interface DaemonAdminSlashClient {
   observabilityCrashes(limit?: number): Promise<unknown[]>
   observabilityPrivacy(): Promise<unknown>
   pruneObservability(): Promise<{ deletedEvents: number; deletedFeedback: number }>
-  dispatchSubagent(input: {
-    prompt: string
-    system?: string
-    model?: string
-    tools?: string[]
-    maxIterations?: number
-  }): Promise<{
+  dispatchSubagentBackground?(input: SubagentDispatchInput): Promise<SubagentBackgroundDispatchResult>
+  dispatchSubagent(input: SubagentDispatchInput): Promise<{
     sessionId: string
     status: string
     output: string
@@ -833,7 +830,7 @@ function usage(command: string): string {
     case '/marketplaces':
       return 'Usage: /marketplaces [list|add <name> <url>|remove <name>]'
     case '/subagent':
-      return 'Usage: /subagent dispatch <prompt> [--system <text>] [--model <model>] [--tools a,b] [--max-iterations n]'
+      return 'Usage: /subagent categories | dispatch <prompt> [--agent id] [--category id] [--provider id] [--model id] [--system text|--system-file path] [--tools a,b] [--max-iterations n] [--isolation worktree] [--worktree-base head|working-tree] [--context-mode packet|fork] [--parent-session id] [--request-key key] [--background]'
     default:
       return `Usage: ${command}`
   }
@@ -843,6 +840,7 @@ export async function runDaemonAdminSlashCommand(
   client: DaemonAdminSlashClient,
   command: string,
   args: string[],
+  context?: { parentSession?: string; cwd?: string; backgroundDefault?: boolean; autonomy?: SubagentDispatchInput['autonomy'] },
 ): Promise<string> {
   const spec = DAEMON_ADMIN_SLASH_COMMANDS.find((entry) => entry.name === command)
   if (spec) {
@@ -933,7 +931,7 @@ export async function runDaemonAdminSlashCommand(
     case '/marketplaces':
       return runMarketplacesCommand(client, args)
     case '/subagent':
-      return runSubagentCommand(client, args)
+      return runSubagentCommand(client, args, context)
     default:
       throw new Error(`Unknown daemon admin command: ${command}`)
   }
@@ -2982,23 +2980,18 @@ async function runMarketplacesCommand(
   return usage('/marketplaces')
 }
 
-async function runSubagentCommand(client: DaemonAdminSlashClient, args: string[]): Promise<string> {
+async function runSubagentCommand(client: DaemonAdminSlashClient, args: string[], context?: { parentSession?: string; cwd?: string; backgroundDefault?: boolean; autonomy?: SubagentDispatchInput['autonomy'] }): Promise<string> {
   const action = args[0]?.toLowerCase()
+  if (action === 'categories') return JSON.stringify(await client.request('/subagents/categories'), null, 2)
   if (action !== 'dispatch') return usage('/subagent')
-  const parsed = parseArgs(args.slice(1))
-  const prompt = requireArg(parsed.positional.join(' '), usage('/subagent'))
-  const result = await client.dispatchSubagent({
-    prompt,
-    system: flag(parsed, 'system'),
-    model: flag(parsed, 'model'),
-    tools: flag(parsed, 'tools')
-      ?.split(',')
-      .map((tool) => tool.trim())
-      .filter(Boolean),
-    maxIterations: parseInteger(flag(parsed, 'max-iterations'), 'max-iterations'),
-  })
-  return [
-    `Subagent ${result.sessionId}: status=${result.status} iterations=${result.iterations}${result.truncated ? ' truncated=true' : ''}`,
-    result.output,
-  ].join('\n')
+  const parsed = parseSubagentArgs(args.slice(1))
+  const request = await buildSubagentRequest(parsed.prompt, { parentSession: context?.parentSession, cwd: context?.cwd, ...parsed.options })
+  if (context?.autonomy) request.autonomy = context.autonomy
+  if (parsed.background || context?.backgroundDefault) {
+    if (!client.dispatchSubagentBackground) throw new Error('Background subagents are unavailable on this connection')
+    const result = await client.dispatchSubagentBackground(request)
+    return `Background subagent ${result.jobId}: ${result.status}\nInspect: /jobs status ${result.jobId}\nResults: sepilot jobs resume ${result.jobId}\nCancel: /jobs cancel ${result.jobId}`
+  }
+  const result = await client.dispatchSubagent(request)
+  return [`Subagent ${result.sessionId}: status=${result.status} iterations=${result.iterations}${result.truncated ? ' truncated=true' : ''}`, result.output].join('\n')
 }

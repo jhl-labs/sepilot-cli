@@ -15,6 +15,7 @@ import { ProviderNetworkConfigurationError } from '../../providers/http-timeout.
 import {
   applyConfigUpdate,
   isConfigUpdateKey,
+  restoreDecisionProviderSecrets,
   restoreMcpServerSecrets,
   restoreProviderSecrets,
   type ConfigUpdateKey,
@@ -154,6 +155,16 @@ export async function configRoutes(app: FastifyInstance) {
         ]),
       ),
     }))
+    const decisionProviders = runtime.config.decisionProviders.map((p) => ({
+      ...p,
+      apiKey: redactProviderApiKey(p.apiKey),
+      headers: Object.fromEntries(
+        Object.entries(p.headers ?? {}).map(([key, value]) => [
+          key,
+          redactProviderApiKey(value) ?? '***redacted***',
+        ]),
+      ),
+    }))
     const channels = (runtime.config.channels ?? []).map((channel) => ({
       ...channel,
       config: redactChannelConfigValue(channel.config),
@@ -201,6 +212,7 @@ export async function configRoutes(app: FastifyInstance) {
       data: {
         ...runtime.config,
         providers,
+        decisionProviders,
         channels,
         hooks,
         eventRouting: redactEventRoutingConfig(runtime.config.eventRouting ?? DEFAULT_EVENT_ROUTING_CONFIG),
@@ -285,6 +297,11 @@ export async function configRoutes(app: FastifyInstance) {
                 runtime.config.providers,
                 value as SepilotdConfig['providers'],
               )
+              : key === 'decisionProviders' && Array.isArray(value)
+                ? restoreDecisionProviderSecrets(
+                  runtime.config.decisionProviders,
+                  value as SepilotdConfig['decisionProviders'],
+                )
               : key === 'mcp.servers' && Array.isArray(value)
                 ? restoreMcpServerSecrets(
                   runtime.config.mcp.servers,

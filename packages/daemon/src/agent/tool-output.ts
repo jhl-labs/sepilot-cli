@@ -210,7 +210,11 @@ function summarizeHeadFirst(
   let used = header.length + 1
   for (const line of lines) {
     const cost = line.length + 1
-    if (used + cost > maxContextChars - 64) break
+    if (used + cost > maxContextChars - 64) {
+      const remaining = Math.max(0, maxContextChars - used - 64)
+      if (remaining > 0) kept.push(`${line.slice(0, remaining)}...[line truncated]...`)
+      break
+    }
     kept.push(line)
     used += cost
   }

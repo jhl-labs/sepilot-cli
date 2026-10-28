@@ -36,6 +36,7 @@ import {
 } from '../task-contract.js'
 import {
   isIncompleteOutput,
+  incompleteOutputReason,
   stopReasonApprovalDenied,
   stopReasonBudget,
   stopReasonCompleted,
@@ -1076,6 +1077,10 @@ export function resolveGraphStopReason(
     if (state.budgetExhausted) {
       return stopReasonBudget('iteration', state.maxIterations, state.iteration, contract)
     }
+  }
+  if (incomplete) {
+    const reason = incompleteOutputReason(state.output)
+    return stopReasonCompletionGate({ source: 'self_reported', unmet: reason ? [reason] : undefined })
   }
   return stopReasonCompleted()
 }

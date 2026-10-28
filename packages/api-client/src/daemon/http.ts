@@ -3,6 +3,7 @@ import type { ApprovalDecisionStatus, ApprovalScope } from '@sepilotd/core'
 import { parseJsonSseStream } from './stream.js'
 import type {
   ApiEnvelope,
+  DaemonModelRoutingHints,
   DaemonAgentMode,
   DaemonAgentDescriptor,
   DaemonAgentGraphSnapshot,
@@ -92,6 +93,10 @@ import type {
   DaemonModelSwitchResult,
   DaemonPersona,
   DaemonRoleBot,
+  DaemonDecideRequest,
+  DaemonDecideResponse,
+  DaemonDecisionProviderInfo,
+  DaemonDecisionTestConnectionResult,
   DaemonPolicySnapshot,
   DaemonProviderInfo,
   DaemonProviderMutationResult,
@@ -264,6 +269,7 @@ export type ChatTextDeltaMode = 'buffered' | 'live'
 export interface ChatOptions {
   deadlineAt?: number
   completionRequest?: string
+  modelRouting?: DaemonModelRoutingHints
   messageId?: string
   model?: string
   provider?: string
@@ -434,6 +440,7 @@ export interface SubagentDispatchInput {
   worktreeBase?: 'head' | 'working-tree'
   contextMode?: 'packet' | 'fork'
   cwd?: string
+  requestKey?: string
   prompt: string
   system?: string
   category?: string
@@ -443,6 +450,8 @@ export interface SubagentDispatchInput {
   tools?: string[]
   model?: string
   parentSessionId?: string
+  provider?: string
+  autonomy?: 'readonly' | 'accept-edits' | 'workspace-write' | 'supervised' | 'autonomous'
 }
 
 export interface SessionInboxItem {
@@ -973,6 +982,10 @@ export class DaemonClient {
 
   async health(options?: DaemonRequestControlOptions): Promise<DaemonHealth> {
     return this.get('/health', { signal: options?.signal })
+  }
+
+  async liveness(options?: DaemonRequestControlOptions): Promise<Pick<DaemonHealth, 'status' | 'version' | 'uptime' | 'apiVersion'> & { timestamp: string }> {
+    return this.get('/health/live', { signal: options?.signal })
   }
 
   async doctor(options?: DaemonRequestControlOptions): Promise<DaemonDoctorReport> {
@@ -2930,6 +2943,18 @@ export class DaemonClient {
 
   async bots(): Promise<DaemonRoleBot[]> {
     return this.get('/bots')
+  }
+
+  async decisionProviders(): Promise<DaemonDecisionProviderInfo[]> {
+    return this.getCapability('/decisions/providers')
+  }
+
+  async decide(body: DaemonDecideRequest, init?: Pick<ApiRequestInit, 'signal'>): Promise<DaemonDecideResponse> {
+    return this.postCapability('/decisions', body, init)
+  }
+
+  async testDecisionProvider(body: { provider?: string; model?: string } = {}): Promise<DaemonDecisionTestConnectionResult> {
+    return this.postCapability('/decisions/test-connection', body)
   }
 
   async devices(): Promise<DaemonDevice[]> {

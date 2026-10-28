@@ -64,12 +64,17 @@ export function PickerFrame({
 
 interface PickerRowProps {
   marker: string
+  markerWidth?: number
   selected: boolean
   current?: boolean
   children: ReactNode
 }
 
-export function PickerRow({ marker, selected, current = false, children }: PickerRowProps) {
+export function pickerMarkerWidth(markers: readonly string[]): number {
+  return markers.reduce((width, marker) => Math.max(width, marker.length), 0)
+}
+
+export function PickerRow({ marker, markerWidth = 0, selected, current = false, children }: PickerRowProps) {
   return (
     <Box gap={1} width="100%" minWidth={0} height={1} overflow="hidden">
       <Text
@@ -78,7 +83,7 @@ export function PickerRow({ marker, selected, current = false, children }: Picke
         bold={selected}
       >
         {' '}
-        {marker}{' '}
+        {marker.padEnd(markerWidth)}{' '}
       </Text>
       <Box flexGrow={1} flexShrink={1} minWidth={0} height={1} overflow="hidden">
         <Text color={selected ? colors.text : colors.muted} wrap="truncate-end">

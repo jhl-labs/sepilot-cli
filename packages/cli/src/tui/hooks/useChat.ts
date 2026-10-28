@@ -240,7 +240,9 @@ export type ChatHttpClient = Pick<
   | 'uploadFiles'
 > & Partial<Pick<DaemonClient, 'listSessionInbox' | 'bots'>>
 
-export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpClient) {
+export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpClient, options: {
+  completionSummary?: 'transcript' | 'footer'
+} = {}) {
   const [state, dispatch] = useReducer(chatReducer, initialState)
   const botNamesRef = useRef<Map<string, string>>(new Map())
   useEffect(() => {
@@ -291,13 +293,14 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
     const work = turnWorkRef.current
     if (!work.completed || work.startedAt === 0) return
     work.completed = false
+    if (options.completionSummary === 'footer') return
     const summary = formatTurnSummary({
       elapsedMs: Date.now() - work.startedAt,
       tools: work,
       locale: detectCliLocale(),
     })
     if (summary) dispatch({ type: 'SYSTEM_MESSAGE', content: summary })
-  }, [])
+  }, [options.completionSummary])
   const alreadyHandledNoticeRef = useRef(new Set<string>())
   const approvalRespondInFlightRef = useRef(new Set<string>())
   const currentRunPhaseRef = useRef<string | null>(null)
@@ -658,7 +661,11 @@ export function useChat(wsClient: DaemonWsClient | null, httpClient: ChatHttpCli
         payload as { type: string } & Record<string, unknown>,
       )
       if (judgmentLine) {
-        dispatch({ type: 'SYSTEM_MESSAGE', content: judgmentLine })
+        dispatch({
+          type: 'SYSTEM_MESSAGE',
+          content: judgmentLine,
+          ...(payload.type === 'action_progress' ? { variant: 'progress' as const } : {}),
+        })
       }
 
       if (payload.type === 'execution_policy') {

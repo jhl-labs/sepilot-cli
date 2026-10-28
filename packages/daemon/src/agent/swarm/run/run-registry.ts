@@ -1,10 +1,12 @@
 import { randomBytes } from 'node:crypto'
+import { createLogger } from '../../../logger.js'
 import { SwarmRun } from './swarm-run.js'
 import type { SwarmRunStore } from './run-store.js'
 import type { TmuxSessionPool } from '../tmux/pool.js'
 import type { SwarmAgentRuntimeAdapter } from '../launcher/runtime-adapter.js'
 import type { SwarmAgentHandle } from '@sepilotd/core'
 import type { Worktree } from '../launcher/worktree.js'
+const log = createLogger('swarm:journal')
 
 export interface CreateRunOpts {
   goal: string
@@ -33,6 +35,7 @@ async function stopAgent(runtime: SwarmShutdownRuntime, agent: SwarmAgentHandle)
 export class SwarmRunRegistry {
   private runs = new Map<string, SwarmRun>()
   private pendingAppends = new Set<Promise<void>>()
+  private appendTails = new Map<string, Promise<void>>()
 
   constructor(
     private store: SwarmRunStore,
@@ -48,9 +51,16 @@ export class SwarmRunRegistry {
       worktree: { path: opts.worktreePath, createdByDaemon: opts.worktreeCreatedByDaemon },
     })
     run.on('event', (e) => {
-      const p = this.store.append(id, e).catch(() => undefined)
+      const previous = this.appendTails.get(id) ?? Promise.resolve()
+      const p = previous.then(() => this.store.append(id, e)).catch(() => {
+        try { log.error('Swarm event could not be persisted; retained history may be incomplete', { runId: id, eventType: e.type }) } catch {}
+      })
+      this.appendTails.set(id, p)
       this.pendingAppends.add(p)
-      p.finally(() => this.pendingAppends.delete(p))
+      void p.finally(() => {
+        this.pendingAppends.delete(p)
+        if (this.appendTails.get(id) === p) this.appendTails.delete(id)
+      })
     })
     this.runs.set(id, run)
     return run

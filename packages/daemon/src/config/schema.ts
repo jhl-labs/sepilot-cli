@@ -1,3 +1,4 @@
+import { modelRoutingPolicySchema } from '../providers/model-routing-policy.js'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { rejectPrivateLiteralUrl } from '../utils/ssrf-guard.js'
@@ -65,12 +66,27 @@ const providerModelCompatibilitySchema = z.object({
   path: ['notes'],
 })
 
+export const promptCacheSchema = z.object({
+  keyMode: z.enum(['session', 'prefix']).optional(),
+  keyNamespace: z.string().trim().min(1).max(64).optional(),
+  retention: z.enum(['in_memory', '24h']).optional(),
+  options: z.object({ mode: z.enum(['implicit', 'explicit']), ttl: z.literal('30m').optional() }).strict().optional(),
+  cachePrompt: z.boolean().optional(),
+  breakpoint: z.enum(['cache-control', 'openai']).optional(),
+  ttl: z.enum(['5m', '1h']).optional(),
+}).strict().refine(value => !value.ttl || value.breakpoint === 'cache-control', {
+  message: 'ttl requires the cache-control breakpoint dialect.',
+}).refine(value => value.options?.mode !== 'explicit' || value.breakpoint === 'openai', {
+  message: 'Explicit-only caching requires openai breakpoints.',
+})
+
 const providerModelOverrideSchema = z.object({
   id: z.string().trim().min(1),
   contextWindow: z.number().int().positive().optional(),
   maxOutputTokens: z.number().int().positive().optional(),
   capabilities: providerModelCapabilitiesOverrideSchema.optional(),
   compatibility: providerModelCompatibilitySchema.optional(),
+  promptCache: promptCacheSchema.optional(),
 })
 
 const agentCapabilitiesSchema = z
@@ -267,6 +283,7 @@ export const providerSchema = z.object({
   apiKey: z.string().optional(),
   baseUrl: z.string().url().optional(),
   headers: z.record(z.string()).default({}),
+  promptCache: promptCacheSchema.optional(),
   models: z.array(z.string()).default([]),
   defaultContextWindow: z.number().int().positive().optional(),
   defaultMaxOutputTokens: z.number().int().positive().optional(),
@@ -274,6 +291,18 @@ export const providerSchema = z.object({
   structuredToolCalling: z.boolean().optional(),
   capabilities: providerModelCapabilitiesOverrideSchema.optional(),
   modelOverrides: z.array(providerModelOverrideSchema).default([]),
+  default: z.boolean().optional().default(false),
+})
+
+export const DECISION_PROVIDER_TYPES = ['ollama', 'systemone', 'ai-gateway', 'openai'] as const
+export const decisionProviderSchema = z.object({
+  id: z.string().trim().min(1),
+  type: z.enum(DECISION_PROVIDER_TYPES),
+  apiKey: z.string().optional(),
+  baseUrl: z.string().url().optional(),
+  headers: z.record(z.string()).default({}),
+  models: z.array(z.string().trim().min(1)).default([]),
+  timeoutMs: z.number().int().min(1000).max(120000).default(15000),
   default: z.boolean().optional().default(false),
 })
 
@@ -1079,6 +1108,7 @@ export const configSchema = z.object({
     })
     .default({ enabled: true, sweepIntervalHours: 24 }),
   providers: z.array(providerSchema).min(0),
+  decisionProviders: z.array(decisionProviderSchema).default([]),
   agent: z
     .object({
       autonomy: z
@@ -1087,6 +1117,7 @@ export const configSchema = z.object({
       thinkingLevel: z.enum(['auto', 'off', 'low', 'medium', 'high', 'max']).default('medium'),
       defaultProvider: z.string().optional(),
       defaultModel: z.string().optional(),
+      modelRouting: modelRoutingPolicySchema.optional(),
       auxModel: z.string().trim().min(1).optional(),
       mode: z.string().trim().min(1).default('instant'),
       persona: z.string().trim().min(1).optional(),

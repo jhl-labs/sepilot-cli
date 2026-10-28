@@ -29,6 +29,7 @@ export interface AgentLayer {
 
 export function assembleAgentLayer(args: {
   providerRegistry: ProviderRegistryInstance
+  modelRouting?: Parameters<typeof buildModelRouter>[1]
   dataDir?: string
   onToolOutcome?: (outcome: ToolOutcomeObservation) => void
 }): AgentLayer {
@@ -36,7 +37,7 @@ export function assembleAgentLayer(args: {
   const providerCircuitBreaker = buildProviderCircuitBreaker()
   const modelFallbackState = new ModelFallbackState()
   const runLimiter = buildRunLimiter()
-  const modelRouter = buildModelRouter(args.providerRegistry)
+  const modelRouter = buildModelRouter(args.providerRegistry, args.modelRouting)
   const editSnapshotStore = new EditSnapshotStore(
     args.dataDir ? { persistDir: join(args.dataDir, 'sessions') } : {},
   )

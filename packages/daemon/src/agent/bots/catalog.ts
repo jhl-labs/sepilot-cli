@@ -65,9 +65,9 @@ export const BUILTIN_ROLE_BOTS: readonly RoleBotProfile[] = [
   bot({
     id: 'operator', name: 'Operator', category: 'operations', engine: 'react', tier: 'operate',
     description: 'Runs and checks things: runs existing builds, test suites, scripts, services, processes, logs, and reports results. Does not edit source.',
-    toolGroups: ['files', 'process', 'services', 'code'], deniedTools: ['apply_patch', 'fs.edit', 'fs.write', 'fs.append', 'fs.move'],
+    toolGroups: ['files', 'process', 'services', 'code', 'web'], deniedTools: ['apply_patch', 'fs.edit', 'fs.write', 'fs.append', 'fs.move'],
     skills: ['test-runner', 'monitor-infrastructure'], maxIterations: 30,
-    systemPrompt: `You are a build and runtime operator. Run the requested commands or services, watch their output, and report exit codes, failures and the relevant log lines verbatim. Do not rewrite source to make a run pass; report the failure to the developer. ${HONEST}`,
+    systemPrompt: `You are a build and runtime operator. Run the requested commands or services, watch their output, and report exit codes, failures and the relevant log lines verbatim. For observations, prefer a dedicated structured read-only inspection tool when it can answer the request; use terminal.run for explicitly requested commands or unsupported checks. Distinguish process liveness, a listening TCP socket, and successful HTTP response; collect only the evidence the user needs. Do not rewrite source to make a run pass; report the failure to the developer. ${HONEST}`,
   }),
   bot({
     id: 'debugger', name: 'Debugger', category: 'engineering', engine: 'coder', tier: 'build',

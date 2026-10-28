@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { runBoundedCommand } from '../utils/bounded-command.js'
 import { isAbsolute } from 'node:path'
 import { z } from 'zod'
@@ -16,57 +16,115 @@ const SUMMARY_MAX_CHARS = 1_200
 const ARG_MAX_CHARS = 2_048
 export const quoteRemoteArgument = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
 
-const portableId = z.string().trim().min(1).max(120)
+const portableId = z
+  .string()
+  .trim()
+  .min(1)
+  .max(120)
   .regex(/^[a-z0-9](?:[a-z0-9._:-]{0,118}[a-z0-9])?$/i)
-const contractId = z.string().trim().min(1).max(80)
+const contractId = z
+  .string()
+  .trim()
+  .min(1)
+  .max(80)
   .regex(/^[a-z0-9](?:[a-z0-9._:-]{0,78}[a-z0-9])?$/i)
-const safeText = z.string().max(ARG_MAX_CHARS).refine((value) => !/[\u0000-\u001f\u007f]/.test(value))
-const absolutePath = z.string().trim().min(1).max(4_096)
-  .refine((value) => isAbsolute(value) && !/[\u0000-\u001f\u007f]/.test(value), 'must be an absolute path')
+const safeText = z
+  .string()
+  .max(ARG_MAX_CHARS)
+  .refine((value) => !/[\u0000-\u001f\u007f]/.test(value))
+const absolutePath = z
+  .string()
+  .trim()
+  .min(1)
+  .max(4_096)
+  .refine(
+    (value) => isAbsolute(value) && !/[\u0000-\u001f\u007f]/.test(value),
+    'must be an absolute path',
+  )
 
 const targetSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('local') }).strict(),
-  z.object({
-    kind: z.literal('ssh'),
-    host: z.string().trim().min(1).max(253).regex(/^[a-zA-Z0-9:][a-zA-Z0-9._:-]*$/),
-    user: z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/).optional(),
-    port: z.number().int().min(1).max(65_535).optional(),
-  }).strict(),
+  z
+    .object({
+      kind: z.literal('ssh'),
+      host: z
+        .string()
+        .trim()
+        .min(1)
+        .max(253)
+        .regex(/^[a-zA-Z0-9:][a-zA-Z0-9._:-]*$/),
+      user: z
+        .string()
+        .trim()
+        .min(1)
+        .max(128)
+        .regex(/^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/)
+        .optional(),
+      port: z.number().int().min(1).max(65_535).optional(),
+    })
+    .strict(),
 ])
 
-export const scriptMonitorConfigSchema = z.object({
-  version: z.literal(1),
-  monitorId: portableId,
-  contractVersion: contractId,
-  target: targetSchema,
-  scriptPath: absolutePath,
-  args: z.array(safeText).max(32).default([]),
-  cwd: absolutePath.optional(),
-  timeoutMs: z.number().int().min(1_000).max(10 * 60_000).default(30_000),
-  anomalyConsecutiveSamples: z.number().int().min(1).max(100).default(2),
-  recoveryConsecutiveSamples: z.number().int().min(1).max(100).default(2),
-  errorConsecutiveSamples: z.number().int().min(1).max(100).default(2),
-  reportEveryMs: z.number().int().min(5 * 60_000).max(30 * 24 * 60 * 60_000).nullable().default(null),
-  notifyOnChange: z.boolean().default(false),
-}).strict()
+export const scriptMonitorConfigSchema = z
+  .object({
+    version: z.literal(1),
+    monitorId: portableId,
+    contractVersion: contractId,
+    target: targetSchema,
+    scriptPath: absolutePath,
+    args: z.array(safeText).max(32).default([]),
+    cwd: absolutePath.optional(),
+    timeoutMs: z
+      .number()
+      .int()
+      .min(1_000)
+      .max(10 * 60_000)
+      .default(30_000),
+    anomalyConsecutiveSamples: z.number().int().min(1).max(100).default(2),
+    recoveryConsecutiveSamples: z.number().int().min(1).max(100).default(2),
+    errorConsecutiveSamples: z.number().int().min(1).max(100).default(2),
+    reportEveryMs: z
+      .number()
+      .int()
+      .min(5 * 60_000)
+      .max(30 * 24 * 60 * 60_000)
+      .nullable()
+      .default(null),
+    notifyOnChange: z.boolean().default(false),
+  })
+  .strict()
 
 export type ScriptMonitorConfig = z.infer<typeof scriptMonitorConfigSchema>
 
-const observationSchema = z.object({
-  version: z.literal(1),
-  status: z.enum(['healthy', 'anomaly', 'unknown']),
-  severity: z.enum(['warning', 'high', 'critical']).optional(),
-  summary: z.string().trim().min(1).max(SUMMARY_MAX_CHARS),
-  metrics: z.record(z.number().finite()).refine((value) => Object.keys(value).length <= 32).default({}),
-  observedAt: z.string().datetime({ offset: true }).optional(),
-}).strict().superRefine((value, ctx) => {
-  if (value.status === 'anomaly' && !value.severity) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['severity'], message: 'severity is required for anomaly' })
-  }
-  if (value.status !== 'anomaly' && value.severity) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['severity'], message: 'severity is only valid for anomaly' })
-  }
-})
+const observationSchema = z
+  .object({
+    version: z.literal(1),
+    status: z.enum(['healthy', 'anomaly', 'unknown']),
+    severity: z.enum(['warning', 'high', 'critical']).optional(),
+    summary: z.string().trim().min(1).max(SUMMARY_MAX_CHARS),
+    metrics: z
+      .record(z.number().finite())
+      .refine((value) => Object.keys(value).length <= 32)
+      .default({}),
+    observedAt: z.string().datetime({ offset: true }).optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.status === 'anomaly' && !value.severity) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['severity'],
+        message: 'severity is required for anomaly',
+      })
+    }
+    if (value.status !== 'anomaly' && value.severity) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['severity'],
+        message: 'severity is only valid for anomaly',
+      })
+    }
+  })
 
 interface ScriptMonitorRuntimeState {
   lastReportAt?: number
@@ -105,9 +163,19 @@ function hash(value: string): string {
 }
 
 function monitorEnvironment(): NodeJS.ProcessEnv {
-  const allowed = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'USER', 'LOGNAME', 'SHELL', 'SSH_AUTH_SOCK'] as const
+  const allowed = [
+    'PATH',
+    'HOME',
+    'LANG',
+    'LC_ALL',
+    'TMPDIR',
+    'USER',
+    'LOGNAME',
+    'SHELL',
+    'SSH_AUTH_SOCK',
+  ] as const
   return Object.fromEntries(
-    allowed.flatMap((name) => process.env[name] === undefined ? [] : [[name, process.env[name]]]),
+    allowed.flatMap((name) => (process.env[name] === undefined ? [] : [[name, process.env[name]]])),
   )
 }
 
@@ -121,20 +189,33 @@ function runtimeState(metadata: Record<string, unknown> | null): ScriptMonitorRu
   }
 }
 
-export function scriptMonitorLaunch(config: ScriptMonitorConfig): { command: string; args: string[]; cwd: string } {
+export function scriptMonitorLaunch(config: ScriptMonitorConfig): {
+  command: string
+  args: string[]
+  cwd: string
+} {
   if (config.target.kind !== 'ssh') {
     return { command: config.scriptPath, args: config.args, cwd: config.cwd ?? process.cwd() }
   }
   const remote = [config.scriptPath, ...config.args].map(quoteRemoteArgument).join(' ')
-  const command = config.cwd ? `cd ${quoteRemoteArgument(config.cwd)} && exec ${remote}` : `exec ${remote}`
+  const command = config.cwd
+    ? `cd ${quoteRemoteArgument(config.cwd)} && exec ${remote}`
+    : `exec ${remote}`
   const args = [
-    '-o', 'BatchMode=yes',
-    '-o', 'StrictHostKeyChecking=yes',
-    '-o', 'ForwardAgent=no',
-    '-o', 'ClearAllForwardings=yes',
-    '-o', 'ConnectTimeout=10',
-    '-o', 'ServerAliveInterval=15',
-    '-o', 'ServerAliveCountMax=2',
+    '-o',
+    'BatchMode=yes',
+    '-o',
+    'StrictHostKeyChecking=yes',
+    '-o',
+    'ForwardAgent=no',
+    '-o',
+    'ClearAllForwardings=yes',
+    '-o',
+    'ConnectTimeout=10',
+    '-o',
+    'ServerAliveInterval=15',
+    '-o',
+    'ServerAliveCountMax=2',
   ]
   if (config.target.port) args.push('-p', String(config.target.port))
   if (config.target.user) args.push('-l', config.target.user)
@@ -142,10 +223,7 @@ export function scriptMonitorLaunch(config: ScriptMonitorConfig): { command: str
   return { command: 'ssh', args, cwd: process.cwd() }
 }
 
-async function executeProbe(
-  config: ScriptMonitorConfig,
-  signal?: AbortSignal,
-): Promise<string> {
+async function executeProbe(config: ScriptMonitorConfig, signal?: AbortSignal): Promise<string> {
   const launch = scriptMonitorLaunch(config)
   const result = await runBoundedCommand({
     ...launch,
@@ -156,29 +234,76 @@ async function executeProbe(
   })
   if (result.exitCode !== 0) {
     const detail = redactSensitive(result.stderr.trim().slice(0, 500)).redacted
-    throw new Error(`script exited ${result.exitCode ?? result.signal ?? 'unknown'}${detail ? `: ${detail}` : ''}`)
+    throw new Error(
+      `script exited ${result.exitCode ?? result.signal ?? 'unknown'}${detail ? `: ${detail}` : ''}`,
+    )
   }
   return result.stdout
 }
 
 function priorityFor(evaluation: MonitorEvaluationResult): 'normal' | 'high' | 'critical' {
   if (evaluation.stableSeverity === 'critical') return 'critical'
-  if (evaluation.stableSeverity === 'high' || evaluation.transitions.includes('observation_error')) return 'high'
+  if (evaluation.stableSeverity === 'high' || evaluation.transitions.includes('observation_error'))
+    return 'high'
   return 'normal'
 }
 
-function notificationTitle(job: ScheduledJob, evaluation: MonitorEvaluationResult, periodic: boolean): string {
+function notificationTitle(
+  job: ScheduledJob,
+  evaluation: MonitorEvaluationResult,
+  periodic: boolean,
+): string {
   if (periodic) return `Monitor report: ${job.name}`
   if (evaluation.transitions.includes('anomaly_recovered')) return `Monitor recovered: ${job.name}`
-  if (evaluation.transitions.includes('observation_error')) return `Monitor probe failed: ${job.name}`
-  if (evaluation.transitions.includes('severity_changed')) return `Monitor severity changed: ${job.name}`
+  if (evaluation.transitions.includes('observation_error'))
+    return `Monitor probe failed: ${job.name}`
+  if (evaluation.transitions.includes('severity_changed'))
+    return `Monitor severity changed: ${job.name}`
   return `Monitor alert: ${job.name}`
 }
 
 export function createScriptMonitorRunner(deps: ScriptMonitorRunnerDeps) {
-  return async (
+  async function drainPending(
+    scopeKey?: string,
+    monitorId?: string,
+    signal?: AbortSignal,
+  ): Promise<number> {
+    signal?.throwIfAborted()
+    const repo = createMonitorStateRepo()
+    const owner = randomUUID()
+    let delivered = 0
+    let attempted = 0
+    let failure: unknown
+    while (attempted < 32) {
+      signal?.throwIfAborted()
+      const rows = repo.claimDeliveries(owner, deps.now?.() ?? Date.now(), scopeKey, monitorId, 32 - attempted)
+      if (!rows.length) break
+      for (const row of rows) {
+        attempted++
+        try {
+          signal?.throwIfAborted()
+          const notification = JSON.parse(row.payload) as Parameters<ScriptMonitorRunnerDeps['notify']>[0]
+          await deps.notify(notification)
+          repo.finishDelivery(row.id, owner, deps.now?.() ?? Date.now())
+          delivered++
+        } catch (error) {
+          const delay = Math.min(300_000, 5_000 * 2 ** Math.min(6, row.attempts - 1))
+          repo.retryDelivery(row.id, owner, (deps.now?.() ?? Date.now()) + delay)
+          failure ??= error
+        }
+      }
+    }
+    if (failure) throw failure
+    return delivered
+  }
+  const run = async (
     job: ScheduledJob,
-    context?: { runId?: string; signal?: AbortSignal; suppressDelivery?: boolean; forceReport?: boolean },
+    context?: {
+      runId?: string
+      signal?: AbortSignal
+      suppressDelivery?: boolean
+      forceReport?: boolean
+    },
   ): Promise<ScriptMonitorRunResult> => {
     const config = scriptMonitorConfigFromMetadata(job.metadata)
     if (!config) throw new Error('script monitor configuration is missing')
@@ -191,7 +316,9 @@ export function createScriptMonitorRunner(deps: ScriptMonitorRunnerDeps) {
     let observedAtForHash: string | null = null
     let evidenceRedacted = false
     try {
-      const parsed = observationSchema.parse(JSON.parse((await executeProbe(config, context?.signal)).trim()))
+      const parsed = observationSchema.parse(
+        JSON.parse((await executeProbe(config, context?.signal)).trim()),
+      )
       status = parsed.status
       severity = parsed.status === 'anomaly' ? parsed.severity! : null
       const redacted = redactSensitive(parsed.summary)
@@ -200,7 +327,8 @@ export function createScriptMonitorRunner(deps: ScriptMonitorRunnerDeps) {
       metrics = parsed.metrics
       observedAt = parsed.observedAt ? Date.parse(parsed.observedAt) : now
       observedAtForHash = parsed.observedAt ?? null
-      if (observedAt > now + 5 * 60_000) throw new Error('observedAt is more than 5 minutes in the future')
+      if (observedAt > now + 5 * 60_000)
+        throw new Error('observedAt is more than 5 minutes in the future')
     } catch (error) {
       if (context?.signal?.aborted) throw error
       status = 'unknown'
@@ -217,15 +345,17 @@ export function createScriptMonitorRunner(deps: ScriptMonitorRunnerDeps) {
     }
     const scopeKey = `scheduler-script-monitor:${job.id}`
     const sampleId = context?.runId ?? `${job.id}:${job.nextRunAt}:${job.attempt}`
-    const contractHash = hash(JSON.stringify({
-      target: config.target,
-      scriptPath: config.scriptPath,
-      args: config.args,
-      cwd: config.cwd ?? null,
-      thresholds,
-    }))
+    const contractHash = hash(
+      JSON.stringify({
+        target: config.target,
+        scriptPath: config.scriptPath,
+        args: config.args,
+        cwd: config.cwd ?? null,
+        thresholds,
+      }),
+    )
     const observation = { status, severity, summary, metrics, observedAt: observedAtForHash }
-    const evaluation = createMonitorStateRepo().evaluate({
+    const observationInput = {
       scopeKey,
       monitorId: config.monitorId,
       contractVersion: config.contractVersion,
@@ -240,36 +370,66 @@ export function createScriptMonitorRunner(deps: ScriptMonitorRunnerDeps) {
       thresholds,
       observedAt,
       now,
-    })
+    }
 
     const state = runtimeState(job.metadata)
-    const observationHash = hash(JSON.stringify({
-      status,
-      severity,
-      metrics: Object.fromEntries(Object.entries(metrics).sort(([a], [b]) => a.localeCompare(b))),
-    }))
-    const changed = config.notifyOnChange
-      && state.lastObservationHash !== undefined
-      && state.lastObservationHash !== observationHash
-      && evaluation.outcome !== 'duplicate'
-    const periodic = config.reportEveryMs !== null
-      && now - (state.lastReportAt ?? 0) >= config.reportEveryMs
-    const notificationKind = evaluation.shouldNotify ? 'transition' : changed ? 'change' : context?.forceReport ? 'manual' : periodic ? 'periodic' : null
-    const notified = Boolean(notificationKind && !context?.suppressDelivery)
-    if (notified) {
-      const deliveryIdentity = evaluation.notificationDedupKey
-        ?? (changed || context?.forceReport ? `${job.id}:report:${sampleId}` : `${job.id}:periodic:${Math.floor(now / config.reportEveryMs!)}`)
+    const observationHash = hash(
+      JSON.stringify({
+        status,
+        severity,
+        metrics: Object.fromEntries(Object.entries(metrics).sort(([a], [b]) => a.localeCompare(b))),
+      }),
+    )
+    const changed =
+      config.notifyOnChange &&
+      state.lastObservationHash !== undefined &&
+      state.lastObservationHash !== observationHash
+    const periodic =
+      config.reportEveryMs !== null && now - (state.lastReportAt ?? 0) >= config.reportEveryMs
+    let notificationKind: ScriptMonitorRunResult['notificationKind'] = null
+    const evaluation = createMonitorStateRepo().evaluateAndEnqueue(observationInput, (result) => {
+      notificationKind = result.shouldNotify
+        ? 'transition'
+        : changed && result.outcome !== 'duplicate'
+          ? 'change'
+          : context?.forceReport
+            ? 'manual'
+            : periodic
+              ? 'periodic'
+              : null
+      if (!notificationKind || context?.suppressDelivery) return null
+      const deliveryIdentity =
+        result.notificationDedupKey ??
+        (changed || context?.forceReport
+          ? `${job.id}:report:${sampleId}`
+          : `${job.id}:periodic:${Math.floor(now / config.reportEveryMs!)}`)
       const id = `script-monitor:${hash(`${job.id}\0${deliveryIdentity}`).slice(0, 32)}`
-      await deps.notify({
+      return {
         id,
-        title: notificationKind === 'manual' ? `Monitor result: ${job.name}` : notificationKind === 'change' ? `Monitor changed: ${job.name}` : notificationTitle(job, evaluation, periodic && !evaluation.shouldNotify),
-        body: summary,
-        priority: priorityFor(evaluation),
-        jobId: job.id,
-        ...(context?.runId ? { runId: context.runId } : {}),
-      })
-    }
-    if (notified || (config.notifyOnChange && !context?.suppressDelivery && evaluation.outcome !== 'duplicate')) {
+        payload: JSON.stringify({
+          id,
+          title: redactSensitive(
+            notificationKind === 'manual'
+              ? `Monitor result: ${job.name}`
+              : notificationKind === 'change'
+                ? `Monitor changed: ${job.name}`
+                : notificationTitle(job, result, periodic && !result.shouldNotify),
+          ).redacted,
+          body: summary,
+          priority: priorityFor(result),
+          jobId: job.id,
+          ...(context?.runId ? { runId: context.runId } : {}),
+        }),
+      }
+    })
+    const delivered = context?.suppressDelivery
+      ? 0
+      : await drainPending(scopeKey, config.monitorId, context?.signal)
+    const notified = delivered > 0
+    if (
+      notified ||
+      (config.notifyOnChange && !context?.suppressDelivery && evaluation.outcome !== 'duplicate')
+    ) {
       deps.updateMetadata(job.id, {
         ...(job.metadata ?? {}),
         scriptMonitorState: {
@@ -279,12 +439,19 @@ export function createScriptMonitorRunner(deps: ScriptMonitorRunnerDeps) {
         },
       })
     }
-    const metricText = Object.entries(metrics).map(([name, value]) => `${name}=${value}`).join(', ')
+    const metricText = Object.entries(metrics)
+      .map(([name, value]) => `${name}=${value}`)
+      .join(', ')
     return {
-      output: `${status}${severity ? `/${severity}` : ''}: ${summary}${metricText ? ` (${metricText})` : ''}`.slice(0, 2_000),
+      output:
+        `${status}${severity ? `/${severity}` : ''}: ${summary}${metricText ? ` (${metricText})` : ''}`.slice(
+          0,
+          2_000,
+        ),
       evaluation,
       notified,
       notificationKind,
     }
   }
+  return Object.assign(run, { drainPending })
 }

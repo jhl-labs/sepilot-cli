@@ -6,6 +6,7 @@ import {
 } from '../agent/task-contract.js'
 import { resolveClosedExactToolNames } from '../agent/tool-call-budget.js'
 import { isVisibleUrlOpenRequest } from '../agent/desktop-control-intent.js'
+import type { Message } from '@sepilotd/core'
 
 type DeviceRole = 'desktop' | 'server' | 'edge'
 
@@ -208,6 +209,7 @@ export interface ContextualToolExposureOptions {
   routingConfidence?: 'high' | 'medium' | 'low'
   routingFallback?: boolean
   activeRemoteBrowser?: boolean
+  previousMessages?: readonly Message[]
   activeWritingDocument?: boolean
   swarmSession?: boolean
   declaredSkillToolNames?: ReadonlySet<string>
@@ -283,6 +285,16 @@ function contextualToolExposureNames(
   if (options.activeRemoteBrowser) {
     allowed.add('browser.remote_snapshot')
     allowed.add('browser.remote_action')
+  }
+  const seenResults = new Set<string>()
+  for (const message of [...(options.previousMessages ?? [])].reverse()) {
+    if (message.role !== 'tool' || !message.name || seenResults.has(message.name)) continue
+    seenResults.add(message.name)
+    if (typeof message.metadata?.userActionRequiredCode !== 'string' || !message.metadata.userActionRequiredCode.trim()) continue
+    if (!source.get(message.name) || source.securityDescriptor(message.name).effect !== 'observe') continue
+    const group = toolExposureGroupForTool(message.name)
+    if (botScoped && (!group || !options.botToolGroups?.includes(group))) continue
+    allowed.add(message.name)
   }
   for (const name of options.supplementalToolNames ?? []) allowed.add(name)
   if (!options.semanticRouting) for (const name of explicitCanonicalToolNames(

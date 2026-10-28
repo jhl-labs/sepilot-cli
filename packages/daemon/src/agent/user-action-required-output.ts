@@ -21,24 +21,24 @@ export function userActionRequiredOutput(code: unknown, diagnostic: string, inpu
   if (code === 'browser_connection_required') {
     return korean
       ? [
-          '이 대화에 브라우저가 아직 연결되지 않았어요. 페이지를 열거나 검색하려면 먼저 Chrome 탭을 연결해 주세요.',
-          '1. 대화 상단의 **브라우저 공동 탐색**을 펼치고 **Chrome 연결 (확장 없음)**을 누르세요. Chrome 144 이상에서 `chrome://inspect/#remote-debugging`의 원격 디버깅이 켜져 있어야 하며, Chrome이 허용을 물으면 **허용**을 누르세요.',
-          '2. 공유할 탭을 목록에서 고른 뒤 **에이전트 제어 허용**을 눌러 주세요.',
-          '다른 방법: Edge나 Chrome 143 이하는 **다른 방법: 브라우저 확장 사용**에서 Browser Companion 확장과 연결 토큰으로 탭을 연결할 수 있어요.',
+          '이 대화에 브라우저 탭이 아직 연결되지 않았어요. 공유한 탭에서 작업하려면 대화 연결과 제어 허용이 필요합니다.',
+          '1. **설정 → Connections → 브라우저 공동 탐색**을 여세요. 이미 확장에서 “이 탭 연결”을 눌렀다면 탭 공유만 완료된 상태입니다. 공유된 탭 목록에서 **이 대화에 연결**을 누른 뒤 **에이전트 제어 허용**을 눌러 주세요.',
+          '2. 아직 공유한 탭이 없다면 **Chrome 연결 (확장 없음)**을 눌러 탭을 고르세요. Chrome 144 이상에서 `chrome://inspect/#remote-debugging`의 원격 디버깅을 켜고, Chrome이 허용을 물으면 **허용**을 누르세요. 탭 선택 후 **에이전트 제어 허용**도 필요합니다.',
+          '다른 방법: Edge나 Chrome 143 이하는 **다른 방법: 브라우저 확장 사용**에서 확장과 연결 토큰으로 탭을 공유한 뒤, 같은 패널에서 **이 대화에 연결 → 에이전트 제어 허용**을 완료하세요.',
           '연결이 끝나면 이 대화에 “이어서 진행해 줘”라고 말씀해 주세요. 연결된 탭을 확인하고 이어서 진행할게요.',
         ].join('\n\n')
       : [
-          'No browser is connected to this chat yet. Connect a Chrome tab before I can open a page or search.',
-          '1. Expand **브라우저 공동 탐색** at the top of the chat and click **Chrome 연결 (확장 없음)**. Chrome 144+ must have remote debugging enabled at `chrome://inspect/#remote-debugging`; click **Allow** when Chrome asks.',
-          '2. Pick the tab to share from the list, then click **에이전트 제어 허용**.',
-          '다른 방법 (alternative): on Edge or Chrome 143 and older, open **다른 방법: 브라우저 확장 사용** and connect the tab through the Browser Companion extension with a connection token.',
+          'No browser tab is attached to this chat yet. Working in a shared tab requires attaching it to this chat and enabling agent control.',
+          '1. Open **Settings → Connections → 브라우저 공동 탐색**. If you already clicked “이 탭 연결” in the extension, tab sharing is complete but chat attachment is still required. Click **이 대화에 연결** beside the shared tab, then **에이전트 제어 허용**.',
+          '2. If no tab is shared yet, click **Chrome 연결 (확장 없음)** and pick a tab. Chrome 144+ must have remote debugging enabled at `chrome://inspect/#remote-debugging`; click **Allow** when Chrome asks. Then click **에이전트 제어 허용**.',
+          '다른 방법 (alternative): on Edge or Chrome 143 and older, open **다른 방법: 브라우저 확장 사용** to share a tab with the extension and a connection token, then complete **이 대화에 연결 → 에이전트 제어 허용** in the same panel.',
           'Then tell me to continue in this chat. I will inspect the connected tab before proceeding.',
         ].join('\n\n')
   }
   if (code === 'browser_control_required') {
     return korean
-      ? '지금은 브라우저를 직접 조작 중이라 제가 화면을 확인하거나 조작할 수 없어요.\n\n직접 조작을 마치면 대화 상단의 **브라우저 공동 탐색**에서 **에이전트 제어 허용**을 누르고, 이 대화에 “이어서 진행해 줘”라고 말씀해 주세요. 제어권을 돌려주실 때까지 기다릴게요.'
-      : 'You currently have control of the browser, so I cannot inspect or interact with the page.\n\nWhen you are ready, open **브라우저 공동 탐색**, click **에이전트 제어 허용**, and tell me to continue in this chat. I will wait until you return control.'
+      ? '브라우저는 이 대화에 연결됐지만 아직 직접 조작 모드라 제가 화면을 확인하거나 조작할 수 없어요.\n\n직접 조작을 마치면 **설정 → Connections → 브라우저 공동 탐색**에서 **에이전트 제어 허용**을 누르고, 이 대화에 이어서 진행하라고 말씀해 주세요.'
+      : 'The browser is attached to this chat, but it is still under your control, so I cannot inspect or interact with the page.\n\nWhen you are ready, open **Settings → Connections → 브라우저 공동 탐색**, click **에이전트 제어 허용**, and tell me to continue in this chat.'
   }
   return diagnostic
 }

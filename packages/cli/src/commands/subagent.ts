@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises'
+import { buildSubagentRequest, type SubagentRequestOptions } from '../utils/subagent-request.js'
 import chalk from 'chalk'
 import type {
   SubagentBackgroundDispatchResult,
@@ -41,18 +41,8 @@ function subagentCopy() {
   return SUBAGENT_COPY[detectCliLocale()] ?? SUBAGENT_COPY.en
 }
 
-export interface SubagentDispatchOptions {
-  isolation?: 'worktree'
-  worktreeBase?: 'head' | 'working-tree'
+export interface SubagentDispatchOptions extends SubagentRequestOptions {
   url?: string
-  system?: string
-  systemFile?: string
-  category?: string
-  agent?: string
-  maxIterations?: string
-  tools?: string
-  model?: string
-  parentSession?: string
   background?: boolean
 }
 
@@ -70,24 +60,6 @@ export interface RunSubagentDispatchInput {
   client: SubagentDaemonClientLike
   readSystemFile?: (path: string) => Promise<string>
   emit?: (result: SubagentDispatchResult | SubagentBackgroundDispatchResult) => void
-}
-
-function parseToolList(raw?: string): string[] | undefined {
-  if (!raw) return undefined
-  const tools = raw
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-  return tools.length > 0 ? tools : undefined
-}
-
-function parseMaxIterations(raw?: string): number | undefined {
-  if (!raw) return undefined
-  const n = Number.parseInt(raw, 10)
-  if (!Number.isFinite(n) || n <= 0) {
-    throw new Error(subagentCopy().maxIterationsPositive(JSON.stringify(raw)))
-  }
-  return n
 }
 
 function defaultEmit(result: SubagentDispatchResult): void {
@@ -133,30 +105,8 @@ export async function runSubagentDispatch(
   input: RunSubagentDispatchInput,
 ): Promise<SubagentDispatchResult | SubagentBackgroundDispatchResult> {
   const { prompt, options, client } = input
-  const reader = input.readSystemFile ?? ((path) => readFile(path, 'utf-8'))
   const emit = input.emit ?? defaultDispatchEmit
-
-  let system = options.system
-  if (options.systemFile) {
-    system = await reader(options.systemFile)
-  }
-
-  if (options.worktreeBase && options.isolation !== 'worktree') {
-    throw new Error('--worktree-base requires --isolation worktree')
-  }
-  const request: SubagentDispatchInput = {
-    isolation: options.isolation,
-    ...(options.worktreeBase ? { worktreeBase: options.worktreeBase } : {}),
-    cwd: process.cwd(),
-    prompt,
-    system,
-    category: options.category,
-    agentId: options.agent,
-    maxIterations: parseMaxIterations(options.maxIterations),
-    tools: parseToolList(options.tools),
-    model: options.model,
-    parentSessionId: options.parentSession,
-  }
+  const request = await buildSubagentRequest(prompt, options, input.readSystemFile)
 
   const result = options.background
     ? await dispatchBackground(client, request)

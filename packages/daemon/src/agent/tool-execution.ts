@@ -12,6 +12,7 @@ import type {
   ContentPart,
   IAuditLogger,
   Message,
+  PolicyCheckResult,
   ToolCall,
 } from '@sepilotd/core'
 import type { HookRegistry } from '../hook/registry.js'
@@ -61,6 +62,7 @@ import {
 import {
   TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY,
   TOOL_RESULT_SECURITY_EFFECT_METADATA_KEY,
+  TOOL_RESULT_EXECUTION_CAPABILITIES_METADATA_KEY,
 } from './policy-failure.js'
 
 export { cloneMessage, cloneToolCall }
@@ -76,6 +78,7 @@ import {
 import type { ToolExecutionRecord } from '../server/runtime/tool-executions.js'
 import { logAgentDebugTrace } from '../observability/agent-trace.js'
 import { resolveDefaultManagedProcessTtlMs } from '../tools/process.js'
+import { containsPromptToolCallEnvelope, stripPromptReActThinkingArtifacts } from './prompt-react.js'
 
 const MAX_TOOL_IMAGE_CONTEXT_PARTS = 3
 const MAX_CLIENT_IMAGE_PARTS = 1
@@ -142,7 +145,6 @@ const CHAT_ROLE_TOOL_NAMES = new Set([
 
 const FILE_MUTATION_TOOL_NAMES = new Set(['fs.write', 'fs.append', 'fs.edit', 'apply_patch'])
 const CACHEABLE_ADJACENT_OBSERVATION_TOOLS = new Set([
-  'fs.read',
   'fs.list',
   'fs.glob',
   'fs.search',
@@ -217,14 +219,36 @@ function messageText(message: Message): string {
 
 const APPROVAL_CONTEXT_MAX_CHARS = 240
 
-export function buildApprovalContext(messages: Message[]): string | undefined {
+const PROMPT_TOOL_MARKUP_START =
+  /<(?:[A-Za-z][\w.-]*:)?(?:sepilot_tool_call|tool_call|tool_code|tool|invoke|function)\b|\[TOOL_CALL\]|^\s*\*\*\* Begin Patch\b/imu
+const ACTION_PROGRESS_BLOCK =
+  /<(?:[A-Za-z][\w.-]*:)?sepilot_action_progress\b[^>]*>[\s\S]*?<\/(?:[A-Za-z][\w.-]*:)?sepilot_action_progress>/giu
+
+function assistantProse(message: Message): string {
+  let text = stripPromptReActThinkingArtifacts(messageText(message)).text
+    .replace(ACTION_PROGRESS_BLOCK, ' ')
+  const markup = PROMPT_TOOL_MARKUP_START.exec(text)
+  if (markup) text = text.slice(0, markup.index)
+  text = text.trim()
+  return text && containsPromptToolCallEnvelope(text) ? '' : text
+}
+
+function boundApprovalContext(text: string): string {
+  if (text.length <= APPROVAL_CONTEXT_MAX_CHARS) return text
+  return `…${text.slice(-APPROVAL_CONTEXT_MAX_CHARS)}`
+}
+
+export function buildApprovalContext(
+  messages: Message[],
+  actionRationale?: string,
+): string | undefined {
+  const authored = actionRationale?.replace(/\s+/gu, ' ').trim()
+  if (authored) return boundApprovalContext(authored)
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]!
     if (message.role !== 'assistant') continue
-    const text = messageText(message).trim()
-    if (!text) return undefined
-    if (text.length <= APPROVAL_CONTEXT_MAX_CHARS) return text
-    return `…${text.slice(-APPROVAL_CONTEXT_MAX_CHARS)}`
+    const text = assistantProse(message)
+    return text ? boundApprovalContext(text) : undefined
   }
   return undefined
 }
@@ -1292,6 +1316,7 @@ function reusableAdjacentObservation(
 
 export interface ApprovalCallbackOptions {
   forcePrompt?: boolean
+  recheckPolicy?: () => PolicyCheckResult
   signal?: AbortSignal
 }
 
@@ -1335,6 +1360,7 @@ export interface ToolExecutionOptions extends ToolExecutionCallbacks {
   tools: ToolRegistry
   policy: PolicyEngine
   autonomy: AutonomyLevel
+  getAutonomy?: () => AutonomyLevel
   primaryAgentId?: string
   autoApprove?: boolean
   requireToolApproval?: boolean
@@ -1352,11 +1378,13 @@ export interface ToolExecutionOptions extends ToolExecutionCallbacks {
   pluginEvents?: import('../plugins/event-bus.js').PluginEventBus
   cwd?: string
   workspaceRoot?: string
+  workspaceIsolation?: 'policy' | 'strict'
   writingDocId?: string
   scopeTags?: string[]
   channelContext?: import('../tools/registry.js').ToolExecutionContext['channelContext']
   runContract?: AgentRunContract
   canAttachVisualContent?: boolean
+  actionRationale?: string
   nestedInstructions?: NestedInstructionInjector | null
 }
 
@@ -1370,7 +1398,6 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     model,
     tools,
     policy,
-    autonomy,
     primaryAgentId,
     autoApprove,
     requireToolApproval,
@@ -1388,6 +1415,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     pluginEvents,
     cwd,
     workspaceRoot,
+    workspaceIsolation,
     runContract,
     writingDocId,
     scopeTags,
@@ -1400,7 +1428,9 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     saveToolExecution,
     canAttachVisualContent = true,
     nestedInstructions = getDefaultNestedInstructionInjector(),
+    actionRationale,
   } = options
+  const currentAutonomy = () => options.getAutonomy?.() ?? options.autonomy
   const effectiveAutoApprove = requireToolApproval === true ? false : autoApprove
   const requiresFreshToolApproval = (toolName: string): boolean =>
     requireToolApproval === true && !isPolicyReadOnlyTool(toolName)
@@ -1422,7 +1452,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       registrationSource: tools.registrationSource(toolCall.name),
       security: tools.securityDescriptor(toolCall.name),
     },
-    autonomy,
+    currentAutonomy(),
     primaryAgentId,
     effectiveAutoApprove,
   )
@@ -1435,9 +1465,13 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     contentParts?: ContentPart[],
     metadata?: Record<string, unknown>,
   ) => {
+    const executionCapabilities = tools.securityDescriptor(toolCall.name)?.executionCapabilities
     const trustedMetadata = {
       ...metadata,
       [TOOL_EXECUTION_SIGNATURE_METADATA_KEY]: toolCallSignature(toolCall),
+      ...(executionCapabilities?.length
+        ? { [TOOL_RESULT_EXECUTION_CAPABILITIES_METADATA_KEY]: [...executionCapabilities] }
+        : {}),
     }
     messages.push({
       role: 'tool',
@@ -1519,7 +1553,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
         toolCall,
         sessionId,
         deviceName,
-        autonomy,
+        autonomy: currentAutonomy(),
         autoApprove: effectiveAutoApprove,
       }),
     )
@@ -1534,6 +1568,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       persistExecution?: boolean
       saveRecoveryResult?: boolean
       recoverySource?: 'journal' | 'probe'
+      approvalGranted?: boolean
       startedAt?: string
       onProgress?: (event: AgentEvent) => void
     },
@@ -1570,7 +1605,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
             registrationSource: tools.registrationSource(toolCall.name),
             security: tools.securityDescriptor(toolCall.name),
           },
-          autonomy,
+          currentAutonomy(),
           primaryAgentId,
           effectiveAutoApprove,
         )
@@ -1692,15 +1727,22 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     }
     const durationSince = () => Date.now() - Date.parse(startedAt)
     try {
-      const executePromise = tool.execute(toolCall.arguments, {
+      const latestPolicy = checkToolPolicyNow(toolCall)
+      const policyChanged = !latestPolicy.allowed || (latestPolicy.requiresApproval && !options?.approvalGranted)
+      const executePromise = policyChanged ? Promise.resolve<ToolResult>({
+        status: 'error', durationMs: 0, code: 'LIVE_PRIVILEGE_BLOCKED',
+        output: `Tool ${toolCall.name} was not started: ${latestPolicy.reason ?? 'current privilege requires approval'}`,
+        metadata: { [TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY]: false },
+      }) : tool.execute(toolCall.arguments, {
         executionId,
         sessionId,
         startedAt,
-        autonomy,
+        autonomy: currentAutonomy(),
         provider,
         model,
         cwd,
         workspaceRoot,
+        workspaceIsolation,
         writingDocId,
         signal: toolController.signal,
         editCheckpoint,
@@ -1709,7 +1751,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
         channelContext,
         runContract,
         delegatedAgentPolicy: {
-          autonomy,
+          autonomy: currentAutonomy(),
           requireToolApproval: requireToolApproval === true,
           allowedToolNames: [...(delegationToolNames ?? tools.list().map((registeredTool) => registeredTool.name))],
         },
@@ -1872,7 +1914,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
           toolCall,
           tools,
           policy,
-          autonomy,
+          autonomy: currentAutonomy(),
           cwd,
           workspaceRoot,
           primaryAgentId,
@@ -1889,7 +1931,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       current,
       tools,
       policy,
-      autonomy,
+      autonomy: currentAutonomy(),
       cwd,
       workspaceRoot,
       primaryAgentId,
@@ -2418,7 +2460,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       data: {
         tool: toolCall.name,
         security: tools.securityDescriptor(toolCall.name),
-        autonomy,
+        autonomy: currentAutonomy(),
         primaryAgentId,
         workspaceBoundary: workspaceRoot ? 'strict' : 'unrestricted',
         freshApprovalRequired,
@@ -2431,7 +2473,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       !executionId &&
       (!policyResult.allowed ||
         (policyResult.requiresApproval &&
-          (autonomy !== AutonomyLevel.Autonomous || freshApprovalRequired || Boolean(approvalCallback))))
+          (currentAutonomy() !== AutonomyLevel.Autonomous || freshApprovalRequired || Boolean(approvalCallback))))
     ) {
       await persistRunCheckpoint?.({
         toolCalls,
@@ -2492,7 +2534,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     let approvalResolvedByRule = false
     if (
       policyResult.requiresApproval &&
-      autonomy === AutonomyLevel.Autonomous &&
+      currentAutonomy() === AutonomyLevel.Autonomous &&
       !freshApprovalRequired
     ) {
       const autoDecision = evaluateAutoApproval?.(toolCall) ?? null
@@ -2534,7 +2576,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
               toolCall,
               sessionId,
               deviceName,
-              autonomy,
+              autonomy: currentAutonomy(),
               reason: policyResult.reason,
             }),
           )
@@ -2556,7 +2598,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
     if (
       policyResult.requiresApproval &&
       !approvalResolvedByRule &&
-      (autonomy !== AutonomyLevel.Autonomous || freshApprovalRequired || Boolean(approvalCallback))
+      (currentAutonomy() !== AutonomyLevel.Autonomous || freshApprovalRequired || Boolean(approvalCallback))
     ) {
       const strictPoisoning = process.env.SEPILOTD_STRICT_DENIAL_POISONING === '1'
       if (strictPoisoning && hasDeniedApprovalInHistory(messages)) {
@@ -2585,6 +2627,10 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
         const approvalDecisionResult = approvalCallback(toolCall, requestId, {
           forcePrompt: freshApprovalRequired,
           signal,
+          recheckPolicy: () => {
+            const checked = checkToolPolicyNow(toolCall)
+            return checked.allowed && requiresFreshToolCallApproval(toolCall) ? { ...checked, requiresApproval: true } : checked
+          },
         })
         if (approvalDecisionResult instanceof Promise) {
           const { describeRuleFor } = await import('../server/runtime/approval-rules.js')
@@ -2601,12 +2647,12 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
                   registrationSource: tools.registrationSource('fs.read'),
                   security: tools.securityDescriptor('fs.read'),
                 },
-                autonomy,
+                currentAutonomy(),
                 primaryAgentId,
                 effectiveAutoApprove,
               ).allowed,
           })
-          const approvalContext = buildApprovalContext(messages)
+          const approvalContext = buildApprovalContext(messages, actionRationale)
           yield {
             type: 'approval_request',
             toolCall,
@@ -2724,7 +2770,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
           return {
             toolCall: currentToolCall,
             result,
-            executionObserved: true,
+            executionObserved: result.code !== 'LIVE_PRIVILEGE_BLOCKED',
           }
         }),
       ))
@@ -2822,6 +2868,7 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
 
     const result = yield* streamToolProgress(emit => executeTool(toolCall, tool, sequentialExecutionId, {
       onProgress: emit,
+      approvalGranted: policyResult.requiresApproval === true && approval.approved,
     }))
     rememberFailureCoupling(toolCall, tool, result)
     const decoratedSequential = decorateErrorOutput(result)
@@ -2836,7 +2883,8 @@ export async function* runToolExecution(options: ToolExecutionOptions): AsyncGen
       ...(result.executionPosture ? { executionPosture: result.executionPosture } : {}),
       ...(result.metadata ? { metadata: result.metadata } : {}),
     }
-    yield* yieldToolSuccessOrRecovery(toolCall, sequentialPostResult, { source: 'execution' })
+    if (result.code === 'LIVE_PRIVILEGE_BLOCKED') yield* yieldToolError(toolCall, result.output, { source: 'policy', reason: result.output })
+    else yield* yieldToolSuccessOrRecovery(toolCall, sequentialPostResult, { source: 'execution' })
     await advanceRunCheckpoint(index + 1)
   }
 

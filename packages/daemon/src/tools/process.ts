@@ -5,9 +5,9 @@ import {
 } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readdirSync, readFileSync } from 'node:fs'
-import { access, mkdtemp, rm } from 'node:fs/promises'
+import { access, mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import { StringDecoder } from 'node:string_decoder'
 import { promisify } from 'node:util'
@@ -16,6 +16,7 @@ import type { Terminal as HeadlessTerminal } from '@xterm/headless'
 import type { IHookRegistry, ToolExecutionPosture, ToolResultMetadata } from '@sepilotd/core'
 import { getAbortError, throwIfAborted } from '../abort.js'
 import type { ToolDefinitionRuntime, ToolResult } from './registry.js'
+import { resolveToolCwd } from './path-utils.js'
 
 const execFileAsync = promisify(execFile)
 const { Terminal } = xtermHeadless
@@ -316,6 +317,7 @@ const MANAGED_PROCESS_START_FIELDS = new Set([
   'pty',
   'network',
   'notifyOnExit',
+  'reuseId',
 ])
 
 function invalidManagedProcessStartShape(output: string): ToolResult {
@@ -328,6 +330,7 @@ function invalidManagedProcessStartShape(output: string): ToolResult {
 }
 
 function validateManagedProcessStartShape(input: Record<string, unknown>): ToolResult | null {
+  if (input.reuseId !== undefined && (typeof input.reuseId !== 'string' || !input.reuseId.trim())) return invalidManagedProcessStartShape('reuseId must be a non-empty managed process id')
   if (input.interactive !== undefined && typeof input.interactive !== 'boolean') return invalidManagedProcessStartShape('interactive must be a boolean')
   if (input.notifyOnExit !== undefined && typeof input.notifyOnExit !== 'boolean') return invalidManagedProcessStartShape('notifyOnExit must be a boolean')
   const unsupported = Object.keys(input).filter((key) => !MANAGED_PROCESS_START_FIELDS.has(key))
@@ -616,11 +619,20 @@ export class ManagedProcessPtyScreen {
 type ManagedProcessStatus = 'running' | 'exited'
 type ManagedProcessLifetime = 'bounded' | 'session'
 
+interface ManagedProcessInvocation {
+  executable: string
+  args: string[]
+  cwd?: string
+}
+
 interface ManagedProcessRecord {
   id: string
   child: ChildProcessByStdio<Writable | null, Readable, Readable>
   pid: number
   command: string
+  invocation: ManagedProcessInvocation
+  sandboxWorkspaceRoot?: string
+  loopbackConsumers: Map<string, Set<number>>
   cwd?: string
   executionPosture?: ToolExecutionPosture
   startedAt: string
@@ -757,6 +769,7 @@ function snapshotManagedProcess(record: ManagedProcessRecord) {
     id: record.id,
     pid: record.pid,
     command: record.command,
+    invocation: { ...record.invocation, args: [...record.invocation.args] },
     cwd: record.cwd,
     executionPosture: record.executionPosture,
     startedAt: record.startedAt,
@@ -1012,6 +1025,8 @@ export class ManagedProcessRegistry {
     env?: Record<string, string>
     ttlMs?: number
     displayCommand?: string
+    requestedInvocation?: ManagedProcessInvocation
+    sandboxWorkspaceRoot?: string
     executionPosture?: ToolExecutionPosture
     pty?: ManagedProcessPtyOptions
     ownerSessionId?: string
@@ -1049,6 +1064,9 @@ export class ManagedProcessRegistry {
       child,
       pid: child.pid ?? 0,
       command: input.displayCommand ?? [input.executable, ...args].join(' '),
+      invocation: { ...(input.requestedInvocation ?? { executable: input.executable, cwd: input.cwd }), args: [...(input.requestedInvocation?.args ?? args)] },
+      sandboxWorkspaceRoot: input.sandboxWorkspaceRoot,
+      loopbackConsumers: new Map(),
       cwd: input.cwd,
       executionPosture: input.executionPosture,
       startedAt,
@@ -1073,6 +1091,7 @@ export class ManagedProcessRegistry {
     record.finalizeExit = () => {
       if (record.status === 'exited') return
       record.status = 'exited'
+      record.loopbackConsumers.clear()
       if (record.ttlTimer) clearTimeout(record.ttlTimer)
       resolveExit?.()
       void record.loopbackBridge?.close()
@@ -1163,19 +1182,37 @@ export class ManagedProcessRegistry {
   ): ManagedLoopbackConnection[] {
     const normalizedWorkspaceRoot = workspaceRoot ? resolve(workspaceRoot) : undefined
     if (!sessionId && !normalizedWorkspaceRoot) return []
-    return [...this.records.values()]
-      .filter((record) => (
-        record.status === 'running'
-        && record.loopbackBridge
-        && (
-          (sessionId != null && record.ownerSessionId === sessionId)
-          || (
-            normalizedWorkspaceRoot != null
-            && record.ownerWorkspaceRoot === normalizedWorkspaceRoot
-          )
-        )
-      ))
-      .flatMap((record) => record.loopbackBridge?.connections ?? [])
+    return [...this.records.values()].flatMap(record => {
+      if (record.status !== 'running' || !record.loopbackBridge) return []
+      if ((sessionId != null && record.ownerSessionId === sessionId)
+        || (normalizedWorkspaceRoot != null && record.ownerWorkspaceRoot === normalizedWorkspaceRoot)) {
+        return record.loopbackBridge.connections
+      }
+      if (normalizedWorkspaceRoot && normalizedWorkspaceRoot !== record.sandboxWorkspaceRoot) return []
+      const ports = sessionId ? record.loopbackConsumers.get(sessionId) : undefined
+      return ports ? record.loopbackBridge.connections.filter(connection => ports.has(connection.port)) : []
+    })
+  }
+
+  matchingLoopbackProcesses(input: ManagedProcessInvocation & { workspaceRoot: string; ports: number[]; lifetime?: string }): ManagedProcessRecord[] {
+    return [...this.records.values()].filter(record => record.status === 'running'
+      && record.loopbackBridge && record.sandboxWorkspaceRoot === input.workspaceRoot
+      && (!input.lifetime || record.lifetime === input.lifetime)
+      && record.invocation.cwd === input.cwd && record.invocation.executable === input.executable
+      && record.invocation.args.length === input.args.length
+      && record.invocation.args.every((arg, index) => arg === input.args[index])
+      && input.ports.every(port => record.loopbackBridge!.connections.some(connection => connection.port === port)))
+  }
+
+  reuseLoopback(input: ManagedProcessInvocation & { id: string; sessionId: string; workspaceRoot: string; ports: number[]; lifetime?: string }): ManagedProcessRecord {
+    const record = this.matchingLoopbackProcesses(input).find(candidate => candidate.id === input.id)
+    if (!record || !isManagedTargetAlive(record)) {
+      throw Object.assign(new Error('The selected process is not a live managed-loopback server with the same trusted workspace, cwd, executable, arguments, lifetime and requested ports. No process was started or network access granted.'), { code: 'PROCESS_REUSE_MISMATCH_PERMANENT' })
+    }
+    const ports = record.loopbackConsumers.get(input.sessionId) ?? new Set<number>()
+    for (const port of input.ports) ports.add(port)
+    record.loopbackConsumers.set(input.sessionId, ports)
+    return record
   }
 
   ownsLoopbackUrl(
@@ -1430,13 +1467,14 @@ export interface ManagedProcessSandboxLauncher {
 export function createProcessListTool(): ToolDefinitionRuntime {
   return {
     name: 'process.list',
-    description: 'List local processes in a structured JSON format.',
+    description: 'Inspect local processes or one TCP listening port read-only. Set port to check whether that exact TCP port is listening and get its listener addresses/owners in one bounded response; prefer this to broad terminal port listings and a second filtered command. Omit port to list processes, optionally filtered by query. A port observation does not establish HTTP health; use webfetch for that.',
     resumeSafety: 'replay-safe',
     scheduling: { mode: 'parallel-safe', resource: 'processes' },
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Optional substring filter for the command.' },
+        port: { type: 'integer', minimum: 1, maximum: 65535, description: 'Inspect this exact TCP listening port instead of listing processes. Do not combine with query.' },
         limit: { type: 'number', description: 'Maximum number of processes to return. Defaults to 50.' },
       },
     },
@@ -1444,8 +1482,38 @@ export function createProcessListTool(): ToolDefinitionRuntime {
       const start = Date.now()
       const query = typeof input.query === 'string' ? input.query.trim().toLowerCase() : ''
       const limit = parseLimit(input.limit, 50, 500)
+      if (input.port !== undefined && (
+        typeof input.port !== 'number' || !Number.isInteger(input.port) || input.port < 1 || input.port > 65535 || query
+      )) {
+        return {
+          output: 'port must be an integer from 1 to 65535; choose either port inspection or a process query.',
+          status: 'error', durationMs: Date.now() - start, code: 'INVALID_INPUT_PERMANENT',
+        }
+      }
       try {
         throwIfAborted(context?.signal, 'Process listing aborted')
+        if (typeof input.port === 'number') {
+          const { stdout, stderr } = await execFileAsync('ss', ['-H', '-ltnp', `sport = :${input.port}`], {
+            signal: context?.signal, timeout: 10_000, maxBuffer: 1024 * 1024,
+          })
+          if (stderr.trim()) throw new Error(`TCP listener inspection failed: ${stderr.trim()}`)
+          const listeners = stdout.split('\n').filter(line => line.trim()).map(line => {
+            const fields = line.trim().split(/\s+/u)
+            const endpoint = fields[3] ?? ''
+            const separator = endpoint.lastIndexOf(':')
+            if (fields[0] !== 'LISTEN' || separator < 0 || Number(endpoint.slice(separator + 1)) !== input.port) {
+              throw new Error('Unrecognized TCP listener output; no port status was inferred.')
+            }
+            return {
+              address: endpoint.slice(0, separator).replace(/^\[|\]$/gu, ''), port: input.port,
+              owners: [...line.matchAll(/"([^"\n]+)",pid=(\d+)/gu)].map(match => ({ name: match[1], pid: Number(match[2]) })),
+            }
+          })
+          return {
+            output: JSON.stringify({ port: input.port, listening: listeners.length > 0, listeners: listeners.slice(0, limit), omitted: Math.max(0, listeners.length - limit) }, null, 2),
+            status: 'success', durationMs: Date.now() - start,
+          }
+        }
         const { stdout } = await execFileAsync(
           'ps',
           ['-eo', 'pid=,ppid=,stat=,etime=,command='],
@@ -1528,19 +1596,20 @@ export function createManagedProcessStartTool(
       && !options.strictWorkspaceLauncher && !options.strictWorkspaceWriteLauncher
       ? 'No strict-workspace background process launcher is configured on this host.'
       : undefined,
-    description: "Spawn a sandboxed background process and track it as a managed session. Installed developer toolchains use the same read-only sandbox projection as terminal.run, so invoke the intended runtime directly without rediscovering host paths. The default lifetime is bounded and temporary. For a user-requested development server that should stay available across later agent turns while this daemon remains running, set lifetime to 'session'; retrieve it later with process.sessions and read logs with process.read/process.follow. For a workspace-local server that browser.navigate, webfetch, or terminal.run must reach, set network to { mode: 'loopback', ports: [PORT] }. Managed loopback is agent-local localhost access only: it does not expose 0.0.0.0 or a LAN port on the host. Use service.start when the user explicitly needs host/LAN exposure or survival across daemon restarts.",
+    description: "Spawn a background process and track it as a managed session, or explicitly reuse a matching live managed server with reuseId after discovering it through process.sessions or a port-conflict receipt. Strict-workspace and managed-loopback processes require a sandbox launcher. In a normal policy CLI session, managed loopback automatically sandboxes this invocation within the trusted session cwd; a tool-supplied cwd cannot widen that boundary. Installed developer toolchains are projected into the sandbox, so invoke the intended runtime directly without rediscovering host paths. The default lifetime is bounded and temporary. For a user-requested development server that should stay available across later agent turns while this daemon remains running, set lifetime to 'session'; retrieve it later with process.sessions and read logs with process.read/process.follow. For a workspace-local server that browser.navigate, webfetch, or terminal.run must reach, set network to { mode: 'loopback', ports: [PORT] }. Managed loopback is agent-local localhost access only: it does not expose 0.0.0.0 or a LAN port on the host. Use service.start when the user explicitly needs host/LAN exposure or survival across daemon restarts.",
     resumeSafety: 'replay-risky',
     validateInput: (input) => validateManagedProcessStartShape(input),
     inputSchema: {
       type: 'object',
       properties: {
-        executable: { type: 'string', description: 'Executable to spawn.' },
+        executable: { type: 'string', description: 'Executable to spawn or match for explicit reuse.' },
+        reuseId: { type: 'string', description: 'Explicitly reuse this running managed-loopback process instead of spawning. Supply its exact invocation from process.sessions and the loopback ports needed. The approved request grants only those ports to this session after trusted workspace/cwd/command matching. Owner, environment and lifetime stay unchanged. Omit to start a new process.' },
         interactive: { type: 'boolean', description: 'Keep stdin open for explicit process.write input. Defaults to false.' },
         args: { type: 'array', items: { type: 'string' }, description: 'Command arguments.' },
         cwd: { type: 'string', description: 'Working directory for the child process. Defaults to the active session cwd.' },
         env: {
           type: 'object',
-          description: 'Optional environment variable overrides for non-workspace local execution. Rejected for strict-workspace sandbox launches so values cannot leak through launcher arguments.',
+          description: 'Optional environment variable overrides for non-workspace local execution. Rejected for strict-workspace and managed-loopback sandbox launches so values cannot leak through launcher arguments.',
           additionalProperties: { type: 'string' },
         },
         ttlMs: {
@@ -1642,9 +1711,12 @@ export function createManagedProcessStartTool(
           }
         }
         const managedTtlMs = lifetime === 'session' ? 0 : explicitTtlMs
-        if (context?.workspaceRoot) {
+        const sandboxWorkspaceRoot = context?.workspaceRoot
+          ?? (loopbackPorts && context?.workspaceIsolation === 'policy' && context.sessionId
+            && context.cwd && isAbsolute(context.cwd) ? context.cwd : undefined)
+        if (sandboxWorkspaceRoot) {
           const workspaceWriteAuthorized = Boolean(
-            context.delegatedAgentPolicy
+            context?.delegatedAgentPolicy
             && context.delegatedAgentPolicy.autonomy !== 'readonly',
           )
           const strictWorkspaceLauncher = workspaceWriteAuthorized
@@ -1666,6 +1738,28 @@ export function createManagedProcessStartTool(
               code: 'SANDBOX_ENV_UNSUPPORTED_PERMANENT',
             }
           }
+          const canonicalRoot = await realpath(sandboxWorkspaceRoot)
+          const sandboxCwd = await realpath(resolveToolCwd(requestedCwd, context?.cwd ?? canonicalRoot))
+          const cwdFromRoot = relative(canonicalRoot, sandboxCwd)
+          if (cwdFromRoot === '..' || cwdFromRoot.startsWith(`..${sep}`) || isAbsolute(cwdFromRoot)) {
+            return {
+              output: 'process.start cwd must stay inside the sandbox workspace root, including after resolving symbolic links.',
+              status: 'error', durationMs: Date.now() - start, code: 'WORKSPACE_ESCAPE_PERMANENT',
+            }
+          }
+          if (typeof input.reuseId === 'string') {
+            if (!context?.sessionId || !loopbackPorts?.length
+              || !context.delegatedAgentPolicy || context.delegatedAgentPolicy.autonomy === 'readonly'
+              || explicitTtlMs !== undefined || input.interactive !== undefined || pty || input.notifyOnExit !== undefined) {
+              return { output: 'Explicit reuse needs a session and declared loopback ports, ordinary process-start authority, and no TTL, stdin, PTY or notification changes. Existing server lifecycle and owner are preserved.', status: 'error', durationMs: Date.now() - start, code: 'PROCESS_REUSE_OPTIONS_PERMANENT' }
+            }
+            throwIfAborted(context.signal, 'Managed server reuse aborted')
+            const existing = registry.reuseLoopback({ id: input.reuseId, sessionId: context.sessionId,
+              workspaceRoot: canonicalRoot, cwd: sandboxCwd, executable, args, ports: loopbackPorts, lifetime })
+            return { output: JSON.stringify({ ...snapshotManagedProcess(existing), reused: true, accessPorts: loopbackPorts }, null, 2),
+              metadata: managedProcessMetadata(existing), status: 'success', durationMs: Date.now() - start,
+              executionPosture: existing.executionPosture }
+          }
           const loopbackBridge = loopbackPorts
             ? await createManagedLoopbackBridge(loopbackPorts)
             : undefined
@@ -1674,8 +1768,8 @@ export function createManagedProcessStartTool(
             prepared = await strictWorkspaceLauncher.prepareManagedProcess({
               executable,
               args,
-              cwd: requestedCwd,
-              workspaceRoot: context.workspaceRoot,
+              cwd: sandboxCwd,
+              workspaceRoot: canonicalRoot,
               cwdBoundary: 'strict_workspace',
               pty,
               ...(loopbackBridge ? {
@@ -1700,11 +1794,13 @@ export function createManagedProcessStartTool(
               cwd: prepared.cwd,
               ttlMs: managedTtlMs,
               displayCommand: [executable, ...args].join(' '),
+              requestedInvocation: { executable, args, cwd: sandboxCwd },
+              sandboxWorkspaceRoot: canonicalRoot,
               executionPosture: prepared.executionPosture,
               pty,
-              ownerSessionId: context.sessionId,
-              ownerExecutionId: context.executionId,
-              ownerWorkspaceRoot: context.workspaceRoot,
+              ownerSessionId: context?.sessionId,
+              ownerExecutionId: context?.executionId,
+              ownerWorkspaceRoot: context?.workspaceRoot,
               notifyOnExit: input.notifyOnExit !== false,
               loopbackBridge,
             })
@@ -1730,6 +1826,8 @@ export function createManagedProcessStartTool(
           }
         }
 
+        if (input.reuseId !== undefined) return { output: 'Reusing a managed server requires a trusted sandbox workspace and session. No host process was started.', status: 'error', durationMs: Date.now() - start, code: 'PROCESS_REUSE_SCOPE_PERMANENT' }
+
         if (options.sandboxMode === 'docker' || options.sandboxMode === 'bubblewrap') {
           return {
             output:
@@ -1741,7 +1839,7 @@ export function createManagedProcessStartTool(
         }
         if (loopbackPorts) {
           return {
-            output: 'Managed loopback exposure requires a strict-workspace sandbox; the command was not run on the host.',
+            output: 'Managed loopback exposure requires a strict workspace root or a trusted absolute cwd in a policy session, backed by a sandbox launcher; the command was not run on the host.',
             status: 'error',
             durationMs: Date.now() - start,
             code: 'SANDBOX_REQUIRED_PERMANENT',
@@ -1766,7 +1864,19 @@ export function createManagedProcessStartTool(
           durationMs: Date.now() - start,
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
+        let message = error instanceof Error ? error.message : String(error)
+        if (error && typeof error === 'object' && 'code' in error && error.code === 'LOOPBACK_PORT_IN_USE_PERMANENT') {
+          try {
+            const root = context?.workspaceRoot ?? (context?.workspaceIsolation === 'policy' ? context.cwd : undefined)
+            const ports = normalizeManagedLoopbackPorts(input.network)
+            if (root && isAbsolute(root) && ports?.length) {
+              const matches = registry.matchingLoopbackProcesses({ workspaceRoot: await realpath(root),
+                cwd: await realpath(resolveToolCwd(input.cwd, context?.cwd ?? root)), executable, args: normalizeArgs(input.args), ports })
+              if (matches.length) message += '\nMatching managed server(s): ' + JSON.stringify(matches.map(record => ({ id: record.id, invocation: record.invocation, lifetime: record.lifetime, ports })))
+                + '\nTo reuse one without stopping or launching another server, call process.start with its reuseId and the same executable, args, cwd and network ports. The request follows normal approval policy and grants only the declared loopback ports to this session.'
+            }
+          } catch {}
+        }
         return {
           output: message,
           status: 'error',

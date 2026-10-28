@@ -1,5 +1,5 @@
 import { TASK_DISCOVERY_GUIDANCE, TASK_INVOCATION_GUIDANCE } from './task-invocation.js'
-import { TURN_CONTEXT_HEADING } from './prompt-sections.js'
+import { RUN_STABLE_SYSTEM_METADATA_KEY, TURN_CONTEXT_END, TURN_CONTEXT_HEADING } from './prompt-sections.js'
 import { KNOWLEDGE_DESTINATION_GUIDANCE } from '../knowledge/chat-tools.js'
 import type { ToolRegistry } from '../tools/registry.js'
 import type { FileSkillRegistry } from '../skills/registry.js'
@@ -22,6 +22,7 @@ import {
   formatSkillDescriptionForPrompt,
   formatSkillDisplayLabel,
   isSkillEligibleForAutomaticRouting,
+  orderSkillsForCatalog,
   MAX_AUTOMATIC_ROUTER_SKILLS,
 } from '../skills/display.js'
 
@@ -162,7 +163,7 @@ export function renderSystemToolGuidance(
       toolList.some((tool) => tool.name === 'process.start')
       && toolList.some((tool) => tool.name === 'process.follow')
     ) {
-      capabilities.push("Managed background-process lifecycle: use process.start for a sandboxed command that must run concurrently. Choose its lifecycle explicitly from purpose, not from wording: (1) agent-internal validation, a fixed observation window, or other temporary work uses lifetime='bounded' with a positive ttlMs (15 minutes by default); (2) a user-requested development/watch server that should remain available while you continue working in later turns uses lifetime='session', which has no TTL but still stops on daemon shutdown. Start the executable directly (never append `&` and never wrap it in nohup). Retain the returned session id; if it is no longer visible, recover it with process.sessions, then use process.follow with the returned stdout/stderr offsets for new logs or readiness and process.read for an immediate snapshot. Do not call process.sessions as a preflight when the current request unconditionally tells you to start a new process, and do not rediscover an id that is still present in the current-turn process.start/process.read result. For a requested observation window on a continuously updating process, call process.follow once with that timeout, then stop the process; PTY follow waits for the full observation window by default while ordinary log follow returns on new output. Do not spend repeated LLM turns polling. For a terminal UI that needs a controlling terminal, set `pty:true` (or `{columns,rows}`); process.read/follow/wait then include a clean `screen` snapshot and suppress raw ANSI stdout by default (set includeRawOutput only for terminal-protocol debugging). PTY mode is headless and has no stdin, so it is suitable for observation and bounded runs, not interactive answering. Before finalizing, stop temporary bounded sessions you no longer need with process.stop, but do not stop a session-lifetime server the user asked to keep running. A positive TTL is mandatory when ReadOnly autonomy starts a strict-workspace process.")
+      capabilities.push("Managed background-process lifecycle: use process.start for a sandboxed command that must run concurrently. Choose its lifecycle explicitly from purpose, not from wording: (1) agent-internal validation, a fixed observation window, or other temporary work uses lifetime='bounded' with a positive ttlMs (15 minutes by default); (2) a user-requested development/watch server that should remain available while you continue working in later turns uses lifetime='session', which has no TTL but still stops on daemon shutdown. Start the executable directly (never append `&` and never wrap it in nohup). When a matching managed server is already running, reuse it explicitly with process.start reuseId plus its exact invocation and required loopback ports. Reuse follows normal approval and preserves the original owner and lifetime; never kill a port owner or grant access based only on a shared cwd. Do not reuse when the user explicitly requires a fresh process or restart. Retain the returned session id; if it is no longer visible, recover it with process.sessions, then use process.follow with the returned stdout/stderr offsets for new logs or readiness and process.read for an immediate snapshot. Do not call process.sessions as a preflight when the current request unconditionally tells you to start a new process, and do not rediscover an id that is still present in the current-turn process.start/process.read result. For a requested observation window on a continuously updating process, call process.follow once with that timeout, then stop the process; PTY follow waits for the full observation window by default while ordinary log follow returns on new output. Do not spend repeated LLM turns polling. For a terminal UI that needs a controlling terminal, set `pty:true` (or `{columns,rows}`); process.read/follow/wait then include a clean `screen` snapshot and suppress raw ANSI stdout by default (set includeRawOutput only for terminal-protocol debugging). PTY mode is headless and has no stdin, so it is suitable for observation and bounded runs, not interactive answering. Before finalizing, stop temporary bounded sessions you no longer need with process.stop, but do not stop a session-lifetime server the user asked to keep running. A positive TTL is mandatory when ReadOnly autonomy starts a strict-workspace process.")
     }
     if (
       toolList.some((tool) => tool.name === 'service.start')
@@ -359,7 +360,7 @@ export function withSystemToolGuidance(
     ? 'Execution cadence: When tools are needed, select the next useful action from the evidence already available, emit the tool call, and wait for its actual result. Do not mentally simulate unavailable tool results or work through later implementation steps that depend on them before returning the current call. Keep all tool permissions, user constraints and completion requirements in force.'
     : ''
   const content = [capability, cadence].filter(Boolean).join('\n\n')
-  return content ? [...retained, { role: 'system', content, metadata: { generatedToolGuidance: true } }] : retained
+  return content ? [...retained, { role: 'system', content, metadata: { generatedToolGuidance: true, [RUN_STABLE_SYSTEM_METADATA_KEY]: true } }] : retained
 }
 
 export async function buildSystemPrompt(options: SystemPromptOptions): Promise<string> {
@@ -393,7 +394,7 @@ async function composeSystemPrompt(options: SystemPromptOptions): Promise<{ prom
   if (unavailableTools.length) parts.push('[Unavailable in this execution boundary]', ...unavailableTools)
   workflow(renderSystemToolGuidance(toolList.map(tool => tool.name), options, options.deferToolGuidance ? 'common' : 'all'))
 
-  const skillList = (options.profile === 'instant' ? [] : await skills.listForCwd(options.cwd, options.workspaceRoot))
+  const skillList = orderSkillsForCatalog(options.profile === 'instant' ? [] : await skills.listForCwd(options.cwd, options.workspaceRoot))
     .filter(isSkillEligibleForAutomaticRouting)
     .filter((skill) => !options.skillInventory || options.skillInventory.includes(skill.id) || !(skill.tags ?? []).includes('builtin'))
     .slice(0, MAX_AUTOMATIC_ROUTER_SKILLS)
@@ -558,6 +559,7 @@ async function composeSystemPrompt(options: SystemPromptOptions): Promise<{ prom
   if (turnContextParts.length > 0) {
     parts.push(`\n${TURN_CONTEXT_HEADING}`)
     parts.push(...turnContextParts)
+    parts.push(TURN_CONTEXT_END)
   }
 
   return {

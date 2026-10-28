@@ -37,6 +37,7 @@ export type {
   ToolReach,
   ToolCall,
   ChatRequest,
+  PromptCacheConfig,
   TokenUsage,
   AgentContextUsage,
   ChatResponse,
@@ -92,6 +93,25 @@ export type {
   ModelCatalogAuthority,
   ModelCatalogRefreshResult,
 } from './agent/provider.js'
+export type {
+  DecisionAnswer,
+  DecisionChoiceAnswer,
+  DecisionChoiceOption,
+  DecisionChoiceQuestion,
+  DecisionPredicateAnswer,
+  DecisionPredicateQuestion,
+  DecisionQuestion,
+  DecisionQuestionType,
+  DecisionRefusalAnswer,
+  DecisionRequest,
+  DecisionRequestOptions,
+  DecisionResponse,
+  DecisionScoreAnswer,
+  DecisionScoreLevel,
+  DecisionScoreQuestion,
+  DecisionUsage,
+  IDecisionProvider,
+} from './agent/decision.js'
 export type { AgentContext, IAgentEngine } from './agent/engine.js'
 export type { RunOptions, RunResult, ISandbox } from './agent/sandbox.js'
 export {
@@ -258,6 +278,7 @@ export {
 export type {
   SkillSourceType,
   SkillSourceRecord,
+  SkillDiscoveryScope,
   SkillMetadata,
   SkillProvenanceRecord,
   SkillSignatureRecord,

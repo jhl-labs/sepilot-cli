@@ -157,7 +157,7 @@ import {
   primaryCommands,
   type CommandDef,
 } from './commands/registry.js'
-import { PRIVILEGE_DESCRIPTIONS, nextPrivilege } from './privilege.js'
+import { PRIVILEGE_DESCRIPTIONS, nextPrivilege, isPrivilegeLevel } from './privilege.js'
 import { AUTO_BOT_ENTRY, ENGINE_OVERRIDE_ENTRY, runBotCommand, runModeCommand, runModelCommand } from './commands/runtime-selection.js'
 import { runProjectCommand, runUsageCommand } from './commands/workspace.js'
 import { runSessionCommand } from './commands/session.js'
@@ -206,7 +206,7 @@ import {
   nextGraphemeOffset,
   previousGraphemeOffset,
 } from '../utils/graphemes.js'
-import { Composer } from './screens/Composer.js'
+import { Composer, composerViewport } from './screens/Composer.js'
 import { Conversation } from './screens/Conversation.js'
 import { StatusLine } from './screens/StatusLine.js'
 import { RunStatusLine, type FooterMetadataState } from './screens/RunStatusLine.js'
@@ -330,11 +330,21 @@ function preferredModelPickerIndex(options: {
   return index >= 0 ? index : 0
 }
 
+function useHumanRequestFocus(requestId: string | null, hasDraft: boolean) {
+  const [focus, setFocus] = useState({ requestId, deferred: Boolean(requestId && hasDraft) })
+  const deferred = Boolean(requestId && (focus.requestId === requestId ? focus.deferred : hasDraft))
+  useEffect(() => {
+    setFocus(current => current.requestId === requestId ? current : { requestId, deferred: Boolean(requestId && hasDraft) })
+  }, [requestId, hasDraft])
+  const review = useCallback(() => setFocus({ requestId, deferred: false }), [requestId])
+  return { deferred, review }
+}
+
 export function NextApp({ config, runtime }: NextAppProps) {
   const { exit: inkExit } = useApp()
   const exit = runtime?.exit ?? inkExit
   const { stdout } = useStdout()
-  const { rows, columns: width } = useTerminalSize(stdout)
+  const { rows, columns } = useTerminalSize(stdout)
   const [client] = useState(() => runtime?.client ?? new DaemonClient(config.url))
   const [swarmClient] = useState(() => runtime?.swarmClient ?? createSwarmClient({ baseUrl: config.url, token: loadDaemonToken(config.url) }))
   const {
@@ -347,7 +357,8 @@ export function NextApp({ config, runtime }: NextAppProps) {
     resolveApproval,
     getTokenSpeedStats,
     resetTokenSpeedStats,
-  } = useChat(null, client)
+  } = useChat(null, client, { completionSummary: 'footer' })
+  const width = state.pendingApproval ? Math.min(columns, 80) : columns
   const [inputValue, setInputValue] = useState('')
   const [cursorOffset, setCursorOffset] = useState(0)
   const inputValueRef = useRef('')
@@ -384,6 +395,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const [dialogs, setDialogs] = useState<string[]>([])
   const [statusError, setStatusError] = useState<string | null>(null)
   const [info, setInfo] = useState<{ title: string; body: string } | null>(null)
+  const [approvalReview, setApprovalReview] = useState<{ requestId: string; text: string } | null>(null)
   const [clearedMessageCount, setClearedMessageCount] = useState(0)
   const [providers, setProviders] = useState<DaemonProviderInfo[]>([])
   const [providerDefaults, setProviderDefaults] = useState({ provider: '', model: '' })
@@ -452,7 +464,14 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const [themeId, setThemeId] = useState<ThemeId>(() => getActiveThemeId())
   const [autonomyPurpose, setAutonomyPurpose] = useState<'session' | 'default'>('session')
   const [defaultAutonomy, setDefaultAutonomy] = useState<typeof state.autonomy | null>(null)
-  const [configuredPrivilege, setConfiguredPrivilege] = useState<string | null>(null)
+  const privilegeChoiceRef = useRef(state.autonomy)
+  const privilegeRevisionRef = useRef(0)
+  const privilegeQueueRef = useRef<Promise<unknown>>(Promise.resolve())
+  const privilegeSessionRef = useRef(state.sessionId)
+  privilegeSessionRef.current = state.sessionId
+  const confirmedPrivilegesRef = useRef(new Map<string, typeof state.autonomy>())
+  const deferredPrivilegeRef = useRef<{ level: typeof state.autonomy; revision: number } | null>(null)
+  useEffect(() => { privilegeChoiceRef.current = state.autonomy }, [state.autonomy])
   const [recapEnabled, setRecapEnabled] = useState(true)
   const [lastTurnRecap, setLastTurnRecap] = useState<string | null>(null)
   const [lastTurnSummary, setLastTurnSummary] = useState<{ durationMs: number; toolCalls: number } | null>(null)
@@ -625,7 +644,6 @@ export function NextApp({ config, runtime }: NextAppProps) {
         if (!config.model && defaultModel) dispatch({ type: 'SET_MODEL', model: defaultModel })
         if (daemonConfig.agent?.autonomy) {
           dispatch({ type: 'SET_AUTONOMY', autonomy: daemonConfig.agent.autonomy })
-          setConfiguredPrivilege(daemonConfig.agent.autonomy)
         }
         if (daemonConfig.agent?.thinkingLevel) dispatch({ type: 'SET_THINKING_LEVEL', thinkingLevel: daemonConfig.agent.thinkingLevel, source: 'default' })
       })
@@ -1323,18 +1341,48 @@ export function NextApp({ config, runtime }: NextAppProps) {
     return result.ok
   }, [runtime, stdout])
 
+  const applyPrivilegeToSession = useCallback((sessionId: string, level: typeof state.autonomy, revision: number) => {
+    const operation = privilegeQueueRef.current.then(() => client.setSessionPrivilege(sessionId, level))
+    privilegeQueueRef.current = operation.catch(() => {})
+    void operation.then(result => {
+      const effective = isPrivilegeLevel(result.level) ? result.level : level
+      confirmedPrivilegesRef.current.set(sessionId, effective)
+      if (revision !== privilegeRevisionRef.current || privilegeSessionRef.current !== sessionId) return
+      privilegeChoiceRef.current = effective
+      dispatch({ type: 'SET_AUTONOMY', autonomy: effective })
+      showNotice(result.applied ? `Privilege: ${effective} (applied to the running turn)` : `Privilege: ${effective} (from the next turn)`)
+    }).catch(error => {
+      if (revision !== privilegeRevisionRef.current || privilegeSessionRef.current !== sessionId) return
+      const previous = confirmedPrivilegesRef.current.get(sessionId)
+      if (previous) { privilegeChoiceRef.current = previous; dispatch({ type: 'SET_AUTONOMY', autonomy: previous }) }
+      setStatusError(`Could not confirm privilege update: ${errorMessage(error)}`)
+    })
+  }, [client, dispatch, showNotice])
+
   const changePrivilege = useCallback((level: typeof state.autonomy) => {
+    const previous = privilegeChoiceRef.current
+    privilegeChoiceRef.current = level
+    const revision = ++privilegeRevisionRef.current
     dispatch({ type: 'SET_AUTONOMY', autonomy: level })
-    if (!state.isStreaming || !state.sessionId) {
+    if (!state.sessionId) {
+      deferredPrivilegeRef.current = { level, revision }
       showNotice(`Privilege: ${level}`)
       return
     }
-    void client.setSessionPrivilege(state.sessionId, level)
-      .then((result) => showNotice(result.applied
-        ? `Privilege: ${result.level} (applied to the running turn)`
-        : `Privilege: ${result.level} (from the next turn)`))
-      .catch((error) => setStatusError(`Privilege change not applied to the running turn: ${errorMessage(error)}`))
-  }, [client, dispatch, showNotice, state.isStreaming, state.sessionId])
+    if (!confirmedPrivilegesRef.current.has(state.sessionId)) confirmedPrivilegesRef.current.set(state.sessionId, previous)
+    applyPrivilegeToSession(state.sessionId, level, revision)
+  }, [applyPrivilegeToSession, dispatch, showNotice, state.sessionId])
+
+  useEffect(() => {
+    if (!state.sessionId || !deferredPrivilegeRef.current) return
+    const { level, revision } = deferredPrivilegeRef.current
+    deferredPrivilegeRef.current = null
+    applyPrivilegeToSession(state.sessionId, level, revision)
+  }, [applyPrivilegeToSession, state.sessionId])
+
+  useInput((input, key) => {
+    if ((key.tab && key.shift) || input === '\u001b[Z') changePrivilege(nextPrivilege(privilegeChoiceRef.current))
+  }, { isActive: dialogs.length === 0 && Boolean(state.pendingApproval) })
 
   const runCommand = useCallback(async (command: CommandDef, args = '') => {
     setStatusError(null)
@@ -1342,6 +1390,11 @@ export function NextApp({ config, runtime }: NextAppProps) {
       case 'work.tasks': {
         if (!args.trim()) { openDialog('tasks'); return }
         try { showNotice(JSON.stringify(await runTasksCommand(client, splitSlashCommandInput(args)), null, 2)) }
+        catch (error) { setStatusError(errorMessage(error)) }
+        return
+      }
+      case 'work.subagent': {
+        try { showNotice(await runDaemonAdminSlashCommand(client, '/subagent', splitSlashCommandInput(args), { parentSession: state.sessionId ?? undefined, cwd: fileRoot, backgroundDefault: true, autonomy: state.autonomy })) }
         catch (error) { setStatusError(errorMessage(error)) }
         return
       }
@@ -2369,7 +2422,8 @@ export function NextApp({ config, runtime }: NextAppProps) {
     }
     if (text.startsWith('/')) {
       if (command) await runCommand(command, rest.join(' '))
-      else await sendMessage(text)
+      else if (userCommands.some((entry) => `/${entry.id}`.toLowerCase() === alias?.toLowerCase())) await sendMessage(text)
+      else { setStatusError(`Unknown command: ${alias}. Use /help or /commands.`); replaceComposerValue(text) }
       return
     }
     if (state.isStreaming) {
@@ -2392,10 +2446,13 @@ export function NextApp({ config, runtime }: NextAppProps) {
     const attachments = await resolveComposerAttachments(text)
     const sent = attachments.length > 0 ? await sendMessage(text, attachments) : await sendMessage(text)
     if (sent) setRedoSessionId(null)
-  }, [appendHistory, client, dispatch, inputValue, rememberQueuedFollowUp, replaceComposerValue, runCommand, runtime, sendMessage, showNotice, state.autonomy, state.isStreaming, state.model, state.provider, state.sessionId])
+  }, [appendHistory, client, dispatch, inputValue, rememberQueuedFollowUp, replaceComposerValue, runCommand, runtime, sendMessage, showNotice, state.autonomy, state.isStreaming, state.model, state.provider, state.sessionId, userCommands])
 
   const pendingQuestion = state.pendingQuestions[0] ?? null
-  const dialogOpen = dialogs.length > 0 || Boolean(state.pendingApproval) || Boolean(pendingQuestion)
+  const humanRequestId = state.pendingApproval ? `approval:${state.pendingApproval.requestId}`
+    : pendingQuestion ? `question:${pendingQuestion.id}` : null
+  const humanRequestFocus = useHumanRequestFocus(humanRequestId, inputValue.length > 0)
+  const dialogOpen = dialogs.length > 0 || (Boolean(humanRequestId) && !humanRequestFocus.deferred)
   const togglePlanTodo = useCallback(() => {
     if (!state.pendingApproval && !pendingQuestion) toggleInspectionDialog('planTodo')
   }, [pendingQuestion, state.pendingApproval, toggleInspectionDialog])
@@ -2415,8 +2472,11 @@ export function NextApp({ config, runtime }: NextAppProps) {
     ? [...matchCommands(inputValue), ...customCommandDefs.filter((command) => inputValue === '/' || command.aliases[0]!.toLowerCase().startsWith(inputValue.toLowerCase()))]
     : []
   const selectedSuggestionIndex = Math.min(suggestionIndex, Math.max(0, suggestions.length - 1))
-  const suggestionWindowStart = Math.max(0, selectedSuggestionIndex - 7)
-  const visibleSuggestions = suggestions.slice(suggestionWindowStart, suggestionWindowStart + 8)
+  const maxEditorRows = Math.max(1, Math.min(6, rows - 7))
+  const editorRows = composerViewport(inputValue, cursorOffset, width, maxEditorRows).rows
+  const maxSuggestionRows = Math.max(0, Math.min(8, rows - editorRows - 6))
+  const suggestionWindowStart = Math.max(0, selectedSuggestionIndex - Math.max(0, maxSuggestionRows - 1))
+  const visibleSuggestions = suggestions.slice(suggestionWindowStart, suggestionWindowStart + maxSuggestionRows)
   const completeSelectedSuggestion = useCallback(() => {
     const suggestion = suggestions[selectedSuggestionIndex]
     const alias = suggestion?.aliases[0]
@@ -2448,6 +2508,11 @@ export function NextApp({ config, runtime }: NextAppProps) {
     attachmentSuggestionIndex,
     Math.max(0, attachmentSuggestions.length - 1),
   )
+  const referenceRows = Math.max(0, maxSuggestionRows - 1)
+  const attachmentWindowStart = Math.max(0, selectedAttachmentIndex - Math.max(0, referenceRows - 1))
+  const visibleAttachmentSuggestions = attachmentSuggestions.slice(attachmentWindowStart, attachmentWindowStart + referenceRows)
+  const skillWindowStart = Math.max(0, selectedSkillIndex - Math.max(0, referenceRows - 1))
+  const visibleSkillSuggestions = skillSuggestions.slice(skillWindowStart, skillWindowStart + referenceRows)
   const completeSelectedAttachment = useCallback(() => {
     if (!activeAttachmentReference) return false
     const selected = attachmentSuggestions[selectedAttachmentIndex]
@@ -2502,6 +2567,10 @@ export function NextApp({ config, runtime }: NextAppProps) {
   useEffect(() => { setSkillSuggestionIndex(0) }, [activeSkillReference?.query])
 
   useInput((input, key) => {
+    if (key.tab && !key.shift && humanRequestFocus.deferred) {
+      humanRequestFocus.review()
+      return
+    }
     if (key.escape && !dialogOpen && state.isStreaming) {
       if (queuedFollowUpsRef.current.some((queued) => queued.sessionId === state.sessionId)) {
         void cancelQueuedFollowUps({ selector: 'all' })
@@ -2603,7 +2672,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       return
     }
     if ((key.tab && key.shift) || input === '\u001b[Z') {
-      changePrivilege(nextPrivilege(state.autonomy, configuredPrivilege) as typeof state.autonomy)
+      changePrivilege(nextPrivilege(privilegeChoiceRef.current))
       return
     }
     if (suggestions.length > 0 && key.upArrow) {
@@ -2808,6 +2877,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
   const contextEstimated = state.contextUsage?.source === 'estimated'
     || (state.contextUsage == null && conversationContextEstimate != null)
   const humanInputPending = Boolean(state.pendingApproval || pendingQuestion)
+  const activeApprovalReview = approvalReview?.requestId === state.pendingApproval?.requestId ? approvalReview : null
   const humanInputLabel = state.pendingApproval
     ? `${cliLocale === 'ko' ? '승인 필요' : 'approval required'} · ${state.pendingApproval.toolName}`
     : pendingQuestion
@@ -2818,10 +2888,9 @@ export function NextApp({ config, runtime }: NextAppProps) {
     phase: state.currentPhase,
     streamStatus: state.streamStatus,
     counts: state.stateBoardCounts,
+    providerWait: state.isStreaming ? state.providerWait : null,
+    locale: cliLocale,
   })
-  const providerWaitLabel = state.isStreaming && state.providerWait
-    ? `${state.providerWait.auxiliary ? (cliLocale === 'ko' ? '검토 중' : 'reviewing') : (cliLocale === 'ko' ? '모델 응답 대기' : 'waiting for model')} ${Math.max(0, Math.floor((Date.now() - state.providerWait.startedAt) / 1000))}s`
-    : null
   const turnToolCounts = useMemo(() => currentTurnToolCounts(state.messages), [state.messages])
   const runWatchLabel = state.isStreaming && state.streamStartedAt
     ? formatRunWatchLabel({
@@ -2832,11 +2901,12 @@ export function NextApp({ config, runtime }: NextAppProps) {
           : null,
         locale: cliLocale,
         showElapsed: false,
+        showStopHint: false,
       })
     : null
   const interactiveProgressLabel = humanInputLabel
     ?? (state.isStreaming
-      ? [progressLabel, providerWaitLabel, runWatchLabel].filter(Boolean).join(' · ') || 'waiting for model events'
+      ? [progressLabel, runWatchLabel].filter(Boolean).join(' · ') || (cliLocale === 'ko' ? '응답 준비 중' : 'Preparing response')
       : progressLabel)
 
   const settingsSelect = useCallback((itemId: string) => {
@@ -3013,7 +3083,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         client={swarmClient}
         target={swarmAttachTarget}
         width={width}
-        height={Math.max(8, rows - 2)}
+        height={Math.max(1, rows - 3)}
         onExit={(reason, message) => {
           setSwarmAttachTarget(null)
           closeTopDialog()
@@ -3026,7 +3096,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         path={filePreview.path}
         content={filePreview.content}
         width={width}
-        height={Math.max(8, rows - 2)}
+        height={Math.max(1, rows - 3)}
         onClose={() => {
           setFilePreview(null)
           closeTopDialog()
@@ -3040,7 +3110,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         isStreaming={state.isStreaming}
         streamStatus={state.streamStatus}
         width={width}
-        height={Math.max(8, rows - 2)}
+        height={Math.max(1, rows - 3)}
         onClose={closeTopDialog}
       />
     ) : id === 'activity' ? (
@@ -3050,7 +3120,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         messages={state.messages}
         isStreaming={state.isStreaming}
         width={width}
-        height={Math.max(8, rows - 2)}
+        height={Math.max(1, rows - 3)}
         onClose={closeTopDialog}
       />
     ) : id === 'planTodo' ? (
@@ -3060,7 +3130,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         progress={state.runWorkProgress}
         isStreaming={state.isStreaming}
         width={width}
-        height={Math.max(8, rows - 2)}
+        height={Math.max(1, rows - 3)}
         onClose={closeTopDialog}
       />
     ) : id === 'files' ? (
@@ -3322,7 +3392,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
       <ChoiceDialog key={id} title={autonomyPurpose === 'default' ? 'Default privilege' : 'Privilege'} options={AUTONOMY_OPTIONS} current={autonomyPurpose === 'default' ? (defaultAutonomy ?? state.autonomy) : state.autonomy} width={width} onSelect={(value) => {
         if (autonomyPurpose === 'default') {
           void client.updateConfig({ 'agent.autonomy': value as typeof state.autonomy })
-            .then(() => { setDefaultAutonomy(value as typeof state.autonomy); setConfiguredPrivilege(value); closeTopDialog() })
+            .then(() => { setDefaultAutonomy(value as typeof state.autonomy); closeTopDialog() })
             .catch((error) => setStatusError(errorMessage(error)))
         } else {
           changePrivilege(value as typeof state.autonomy)
@@ -3332,12 +3402,18 @@ export function NextApp({ config, runtime }: NextAppProps) {
     ) : id === 'maxTokens' ? (
       <ChoiceDialog key={id} title="Max output tokens" options={MAX_TOKEN_OPTIONS} current={state.maxTokens?.toString() ?? 'default'} width={width} onSelect={(value) => { dispatch({ type: 'SET_MAX_TOKENS', maxTokens: value === 'default' ? null : Number(value) }); closeTopDialog() }} onClose={closeTopDialog} />
     ) : (
-      <InfoDialog key={id} title={info?.title ?? 'Information'} body={info?.body ?? 'Information unavailable.'} width={width} onClose={closeTopDialog} />
+      <InfoDialog key={id} title={info?.title ?? 'Information'} body={info?.body ?? 'Information unavailable.'} width={width} height={Math.max(1, rows - 3)} onClose={closeTopDialog} />
     ),
   }))
 
+  const suggestionRows = suggestions.length > 0 ? visibleSuggestions.length
+    : activeAttachmentReference && visibleAttachmentSuggestions.length > 0 ? visibleAttachmentSuggestions.length + 1
+      : activeSkillReference && visibleSkillSuggestions.length > 0 ? visibleSkillSuggestions.length + 1 : 0
+  const showRationale = state.isStreaming && Boolean(state.plannerWorkingMemory?.currentStepRationale)
+  const conversationRows = Math.max(0, rows - 1 - editorRows - 4 - suggestionRows - (showRationale ? 1 : 0))
+
   return (
-    <Box flexDirection="column" width={width}>
+    <Box flexDirection="column" width={width} height={(dialogOpen && !state.pendingApproval) || rows < 6 ? Math.max(0, rows - 1) : undefined} overflowY="hidden">
       <Conversation
         messages={visibleMessages}
         isStreaming={state.isStreaming}
@@ -3348,12 +3424,18 @@ export function NextApp({ config, runtime }: NextAppProps) {
         showBrandMark={!dialogOpen}
         activityFrame={activityAnimation.frame}
         suspended={dialogOpen}
+        maxLiveRows={conversationRows}
       />
-      {state.pendingApproval ? (
-        <ApprovalModal compact approval={state.pendingApproval} onResolve={(approved, scope, note, interrupt) => {
+      {humanRequestFocus.deferred ? null : activeApprovalReview ? (
+        <InfoDialog key={`approval-review-${activeApprovalReview.requestId}`} title={cliLocale === 'ko' ? '승인 요청 전체 내용' : 'Full approval request'}
+          body={activeApprovalReview.text} width={Math.min(width, 80)} height={Math.max(1, Math.min(16, rows - 3))} onClose={() => setApprovalReview(null)} />
+      ) : state.pendingApproval ? (
+        <ApprovalModal compact locale={cliLocale} width={width} height={Math.max(1, rows - 3)} approval={state.pendingApproval} onResolve={(approved, scope, note, interrupt) => {
           void resolveApproval(approved, scope, note)
           if (interrupt) cancelStream()
-        }} onShowFull={(text) => dispatch({ type: 'SYSTEM_MESSAGE', content: `Full ${state.pendingApproval?.toolName ?? 'tool'} request for review:\n${text}` })} />
+        }} onShowFull={(text) => setApprovalReview({ requestId: state.pendingApproval!.requestId,
+          text: [state.pendingApproval?.context, text].filter(Boolean).join('\n\n'),
+        })} />
       ) : pendingQuestion ? (
         <QuestionDialog
           question={pendingQuestion}
@@ -3368,37 +3450,37 @@ export function NextApp({ config, runtime }: NextAppProps) {
           {visibleSuggestions.map((command, index) => {
             const absoluteIndex = suggestionWindowStart + index
             return (
-            <Text key={command.id} color={absoluteIndex === selectedSuggestionIndex ? colors.primary : colors.dimText}>
+            <Text key={command.id} color={absoluteIndex === selectedSuggestionIndex ? colors.primary : colors.dimText} wrap="truncate-end">
               {`${absoluteIndex === selectedSuggestionIndex ? '› ' : '  '}${command.aliases[0]}  ${command.title}`}
             </Text>
             )
           })}
         </Box>
       ) : null}
-      {!dialogOpen && suggestions.length === 0 && activeAttachmentReference && attachmentSuggestions.length > 0 ? (
+      {!dialogOpen && suggestions.length === 0 && activeAttachmentReference && visibleAttachmentSuggestions.length > 0 ? (
         <Box flexDirection="column">
-          {attachmentSuggestions.slice(0, 8).map((candidate, index) => (
-            <Text key={candidate.path} color={index === selectedAttachmentIndex ? colors.primary : colors.dimText}>
-              {`${index === selectedAttachmentIndex ? '› ' : '  '}@${candidate.path}${candidate.isDirectory ? ' [dir]' : ''}`}
+          {visibleAttachmentSuggestions.map((candidate, index) => (
+            <Text key={candidate.path} color={attachmentWindowStart + index === selectedAttachmentIndex ? colors.primary : colors.dimText} wrap="truncate-end">
+              {`${attachmentWindowStart + index === selectedAttachmentIndex ? '› ' : '  '}@${candidate.path}${candidate.isDirectory ? ' [dir]' : ''}`}
             </Text>
           ))}
-          <Text color={colors.dimText}>↑/↓ move  Enter/Tab attach</Text>
+          <Text color={colors.dimText} wrap="truncate-end">↑/↓ move  Enter/Tab attach</Text>
         </Box>
       ) : null}
-      {!dialogOpen && suggestions.length === 0 && activeSkillReference && skillSuggestions.length > 0 ? (
+      {!dialogOpen && suggestions.length === 0 && activeSkillReference && visibleSkillSuggestions.length > 0 ? (
         <Box flexDirection="column">
-          {skillSuggestions.map((skill, index) => (
-            <Text key={skill.id} color={index === selectedSkillIndex ? colors.primary : colors.dimText}>
-              {`${index === selectedSkillIndex ? '› ' : '  '}@skill:${skill.id} · ${skill.name}`}
+          {visibleSkillSuggestions.map((skill, index) => (
+            <Text key={skill.id} color={skillWindowStart + index === selectedSkillIndex ? colors.primary : colors.dimText} wrap="truncate-end">
+              {`${skillWindowStart + index === selectedSkillIndex ? '› ' : '  '}@skill:${skill.id} · ${skill.name}`}
             </Text>
           ))}
-          <Text color={colors.dimText}>↑/↓ move  Enter/Tab select</Text>
+          <Text color={colors.dimText} wrap="truncate-end">↑/↓ move  Enter/Tab select</Text>
         </Box>
       ) : null}
       {!dialogOpen && state.isStreaming && state.plannerWorkingMemory?.currentStepRationale ? (
         <Text color={colors.info} wrap="truncate-end">Why now · {state.plannerWorkingMemory.currentStepRationale.replace(/\s+/g, ' ')} · /planner details</Text>
       ) : null}
-      {!dialogOpen ? <Composer value={inputValue} cursorOffset={cursorOffset} busy={state.isStreaming} activityColor={activityAnimation.color} width={width} hardwareCursor={runtime?.hardwareCursor} /> : null}
+      {!dialogOpen ? <Composer value={inputValue} cursorOffset={cursorOffset} busy={state.isStreaming} activityColor={activityAnimation.color} width={width} hardwareCursor={runtime?.hardwareCursor} maxEditorRows={maxEditorRows} /> : null}
       <RunStatusLine
         width={width}
         locale={cliLocale}
@@ -3406,7 +3488,7 @@ export function NextApp({ config, runtime }: NextAppProps) {
         metadata={metadataState}
         progressLabel={interactiveProgressLabel}
         attention={humanInputPending}
-        attentionHint={pendingQuestion ? (cliLocale === 'ko' ? 'Enter 응답' : 'Enter answer') : undefined}
+        attentionHint={humanRequestFocus.deferred ? (cliLocale === 'ko' ? 'Tab 검토 · 입력 보존' : 'Tab review · draft kept') : activeApprovalReview ? (cliLocale === 'ko' ? 'Esc 승인 창으로' : 'Esc approval card') : pendingQuestion ? (cliLocale === 'ko' ? 'Enter 응답' : 'Enter answer') : undefined}
         dialogOpen={dialogOpen}
         shellMode={inputValue.startsWith('!')}
         hasDraft={Boolean(inputValue)}

@@ -1,3 +1,4 @@
+import { resolveSubagentModel } from '../providers/subagent-model.js'
 import { createJournalTools } from '../tools/journal.js'
 import { forgetAllOwnedMemory } from '../memory/forget-all.js'
 import { forgetSelectedMemory } from '../memory/forget-selected.js'
@@ -22,6 +23,7 @@ import {
   createProviderFactoryRegistry,
   resolveAutonomy,
 } from './runtime/providers.js'
+import { buildDecisionProviderRegistry } from './runtime/decision-providers.js'
 import { buildSkillRegistry, buildSkillStore, buildMarketplaceCatalog } from './runtime/storage.js'
 import { assembleStorageLayer } from './runtime/storage-layer.js'
 import { assembleSecurityLayer } from './runtime/security-layer.js'
@@ -131,6 +133,7 @@ import { startRuntime } from './runtime/lifecycle.js'
 import { assembleApprovalsLayer } from './runtime/approvals-layer.js'
 import { DelegationWorker } from '../agent/delegation-worker.js'
 import { AgentEngine } from '../agent/engine.js'
+import { createSubagentSpecStore } from '../agent/subagent-spec-store.js'
 import { SubagentDispatcher } from '../agent/subagent-dispatcher.js'
 import { createSubagentDispatchTool, createSubagentJobTool } from '../tools/subagent-dispatch.js'
 import { assertCustomAgentUsable } from '../agent/custom/agents.js'
@@ -290,6 +293,7 @@ export async function buildRuntime(
 
   const providerRegistry = buildProviderRegistry(config, providerFactoryRegistry)
   providerRegistryRef.current = providerRegistry
+  const decisionProviderRegistry = buildDecisionProviderRegistry(config)
   await syncDynamicProviderModels(providerRegistry, config)
   await mcpManager.configureServers(
     config.mcp.servers,
@@ -842,6 +846,7 @@ export async function buildRuntime(
     sessionUndoStack,
   } = assembleAgentLayer({
     providerRegistry,
+    modelRouting: config.agent.modelRouting,
     dataDir,
     onToolOutcome: (outcome) => {
       observability.recordEvents([
@@ -956,6 +961,7 @@ export async function buildRuntime(
     storageDegraded,
     providerFactoryRegistry,
     providerRegistry,
+    decisionProviderRegistry,
     channelFactoryRegistry,
     toolRegistry,
     managedProcesses,
@@ -1061,6 +1067,8 @@ export async function buildRuntime(
   runtimeRef = runtime
 
   const subagentDispatcher = new SubagentDispatcher({
+    specStore: createSubagentSpecStore(),
+    resolveModel: (input) => resolveSubagentModel(runtime.providerRegistry, input),
     sessions: runtime.sessions,
     onLifecycle: async (event, data) => {
       try {
@@ -1074,7 +1082,7 @@ export async function buildRuntime(
       runtime.activeRuns.finish(sessionId)
     },
     engineFactory: ({ tools, maxIterations, executionPolicy, sessionId, onEvent, providerId, reviewOutcomes }) => {
-      const provider = (providerId ? runtime.providerRegistry.get(providerId) : undefined) ?? runtime.providerRegistry.getDefault()
+      const provider = providerId ? runtime.providerRegistry.get(providerId) : runtime.providerRegistry.getDefault()
       if (!provider) {
         throw new Error('SUBAGENT_NO_PROVIDER: no LLM provider configured')
       }
@@ -1106,6 +1114,7 @@ export async function buildRuntime(
         approvalCallback: async (toolCall, requestId, options) => {
           const decision = await runtime.approvalRegistry.waitForApproval({
             sessionId, toolCall, requestId, runId: sessionId,
+            recheckPolicy: options?.recheckPolicy,
             forcePrompt: options?.forcePrompt, signal: options?.signal,
           })
           onEvent?.({ type: 'approval_response', requestId, decision: decision.decision, approved: decision.approved, note: decision.note })
@@ -1126,8 +1135,8 @@ export async function buildRuntime(
         defaultModel: runtime.config.agent.defaultModel ?? provider.models[0]?.id ?? 'default',
       }
     },
-    modelContextWindow: (model) =>
-      runtime.providerRegistry.getDefault()?.models.find((candidate) => candidate.id === model)?.contextWindow,
+    modelContextWindow: (model, providerId) =>
+      (providerId ? runtime.providerRegistry.get(providerId) : runtime.providerRegistry.getDefault())?.models.find((candidate) => candidate.id === model)?.contextWindow,
     resolveUserAgent: async (id, cwd, workspaceRoot) => {
       const custom = (await runtime.customDefs.agentsForCwd(cwd, workspaceRoot)).find((agent) => agent.id === id)
       if (custom) {

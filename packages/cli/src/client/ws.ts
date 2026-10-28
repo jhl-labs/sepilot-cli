@@ -10,7 +10,7 @@ export class DaemonWsClient extends SharedDaemonWsClient {
       baseUrl: resolvedBaseUrl,
       token,
       surface: 'cli',
-      memoryScope: resolvedBaseUrl ? memoryScopeFor(resolvedBaseUrl, token) : undefined,
+      memoryScope: memoryScopeFor(resolvedBaseUrl, token),
     })
   }
 }

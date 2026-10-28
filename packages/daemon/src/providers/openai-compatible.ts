@@ -6,6 +6,7 @@ import type {
   ChatResponse,
   StreamChunk,
   ModelInfo,
+  PromptCacheConfig,
   ModelCatalogAuthority,
   ModelCatalogRefreshResult,
 } from '@sepilotd/core'
@@ -26,6 +27,7 @@ export interface OpenAICompatibleConfig {
   baseUrl: string
   headers?: Record<string, string>
   models: string[]
+  promptCache?: PromptCacheConfig
   defaultContextWindow?: number
   defaultMaxOutputTokens?: number
   capabilities?: Partial<ModelInfo['capabilities']>
@@ -382,6 +384,7 @@ export class OpenAICompatibleProvider implements ILLMProvider {
   async chat(request: ChatRequest, options?: LLMRequestOptions): Promise<ChatResponse> {
     const model = this.models.find((candidate) => candidate.id === request.model)
     return createOpenAIChatResponse(this.client, request, options, {
+      promptCache: model?.promptCache ?? this.config.promptCache,
       filterThinkTags: true,
       thinkingControl: model?.capabilities.thinkingControl,
       reasoningEffortOffValue: model?.compatibility?.reasoningEffortOffValue,
@@ -426,6 +429,7 @@ export class OpenAICompatibleProvider implements ILLMProvider {
     }
 
     yield* streamOpenAIChatResponse(this.client, request, options, {
+      promptCache: model?.promptCache ?? this.config.promptCache,
       filterThinkTags: true,
       thinkingControl: model?.capabilities.thinkingControl,
       reasoningEffortOffValue: model?.compatibility?.reasoningEffortOffValue,

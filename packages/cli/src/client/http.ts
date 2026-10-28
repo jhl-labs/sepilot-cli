@@ -86,7 +86,7 @@ export class DaemonClient extends SharedDaemonClient {
       baseUrl: resolvedBaseUrl,
       token,
       surface: 'cli',
-      memoryScope: resolvedBaseUrl ? memoryScopeFor(resolvedBaseUrl, token) : undefined,
+      memoryScope: memoryScopeFor(resolvedBaseUrl, token),
     })
     this.token = token
     this.jobs = createJobsClient({ origin: this.baseUrl, token })

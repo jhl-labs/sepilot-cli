@@ -1,3 +1,4 @@
+import { modelCatalogCost, modelMeetsRoutingRequirements, resolveModelRoutingHints, type ModelRoutingHints } from '../../providers/model-routing-policy.js'
 import { randomUUID } from 'node:crypto'
 import type {
   AgentEvent,
@@ -30,6 +31,7 @@ export interface ChatProviderSelection {
   model: string
   source: ChatProviderSelectionSource
   rank: number
+  reason?: string
 }
 
 export type ChatProviderAttemptStatus = 'started' | 'failed' | 'succeeded'
@@ -40,9 +42,9 @@ export interface NoProviderError {
 }
 
 export interface ProviderSelectionFailure {
-  statusCode: 404 | 503
+  statusCode: 404 | 422 | 503
   error: NoProviderError | {
-    code: 'PROVIDER_NOT_FOUND' | 'MODEL_NOT_FOUND'
+    code: 'PROVIDER_NOT_FOUND' | 'MODEL_NOT_FOUND' | 'MODEL_REQUIREMENTS_UNSATISFIED'
     message: string
     providerId?: string
     modelId?: string
@@ -105,6 +107,7 @@ export function buildProviderSelectionFailure(
   },
   requestedProvider?: string,
   requestedModel?: string,
+  routing?: ModelRoutingHints,
 ): ProviderSelectionFailure {
   if (requestedProvider && !runtime.providerRegistry.get(requestedProvider)) {
     return {
@@ -147,6 +150,10 @@ export function buildProviderSelectionFailure(
     }
   }
 
+  const requirements = resolveModelRoutingHints(runtime.config?.agent?.modelRouting?.defaults, routing)
+  if (runtime.providerRegistry.list().length && (requirements.requireToolUse || requirements.minContextWindow !== undefined || requirements.maxInputCostPer1k !== undefined || requirements.maxOutputCostPer1k !== undefined)) {
+    return { statusCode: 422, error: { code: 'MODEL_REQUIREMENTS_UNSATISFIED', message: 'No available selected model satisfies the configured capabilities and catalog cost limits. Review modelRouting and provider catalog metadata.', providerId: requestedProvider, modelId: requestedModel } }
+  }
   return { statusCode: 503, error: buildNoProviderError(runtime) }
 }
 
@@ -158,9 +165,11 @@ export function selectChatProviderCandidates(args: {
   existingSession?: SessionMeta | null
   requireVision?: boolean
   preferVision?: boolean
+  routing?: ModelRoutingHints
 }): ChatProviderSelection[] {
   const { runtime, message, requestedProvider, requestedModel, existingSession, requireVision, preferVision } =
     args
+  const routing = resolveModelRoutingHints(runtime.config?.agent?.modelRouting?.defaults, args.routing)
   const shouldPreferVision = Boolean(preferVision && !requestedModel && !requireVision)
 
   const modelInfoHasRequiredCapabilities = (
@@ -170,6 +179,7 @@ export function selectChatProviderCandidates(args: {
     if (modelInfo.capabilities.embedding === true && modelInfo.capabilities.toolUse !== true) {
       return false
     }
+    if (!modelMeetsRoutingRequirements(modelInfo, routing)) return false
     if (requireVision && !modelInfo.capabilities.vision) {
       return false
     }
@@ -185,7 +195,7 @@ export function selectChatProviderCandidates(args: {
 
   const modelHasRequiredCapabilities = (provider: ILLMProvider, model: string): boolean => {
     const knownModel = provider.models.find((candidate) => candidate.id === model)
-    if (!knownModel) return !requireVision
+    if (!knownModel) return !requireVision && !routing.requireToolUse && routing.minContextWindow === undefined && routing.maxInputCostPer1k === undefined && routing.maxOutputCostPer1k === undefined
     return modelInfoHasRequiredCapabilities(provider, knownModel)
   }
   const modelHasVision = (provider: ILLMProvider, model: string): boolean =>
@@ -208,17 +218,18 @@ export function selectChatProviderCandidates(args: {
     const knownPreferredModel = preferredModel
       ? provider.models.find((candidate) => candidate.id === preferredModel)
       : undefined
+    if (knownPreferredModel && !modelMeetsRoutingRequirements(knownPreferredModel, routing)) return null
     if (knownPreferredModel && modelInfoHasRequiredCapabilities(provider, knownPreferredModel)) {
       return knownPreferredModel.id
     }
     if (preferredModel && !knownPreferredModel) {
+      if (requestedModel && runtime.providerRegistry.list().some(candidate => candidate.models.some(model => model.id === preferredModel))) return null
       if (provider.modelCatalogAuthority === 'endpoint') return null
-      if (!requireVision) return preferredModel
+      if (modelHasRequiredCapabilities(provider, preferredModel)) return preferredModel
     }
-    const candidate = provider.models.find(
-      (modelInfo) => modelInfoHasRequiredCapabilities(provider, modelInfo),
-    )
-    return candidate?.id ?? null
+    const eligible = provider.models.filter(modelInfo => modelInfoHasRequiredCapabilities(provider, modelInfo))
+    if (routing.preference === 'lowest-cost') eligible.sort((a, b) => modelCatalogCost(a) - modelCatalogCost(b))
+    return eligible[0]?.id ?? null
   }
   const sortVisionPreferred = (selections: ChatProviderSelection[]): ChatProviderSelection[] => {
     if (!shouldPreferVision) return selections
@@ -269,7 +280,8 @@ export function selectChatProviderCandidates(args: {
 
     const fallbackTail =
       runtime.modelRouter?.selectCandidates(message, pinnedModelName, {
-        includeFallbacksForExplicitModel: true,
+        ...routing,
+        includeFallbacksForExplicitModel: !requestedModel,
         isCandidateAvailable: (candidate) =>
           modelHasRequiredCapabilities(candidate.provider, candidate.model) &&
           isCandidateAvailable(candidate.providerId, candidate.model),
@@ -282,6 +294,7 @@ export function selectChatProviderCandidates(args: {
         provider: candidate.provider,
         model: candidate.model,
         source: 'model_router',
+        reason: `${routing.taskType ?? 'general'}:${candidate.reason}`,
         rank: results.length,
       })
     }
@@ -289,15 +302,18 @@ export function selectChatProviderCandidates(args: {
     if (results.length > 0) {
       return sortVisionPreferred(results)
     }
+    if (requestedModel) return []
   }
 
   const configuredDefaultModel =
     !requestedModel && !existingSession
       ? runtime.config?.agent.defaultModel
       : undefined
-  const routedPreferredModel = requestedModel ?? configuredDefaultModel
+  const hasTaskRoute = runtime.config?.agent?.modelRouting?.routes?.some(route => route.taskType === routing.taskType)
+  const routedPreferredModel = requestedModel ?? (hasTaskRoute || routing.preference === 'lowest-cost' ? undefined : configuredDefaultModel)
   const routed = runtime.modelRouter
     ? runtime.modelRouter.selectCandidates(message, routedPreferredModel, {
+        ...routing,
         includeFallbacksForExplicitModel:
           Boolean(configuredDefaultModel) && !requestedModel,
         isCandidateAvailable: (candidate) =>
@@ -314,10 +330,12 @@ export function selectChatProviderCandidates(args: {
       provider: candidate.provider,
       model: candidate.model,
       source: 'model_router',
+      reason: `${routing.taskType ?? 'general'}:${candidate.reason}`,
       rank: index,
     })))
   }
 
+  if (routedPreferredModel && runtime.modelRouter && !routed?.length) return []
   const provider = runtime.providerRegistry.getDefault()
   if (!provider) return []
   const candidateModel = selectModelForProvider(provider, requestedModel)
@@ -429,6 +447,7 @@ export async function appendChatProviderAttemptEvent(
     model: selection.model,
     source: selection.source,
     rank: selection.rank,
+    selectionReason: selection.reason ?? selection.source,
     attempt,
     status,
     retryable: options.retryable,

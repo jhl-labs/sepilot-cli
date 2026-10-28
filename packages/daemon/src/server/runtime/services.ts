@@ -189,6 +189,7 @@ export interface SchedulerStackDeps {
     requestId: string
     runId?: string
     forcePrompt?: boolean
+    recheckPolicy?: () => import('@sepilotd/core').PolicyCheckResult
     signal?: AbortSignal
   }) => ApprovalDecision | Promise<ApprovalDecision>
   onRunFinished?: (finished: SchedulerRunFinished) => void
@@ -284,7 +285,7 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
   const channelLookup: ChannelLookup = {
     get: (type: string) => channels.find((ch) => ch.type === type),
   }
-  const deliveryWorker = createSchedulerDeliveryWorker(deliveryOutbox, channelLookup)
+  const channelDeliveryWorker = createSchedulerDeliveryWorker(deliveryOutbox, channelLookup)
 
   const channelAgentExecutor = new ChannelAgentExecutor(channelPipelineCapabilities)
   const sessionResolver = new ChannelSessionResolver(channelPipelineCapabilities)
@@ -484,6 +485,7 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
                 sessionId: opts.sessionId,
                 toolCall,
                 requestId,
+                recheckPolicy: options?.recheckPolicy,
                 forcePrompt: options?.forcePrompt,
                 signal: options?.signal,
               }),
@@ -655,22 +657,15 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
     })
   }
 
-  const executor = createSchedulerExecutor({
-    jobStore,
-    channelRegistry: channelLookup,
-    channelAgentExecutor,
-    sessionResolver,
-    providerRegistry,
-    runHeadlessAgent,
-    runInternalJob: internalJobRunner,
-    runScriptMonitor: createScriptMonitorRunner({
+  const scriptMonitorRunner = createScriptMonitorRunner({
       updateMetadata(jobId, metadata) {
         jobStore.updateMetadata(jobId, metadata)
       },
       async notify(input) {
         const job = jobStore.get(input.jobId)
-        if (job?.parentSessionId && !job.channelType && !job.channelTarget) {
-          new SessionInbox().tryPublish({ sessionId: job.parentSessionId, source: 'monitor', sourceId: job.id,
+        if (!job) return
+        if (job.parentSessionId && !job.channelType && !job.channelTarget) {
+          new SessionInbox().publish({ sessionId: job.parentSessionId, source: 'monitor', sourceId: job.id,
             eventKey: input.id, title: input.title, body: input.body })
           await appendSchedulerChatProgress(job, input.body)
         }
@@ -679,7 +674,42 @@ export function buildSchedulerStack(deps: SchedulerStackDeps): SchedulerStack {
           audience: job ? schedulerNotificationAudience(job) : null,
         })
       },
-    }),
+    })
+
+  let monitorTimer: ReturnType<typeof setInterval> | undefined
+  let monitorFlight: Promise<number> | undefined
+  const drainMonitors = () => {
+    if (!monitorFlight) monitorFlight = scriptMonitorRunner.drainPending().finally(() => { monitorFlight = undefined })
+    return monitorFlight
+  }
+  const wakeMonitors = () => { void drainMonitors().catch(() => log.warn('monitor notification delivery will retry')) }
+  const deliveryWorker: SchedulerDeliveryWorker = {
+    start() {
+      channelDeliveryWorker.start()
+      if (monitorTimer) return
+      wakeMonitors()
+      monitorTimer = setInterval(wakeMonitors, 30_000)
+      monitorTimer.unref?.()
+    },
+    stop() {
+      channelDeliveryWorker.stop()
+      if (monitorTimer) clearInterval(monitorTimer)
+      monitorTimer = undefined
+    },
+    async drainOnce() {
+      const [channels, monitors] = await Promise.all([channelDeliveryWorker.drainOnce(), drainMonitors()])
+      return channels + monitors
+    },
+  }
+  const executor = createSchedulerExecutor({
+    jobStore,
+    channelRegistry: channelLookup,
+    channelAgentExecutor,
+    sessionResolver,
+    providerRegistry,
+    runHeadlessAgent,
+    runInternalJob: internalJobRunner,
+    runScriptMonitor: scriptMonitorRunner,
     grantUnattendedApproval: deps.grantUnattendedApproval,
     onJobProgress: appendSchedulerChatProgress,
     deliveryOutbox,
@@ -1125,8 +1155,9 @@ export function buildRunLimiter(): RunLimiter {
 
 export function buildModelRouter(
   providerRegistry: ProviderRegistry,
+  policy?: SepilotdConfig['agent']['modelRouting'],
 ): ModelRouter {
-  return new ModelRouter(providerRegistry)
+  return new ModelRouter(providerRegistry, policy?.routes)
 }
 
 export async function buildPluginLoader(

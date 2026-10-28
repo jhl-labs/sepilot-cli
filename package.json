@@ -29,7 +29,8 @@
     "patchedDependencies": {
       "image-size@1.2.1": "patches/image-size@1.2.1.patch",
       "ssh2@1.17.0": "patches/ssh2@1.17.0.patch",
-      "vitest@3.2.7": "patches/vitest@3.2.7.patch"
+      "vitest@3.2.7": "patches/vitest@3.2.7.patch",
+      "cli-truncate@5.2.0": "patches/cli-truncate@5.2.0.patch"
     },
     "allowUnusedPatches": true,
     "onlyBuiltDependencies": [
@@ -38,8 +39,8 @@
       "node-pty"
     ],
     "overrides": {
-      "undici@7.29.0": "7.29.1",
-      "undici@6.28.0": "6.28.1",
+      "undici@>=7.0.0 <7.30.1": "7.30.1",
+      "undici@>=6.0.0 <6.29.1": "6.29.1",
       "@types/react": "^19.0.0",
       "@types/react-dom": "^19.0.0",
       "@xmldom/xmldom@0.8.12": "0.8.15",

@@ -79,6 +79,8 @@ export interface ActiveSkillExecutionPolicy {
   policy: SkillExecutionPolicy
 }
 
+export type SkillDiscoveryScope = 'home' | 'project'
+
 export interface SkillMetadata {
   id: string
   name: string
@@ -95,5 +97,6 @@ export interface SkillMetadata {
   permissions?: SkillPermissionManifest
   execution?: SkillExecutionPolicy
   autoDiscovered?: boolean
+  discoveryScope?: SkillDiscoveryScope
   enabled?: boolean
 }

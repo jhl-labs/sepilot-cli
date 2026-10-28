@@ -4,6 +4,7 @@ export interface CostTokens {
   cacheReadTokens?: number
   cacheCreationTokens?: number
   thinkingTokens?: number
+  inputTokensIncludeCache?: boolean
 }
 
 export interface CostResult {
@@ -59,15 +60,19 @@ export function computeCostUsd(_provider: string, model: string, tokens: CostTok
   if (!rate) {
     return { costUsd: 0, costKnown: false }
   }
-  const cacheReadRate = rate.cacheRead ?? rate.input * 0.1
-  const cacheWriteRate = rate.cacheWrite ?? rate.input * 1.25
   const input = tokens.inputTokens ?? 0
   const output = tokens.outputTokens ?? 0
   const thinking = tokens.thinkingTokens ?? 0
   const cacheRead = tokens.cacheReadTokens ?? 0
   const cacheWrite = tokens.cacheCreationTokens ?? 0
+  if ((cacheRead > 0 && rate.cacheRead === undefined) || (cacheWrite > 0 && rate.cacheWrite === undefined)) {
+    return { costUsd: 0, costKnown: false }
+  }
+  const cacheReadRate = rate.cacheRead ?? 0
+  const cacheWriteRate = rate.cacheWrite ?? 0
+  const freshInput = tokens.inputTokensIncludeCache ? Math.max(0, input - cacheRead - cacheWrite) : input
   const costUsd =
-    (input / 1000) * rate.input +
+    (freshInput / 1000) * rate.input +
     ((output + thinking) / 1000) * rate.output +
     (cacheRead / 1000) * cacheReadRate +
     (cacheWrite / 1000) * cacheWriteRate

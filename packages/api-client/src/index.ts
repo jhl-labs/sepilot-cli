@@ -48,6 +48,23 @@ export * from './acp/protocol.js'
 export * from './gateway/http.js'
 export * from './gateway/watch-surface.js'
 export type {
+  DecisionAnswer,
+  DecisionChoiceAnswer,
+  DecisionChoiceOption,
+  DecisionChoiceQuestion,
+  DecisionPredicateAnswer,
+  DecisionPredicateQuestion,
+  DecisionQuestion,
+  DecisionQuestionType,
+  DecisionRefusalAnswer,
+  DecisionRequest,
+  DecisionResponse,
+  DecisionScoreAnswer,
+  DecisionScoreLevel,
+  DecisionScoreQuestion,
+  DecisionUsage,
+} from '@sepilotd/core'
+export type {
   ToolCall,
   SessionEvent,
   SessionStartEvent,

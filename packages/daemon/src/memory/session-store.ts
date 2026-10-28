@@ -19,7 +19,7 @@ import { retryTransientFsOperation } from '../utils/fs-retry.js'
 
 const log = createLogger('session-store')
 
-const SESSION_INDEX_VERSION = 2
+const SESSION_INDEX_VERSION = 3
 const MAX_SESSION_PERSONAS = 6
 
 function normalizeSessionPersonaIds(personaIds: readonly string[]): string[] {
@@ -161,7 +161,7 @@ export class JsonlSessionStore implements ISessionStore {
 
     try {
       this.index = parseSessionIndex(data)
-      await this.ensureSearchIndex()
+      await this.migrateIndexVersion()
     } catch (err) {
       const aside = `${indexPath}.broken-${Date.now()}`
       log.error('session index unparseable; rotating aside before rebuild', {
@@ -280,7 +280,6 @@ export class JsonlSessionStore implements ISessionStore {
     }
     const query = normalizeSearchQuery(params?.query)
     if (query) {
-      let populatedLegacySearchText = false
       const matches = await Promise.all(
         filtered.map(async (session) => {
           if (sessionSearchIndexMatchesQuery(session, query)) {
@@ -291,16 +290,11 @@ export class JsonlSessionStore implements ISessionStore {
             return null
           }
 
-          const events = await this.getEvents(session.id)
-          session.searchText = buildSessionSearchText(session, events)
-          populatedLegacySearchText = true
-          return sessionSearchIndexMatchesQuery(session, query) ? session : null
+          const indexed = await this.cacheSearchText(session.id)
+          return indexed && sessionSearchIndexMatchesQuery(indexed, query) ? indexed : null
         }),
       )
       filtered = matches.filter((session): session is IndexedSessionMeta => session !== null)
-      if (populatedLegacySearchText) {
-        await this.saveIndex()
-      }
     }
     filtered.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     const page = params?.page ?? 1
@@ -314,6 +308,16 @@ export class JsonlSessionStore implements ISessionStore {
       perPage,
       hasNextPage: start + perPage < filtered.length,
     }
+  }
+
+  private cacheSearchText(sessionId: string): Promise<IndexedSessionMeta | null> {
+    return this.withSessionWrite(sessionId, async () => {
+      const events = await this.getEvents(sessionId)
+      const session = this.index.sessions.find((candidate) => candidate.id === sessionId)
+      if (!session) return null
+      session.searchText ??= buildSessionSearchText(session, events)
+      return session
+    })
   }
 
   async delete(id: string): Promise<void> {
@@ -384,7 +388,6 @@ export class JsonlSessionStore implements ISessionStore {
     patch: SessionMetaPatch,
     expectedTitle?: Pick<SessionMeta, 'title' | 'createdAt'>,
   ): Promise<SessionMeta | null> {
-    const events = await this.getEvents(sessionId)
     return this.withIndexWrite(async () => {
       const index = this.index.sessions.findIndex((session) => session.id === sessionId)
       if (index < 0) return null
@@ -446,7 +449,7 @@ export class JsonlSessionStore implements ISessionStore {
       if (Array.isArray(patch.tags)) {
         meta.tags = normalizeSessionTags(patch.tags)
       }
-      meta.searchText = buildSessionSearchText(meta, events)
+      delete meta.searchText
       this.index.sessions[index] = meta
       try {
         await this._flushIndex()
@@ -497,10 +500,9 @@ export class JsonlSessionStore implements ISessionStore {
         meta.totalTokens = event.totalTokens
         meta.totalCost = event.totalCost
       }
-      meta.searchText = appendSessionSearchText(
-        meta.searchText ?? buildSessionSearchText(meta, []),
-        event,
-      )
+      if (typeof meta.searchText === 'string') {
+        meta.searchText = appendSessionSearchText(meta.searchText, event)
+      }
       this.index.sessions[index] = meta
       await this._flushIndex()
     })
@@ -638,24 +640,17 @@ export class JsonlSessionStore implements ISessionStore {
       ).length
       const last = events.at(-1)
       if (last) meta.updatedAt = last.timestamp
-      meta.searchText = buildSessionSearchText(meta, events)
+      delete meta.searchText
       this.index.sessions[index] = meta
       await this._flushIndex()
     })
   }
 
-  private async ensureSearchIndex(): Promise<void> {
-    let changed = this.index.version !== SESSION_INDEX_VERSION
+  private async migrateIndexVersion(): Promise<void> {
+    if (this.index.version === SESSION_INDEX_VERSION) return
+    for (const session of this.index.sessions) delete session.searchText
     this.index.version = SESSION_INDEX_VERSION
-    for (const session of this.index.sessions) {
-      if (typeof session.searchText !== 'string') {
-        session.searchText = buildSessionSearchText(session, await this.getEvents(session.id))
-        changed = true
-      }
-    }
-    if (changed) {
-      await this.saveIndex()
-    }
+    await this.saveIndex()
   }
 
   private saveIndex(): Promise<void> {
@@ -665,7 +660,11 @@ export class JsonlSessionStore implements ISessionStore {
   private async _flushIndex(): Promise<void> {
     const indexPath = join(this.sessionsDir, 'index.json')
     try {
-      await writeFileAtomic(indexPath, JSON.stringify(this.index, null, 2))
+      const persisted: SessionIndex = {
+        version: this.index.version,
+        sessions: this.index.sessions.map(withoutSearchText),
+      }
+      await writeFileAtomic(indexPath, JSON.stringify(persisted, null, 2))
     } catch (error) {
       log.error('failed to persist session index', {
         indexPath,
@@ -701,8 +700,13 @@ function parseSessionIndex(data: string): SessionIndex {
   }
 }
 
-function toSessionMeta(session: IndexedSessionMeta): SessionMeta {
+function withoutSearchText(session: IndexedSessionMeta): SessionMeta {
   const { searchText: _searchText, ...meta } = session
+  return meta
+}
+
+function toSessionMeta(session: IndexedSessionMeta): SessionMeta {
+  const meta = withoutSearchText(session)
   return {
     ...meta,
     tags: [...meta.tags],

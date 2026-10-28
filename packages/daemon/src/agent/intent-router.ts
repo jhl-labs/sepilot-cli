@@ -35,6 +35,7 @@ import {
   formatSkillDisplayLabel,
   isSkillEligibleForAutomaticRouting,
   MAX_AUTOMATIC_ROUTER_SKILLS,
+  orderSkillsForCatalog,
 } from '../skills/display.js'
 import {
   TOOL_EXPOSURE_GROUP_DESCRIPTIONS,
@@ -244,7 +245,7 @@ export class IntentRouter {
     const all = this.opts.skillRegistry.listForCwd
       ? await this.opts.skillRegistry.listForCwd(this.opts.cwd, this.opts.workspaceRoot)
       : await this.opts.skillRegistry.list()
-    return all
+    return orderSkillsForCatalog(all)
       .filter((s: SkillMetadata) =>
         isSkillEligibleForAutomaticRouting(s)
         && autonomyAllows(s.autonomy_required, this.opts.currentAutonomy),

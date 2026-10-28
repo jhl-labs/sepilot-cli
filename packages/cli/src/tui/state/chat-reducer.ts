@@ -66,7 +66,7 @@ export type ChatAction =
   | { type: 'ERROR'; message: string; outcome?: TurnOutcome }
   | { type: 'SET_TURN_OUTCOME'; outcome: TurnOutcome }
   | { type: 'STREAM_FINALIZED' }
-  | { type: 'SYSTEM_MESSAGE'; content: string }
+  | { type: 'SYSTEM_MESSAGE'; content: string; variant?: 'progress' }
   | { type: 'APPEND_MESSAGE'; message: Message }
   | { type: 'UPSERT_MESSAGE'; message: Message }
   | { type: 'NEW_SESSION' }
@@ -491,6 +491,7 @@ function reduceChat(state: ChatState, action: ChatAction): ChatState {
           {
             id: crypto.randomUUID(),
             role: 'system',
+            ...(action.variant ? { variant: action.variant } : {}),
             content: action.content,
             timestamp: Date.now(),
           },

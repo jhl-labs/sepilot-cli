@@ -5,12 +5,18 @@ const HOME_RELATIVE_SKILL_ROOTS = [
   '.agents/skills',
   '.claude/skills',
   '.codex/skills',
+  '.config/opencode/skill',
   '.config/opencode/skills',
+  '.opencode/skill',
   '.opencode/skills',
   '.roo/skills',
 ]
 
 const PROJECT_CONFIG_DIRS = ['.agents', '.claude', '.codex', '.opencode', '.roo']
+
+function skillDirNames(configDir: string): string[] {
+  return configDir === '.opencode' ? ['skill', 'skills'] : ['skills']
+}
 
 export async function defaultCompatibleSkillRoots(
   env: NodeJS.ProcessEnv = process.env,
@@ -23,6 +29,14 @@ export async function defaultCompatibleSkillRoots(
     }
     if (env.CODEX_HOME) {
       roots.push(join(env.CODEX_HOME, 'skills'))
+    }
+    if (env.XDG_CONFIG_HOME) {
+      roots.push(join(env.XDG_CONFIG_HOME, 'opencode', 'skill'))
+      roots.push(join(env.XDG_CONFIG_HOME, 'opencode', 'skills'))
+    }
+    if (env.OPENCODE_CONFIG_DIR) {
+      roots.push(join(env.OPENCODE_CONFIG_DIR, 'skill'))
+      roots.push(join(env.OPENCODE_CONFIG_DIR, 'skills'))
     }
     roots.push(...await expandModeSpecificRoots(join(home, '.agents')))
     roots.push(...await expandModeSpecificRoots(join(home, '.roo')))
@@ -38,7 +52,7 @@ export async function projectCompatibleSkillRoots(
   for (const dir of await ancestorDirs(cwd, boundaryRoot)) {
     for (const configDir of PROJECT_CONFIG_DIRS) {
       const root = join(dir, configDir)
-      roots.push(join(root, 'skills'))
+      for (const name of skillDirNames(configDir)) roots.push(join(root, name))
       if (configDir === '.agents' || configDir === '.roo') {
         roots.push(...await expandModeSpecificRoots(root, boundaryRoot))
       }
@@ -53,6 +67,7 @@ export async function gitCompatibleSkillRoots(repoRoot: string): Promise<string[
     join(repoRoot, '.agents', 'skills'),
     join(repoRoot, '.claude', 'skills'),
     join(repoRoot, '.codex', 'skills'),
+    join(repoRoot, '.opencode', 'skill'),
     join(repoRoot, '.opencode', 'skills'),
     join(repoRoot, '.roo', 'skills'),
   ]

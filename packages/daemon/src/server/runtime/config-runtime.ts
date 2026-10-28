@@ -22,6 +22,7 @@ import {
   type ConfigUpdateValues,
 } from './config-mutations.js'
 import { buildProviderRegistry, resolveAutonomy, syncDynamicProviderModels } from './providers.js'
+import { buildDecisionProviderRegistry } from './decision-providers.js'
 import { buildModelRouter, syncDreamingProvider } from './services.js'
 import { buildSemanticIndex } from './storage.js'
 import { replaceSemanticStore } from '../../memory/rebindable-store.js'
@@ -140,7 +141,7 @@ export async function reconfigureRuntimeProviders(
     runtime.providerFactoryRegistry,
   )
   await syncDynamicProviderModels(runtime.providerRegistry, runtime.config)
-  runtime.modelRouter = buildModelRouter(runtime.providerRegistry)
+  runtime.modelRouter = buildModelRouter(runtime.providerRegistry, runtime.config.agent.modelRouting)
   syncDreamingProvider(runtime.dreaming, runtime.providerRegistry, runtime.config.agent)
 }
 
@@ -231,11 +232,16 @@ export async function reconfigureRuntimeExtensions(
     configureProviderHttpTimeout(runtime.config.network)
   }
 
+  if (updatedKeys.has('decisionProviders')) {
+    runtime.decisionProviderRegistry = buildDecisionProviderRegistry(runtime.config)
+  }
+
   if (
     updatedKeys.has('providers')
     || updatedKeys.has('agent.defaultProvider')
     || updatedKeys.has('agent.defaultModel')
     || updatedKeys.has('agent.auxModel')
+    || updatedKeys.has('agent.modelRouting')
   ) {
     await reconfigureRuntimeProviders(runtime)
   }

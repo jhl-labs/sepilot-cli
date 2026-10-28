@@ -1,4 +1,5 @@
 import { Box, Text } from 'ink'
+import wrapAnsi from 'wrap-ansi'
 import { colors } from '../../theme.js'
 import { clampGraphemeOffset } from '../../utils/graphemes.js'
 import { IME_CURSOR_MARKER } from '../runtime/ime-cursor.js'
@@ -11,6 +12,19 @@ export interface ComposerProps {
   activityColor?: string
   width: number
   hardwareCursor?: boolean
+  maxEditorRows?: number
+}
+
+export function composerViewport(value: string, cursorOffset: number, width: number, maxRows = 6): { text: string; rows: number } {
+  const presentation = deriveComposerInputPresentation(value, cursorOffset)
+  const offset = clampGraphemeOffset(presentation.editorValue, presentation.editorCursorOffset)
+  const content = `${presentation.editorValue.slice(0, offset)}${IME_CURSOR_MARKER}${presentation.editorValue.slice(offset)}`
+  const lines = wrapAnsi(content, Math.max(1, width - 6), { hard: true, trim: false }).split('\n')
+  const limit = Math.max(1, Math.floor(maxRows))
+  const caretRow = Math.max(0, lines.findIndex(line => line.includes(IME_CURSOR_MARKER)))
+  const start = Math.max(0, Math.min(caretRow - Math.floor(limit / 2), lines.length - limit))
+  const visible = lines.slice(start, start + limit)
+  return { text: visible.join('\n'), rows: visible.length }
 }
 
 export function Composer({
@@ -20,15 +34,11 @@ export function Composer({
   activityColor = colors.primary,
   width,
   hardwareCursor = false,
+  maxEditorRows = 6,
 }: ComposerProps) {
   const presentation = deriveComposerInputPresentation(value, cursorOffset)
   const shellMode = presentation.mode === 'shell'
-  const safeCursorOffset = clampGraphemeOffset(
-    presentation.editorValue,
-    presentation.editorCursorOffset,
-  )
-  const beforeCursor = presentation.editorValue.slice(0, safeCursorOffset)
-  const afterCursor = presentation.editorValue.slice(safeCursorOffset)
+  const viewport = composerViewport(value, cursorOffset, width, maxEditorRows)
   return (
     <Box flexDirection="column" width={width}>
       <Box
@@ -39,9 +49,9 @@ export function Composer({
         <Text color={shellMode ? colors.warning : colors.dimText} bold={shellMode}>
           {shellMode ? '$ ' : '› '}
         </Text>
-        <Text>{`${beforeCursor}${hardwareCursor ? IME_CURSOR_MARKER : '│'}${afterCursor}`}</Text>
+        <Text wrap="truncate-end">{hardwareCursor ? viewport.text : viewport.text.replaceAll(IME_CURSOR_MARKER, '│')}</Text>
         {shellMode && presentation.editorValue.length === 0 ? (
-          <Text color={colors.dimText}> Type a local shell command...</Text>
+          <Text color={colors.dimText} wrap="truncate-end"> Type a local shell command...</Text>
         ) : null}
       </Box>
     </Box>

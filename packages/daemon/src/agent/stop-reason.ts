@@ -7,9 +7,10 @@ import type {
 } from '@sepilotd/core'
 
 export const INCOMPLETE_OUTPUT_PREFIX = 'INCOMPLETE:'
+const INCOMPLETE_OUTPUT_STEM = /^(?:INCOMPLETE|UNVERIFIED):/
 
 export function isIncompleteOutput(content: string | undefined): boolean {
-  return typeof content === 'string' && content.trimStart().startsWith(INCOMPLETE_OUTPUT_PREFIX)
+  return typeof content === 'string' && INCOMPLETE_OUTPUT_STEM.test(content.trimStart())
 }
 
 export type BudgetStopLayer =
@@ -151,7 +152,7 @@ const MAX_REPORTED_REASON_CHARS = 300
 
 export function incompleteOutputReason(content: string | undefined): string | undefined {
   if (!isIncompleteOutput(content)) return undefined
-  const body = content!.trimStart().slice(INCOMPLETE_OUTPUT_PREFIX.length)
+  const body = content!.trimStart().replace(INCOMPLETE_OUTPUT_STEM, '')
   const line = body.split('\n').map((part) => part.trim()).find(Boolean)
   if (!line) return undefined
   return line.length > MAX_REPORTED_REASON_CHARS ? `${line.slice(0, MAX_REPORTED_REASON_CHARS - 1)}…` : line

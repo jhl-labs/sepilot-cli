@@ -1,4 +1,5 @@
 export const TURN_CONTEXT_HEADING = 'Turn context (retrieved for this turn; may differ on the next turn):'
+export const TURN_CONTEXT_END = '[End generated turn context]'
 
 export interface SplitSystemText {
   staticText: string
@@ -10,9 +11,11 @@ export function splitTurnContext(systemText: string): SplitSystemText {
   const index = systemText.startsWith(TURN_CONTEXT_HEADING) ? 0 : systemText.indexOf(marker)
   if (index < 0) return { staticText: systemText }
   const boundary = index === 0 ? 0 : index + 1
+  const lastEnd = systemText.lastIndexOf(TURN_CONTEXT_END)
+  const end = lastEnd >= boundary + TURN_CONTEXT_HEADING.length ? lastEnd : -1
   return {
-    staticText: systemText.slice(0, boundary).trimEnd(),
-    turnText: systemText.slice(boundary),
+    staticText: [systemText.slice(0, boundary).trimEnd(), end < 0 ? '' : systemText.slice(end + TURN_CONTEXT_END.length).trim()].filter(Boolean).join('\n\n'),
+    turnText: systemText.slice(boundary, end < 0 ? undefined : end).trimEnd(),
   }
 }
 

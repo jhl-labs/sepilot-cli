@@ -8,6 +8,7 @@ import {
   previewTextLines,
   rowToolMeta,
   summarizeToolInput,
+  toolDisplayName,
   toolFilePath,
   truncatePreviewItems,
 } from '../utils/tooling.js'
@@ -67,7 +68,8 @@ function buildToolHeader(
     superseded: tool.superseded,
     softenSupersededError,
   })
-  const parts = [toggleLabel, status.label, tool.name]
+  const parts = [toggleLabel, status.label, toolDisplayName(tool.name)]
+  if (tool.repeatCount && tool.repeatCount > 1) parts.push(`×${tool.repeatCount}`)
 
   const meta = (
     softenSupersededError
@@ -77,22 +79,11 @@ function buildToolHeader(
     ? SUPERSEDED_ERROR_META
     : rowToolMeta(tool.meta, tool.status)
 
-  if (compact) {
-    const summary = linkedToolInputSummary(tool)
-    if (summary) {
-      parts.push(summary)
-    }
-  }
+  const summary = linkedToolInputSummary(tool)
+  if (summary) parts.push(summary)
 
   if (meta) {
     parts.push(meta)
-  }
-
-  if (collapsed && !compact) {
-    const summary = linkedToolInputSummary(tool)
-    if (summary) {
-      parts.push(summary)
-    }
   }
 
   return parts.join(' ')
@@ -112,10 +103,15 @@ function previewToolOutput(output: string): string {
   return `${output.slice(0, TOOL_OUTPUT_PREVIEW_CHARS).trimEnd()}\n[tool output preview truncated in UI; full output is stored in the session]`
 }
 
-function FileReadPreview({ path, output }: { path?: string; output: string }) {
+function FileReadPreview({ path, output, input }: { path?: string; output: string; input: Record<string, unknown> }) {
   const lines = previewTextLines(output)
   const preview = truncatePreviewItems(lines, DEFAULT_TOOL_PREVIEW_LINES)
-  const lineNumberWidth = String(Math.max(1, preview.visible.length)).length
+  const offset = typeof input.offset === 'number' && input.offset > 0 ? input.offset : 1
+  const numbered = input.lineNumbers !== false && lines.every((line, index) => {
+    const match = /^\s*(\d+)\t/u.exec(line)
+    return match && Number(match[1]) === offset + index
+  })
+  const lineNumberWidth = String(offset + Math.max(0, preview.visible.length - 1)).length
 
   return (
     <Box flexDirection="column">
@@ -127,8 +123,8 @@ function FileReadPreview({ path, output }: { path?: string; output: string }) {
       ) : null}
       {preview.visible.map((line, index) => (
         <Text key={`${index}-${line.slice(0, 24)}`} wrap="truncate-end">
-          <Text color={colors.dimText}>{String(index + 1).padStart(lineNumberWidth)} │ </Text>
-          {line || ' '}
+          <Text color={colors.dimText}>{String(offset + index).padStart(lineNumberWidth)} │ </Text>
+          {(numbered ? line.replace(/^\s*\d+\t/u, '') : line) || ' '}
         </Text>
       ))}
       {preview.omitted > 0 ? (
@@ -153,13 +149,11 @@ export const ToolCallView = React.memo(function ToolCallView({
     softenSupersededError,
   })
   const forceExpandedError = (
-    !compact
-    && tool.status === 'error'
+    tool.status === 'error'
     && !(softenSupersededError && tool.superseded)
   )
-  const renderCompact = compact && !forceExpanded
+  const renderCompact = compact && !forceExpanded && tool.status !== 'error' && tool.status !== 'pending'
   const collapsed = tool.collapsed && !forceExpandedError && !forceExpanded
-  const header = buildToolHeader(tool, softenSupersededError, collapsed, renderCompact)
   const editOldText = tool.name === 'fs.edit' && typeof tool.input.oldText === 'string'
     ? tool.input.oldText
     : undefined
@@ -170,12 +164,17 @@ export const ToolCallView = React.memo(function ToolCallView({
     ? tool.editDiff
     : undefined
   const hasEditPreview = editOldText !== undefined && editNewText !== undefined
-  const showDetails = (!renderCompact && !collapsed) || (renderCompact && (editDiff !== undefined || hasEditPreview))
+  const header = [buildToolHeader(tool, softenSupersededError, collapsed, renderCompact),
+    renderCompact && tool.status === 'success' && (editDiff !== undefined || hasEditPreview) ? '· Ctrl+O changes' : '',
+  ].filter(Boolean).join(' ')
+  const showDetails = (!renderCompact && !collapsed)
+    || (renderCompact && tool.status !== 'success' && (editDiff !== undefined || hasEditPreview))
   const path = toolFilePath(tool.input, tool.name) ?? undefined
 
   if (maxRows !== undefined) {
     const outputRows = Math.max(0, maxRows - 1)
-    const lines = tool.output ? previewTextLines(previewToolOutput(tool.output)) : []
+    const output = tool.output || (tool.status === 'pending' ? tool.meta || 'Approval required' : '')
+    const lines = output ? previewTextLines(previewToolOutput(output)) : []
     return (
       <Box flexDirection="column" marginLeft={indent} flexShrink={0}>
         <Text color={status.color} wrap="truncate-end">{buildToolHeader(tool, softenSupersededError, false, true)}</Text>
@@ -222,13 +221,12 @@ export const ToolCallView = React.memo(function ToolCallView({
             tool.status === 'error' ? (
               <Text color={colors.error} wrap="wrap">{previewToolOutput(tool.output)}</Text>
             ) : (
-              <FileReadPreview path={path} output={tool.output} />
+              <FileReadPreview path={path} output={tool.output} input={tool.input} />
             )
           ) : tool.name === 'terminal.run' ? (
             <TerminalOutput tool={tool} maxLines={DEFAULT_TOOL_PREVIEW_LINES} />
           ) : (
             <>
-              <Text color={colors.dimText} wrap="truncate-end">{tool.arguments}</Text>
               {tool.output && (
                 <Text
                   color={tool.status === 'error' ? colors.error : colors.muted}
