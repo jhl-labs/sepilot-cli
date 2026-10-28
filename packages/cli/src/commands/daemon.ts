@@ -1,3 +1,4 @@
+import { resolveDaemonReadyTimeoutMs } from '../client/daemon-readiness.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import chalk from 'chalk'
@@ -167,7 +168,7 @@ async function startCommandWithEnvironment(
   await persistDaemonForwardEnvNames(prepared.forwardNames, dataDir)
 
   const healthUrl = `${listenTarget.baseUrl}/api/v1/health`
-  const ready = await waitForDaemonReady(healthUrl, { timeoutMs: 5_000, isProcessAlive: proc.isRunning })
+  const ready = await waitForDaemonReady(healthUrl, { timeoutMs: resolveDaemonReadyTimeoutMs(), isProcessAlive: proc.isRunning })
 
   if (ready) {
     const health = await client.health().catch(() => undefined)

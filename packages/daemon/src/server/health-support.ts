@@ -8,6 +8,7 @@ import { getLatestChannelPipelineHealthPolicyChange } from './runtime/channel-pi
 import { resolveWebhookSecurityHealthConfig } from './runtime/webhook-security-health.js'
 import { summarizeWebhookSecurity } from './runtime/webhook-endpoints.js'
 import { getLatestWebhookSecurityPolicyChange } from './runtime/webhook-security-policy-audit.js'
+import { createMonitorStateRepo } from '../monitoring/state-repo.js'
 import { DAEMON_VERSION } from '../version.js'
 
 export interface HealthComponentStatus {
@@ -425,6 +426,19 @@ async function buildDetailedComponents(
   components.plugins = {
     status: failedPlugins > 0 ? 'degraded' : 'ok',
     details: `${registeredPlugins}/${plugins.length} registered`,
+  }
+
+  if (runtime.jobStore) {
+    try {
+      const delivery = createMonitorStateRepo().deliveryStatus(Date.now())
+      components.monitor_delivery = { status: delivery.retrying ? 'degraded' : 'ok', core: false,
+        details: `${delivery.pending} pending, ${delivery.retrying} retrying, ${delivery.leased} leased`,
+        ...delivery,
+        oldestPendingAgeMs: delivery.oldestPendingAt === null ? 0 : Math.max(0, Date.now() - delivery.oldestPendingAt),
+      }
+    } catch {
+      components.monitor_delivery = { status: 'error', core: false, details: 'Monitor delivery status unavailable' }
+    }
   }
 
   const mcpServers = runtime.mcpManager?.listServers?.() ?? []

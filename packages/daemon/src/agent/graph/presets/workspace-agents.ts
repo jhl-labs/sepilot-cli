@@ -75,7 +75,7 @@ function withWorkspaceProfiles(
 ): AgentGraph {
   const allowed = new Set(raw.tools.list().filter((tool) =>
     /^(fs\.|code\.|git\.|process\.)/.test(tool.name)
-    || ['terminal.run', 'apply_patch', 'todowrite', 'question'].includes(tool.name),
+    || ['terminal.run', 'workspace.prepare', 'apply_patch', 'todowrite', 'question'].includes(tool.name),
   ).map((tool) => tool.name))
   const deps = { ...raw, tools: withToolNameAllowlist(raw.tools, allowed),
     autonomy: raw.autonomy === AutonomyLevel.ReadOnly ? AutonomyLevel.ReadOnly : AutonomyLevel.Supervised }

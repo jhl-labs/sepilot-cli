@@ -6,9 +6,11 @@ import type {
 import type { JobsRepo } from '../../jobs/repo.js'
 import type { JobRunner } from '../../jobs/runner.js'
 import type { Job } from '../../jobs/types.js'
-import { executeSubagentJob } from '../../jobs/subagent.js'
+import type { BackgroundSubagents } from '../../jobs/subagent.js'
 import { subagentDispatchRequestSchema } from './subagents-schema.js'
 import { z } from 'zod'
+import { admitHttpSubagent, backgroundAdmissionError, prepareSubagentRequest, type SubagentRequestAuthority } from '../runtime/subagent-request.js'
+import { resolveAutonomy } from '../runtime/providers.js'
 
 export interface JobsBatchExecutor {
   executeItem(item: { idx: number; request: unknown }, signal?: AbortSignal): Promise<unknown>
@@ -19,6 +21,9 @@ export interface RegisterJobsRoutesDeps {
   runner: JobRunner
   executor: JobsBatchExecutor
   subagentDispatcher?: () => SubagentDispatcher | null
+  backgroundSubagents?: () => BackgroundSubagents | null | undefined
+  callerExecutionPolicy?: SubagentRequestAuthority['callerExecutionPolicy']
+  parentSelection?: SubagentRequestAuthority['parentSelection']
   jobMaxConcurrency: number
   onSubagentFinished?: (job: Job, parentSessionId: string) => void
 }
@@ -105,34 +110,26 @@ export function registerJobsRoutes(
       throw err
     }
 
-    const input = parsed.data
-    const job = deps.repo.create({
-      kind: 'subagent',
-      total: 1,
-      concurrency: 1,
-    })
-    deps.repo.insertItems(job.id, [{ idx: 0, request: input }])
-
-    void deps.runner
-      .run({
-        jobId: job.id,
-        concurrency: 1,
-        failureMode: 'abort',
-        execute: (item, signal) => executeSubagentJob(dispatcher, deps.repo, item, signal),
-      })
-      .then(() => {
-        const final = deps.repo.get(job.id)
-        if (final && input.parentSessionId) deps.onSubagentFinished?.(final, input.parentSessionId)
-      })
-      .catch(() => {
-      })
-
-    return reply.status(202).send({
-      jobId: job.id,
-      status: 'pending',
-      total: 1,
-      createdAt: job.createdAt,
-    })
+    let input: Awaited<ReturnType<typeof prepareSubagentRequest>>
+    try {
+      input = await prepareSubagentRequest({
+        callerExecutionPolicy: deps.callerExecutionPolicy ?? (() => {
+          const runtime = app.runtime
+          return runtime ? { autonomy: resolveAutonomy(runtime.config), requireToolApproval: false, allowedToolNames: runtime.toolRegistry.list().map(tool => tool.name) } : null
+        }),
+        parentSelection: deps.parentSelection ?? (app.runtime ? async (id) => app.runtime!.sessions.get(id) : undefined),
+      }, parsed.data)
+    } catch (err) {
+      return reply.status(400).send({ error: { code: (err as { code?: string }).code ?? 'INVALID_REQUEST', message: err instanceof Error ? err.message : String(err) } })
+    }
+    try {
+      return reply.status(202).send(admitHttpSubagent(deps.backgroundSubagents?.() ?? app.runtime?.backgroundSubagents, input))
+    } catch (err) {
+      const failure = backgroundAdmissionError(err)
+      if (failure) return reply.status(failure.statusCode).send({ error: failure.error })
+      if ((err as { code?: string }).code === 'SUBAGENT_TOOL_ESCALATION') return reply.status(400).send({ error: { code: 'SUBAGENT_TOOL_ESCALATION', message: err instanceof Error ? err.message : String(err) } })
+      throw err
+    }
   })
 
   app.get<{ Params: { id: string } }>('/jobs/:id', async (req) => {

@@ -767,7 +767,13 @@ export async function* guardedProviderStream(
 
   const model = provider.models.find((candidate) => candidate.id === request.model)
   if (model?.capabilities.streaming === false) {
-    const fallbackTimeoutMs = resolveProviderStreamFirstTokenMs()
+    const firstTokenTimeoutMs = resolveProviderStreamFirstTokenMs()
+    const fallbackTimeoutMs = firstTokenTimeoutMs !== null
+      && process.env.SEPILOTD_PROVIDER_STREAM_FIRST_TOKEN_MS === undefined
+      && process.env.SEPILOTD_PROVIDER_STREAM_IDLE_MS === undefined
+      && process.env.SEPILOTD_STREAM_IDLE_MS === undefined
+      ? Math.max(firstTokenTimeoutMs, resolveBufferedProviderFirstTokenMs())
+      : firstTokenTimeoutMs
     const adaptedRequest = request.timeoutMs === undefined && fallbackTimeoutMs !== null
       ? { ...request, timeoutMs: fallbackTimeoutMs }
       : request

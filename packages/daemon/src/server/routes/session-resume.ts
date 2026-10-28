@@ -266,6 +266,7 @@ export function registerSessionResumeRoute(app: FastifyInstance): void {
           sessionId: checkpoint.sessionId,
           toolCall,
           requestId,
+          recheckPolicy: options?.recheckPolicy,
           forcePrompt: options?.forcePrompt,
             signal: options?.signal,
         })

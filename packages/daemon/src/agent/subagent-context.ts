@@ -11,12 +11,12 @@ export function resolveChildHistoryBudgetTokens(
   contextWindow: number | undefined,
   requested = Number(process.env[FORK_MAX_TOKENS_ENV] ?? DEFAULT_FORK_MAX_TOKENS),
 ): number {
-  const configured = Number.isFinite(requested) && requested > 0
-    ? Math.floor(requested)
-    : DEFAULT_FORK_MAX_TOKENS
-  const windowCap = contextWindow && contextWindow > 0
-    ? Math.floor(contextWindow * CONTEXT_WINDOW_SHARE)
-    : configured
+  const configured =
+    Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : DEFAULT_FORK_MAX_TOKENS
+  const windowCap =
+    contextWindow && contextWindow > 0
+      ? Math.floor(contextWindow * CONTEXT_WINDOW_SHARE)
+      : configured
   return Math.max(Math.min(MIN_FORK_TOKENS, windowCap), Math.min(configured, windowCap))
 }
 
@@ -42,7 +42,9 @@ export function boundConversationForChild(
     normalized.push({
       role: message.role,
       content,
-      ...(message.toolCalls?.length ? { toolCalls: message.toolCalls.map((call) => ({ ...call })) } : {}),
+      ...(message.toolCalls?.length
+        ? { toolCalls: message.toolCalls.map((call) => ({ ...call })) }
+        : {}),
       ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
       ...(message.name ? { name: message.name } : {}),
     })
@@ -58,9 +60,13 @@ export function boundConversationForChild(
     used += cost
   }
 
-  const callIds = new Set(selected.flatMap((message) => message.toolCalls?.map((call) => call.id) ?? []))
+  const callIds = new Set(
+    selected.flatMap((message) => message.toolCalls?.map((call) => call.id) ?? []),
+  )
   const resultIds = new Set(
-    selected.filter((message) => message.role === 'tool' && message.toolCallId).map((message) => message.toolCallId!),
+    selected
+      .filter((message) => message.role === 'tool' && message.toolCallId)
+      .map((message) => message.toolCallId!),
   )
   const repaired: Message[] = []
   for (const message of selected) {
@@ -83,4 +89,19 @@ export function boundConversationForChild(
 
   const firstUser = repaired.findIndex((message) => message.role === 'user')
   return firstUser > 0 ? repaired.slice(firstUser) : repaired
+}
+
+export function mergeChildHistory(
+  snapshot: readonly Message[],
+  child: readonly Message[],
+  maxTokens: number,
+): Message[] {
+  if (!snapshot.length) return boundConversationForChild(child, { maxTokens })
+  const inherited = boundConversationForChild(snapshot, {
+    maxTokens: child.length ? Math.floor(maxTokens / 2) : maxTokens,
+  })
+  const recent = boundConversationForChild(child, {
+    maxTokens: Math.max(0, maxTokens - estimateMessagesTokens(inherited)),
+  })
+  return [...inherited, ...recent]
 }

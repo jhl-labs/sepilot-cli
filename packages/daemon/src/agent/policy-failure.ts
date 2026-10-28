@@ -8,6 +8,7 @@ export const READ_ONLY_INVOCATION_REPAIR_TOOL_CALL_ID_METADATA_KEY =
   'readOnlyInvocationRepairToolCallId'
 export const TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY = 'toolResultExecutionObserved'
 export const TOOL_RESULT_SECURITY_EFFECT_METADATA_KEY = 'toolResultSecurityEffect'
+export const TOOL_RESULT_EXECUTION_CAPABILITIES_METADATA_KEY = 'toolResultExecutionCapabilities'
 
 const READ_ONLY_TERMINAL_POLICY_REASON = "ReadOnly mode blocks tool 'terminal.run'"
 const SHELL_WRAPPER_EXECUTABLES = new Set([

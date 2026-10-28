@@ -227,7 +227,7 @@ export function createWebFetchTool(options: WebFetchToolOptions = {}): ToolDefin
               return {
                 output: [
                   `Local URL ${currentUrl} is not exposed by a live process.start managed-loopback service available to this session or strict workspace.`,
-                  'Start or rediscover the server with process.start/process.sessions and declared loopback ports, then use webfetch or browser for GET requests. For curl or custom HTTP requests use terminal.run with network=loopback. If the process exited, inspect process.read and fix that failure before retrying HTTP.',
+                  'Start or rediscover the server with process.start/process.sessions and declared loopback ports. If a matching server belongs to another policy session, request process.start with its reuseId and exact invocation to approve scoped reuse, then use webfetch or browser for GET requests. Use terminal.run network=loopback for custom HTTP only when the execution contract permits terminal access. If the process exited, inspect process.read and fix that failure before retrying HTTP.',
                 ].join('\n'),
                 status: 'error',
                 durationMs: Date.now() - start,

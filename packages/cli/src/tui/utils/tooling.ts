@@ -53,10 +53,54 @@ export function formatToolInput(input?: Record<string, unknown>): string {
   return JSON.stringify(input ?? {}, null, 2)
 }
 
+export function toolDisplayName(name: string): string {
+  const labels: Record<string, string> = {
+    'fs.read': 'Read',
+    'fs.write': 'Write',
+    'fs.edit': 'Edit',
+    'fs.append': 'Append to',
+    'fs.list': 'List files',
+    'fs.glob': 'Find files',
+    'fs.search': 'Search contents',
+    'apply_patch': 'Apply patch',
+    'git.status': 'Git status',
+    'git.diff': 'Review changes',
+    'terminal.run': 'Run',
+    'workspace.prepare': 'Prepare workspace',
+    'process.list': 'Inspect processes',
+    'process.start': 'Start process',
+    'web.search': 'Search web',
+    'web.fetch': 'Fetch page',
+  }
+  return labels[name] ?? name
+}
+
+function clipToolSummary(value: string): string {
+  const line = value.replace(/\s+/gu, ' ').trim()
+  return line.length > 120 ? `${line.slice(0, 119)}…` : line
+}
+
 export function summarizeToolInput(
   input?: Record<string, unknown>,
   toolName?: string,
 ): string {
+  if (toolName === 'apply_patch' && typeof input?.patch === 'string') {
+    const paths = [...new Set([...input.patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)\r?$/gmu)]
+      .map((match) => match[1]!.trim()))]
+    if (paths.length > 0) return clipToolSummary(`${paths.length} ${paths.length === 1 ? 'file' : 'files'} · ${paths.slice(0, 3).join(', ')}${paths.length > 3 ? ', …' : ''}`)
+  }
+  if (toolName === 'process.list' && typeof input?.port === 'number') return `TCP port ${input.port}`
+  if (toolName === 'process.start') {
+    const network = input?.network
+    const ports = network && typeof network === 'object' && 'ports' in network && Array.isArray(network.ports)
+      ? network.ports.filter(port => typeof port === 'number') : []
+    return clipToolSummary([
+      input?.reuseId ? 'reuse existing server' : null,
+      `$ ${compactTerminalCommandLabel(input ?? {})}`,
+      ports.length > 0 ? `localhost ${ports.join(', ')}` : null,
+      input?.lifetime === 'session' ? 'session lifetime' : null,
+    ].filter(Boolean).join(' · '))
+  }
   if (toolName === 'terminal.run') {
     const summary = `$ ${compactTerminalCommandLabel(input ?? {})}`
     return summary.length > 120
@@ -87,10 +131,22 @@ export function summarizeToolInput(
     return `file ${path}`
   }
 
-  const serialized = JSON.stringify(input ?? {})
-  return serialized.length > 120
-    ? `${serialized.slice(0, 119)}…`
-    : serialized
+  if (toolName === 'fs.list' || toolName === 'fs.glob' || toolName === 'fs.search') {
+    return clipToolSummary([
+      typeof input?.query === 'string' ? input.query : null,
+      typeof input?.pattern === 'string' ? input.pattern : null,
+      typeof input?.cwd === 'string' ? `in ${input.cwd}` : 'in current folder',
+      input?.hidden === true ? 'including hidden files' : null,
+      typeof input?.glob === 'string' ? `files ${input.glob}` : null,
+    ].filter(Boolean).join(' · '))
+  }
+
+  if (!input || Object.keys(input).length === 0) return ''
+  const fields = ['path', 'pattern', 'query', 'cwd', 'url', 'target', 'name']
+    .flatMap((key) => typeof input[key] === 'string' ? [`${key}: ${input[key]}`] : [])
+  if (fields.length > 0) return clipToolSummary(fields.join(' · '))
+  const count = Object.keys(input).length
+  return `${count} parameter${count === 1 ? '' : 's'} · Ctrl+O details`
 }
 
 export function toolFilePath(

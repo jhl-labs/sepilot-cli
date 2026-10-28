@@ -336,6 +336,19 @@ function currentTurnMessages(messages: readonly Message[]): readonly Message[] {
   return start >= 0 ? messages.slice(start) : messages
 }
 
+function appendObservation(
+  observations: ToolCall[],
+  call: ToolCall,
+  context: ToolInputNormalizationContext,
+): void {
+  if (call.name === 'fs.read' && call.arguments.fresh === true) {
+    const superseded = new Set(observationsRelevantToRequestedCall(observations, call, context))
+    const retained = observations.filter((entry) => !superseded.has(entry))
+    observations.splice(0, observations.length, ...retained)
+  }
+  observations.push(call)
+}
+
 export function reusableObservationsInCurrentTurn(
   messages: readonly Message[],
   tools: ToolRegistry,
@@ -369,7 +382,7 @@ export function reusableObservationsInCurrentTurn(
       typeof message.content === 'string' ? message.content : undefined,
     )
     if (visibleCall && tools.get(call.name)?.observationCoverage) {
-      observations.push(visibleCall)
+      appendObservation(observations, visibleCall, context)
     }
   }
 
@@ -401,7 +414,7 @@ export function reusableObservationsFromHistory(
     }
     const visibleCall = agentVisibleObservationCall(call, entry.output)
     if (visibleCall && tools.get(call.name)?.observationCoverage) {
-      observations.push(visibleCall)
+      appendObservation(observations, visibleCall, context)
     }
   }
 
@@ -424,6 +437,10 @@ export function partitionCallsCoveredByCurrentTurnObservations(
   const narrowedCalls: NarrowedObservationCall[] = []
 
   for (const requested of requestedCalls) {
+    if (requested.name === 'fs.read' && requested.arguments.fresh === true) {
+      executableCalls.push(requested)
+      continue
+    }
     const coverage = tools.get(requested.name)?.observationCoverage
     const relevantObservations = observationsRelevantToRequestedCall(
       observations,

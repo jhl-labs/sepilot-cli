@@ -280,7 +280,9 @@ function renderInline(tokens: Token[]): string {
         case 'link': {
           const l = t as Tokens.Link
           const text = renderInline(l.tokens)
-          return `${UNDERLINE}${text}${RESET} ${GRAY}(${l.href})${RESET}`
+          return l.text === l.href
+            ? `${UNDERLINE}${text}${RESET}`
+            : `${UNDERLINE}${text}${RESET} ${GRAY}(${l.href})${RESET}`
         }
         case 'br':
           return '\n'

@@ -39,6 +39,7 @@ export function presentReasoningPreview(
   options: { details: boolean; locale: CliLocale },
 ): string | null {
   const trimmed = text.trim()
+  if (!options.details && trimmed.startsWith('[progress]')) return null
   if (!trimmed.startsWith(SUPERVISOR_PREFIX) || options.details) return text
   for (const rule of SUPERVISOR_NOTICE_RULES) {
     const match = rule.pattern.exec(trimmed)
@@ -82,6 +83,7 @@ export function formatRunWatchLabel(input: {
   modelWaitMs?: number | null
   locale: CliLocale
   showElapsed?: boolean
+  showStopHint?: boolean
 }): string | null {
   const ko = input.locale === 'ko'
   const parts = input.showElapsed === false ? [] : [formatElapsed(input.elapsedMs)]
@@ -92,7 +94,9 @@ export function formatRunWatchLabel(input: {
     parts.push(ko ? `도구 ${input.tools.done}회${failed}` : `${input.tools.done} tool call${input.tools.done === 1 ? '' : 's'}${failed}`)
   }
   if ((input.modelWaitMs ?? 0) >= SLOW_MODEL_HINT_AFTER_MS) {
-    parts.push(ko ? '모델 응답이 느립니다 · Esc 중단' : 'slow model response · Esc to stop')
+    parts.push(input.showStopHint === false
+      ? (ko ? '모델 응답이 느립니다' : 'slow model response')
+      : (ko ? '모델 응답이 느립니다 · Esc 중단' : 'slow model response · Esc to stop'))
   }
   return parts.length > 0 ? parts.join(' · ') : null
 }

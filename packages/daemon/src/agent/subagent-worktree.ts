@@ -236,9 +236,18 @@ export async function reopenSubagentWorktree(input: {
     throw new Error('The subagent checkout was removed; dispatch a new subagent instead')
   }
   const path = await realpath(previous.path)
+  if (path !== resolve(previous.path)) throw new Error('The retained subagent checkout was redirected')
   const top = await realpath(await git(path, ['rev-parse', '--show-toplevel']))
   if (top !== path) throw new Error('The retained subagent checkout is no longer a git worktree')
-  const cwd = await realpath(input.cwd).catch(() => path)
+  const repo = await realpath(previous.repoRoot)
+  const common = await realpath(resolve(path, await git(path, ['rev-parse', '--git-common-dir'])))
+  const parentCommon = await realpath(resolve(repo, await git(repo, ['rev-parse', '--git-common-dir'])))
+  const gitDir = await realpath(resolve(path, await git(path, ['rev-parse', '--git-dir'])))
+  if (common !== parentCommon || gitDir === common) throw new Error('The retained checkout does not belong to its recorded repository')
+  if (await git(path, ['symbolic-ref', '--short', 'HEAD']) !== previous.branch) throw new Error('The retained checkout changed branches')
+  await git(path, ['merge-base', '--is-ancestor', previous.seedCommit ?? previous.baseCommit, 'HEAD'])
+  const cwd = await realpath(input.cwd)
+  if (!contains(path, cwd)) throw new Error('The retained working directory is outside its checkout')
   const receipt: SubagentWorktreeReceipt = {
     ...previous,
     path,
@@ -248,7 +257,7 @@ export async function reopenSubagentWorktree(input: {
   delete receipt.patchPath
   delete receipt.mergeCommand
   return {
-    cwd: contains(path, cwd) ? cwd : path,
+    cwd,
     receipt,
     finish: createFinisher({
       repo: previous.repoRoot,

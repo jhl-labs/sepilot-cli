@@ -290,7 +290,7 @@ import {
 
 const urlOption = [
   '--url <url>',
-  'Daemon URL (defaults to SEPILOTD_URL env or http://127.0.0.1:17600)',
+  'Daemon URL (defaults to SEPILOTD_URL env, then daemon.port in config.yaml, then http://127.0.0.1:17600)',
 ] as const
 const perTurnAutonomyDescription =
   'Per-turn autonomy selection (readonly|accept-edits|workspace-write|supervised|autonomous); channel ACL and tool policy still apply'
@@ -2190,7 +2190,11 @@ subagent
   .option('--max-iterations <n>', 'Max turns (default 20, hard cap 50)')
   .option('--tools <a,b,c>', 'Comma-separated subset of parent allowed tools')
   .option('--model <id>', 'Provider model override')
+  .option('--provider <id>', 'Configured provider for this model')
+  .option('--context-mode <mode>', 'packet or fork parent context')
+  .option('--cwd <path>', 'Working directory')
   .option('--parent-session <id>', 'Tag the subagent session with this parent id')
+  .option('--request-key <key>', 'Reuse a background request within the explicit parent session')
   .option('--background', 'Queue the subagent as a daemon background job')
   .addOption(new Option('--isolation <kind>', 'Run in an owned git worktree; retain changes for explicit merge').choices(['worktree']))
   .addOption(new Option('--worktree-base <base>', 'Worktree start: committed HEAD (default) or the current working tree incl. uncommitted edits').choices(['head', 'working-tree']))
@@ -2412,7 +2416,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     setOutputFormat(outputFormatFlag)
   }
 
-  const rootUrl = resolveDaemonBaseUrl(readOptionValue(argv, '--url')) ?? 'http://127.0.0.1:17600'
+  const rootUrl = resolveDaemonBaseUrl(readOptionValue(argv, '--url'))
 
   if (shouldRunRootPrompt(argv)) {
     await askCommand(readOptionValue(argv, '--prompt') ?? readOptionValue(argv, '-p'), {
@@ -2539,7 +2543,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       instance = render(
         React.createElement(App, {
           config: {
-            url: url ?? 'http://127.0.0.1:17600',
+            url,
             model,
             provider,
             sessionId,

@@ -40,6 +40,9 @@ const STATUS_COPY = {
       `    answer: sepilot answer ${sessionId} ${questionId} <reply>`,
     backgroundCancel: (jobId: string) => `    cancel: sepilot ask --background-cancel ${jobId}`,
     cannotConnect: 'Cannot connect to sepilotd.',
+    httpFailure: (status: number) => `Daemon responded with HTTP ${status}. Check credentials and daemon diagnostics.`,
+    probeTimeout: 'Daemon liveness check timed out. Check server load and connection settings.',
+    diagnosticsFailed: 'Daemon is reachable, but detailed status collection failed.',
     startHint: 'Is the daemon running? Start with: sepilot start',
     unknown: 'unknown',
   },
@@ -71,6 +74,9 @@ const STATUS_COPY = {
       `    답변: sepilot answer ${sessionId} ${questionId} <reply>`,
     backgroundCancel: (jobId: string) => `    취소: sepilot ask --background-cancel ${jobId}`,
     cannotConnect: 'sepilotd에 연결할 수 없습니다.',
+    httpFailure: (status: number) => `daemon이 HTTP ${status}로 응답했습니다. 인증 정보와 서버 진단을 확인하세요.`,
+    probeTimeout: 'daemon 연결 확인 시간이 초과됐습니다. 서버 부하와 연결 설정을 확인하세요.',
+    diagnosticsFailed: 'daemon에 연결됐지만 상세 상태를 수집하지 못했습니다.',
     startHint: 'daemon이 실행 중인가요? 시작: sepilot start',
     unknown: '알 수 없음',
   },
@@ -120,6 +126,17 @@ function formatBackgroundJobLines(
   ]
 }
 
+function reportStatusFailure(error: unknown, copy: StatusCopy, connected: boolean): never {
+  const status = (error as { status?: number } | null)?.status
+  const timeout = (error as { code?: string } | null)?.code === 'DAEMON_PROBE_TIMEOUT'
+    || ['TimeoutError', 'ApiTimeoutError'].includes((error as { name?: string } | null)?.name ?? '')
+  const code = typeof status === 'number' ? 'daemon-http-error' : timeout ? 'daemon-probe-timeout' : connected ? 'daemon-diagnostics-failed' : 'daemon-unreachable'
+  const message = typeof status === 'number' ? copy.httpFailure(status) : timeout ? copy.probeTimeout : connected ? copy.diagnosticsFailed : copy.cannotConnect
+  if (getOutputFormat() === 'json') console.log(JSON.stringify({ ok: false, error: code, message, ...(typeof status === 'number' ? { statusCode: status } : {}) }, null, 2))
+  else { console.error(chalk.red(message)); if (code === 'daemon-unreachable') console.error(chalk.gray(copy.startHint)) }
+  process.exit(1)
+}
+
 export async function statusCommand(options: {
   url?: string
   report?: boolean
@@ -130,15 +147,7 @@ export async function statusCommand(options: {
 
   try {
     await ensureDaemon(client, { url: options.url, quiet: true })
-  } catch {
-    if (getOutputFormat() === 'json') {
-      console.log(JSON.stringify({ ok: false, error: 'daemon-unreachable' }, null, 2))
-    } else {
-      console.error(chalk.red(copy.cannotConnect))
-      console.error(chalk.gray(copy.startHint))
-    }
-    process.exit(1)
-  }
+  } catch (error) { reportStatusFailure(error, copy, false) }
 
   if (options.report) {
     const reportFormat = getOutputFormat() === 'json' ? 'json' : 'markdown'
@@ -228,15 +237,7 @@ export async function statusCommand(options: {
       }
     } catch {}
 
-  } catch {
-    if (getOutputFormat() === 'json') {
-      console.log(JSON.stringify({ ok: false, error: 'daemon-unreachable' }, null, 2))
-    } else {
-      console.error(chalk.red(copy.cannotConnect))
-      console.error(chalk.gray(copy.startHint))
-    }
-    process.exit(1)
-  }
+  } catch (error) { reportStatusFailure(error, copy, true) }
 }
 
 function formatUptime(seconds: number | undefined, unknownLabel = 'unknown'): string {

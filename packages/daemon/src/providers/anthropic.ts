@@ -110,7 +110,7 @@ function mapMessages(
 function mapTools(
   tools: ToolDefinition[],
 ): Anthropic.Tool[] {
-  return tools.map((t) => ({
+  return [...tools].sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0).map((t) => ({
     name: t.name,
     description: t.description,
     input_schema: normalizeToolSchema(t.inputSchema, 'anthropic') as Anthropic.Tool.InputSchema,

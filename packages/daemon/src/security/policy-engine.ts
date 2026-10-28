@@ -781,6 +781,7 @@ const STRICT_WORKSPACE_UNCONFINED_PREFIXES = [
 ] as const
 
 const STRICT_WORKSPACE_AUDITED_TOOLS = new Set([
+  'tool.output.read',
   'knowledge.search',
   'knowledge.read',
   'knowledge.save',
@@ -1153,7 +1154,7 @@ function checkDeniedPathCandidates(
 }
 
 function isStrictReadOnlyManagedProcessStart(request: ToolExecRequest): boolean {
-  if (request.tool !== 'process.start' || !request.workspaceRoot) return false
+  if (request.tool !== 'process.start' || !request.workspaceRoot || request.input.reuseId !== undefined) return false
   const env = request.input.env
   if (env && typeof env === 'object' && Object.keys(env).length > 0) return false
   const lifetime = request.input.lifetime
@@ -1811,6 +1812,10 @@ export function createDefaultPolicy(): PolicyConfig {
       },
       'apps.mutate': {
         mode: 'supervised',
+      },
+      'workspace.prepare': {
+        mode: 'supervised',
+        deny_paths: [...writeDenyPaths],
       },
       'fs.write': {
         mode: 'supervised',

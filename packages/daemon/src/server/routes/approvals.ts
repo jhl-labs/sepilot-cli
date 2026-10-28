@@ -714,6 +714,7 @@ async function executeApprovalResume(input: ApprovalResumeRuntime): Promise<void
       toolCall,
       requestId: nextRequestId,
       runId: parked?.runId,
+      recheckPolicy: options?.recheckPolicy,
       forcePrompt: options?.forcePrompt,
       signal: options?.signal,
     })

@@ -12,6 +12,11 @@ import {
 } from './evidence-requirement-policy.js'
 import { explicitlyForbidsToolUse } from './request-shape.js'
 import { CURRENT_AGENT_TURN_USER_METADATA_KEY } from './turn-context.js'
+import { TOOL_RESULT_STATUS_METADATA_KEY } from './memory-write-completion.js'
+import {
+  TOOL_RESULT_EXECUTION_CAPABILITIES_METADATA_KEY,
+  TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY,
+} from './policy-failure.js'
 
 export type RunOutcomeReviewStatus = 'complete' | 'needs_recovery'
 export type RunOutcomeReviewRecoveryBasis =
@@ -665,6 +670,15 @@ function hasStructuredGitPathEvidence(toolCall: ToolCall): boolean {
     || (toolCall.name === 'git.log' && toolCall.arguments.detailed === true)
 }
 
+function resultObservesWorkspacePaths(message: Message): boolean {
+  const metadata = message.metadata
+  if (metadata?.[TOOL_RESULT_EXECUTION_OBSERVED_METADATA_KEY] !== true) return false
+  if (metadata[TOOL_RESULT_STATUS_METADATA_KEY] !== 'success') return false
+  const capabilities = metadata[TOOL_RESULT_EXECUTION_CAPABILITIES_METADATA_KEY]
+  return Array.isArray(capabilities)
+    && capabilities.some((capability) => capability === 'filesystem-read' || capability === 'terminal')
+}
+
 export function findUnsupportedRepositoryPathClaims(options: {
   text: string
   messages: Message[]
@@ -735,6 +749,12 @@ export function findUnsupportedRepositoryPathClaims(options: {
       || toolCall?.name === 'fs.glob'
       || toolCall?.name === 'fs.search'
     ) {
+      for (const observedPath of extractClaimedRepositoryPaths(output)) {
+        evidencedPaths.add(normalizeEvidencePath(observedPath))
+      }
+    }
+    if (resultObservesWorkspacePaths(message)) {
+      evidenceOutputs.push(output)
       for (const observedPath of extractClaimedRepositoryPaths(output)) {
         evidencedPaths.add(normalizeEvidencePath(observedPath))
       }
@@ -2257,11 +2277,11 @@ function evaluateUnsupportedPathClaims(
   const sample = unsupported.slice(0, 6)
   return {
     reason: [
-      'The candidate answer cites repository path-like items that are not grounded in the recent read/search/glob/write or structured Git evidence:',
+      'The candidate answer cites repository path-like items that are not grounded in the recent read/search/glob/write, workspace command output, or structured Git evidence:',
       sample.join(', '),
       'Final answers may not introduce concrete file or directory claims that the run did not observe.',
     ].join(' '),
-    instruction: 'Verify the cited paths with read/search/glob or structured Git evidence, remove unsupported path claims, or answer INCOMPLETE with the missing verification scope.',
+    instruction: 'Verify the cited paths with read/search/glob, a workspace command, or structured Git evidence, remove unsupported path claims, or answer INCOMPLETE with the missing verification scope.',
     toolCalls: sample.slice(0, 4).map((path) => ({
       name: 'fs.glob',
       arguments: { pattern: path },

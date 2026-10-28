@@ -26,7 +26,7 @@ export function createWorkspacePrepareTool(options: { reviewRunner?: TerminalRun
   return {
     name: 'workspace.prepare',
     description:
-      'Prepare a directory directly inside the active workspace. mode="project" (default) creates a new project directory. mode="review" prepares an independent detached Git worktree for an exact locally available ref/commit inside an existing repository, without switching its original branch, discarding changes or fetching remotely. Review mode requires ref and an isolated network-disabled runner; fetch using a separately authorized tool first. path must be a portable single-segment name; absolute paths, separators, "." and ".." are rejected. Existing paths require onExisting="reuse"; review reuse additionally requires the same clean detached worktree and exact revision. Use the returned path for subsequent tools. Do not treat a project directory as a review checkout.',
+      'Prepare a directory directly inside the active workspace root, or the explicitly selected cwd of a policy session when no strict root is set. mode="project" (default) creates a new project directory. mode="review" prepares an independent detached Git worktree for an exact locally available ref/commit inside an existing repository, without switching its original branch, discarding changes or fetching remotely. Review mode requires ref and an isolated network-disabled runner; fetch using a separately authorized tool first. path must be a portable single-segment name; absolute paths, separators, "." and ".." are rejected. Existing paths require onExisting="reuse"; review reuse additionally requires the same clean detached worktree and exact revision. Use the returned path for subsequent tools. Do not treat a project directory as a review checkout.',
     resumeSafety: 'replay-risky',
     inputSchema: {
       type: 'object',
@@ -62,17 +62,20 @@ export function createWorkspacePrepareTool(options: { reviewRunner?: TerminalRun
         )
       }
 
-      if (!context?.workspaceRoot) {
+      const preparationRoot = context?.workspaceRoot
+        ?? (context?.workspaceIsolation === 'policy' && context.cwd && isAbsolute(context.cwd)
+          ? context.cwd : undefined)
+      if (!context || !preparationRoot) {
         return failure(
-          'workspace.prepare requires an active workspaceRoot.',
+          'workspace.prepare requires a workspace root or an explicitly selected absolute cwd in a policy session.',
           startedAt,
           'WORKSPACE_REQUIRED_USER',
         )
       }
 
       try {
-        throwIfAborted(context.signal, 'Workspace preparation aborted')
-        const root = await realpath(resolveToolPath(context.workspaceRoot))
+        throwIfAborted(context?.signal, 'Workspace preparation aborted')
+        const root = await realpath(resolveToolPath(preparationRoot))
         if (!(await stat(root)).isDirectory()) {
           return failure(`Workspace root is not a directory: ${root}`, startedAt, 'ENOTDIR_PERMANENT')
         }
@@ -101,7 +104,7 @@ export function createWorkspacePrepareTool(options: { reviewRunner?: TerminalRun
           }
         }
 
-        throwIfAborted(context.signal, 'Workspace preparation aborted')
+        throwIfAborted(context?.signal, 'Workspace preparation aborted')
         const entry = await lstat(candidate)
         if (entry.isSymbolicLink()) {
           return failure('Refusing to use a symbolic link as a project directory.', startedAt, 'SYMLINK_PERMANENT')
@@ -112,7 +115,7 @@ export function createWorkspacePrepareTool(options: { reviewRunner?: TerminalRun
           return failure('Prepared project path is not a directory inside the workspace root.', startedAt, 'WORKSPACE_ESCAPE_PERMANENT')
         }
 
-        await context.workspaceMutation?.recordWrite(prepared)
+        await context?.workspaceMutation?.recordWrite(prepared)
         return {
           output: JSON.stringify({ path: prepared, created, reused: !created }),
           status: 'success',

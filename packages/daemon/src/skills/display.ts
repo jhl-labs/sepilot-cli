@@ -18,7 +18,16 @@ export function formatSkillDescriptionForPrompt(description: string): string {
 }
 
 export function isSkillEligibleForAutomaticRouting(
-  skill: Pick<SkillMetadata, 'autoDiscovered' | 'enabled'>,
+  skill: Pick<SkillMetadata, 'autoDiscovered' | 'discoveryScope' | 'enabled'>,
 ): boolean {
-  return skill.enabled !== false && skill.autoDiscovered !== true
+  if (skill.enabled === false) return false
+  if (skill.autoDiscovered !== true) return true
+  return skill.discoveryScope === 'home'
+}
+
+export function orderSkillsForCatalog<T extends Pick<SkillMetadata, 'autoDiscovered'>>(skills: T[]): T[] {
+  return [
+    ...skills.filter((s) => s.autoDiscovered !== true),
+    ...skills.filter((s) => s.autoDiscovered === true),
+  ]
 }

@@ -25,6 +25,7 @@ export type ConfigMutationCapabilities = Pick<
 export type ChannelPipelineCapabilities = Pick<
   RuntimeServices,
   | 'channelPipelineMonitor'
+  | 'decisionProviderRegistry'
   | 'autonomy'
   | 'sessions'
   | 'questions'
@@ -120,6 +121,7 @@ export type StartupCapabilities = Pick<
   | 'mdns'
   | 'updater'
   | 'providerRegistry'
+  | 'decisionProviderRegistry'
   | 'toolRegistry'
   | 'policyEngine'
   | 'autonomy'
@@ -179,6 +181,7 @@ export type ConfigRebindCapabilities = Pick<
   | 'dataDir'
   | 'providerFactoryRegistry'
   | 'providerRegistry'
+  | 'decisionProviderRegistry'
   | 'modelRouter'
   | 'dreaming'
   | 'semanticIndex'

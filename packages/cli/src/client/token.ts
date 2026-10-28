@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { DEFAULT_DAEMON_BASE_URL } from '@sepilotd/api-client'
+import { resolveLocalDaemonEndpoint } from '@sepilotd/api-client/node'
 
 function isNodeFsError(error: unknown, code: string): boolean {
   return Boolean(
@@ -12,11 +12,12 @@ function isNodeFsError(error: unknown, code: string): boolean {
   )
 }
 
-export function resolveDaemonBaseUrl(explicit?: string): string | undefined {
+export function resolveDaemonBaseUrl(explicit?: string): string {
   const trimmed = explicit?.trim()
   if (trimmed) return trimmed
   const fromEnv = process.env.SEPILOTD_URL?.trim()
-  return fromEnv && fromEnv.length > 0 ? fromEnv : undefined
+  if (fromEnv) return fromEnv
+  return resolveLocalDaemonEndpoint({ dataDir: resolveDaemonDataDir() }).origin
 }
 
 export type DaemonEndpointScope = 'loopback' | 'remote'
@@ -34,7 +35,7 @@ export const LOCAL_DAEMON_START_ERROR =
 export function resolveLocalDaemonListenTarget(
   explicit?: string,
 ): LocalDaemonListenTarget | null {
-  const resolved = resolveDaemonBaseUrl(explicit) ?? DEFAULT_DAEMON_BASE_URL
+  const resolved = resolveDaemonBaseUrl(explicit)
   let url: URL
   try {
     url = new URL(resolved)
@@ -74,7 +75,7 @@ export function resolveLocalDaemonListenTarget(
 }
 
 export function resolveDaemonEndpointScope(explicit?: string): DaemonEndpointScope {
-  const resolved = resolveDaemonBaseUrl(explicit) ?? DEFAULT_DAEMON_BASE_URL
+  const resolved = resolveDaemonBaseUrl(explicit)
   const hostname = new URL(resolved).hostname.toLowerCase()
   return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(hostname)
     ? 'loopback'

@@ -35,6 +35,7 @@ import type { ProviderCircuitBreaker } from '../../providers/circuit-breaker.js'
 import type { ModelFallbackState } from '../../providers/model-fallback.js'
 import type { ModelRouter } from '../../providers/model-router.js'
 import type { ProviderRegistry } from '../../providers/registry.js'
+import type { DecisionProviderRegistry } from '../../decisions/registry.js'
 import type { JobStore } from '../../scheduler/job-store.js'
 import type { SchedulerEngine } from '../../scheduler/engine.js'
 import type { parseWhen } from '../../scheduler/time-parser.js'
@@ -86,6 +87,7 @@ export interface RuntimeServices {
   storageDegraded?: Array<{ store: string; error: string }>
   providerFactoryRegistry: IProviderFactoryRegistry
   providerRegistry: ProviderRegistry
+  decisionProviderRegistry: DecisionProviderRegistry
   channelFactoryRegistry: IChannelFactoryRegistry
   toolRegistry: ToolRegistry
   managedProcesses: ManagedProcessRegistry

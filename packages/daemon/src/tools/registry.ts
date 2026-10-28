@@ -65,6 +65,7 @@ export interface ToolExecutionContext {
   model?: string
   cwd?: string
   workspaceRoot?: string
+  workspaceIsolation?: 'policy' | 'strict'
   writingDocId?: string
   signal?: AbortSignal
   editCheckpoint?: EditCheckpointHandle

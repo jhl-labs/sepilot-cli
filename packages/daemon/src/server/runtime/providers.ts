@@ -233,6 +233,9 @@ export function applyProviderModelOverrides(
   }
 
   for (const model of models) {
+    if (provider.promptCache) model.promptCache = { ...provider.promptCache }
+    const cacheOverride = exactModelOverrides.get(model.id)?.promptCache
+    if (cacheOverride) model.promptCache = { ...cacheOverride }
     if (provider.defaultContextWindow !== undefined) {
       model.contextWindow = provider.defaultContextWindow
     }

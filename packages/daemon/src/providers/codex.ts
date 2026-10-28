@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { execFile as defaultExecFile } from 'node:child_process'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -19,6 +20,11 @@ import { AcpStdioClient, type AcpClientSpec } from '../acp/client.js'
 import type { JsonRpcMessage } from '../acp/rpc.js'
 import { extractContent, ProviderError, toApiError } from './utils.js'
 import { codexToolOutputSchema, parseCodexToolResponse, withCodexToolInstructions } from './codex-tool-transport.js'
+import { prepareCodexProviderHome } from './codex-home.js'
+import { CodexResponseObservation } from './codex-response.js'
+import { createLogger } from '../logger.js'
+
+const log = createLogger('provider.codex')
 
 const DEFAULT_CONTEXT_WINDOW = 192_000
 const DEFAULT_MAX_OUTPUT_TOKENS = 128_000
@@ -26,7 +32,7 @@ const DEFAULT_TIMEOUT_MS = 120_000
 const MODEL_LIST_TIMEOUT_MS = 15_000
 
 class CodexHostProtocolError extends Error {
-  constructor(message: string, readonly usage: TokenUsage) {
+  constructor(message: string, readonly usage: TokenUsage, readonly reason: 'empty_response' | 'invalid_host_response' = 'invalid_host_response') {
     super(message)
     this.name = 'CodexHostProtocolError'
   }
@@ -60,6 +66,8 @@ interface CodexProviderOptions {
       timeoutMs: number
       onNotification: (message: JsonRpcMessage) => void
       onClientRequest: (message: JsonRpcMessage) => unknown
+      onStderr?: (chunk: Buffer) => void
+      onExit?: (error: Error) => void
     },
   ) => CodexAppServerClient
   modelLister?: () => Promise<CodexCatalogModel[]>
@@ -89,7 +97,7 @@ function uniqueModels(models: string[]): string[] {
   return Array.from(new Set(models.map((model) => model.trim()).filter(Boolean))).sort()
 }
 
-function toModelInfo(model: CodexCatalogModel, structuredToolCalling = false): ModelInfo {
+function toModelInfo(model: CodexCatalogModel, structuredToolCalling = true): ModelInfo {
   return {
     id: model.id,
     name: model.name,
@@ -164,15 +172,29 @@ export const CODEX_APP_SERVER_ARGS: readonly string[] = [
 export const CODEX_TRANSPORT_BOUNDARY = [
   "You are the language model behind a host application. Codex's own execution environment is disabled for this session: do not invoke Codex's shell, code mode, file, patch, web, MCP, plugin, skill, or subagent tools. The Codex sandbox and approval settings apply only to those disabled Codex tools.",
   "If a Codex tool answers that it is disabled or unavailable, that is expected and says nothing about the host's tools or environment: never report it as a host failure or blocker. Do that work — a shell or git command included — with the host tool that runs commands.",
-  'The host application has its own tools and executes them itself, under its own permissions. When the transcript defines a tool-call format, every tool it lists is available to you, including tools that read, create, or edit files. To use one, write the call in exactly that format as your response. That is ordinary response text, not Codex tool use, and the host returns the result in a later message. Do not claim that a listed host tool is unavailable.',
-  'When the transcript defines no tool-call format, answer in text.',
+  'The host application has its own tools and executes them itself, under its own permissions. When the trusted host instructions or transcript define a tool-call format, every tool it lists is available to you, including tools that read, create, or edit files. To use one, write the call in exactly that format as your response. That is ordinary response text, not Codex tool use, and the host returns the result in a later message. Do not claim that a listed host tool is unavailable.',
+  'When neither the trusted host instructions nor transcript define a tool-call format, answer in text.',
   'Return only the next assistant response for the transcript below.',
 ].join(' ')
 
 const CODEX_DEVELOPER_INSTRUCTIONS = [
   "Codex's own tools (shell commands, code mode, file access, patches, browsing, MCP servers, plugins, skills, subagents) are disabled and must not be invoked. The read-only sandbox applies only to them. A disabled-tool answer from Codex is expected and is not a host failure; run commands through the host's tools instead.",
-  'The user message is a transcript from a host application that executes its own tools. When it defines a tool-call format, request the tools it lists, file writes included, by writing calls in that format as your response text; that is not Codex tool use. Otherwise answer in text.',
+  'The trusted application instructions below and the user-message transcript belong to a host application that executes its own tools. When they define a tool-call format, request the tools it lists, file writes included, by writing calls in that format as your response text; that is not Codex tool use. Otherwise answer in text.',
 ].join(' ')
+
+function partitionCodexHostContext(request: ChatRequest): { developerInstructions: string; transcript: ChatRequest } {
+  const instructions = [request.systemPrompt, ...request.messages.filter(message => message.role === 'system').map(extractContent)]
+    .filter((text): text is string => Boolean(text?.trim()))
+  const messages = request.messages.flatMap((message): Message[] => {
+    if (message.role !== 'system') return [message]
+    const images = typeof message.content === 'string' ? [] : message.content.filter(part => part.type === 'image')
+    return images.length > 0 ? [{ role: 'user', content: images }] : []
+  })
+  return {
+    developerInstructions: [CODEX_DEVELOPER_INSTRUCTIONS, ...instructions.map(text => `[Host system instruction]\n${text}`)].join('\n\n'),
+    transcript: { ...request, systemPrompt: undefined, messages },
+  }
+}
 
 export function formatCodexProviderPrompt(request: ChatRequest): string {
   let imageNumber = 0
@@ -259,32 +281,27 @@ function tokenUsageFromNotification(message: JsonRpcMessage): TokenUsage | null 
     thinkingTokens: positiveInteger(usage.reasoningOutputTokens, 0),
     cacheReadTokens: positiveInteger(usage.cachedInputTokens, 0),
     cacheCreationTokens: positiveInteger(usage.cacheWriteInputTokens, 0),
+    inputTokensIncludeCache: true,
   }
 }
 
-function completedAgentMessage(message: JsonRpcMessage): { text: string; final: boolean } | null {
-  if (message.method !== 'item/completed') return null
-  const item = notificationParams(message)?.item
-  if (!item || typeof item !== 'object') return null
-  const record = item as Record<string, unknown>
-  if (record.type !== 'agentMessage' || typeof record.text !== 'string') return null
-  return { text: record.text, final: record.phase === 'final_answer' }
-}
+const FORBIDDEN_CODEX_TOOL_ITEMS = new Set([
+  'commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'collabToolCall', 'webSearch',
+])
 
 function toolItemType(message: JsonRpcMessage): string | null {
-  if (message.method !== 'item/started') return null
-  const item = notificationParams(message)?.item
-  if (!item || typeof item !== 'object') return null
-  const type = (item as { type?: unknown }).type
-  if (typeof type !== 'string') return null
-  return new Set([
-    'commandExecution',
-    'fileChange',
-    'mcpToolCall',
-    'dynamicToolCall',
-    'collabToolCall',
-    'webSearch',
-  ]).has(type) ? type : null
+  const params = notificationParams(message)
+  let items: unknown[] = []
+  if (message.method === 'item/started' || message.method === 'item/completed') items = [params?.item]
+  if (message.method === 'turn/completed' && params?.turn && typeof params.turn === 'object') {
+    const snapshot = (params.turn as { items?: unknown }).items
+    if (Array.isArray(snapshot)) items = snapshot
+  }
+  for (const item of items) {
+    const type = item && typeof item === 'object' ? (item as { type?: unknown }).type : undefined
+    if (typeof type === 'string' && FORBIDDEN_CODEX_TOOL_ITEMS.has(type)) return type
+  }
+  return null
 }
 
 function denyCodexClientRequest(message: JsonRpcMessage): unknown {
@@ -332,7 +349,7 @@ export class CodexProvider implements ILLMProvider {
     this.modelLister = options.modelLister
     this.contextWindow = options.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW
     this.maxOutputTokens = options.defaultMaxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
-    this.structuredToolCalling = options.structuredToolCalling ?? this.env.SEPILOTD_CODEX_STRUCTURED_TOOLS === '1'
+    this.structuredToolCalling = options.structuredToolCalling ?? this.env.SEPILOTD_CODEX_STRUCTURED_TOOLS !== '0'
     const configured = uniqueModels(options.models ?? [])
     this.models = (configured.length > 0 ? configured : ['default'])
       .map((id) => toModelInfo(configuredModel(id, this.contextWindow, this.maxOutputTokens), this.structuredToolCalling))
@@ -405,27 +422,56 @@ export class CodexProvider implements ILLMProvider {
   }
 
   async chat(request: ChatRequest, options?: LLMRequestOptions): Promise<ChatResponse> {
+    const diagnosticId = randomUUID()
+    const deadline = Date.now() + Math.max(1, request.timeoutMs ?? DEFAULT_TIMEOUT_MS)
     try {
-      return await this.chatOnce(request, options)
+      const response = await this.chatOnce(request, options, { diagnosticId, attempt: 1, deadline })
+      options?.signal?.throwIfAborted()
+      return response
     } catch (error) {
-      if (!(error instanceof CodexHostProtocolError) || options?.signal?.aborted) throw error
+      options?.signal?.throwIfAborted()
+      if (!(error instanceof CodexHostProtocolError) || Date.now() >= deadline) throw error
+      const correction = error.reason === 'empty_response'
+        ? 'The previous completed turn contained no usable assistant response. Return a non-empty response following the original requested format.'
+        : `The previous response was rejected by the host: ${error.message}. Respond again with exactly one JSON object with toolCalls and answer; every argumentsJson must be a valid JSON object string.`
       const retry = await this.chatOnce({
         ...request,
-        systemPrompt: [request.systemPrompt, `[Host response correction] The previous response was rejected by the host: ${error.message}. Respond again with exactly one JSON object with toolCalls and answer; every argumentsJson must be a valid JSON object string.`].filter(Boolean).join('\n'),
-      }, options)
-      return { ...retry, usage: { ...retry.usage, inputTokens: retry.usage.inputTokens + error.usage.inputTokens, outputTokens: retry.usage.outputTokens + error.usage.outputTokens } }
+        systemPrompt: [request.systemPrompt, `[Host response correction] ${correction}`].filter(Boolean).join('\n'),
+      }, options, { diagnosticId, attempt: 2, deadline })
+      options?.signal?.throwIfAborted()
+      log.info('response_recovered', { diagnosticId, attempts: 2, reason: error.reason })
+      const usage = { ...retry.usage }
+      for (const key of ['inputTokens', 'outputTokens', 'thinkingTokens', 'cacheReadTokens', 'cacheCreationTokens', 'estimatedCost', 'generationMs'] as const) {
+        if (error.usage[key] !== undefined || retry.usage[key] !== undefined) usage[key] = (error.usage[key] ?? 0) + (retry.usage[key] ?? 0)
+      }
+      return { ...retry, usage }
     }
   }
 
-  private async chatOnce(request: ChatRequest, options?: LLMRequestOptions): Promise<ChatResponse> {
+  private async chatOnce(request: ChatRequest, options: LLMRequestOptions | undefined, attempt: { diagnosticId: string; attempt: number; deadline: number }): Promise<ChatResponse> {
     if (!this.structuredToolCalling) assertNoNativeToolCalls(request)
     const structured = this.structuredToolCalling && Boolean(request.tools?.length) && request.toolChoice !== 'none'
-    const timeoutMs = Math.max(1, request.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+    const remainingTimeout = () => {
+      const remaining = attempt.deadline - Date.now()
+      if (remaining <= 0) throw new Error('Codex response deadline exceeded')
+      return remaining
+    }
+    const timeoutMs = remainingTimeout()
+    const modelInfo = this.models.find((model) => model.id === request.model)
+      ?? (request.model === 'default' ? this.models[0] : undefined)
+    const semanticEffort = request.thinkingLevel === 'max' ? 'high' : request.thinkingLevel
+    const effort = !semanticEffort || semanticEffort === 'auto' ? undefined
+      : semanticEffort === 'off' ? modelInfo?.compatibility?.reasoningEffortOffValue ?? 'none'
+        : modelInfo?.compatibility?.reasoningEffortAliases?.[semanticEffort] ?? semanticEffort
+    const hostContext = partitionCodexHostContext(structured ? withCodexToolInstructions(request) : request)
     const workspace = await mkdtemp(join(tmpdir(), 'sepilot-codex-provider-'))
+    const privateHome = await mkdtemp(join(tmpdir(), 'sepilot-codex-home-'))
+    const env = await prepareCodexProviderHome(this.env, privateHome)
     let threadId = ''
     let turnId = ''
-    let finalText = ''
-    let fallbackText = ''
+    const observation = new CodexResponseObservation()
+    let stage: 'initialize' | 'thread_start' | 'turn_start' | 'turn_wait' | 'response' = 'initialize'
+    let turnStatus = 'not_completed'
     let usage: TokenUsage = { inputTokens: 0, outputTokens: 0 }
     let toolViolation = ''
     let completeTurn!: (result: { status: string; error?: string }) => void
@@ -436,17 +482,18 @@ export class CodexProvider implements ILLMProvider {
       command: this.command,
       args: [...CODEX_APP_SERVER_ARGS],
       cwd: workspace,
-      env: this.env,
+      env,
       framing: 'ndjson',
     }, {
       timeoutMs,
       onClientRequest: denyCodexClientRequest,
+      onStderr: chunk => observation.observeStderr(chunk),
+      onExit: () => {
+        observation.observeExit()
+        completeTurn({ status: 'failed', error: 'Codex app-server exited before completing the turn' })
+      },
       onNotification: (message) => {
-        const completed = completedAgentMessage(message)
-        if (completed) {
-          fallbackText = completed.text
-          if (completed.final) finalText = completed.text
-        }
+        observation.observe(message)
         const nextUsage = tokenUsageFromNotification(message)
         if (nextUsage) usage = nextUsage
         const forbiddenTool = toolItemType(message)
@@ -475,8 +522,9 @@ export class CodexProvider implements ILLMProvider {
       client.start()
       await client.request('initialize', {
         clientInfo: { name: 'sepilotd', title: 'sepilotd', version: '0.0.0' },
-      }, timeoutMs)
+      }, remainingTimeout())
       client.notify('initialized', {})
+      stage = 'thread_start'
       threadId = parseThreadId(await client.request('thread/start', {
         ...(request.model === 'default' ? {} : { model: request.model }),
         cwd: workspace,
@@ -485,25 +533,29 @@ export class CodexProvider implements ILLMProvider {
         ephemeral: true,
         serviceName: 'sepilotd-provider',
         baseInstructions: CODEX_TRANSPORT_BOUNDARY,
-        developerInstructions: CODEX_DEVELOPER_INSTRUCTIONS,
-      }, timeoutMs))
+        developerInstructions: hostContext.developerInstructions,
+      }, remainingTimeout()))
+      stage = 'turn_start'
       turnId = parseTurnId(await client.request('turn/start', {
         threadId,
-        input: formatCodexProviderInput(structured ? withCodexToolInstructions(request) : request),
+        input: formatCodexProviderInput(hostContext.transcript),
+        ...(effort ? { effort } : {}),
         ...(structured ? { outputSchema: codexToolOutputSchema(request) } : {}),
         ...(request.model === 'default' ? {} : { model: request.model }),
         approvalPolicy: 'never',
         sandboxPolicy: {
           type: 'readOnly',
         },
-      }, timeoutMs))
+      }, remainingTimeout()))
+      stage = 'turn_wait'
       const timedCompletion = new Promise<never>((_, reject) => {
         completionTimer = setTimeout(
           () => reject(new Error(`Codex turn timed out after ${timeoutMs}ms`)),
-          timeoutMs,
+          remainingTimeout(),
         )
       })
       const result = await Promise.race([completion, timedCompletion])
+      turnStatus = ['completed', 'failed', 'interrupted', 'cancelled'].includes(result.status) ? result.status : 'unknown'
       options?.signal?.throwIfAborted()
       if (toolViolation) {
         throw new Error(`Codex provider attempted to use a forbidden tool: ${toolViolation}`)
@@ -511,8 +563,12 @@ export class CodexProvider implements ILLMProvider {
       if (result.status !== 'completed') {
         throw new Error(result.error ?? `Codex turn ended with status: ${result.status}`)
       }
-      const content = (finalText || fallbackText).trim()
-      if (!content) throw new Error('Codex app-server returned an empty assistant response')
+      stage = 'response'
+      const content = structured ? observation.finalAnswer : observation.transcript
+      if (!structured && observation.sealedMessageCount > 1) {
+        log.info('multi_message_response', { diagnosticId: attempt.diagnosticId, messages: observation.sealedMessageCount })
+      }
+      if (!content) throw new CodexHostProtocolError(`Codex app-server returned an empty assistant response (diagnostic: ${attempt.diagnosticId})`, usage, 'empty_response')
       let message: Message
       try {
         message = structured ? parseCodexToolResponse(content, request) : { role: 'assistant' as const, content }
@@ -524,11 +580,19 @@ export class CodexProvider implements ILLMProvider {
         usage,
         finishReason: message.toolCalls?.length ? 'tool_use' : 'stop',
       }
+    } catch (error) {
+      log.warn('turn_failed', {
+        diagnosticId: attempt.diagnosticId, attempt: attempt.attempt, stage, turnStatus, structured,
+        reason: options?.signal?.aborted ? 'aborted' : error instanceof CodexHostProtocolError ? error.reason : toolViolation ? 'forbidden_tool' : 'provider_error',
+        ...observation.diagnostics(),
+      })
+      throw error
     } finally {
       if (completionTimer) clearTimeout(completionTimer)
       options?.signal?.removeEventListener('abort', abort)
       client.stop()
       await rm(workspace, { recursive: true, force: true, maxRetries: 3 })
+      await rm(privateHome, { recursive: true, force: true, maxRetries: 3 })
     }
   }
 
@@ -555,6 +619,8 @@ export class CodexProvider implements ILLMProvider {
       timeoutMs: number
       onNotification: (message: JsonRpcMessage) => void
       onClientRequest: (message: JsonRpcMessage) => unknown
+      onStderr?: (chunk: Buffer) => void
+      onExit?: (error: Error) => void
     },
   ): CodexAppServerClient {
     return this.clientFactory
@@ -563,6 +629,8 @@ export class CodexProvider implements ILLMProvider {
           requestTimeoutMs: options.timeoutMs,
           onNotification: options.onNotification,
           onClientRequest: options.onClientRequest,
+          onStderr: options.onStderr,
+          onExit: options.onExit,
         })
   }
 }

@@ -2,12 +2,10 @@ import { colors } from '../theme.js'
 
 export type PrivilegeLevel = 'readonly' | 'accept-edits' | 'workspace-write' | 'supervised' | 'autonomous'
 
-export const PRIVILEGE_CYCLE: readonly PrivilegeLevel[] = ['supervised', 'accept-edits', 'workspace-write', 'readonly']
+export const PRIVILEGE_CYCLE: readonly PrivilegeLevel[] = ['supervised', 'accept-edits', 'workspace-write', 'readonly', 'autonomous']
 
-export function privilegeCycle(configuredDefault?: string | null): PrivilegeLevel[] {
-  const cycle = [...PRIVILEGE_CYCLE]
-  if (configuredDefault && isPrivilegeLevel(configuredDefault) && !cycle.includes(configuredDefault)) cycle.push(configuredDefault)
-  return cycle
+export function privilegeCycle(_configuredDefault?: string | null): PrivilegeLevel[] {
+  return [...PRIVILEGE_CYCLE]
 }
 
 export function nextPrivilege(current: string, configuredDefault?: string | null): PrivilegeLevel {

@@ -1,7 +1,7 @@
 import { readdir, readFile, rm, mkdir, writeFile, lstat, realpath } from 'node:fs/promises'
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { stringify as stringifyToml } from 'smol-toml'
-import type { AutonomyLevel, ISkillRegistry, SkillMetadata } from '@sepilotd/core'
+import type { AutonomyLevel, ISkillRegistry, SkillDiscoveryScope, SkillMetadata } from '@sepilotd/core'
 import type { PolicyEngine } from '../security/policy-engine.js'
 import type { ToolRegistry } from '../tools/registry.js'
 import { projectCompatibleSkillRoots } from './compat.js'
@@ -26,6 +26,7 @@ export interface FileSkillRegistryOptions {
 
 interface LoadRootOptions {
   trusted: boolean
+  scope?: SkillDiscoveryScope
 }
 
 function assertSafeSkillId(id: string): void {
@@ -65,7 +66,7 @@ export class FileSkillRegistry implements ISkillRegistry {
     await mkdir(this.skillsDir, { recursive: true })
     this.skills.clear()
     for (const root of this.additionalRoots) {
-      await this.loadSkillRoot(root, this.skills, { trusted: this.trustProjectSkills })
+      await this.loadSkillRoot(root, this.skills, { trusted: this.trustProjectSkills, scope: 'home' })
     }
     await this.loadSkillRoot(this.skillsDir, this.skills, { trusted: true })
   }
@@ -205,7 +206,7 @@ export class FileSkillRegistry implements ISkillRegistry {
     const skills = new Map(this.skills)
     for (const root of await projectCompatibleSkillRoots(cwd, boundaryRoot)) {
       if (boundaryRoot && !await canonicalPathIsWithin(boundaryRoot, root)) continue
-      await this.loadSkillRoot(root, skills, { trusted: this.trustProjectSkills })
+      await this.loadSkillRoot(root, skills, { trusted: this.trustProjectSkills, scope: 'project' })
     }
     return skills
   }
@@ -241,7 +242,7 @@ export class FileSkillRegistry implements ISkillRegistry {
       const parsed = parseSkillMd(raw, basename(dir))
       const metadata: SkillMetadata = opts.trusted
         ? parsed.metadata
-        : { ...parsed.metadata, autoDiscovered: true }
+        : { ...parsed.metadata, autoDiscovered: true, ...(opts.scope ? { discoveryScope: opts.scope } : {}) }
       if (this.validator) {
         const result = validateSkill(
           metadata,

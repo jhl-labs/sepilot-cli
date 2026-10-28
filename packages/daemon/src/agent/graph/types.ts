@@ -405,6 +405,9 @@ export interface AgentState extends GraphRuntimeState {
   lastIterationToolCallCount?: number
   artifactRevisionDrafts?: number
   lastTurnFinishReason?: ChatResponse['finishReason']
+  lastTurnNeedsProtocolRepair?: boolean
+  modelResponseRecoveryCount?: number
+  modelResponseRecoveryPending?: boolean
   lengthContinuationCount?: number
   lengthContinuationPrefix?: string
   pendingLengthContinuationText?: string
@@ -445,6 +448,7 @@ export interface AgentState extends GraphRuntimeState {
     blocked?: boolean
     ts: number
     outputFingerprint?: string
+    observationContentHash?: string
     output?: string
   }>
   validationOutcome?: {

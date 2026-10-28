@@ -11,3 +11,10 @@ export {
   type SpawnLockOptions,
   type AcquiredSpawnLock,
 } from './spawn-lock.js'
+export {
+  resolveLocalDaemonEndpoint,
+  DEFAULT_LOCAL_DAEMON_HOST,
+  DEFAULT_LOCAL_DAEMON_PORT,
+  type LocalDaemonEndpoint,
+  type LocalDaemonEndpointOptions,
+} from './daemon-endpoint.js'

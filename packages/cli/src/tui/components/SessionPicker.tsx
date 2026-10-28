@@ -5,7 +5,7 @@ import { colors, symbols } from '../theme.js'
 import { calculateVisibleWindow } from '../utils/layout.js'
 import { isReturnKey } from '../utils/key.js'
 import type { SessionExportFormat } from '../utils/session-commands.js'
-import { PickerFrame, PickerRow } from './PickerPrimitives.js'
+import { PickerFrame, PickerRow, pickerMarkerWidth } from './PickerPrimitives.js'
 
 const MAX_RECENT_SESSIONS = 5
 
@@ -244,11 +244,16 @@ export function buildSessionPickerList(
   }
 }
 
-function renderSessionRow(item: SessionPickerItem, selected: boolean) {
+function sessionRowMarker(item: SessionPickerItem): string {
+  return item.shortcut ? `${item.shortcut}` : item.session.id.slice(0, 8)
+}
+
+function renderSessionRow(item: SessionPickerItem, selected: boolean, markerWidth: number) {
   return (
     <PickerRow
       key={item.session.id}
-      marker={item.shortcut ? `${item.shortcut}` : item.session.id.slice(0, 8)}
+      marker={sessionRowMarker(item)}
+      markerWidth={markerWidth}
       selected={selected}
       current={item.isCurrent}
     >
@@ -293,6 +298,7 @@ export function SessionPicker({
     [clampedIndex, maxVisibleItems, ordered.length],
   )
   const visibleOrdered = ordered.slice(start, end)
+  const markerWidth = pickerMarkerWidth(visibleOrdered.map(sessionRowMarker))
   const projectBoundary = hasQuery ? 0 : project.length
   const recentBoundary = hasQuery ? 0 : project.length + recent.length
   const visibleProject = hasQuery ? [] : visibleOrdered.filter((_, index) => start + index < projectBoundary)
@@ -483,12 +489,12 @@ export function SessionPicker({
           {visibleProject.length > 0 && (
             <>
               <Text color={colors.dimText}>Project Context</Text>
-              {visibleProject.map((item, index) => renderSessionRow(item, start + index === clampedIndex))}
+              {visibleProject.map((item, index) => renderSessionRow(item, start + index === clampedIndex, markerWidth))}
             </>
           )}
           <Text color={colors.dimText}>Recent Context</Text>
           {visibleRecent.map((item, index) =>
-            renderSessionRow(item, start + visibleProject.length + index === clampedIndex),
+            renderSessionRow(item, start + visibleProject.length + index === clampedIndex, markerWidth),
           )}
           {visibleAll.length > 0 && <Text color={colors.dimText}>All Sessions</Text>}
         </>
@@ -496,7 +502,7 @@ export function SessionPicker({
       {!loading && !error && visibleProject.length > 0 && visibleRecent.length === 0 && (
         <>
           <Text color={colors.dimText}>Project Context</Text>
-          {visibleProject.map((item, index) => renderSessionRow(item, start + index === clampedIndex))}
+          {visibleProject.map((item, index) => renderSessionRow(item, start + index === clampedIndex, markerWidth))}
           {visibleAll.length > 0 && <Text color={colors.dimText}>All Sessions</Text>}
         </>
       )}
@@ -504,7 +510,7 @@ export function SessionPicker({
         !error &&
         visibleAll.map((item, index) => {
           const rowIndex = hasQuery ? start + index : start + visibleProject.length + visibleRecent.length + index
-          return renderSessionRow(item, rowIndex === clampedIndex)
+          return renderSessionRow(item, rowIndex === clampedIndex, markerWidth)
         })}
       {!loading && !error && selectedSession && (
         <>

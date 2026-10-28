@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 export interface TerminalStreamLike {
   rows?: number
   columns?: number
+  prependListener?: (event: 'resize', listener: () => void) => void
   on?: (event: 'resize', listener: () => void) => void
   off?: (event: 'resize', listener: () => void) => void
   addListener?: (event: 'resize', listener: () => void) => void
@@ -36,6 +37,10 @@ function attachResizeListener(
   stdout: TerminalStreamLike,
   listener: () => void,
 ): () => void {
+  if (typeof stdout.prependListener === 'function' && typeof stdout.off === 'function') {
+    stdout.prependListener('resize', listener)
+    return () => { stdout.off?.('resize', listener) }
+  }
   if (typeof stdout.on === 'function' && typeof stdout.off === 'function') {
     stdout.on('resize', listener)
     return () => { stdout.off?.('resize', listener) }

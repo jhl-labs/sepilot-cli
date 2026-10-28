@@ -127,7 +127,7 @@ export function buildFocusedLoopGraph(
     graph
       .addNode('reporter', N.reporter(), { lifecycleState: 'done' })
       .addEdge('context_manager', 'agent')
-      .addConditionalEdge('agent', (s) => s.toolCalls.length > 0 ? 'tools' : 'reporter', ['tools', 'reporter'])
+      .addConditionalEdge('agent', (s) => s.modelResponseRecoveryPending ? 'agent' : s.toolCalls.length > 0 ? 'tools' : 'reporter', ['agent', 'tools', 'reporter'])
       .addConditionalEdge('tools', (s) => s.shouldStop ? 'reporter' : 'agent', ['reporter', 'agent'])
       .addEdge('reporter', '__end__')
     return graph

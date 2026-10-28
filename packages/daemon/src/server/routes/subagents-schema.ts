@@ -8,6 +8,8 @@ export const subagentDispatchRequestSchema = z.object({
   maxIterations: z.number().int().positive().optional(),
   tools: z.array(z.string().min(1)).optional(),
   model: z.string().min(1).optional(),
+  provider: z.string().min(1).optional(),
+  autonomy: z.enum(['readonly', 'supervised', 'accept-edits', 'workspace-write', 'autonomous']).optional(),
   parentSessionId: z.string().min(1).optional(),
   contextPacket: z.string().optional(),
   cwd: z.string().min(1).optional(),

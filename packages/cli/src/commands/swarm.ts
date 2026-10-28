@@ -69,7 +69,7 @@ export async function runSwarmStart(
 }
 
 function buildClient(url?: string): SwarmClient {
-  const baseUrl = resolveDaemonBaseUrl(url) ?? 'http://127.0.0.1:17600'
+  const baseUrl = resolveDaemonBaseUrl(url)
   const token = loadDaemonToken(baseUrl)
   return createSwarmClient({ baseUrl, token })
 }

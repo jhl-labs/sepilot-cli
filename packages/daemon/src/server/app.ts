@@ -636,6 +636,7 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
         runner: jobRunner,
         executor: batchExecutor,
         subagentDispatcher: () => app.runtime?.subagentDispatcher ?? null,
+        backgroundSubagents: () => app.runtime?.backgroundSubagents,
         onSubagentFinished,
         jobMaxConcurrency: parseInt(process.env.JOBS_MAX_CONCURRENCY ?? '8', 10),
       })

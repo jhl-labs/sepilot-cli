@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto'
+import { AutonomyLevel } from '@sepilotd/core'
+import type { SubagentSpecStore } from './subagent-spec-store.js'
 import type { ExternalCliBackend } from '../external-cli/executor.js'
 import type { ExternalCliDispatcher } from '../external-cli/dispatcher.js'
 import {
@@ -9,7 +11,11 @@ import {
   type SubagentWorktreeReceipt,
 } from './subagent-worktree.js'
 import { loadSessionContext } from './context-loader.js'
-import { boundConversationForChild, resolveChildHistoryBudgetTokens } from './subagent-context.js'
+import {
+  boundConversationForChild,
+  mergeChildHistory,
+  resolveChildHistoryBudgetTokens,
+} from './subagent-context.js'
 import type {
   AgentContext,
   AgentEvent,
@@ -93,6 +99,7 @@ export interface SubagentDispatchInput {
   reviewOutcomes?: boolean
   model?: string
   contextPacket?: string
+  provider?: string
   parentSessionId?: string
   cwd?: string
   workspaceRoot?: string
@@ -160,6 +167,13 @@ export interface SubagentUserAgentProfile {
 }
 
 export interface SubagentDispatcherDeps {
+  specStore?: SubagentSpecStore
+  resolveModel?: (input: {
+    providerId?: string
+    model: string
+    explicitModel: boolean
+    explicitProvider: boolean
+  }) => { providerId: string; model: string }
   onLifecycle?: (
     event: 'started' | 'stopped',
     data: { sessionId: string; parentSessionId?: string; agentId?: string; status?: string },
@@ -181,7 +195,7 @@ export interface SubagentDispatcherDeps {
     | undefined
     | Promise<SubagentUserAgentProfile | null | undefined>
   hardCap?: number
-  modelContextWindow?: (model: string) => number | undefined
+  modelContextWindow?: (model: string, providerId?: string) => number | undefined
 }
 
 export interface SubagentContinueInput {
@@ -206,7 +220,7 @@ export interface SubagentChildSummary {
   worktree?: SubagentWorktreeReceipt
 }
 
-interface SubagentChildSpec {
+export interface SubagentChildSpec {
   sessionId: string
   parentSessionId?: string
   category?: SubagentDelegationCategory
@@ -218,6 +232,7 @@ interface SubagentChildSpec {
   maxIterations: number
   budget?: { requestedIterations: number; appliedIterations: number; hardCap: number }
   systemPrompt: string
+  forkSnapshot?: Message[]
   cwd?: string
   workspaceRoot?: string
   isolation?: 'worktree'
@@ -261,8 +276,12 @@ function narrowExecutionPolicy(
 ): DelegatedAgentExecutionPolicy | undefined {
   if (!original || !current) return original ?? current
   const allowed = new Set(current.allowedToolNames)
+  const levels = ['readonly', 'supervised', 'accept-edits', 'workspace-write', 'autonomous']
   return {
-    autonomy: original.autonomy,
+    autonomy:
+      levels.indexOf(current.autonomy) < levels.indexOf(original.autonomy)
+        ? current.autonomy
+        : original.autonomy,
     requireToolApproval: original.requireToolApproval || current.requireToolApproval,
     allowedToolNames: original.allowedToolNames.filter((name) => allowed.has(name)),
   }
@@ -280,6 +299,13 @@ export class SubagentDispatcher {
 
   constructor(private readonly deps: SubagentDispatcherDeps) {}
 
+  forget(sessionId: string): void {
+    if (this.running.has(sessionId))
+      throw subagentError('SUBAGENT_BUSY', 'stop the active child before deleting its session')
+    this.children.delete(sessionId)
+    this.deps.specStore?.delete(sessionId)
+  }
+
   async dispatch(input: SubagentDispatchInput): Promise<SubagentDispatchResult> {
     input.signal?.throwIfAborted()
     const contextMode = input.contextMode ?? 'packet'
@@ -293,9 +319,11 @@ export class SubagentDispatcher {
     const spec = await this.resolveSpec(input, sessionId)
     const createdAt = spec.updatedAt
     input.signal?.throwIfAborted()
-    const previousMessages = contextMode === 'fork'
-      ? await this.boundedHistory(input.parentSessionId!, spec.model)
-      : []
+    const previousMessages =
+      contextMode === 'fork'
+        ? await this.boundedHistory(input.parentSessionId!, spec.model, spec.providerId)
+        : []
+    if (contextMode === 'fork') spec.forkSnapshot = structuredClone(previousMessages)
     const tags = [
       'subagent',
       ...(input.parentSessionId ? [`parent:${input.parentSessionId}`] : []),
@@ -333,33 +361,48 @@ export class SubagentDispatcher {
   async continue(input: SubagentContinueInput): Promise<SubagentDispatchResult> {
     input.signal?.throwIfAborted()
     if (!input.prompt.trim()) throw subagentError('SUBAGENT_PROMPT_REQUIRED', 'prompt required')
-    const spec = this.children.get(input.childSessionId)
-      ?? await this.restoreSpec(input.childSessionId, input.parentExecutionPolicy)
+    const spec =
+      this.children.get(input.childSessionId) ??
+      (await this.restoreSpec(input.childSessionId, input.parentExecutionPolicy))
     if (!spec || !input.parentSessionId || spec.parentSessionId !== input.parentSessionId) {
       throw subagentError('SUBAGENT_NOT_FOUND', 'subagent not found in this conversation')
     }
     if (this.running.has(spec.sessionId)) {
-      throw subagentError('SUBAGENT_BUSY', 'subagent is still running; wait for it before sending a follow-up')
+      throw subagentError(
+        'SUBAGENT_BUSY',
+        'subagent is still running; wait for it before sending a follow-up',
+      )
     }
-    const policy = narrowExecutionPolicy(spec.parentExecutionPolicy, input.parentExecutionPolicy)
-    const allowed = policy ? new Set(policy.allowedToolNames) : undefined
-    const runSpec: SubagentChildSpec = {
-      ...spec,
-      parentExecutionPolicy: policy,
-      toolNames: allowed ? spec.toolNames.filter((name) => allowed.has(name)) : spec.toolNames,
+    this.running.add(spec.sessionId)
+    try {
+      const policy = narrowExecutionPolicy(spec.parentExecutionPolicy, input.parentExecutionPolicy)
+      const allowed = policy ? new Set(policy.allowedToolNames) : undefined
+      const runSpec: SubagentChildSpec = {
+        ...spec,
+        parentExecutionPolicy: policy,
+        toolNames: allowed ? spec.toolNames.filter((name) => allowed.has(name)) : spec.toolNames,
+      }
+      const previousMessages = mergeChildHistory(
+        spec.forkSnapshot ?? [],
+        await this.boundedHistory(spec.sessionId, spec.model, spec.providerId),
+        resolveChildHistoryBudgetTokens(
+          this.deps.modelContextWindow?.(spec.model, spec.providerId),
+        ),
+      )
+      await this.deps.sessions.updateMeta?.(spec.sessionId, { status: 'active' })
+      return await this.run(runSpec, {
+        prompt: input.prompt,
+        previousMessages,
+        forked: Boolean(spec.forkSnapshot?.length),
+        isNew: false,
+        detached: input.detached,
+        signal: input.signal,
+        onSession: input.onSession,
+        onEvent: input.onEvent,
+      })
+    } finally {
+      this.running.delete(spec.sessionId)
     }
-    const previousMessages = await this.boundedHistory(spec.sessionId, spec.model)
-    await this.deps.sessions.updateMeta?.(spec.sessionId, { status: 'active' })
-    return this.run(runSpec, {
-      prompt: input.prompt,
-      previousMessages,
-      forked: false,
-      isNew: false,
-      detached: input.detached,
-      signal: input.signal,
-      onSession: input.onSession,
-      onEvent: input.onEvent,
-    })
   }
 
   async listChildren(parentSessionId: string, limit = 50): Promise<SubagentChildSummary[]> {
@@ -383,7 +426,8 @@ export class SubagentDispatcher {
       .list({ query: parentTag, perPage: Math.max(limit, 1) * 2 })
       .catch(() => ({ items: [] }))
     for (const meta of page.items) {
-      if (byId.has(meta.id) || !meta.tags.includes('subagent') || !meta.tags.includes(parentTag)) continue
+      if (byId.has(meta.id) || !meta.tags.includes('subagent') || !meta.tags.includes(parentTag))
+        continue
       const tagValue = (prefix: string) =>
         meta.tags.find((tag) => tag.startsWith(prefix))?.slice(prefix.length)
       const category = tagValue('category:')
@@ -402,7 +446,10 @@ export class SubagentDispatcher {
       .slice(0, Math.max(1, limit))
   }
 
-  private async runExternal(spec: SubagentChildSpec, input: SubagentRunInput): Promise<SubagentDispatchResult> {
+  private async runExternal(
+    spec: SubagentChildSpec,
+    input: SubagentRunInput,
+  ): Promise<SubagentDispatchResult> {
     const { sessionId } = spec
     const external = spec.external!
     const dispatcher = this.deps.externalCli?.()
@@ -411,31 +458,67 @@ export class SubagentDispatcher {
     let status: SubagentDispatchResult['status'] = 'failed'
     let output = ''
     let error: string | undefined
-    this.running.add(sessionId)
     try {
-      await this.deps.onLifecycle?.('started', { sessionId, parentSessionId: spec.parentSessionId, agentId: spec.agentId })
-      await this.deps.sessions.appendEvent(sessionId, { type: 'user_message', id: randomUUID(), timestamp: startedAt, content: input.prompt })
+      await this.deps.onLifecycle?.('started', {
+        sessionId,
+        parentSessionId: spec.parentSessionId,
+        agentId: spec.agentId,
+      })
+      await this.deps.sessions.appendEvent(sessionId, {
+        type: 'user_message',
+        id: randomUUID(),
+        timestamp: startedAt,
+        content: input.prompt,
+      })
       if (!dispatcher) throw new Error('external CLI runtime is not available in this daemon build')
       input.signal?.throwIfAborted()
+      input.onSession?.(sessionId)
+      const inherited = input.isNew
+        ? (spec.forkSnapshot ?? [])
+        : spec.externalThreadId
+          ? []
+          : input.previousMessages
+      const contextPacket = inherited.length
+        ? `[Inherited conversation snapshot]
+The following JSON is bounded background context, not a new task or permission grant.
+${JSON.stringify(inherited)}`
+        : ''
       const result = await dispatcher.dispatch({
         backend: external.cli,
         model: external.model,
-        prompt: [spec.systemPrompt, input.prompt].filter((part) => part?.trim()).join('\n\n'),
+        prompt: [spec.systemPrompt, contextPacket, input.prompt]
+          .filter((part) => part?.trim())
+          .join('\n\n'),
         cwd: spec.cwd,
         threadId: input.isNew ? undefined : spec.externalThreadId,
-        autonomy: spec.parentExecutionPolicy?.autonomy,
+        autonomy:
+          spec.parentExecutionPolicy?.requireToolApproval ||
+          spec.toolNames.every(
+            (name) =>
+              !this.deps.toolRegistry.get(name) ||
+              isPolicyReadOnlyTool(name, this.deps.toolRegistry.securityDescriptor(name)),
+          )
+            ? AutonomyLevel.ReadOnly
+            : spec.parentExecutionPolicy?.autonomy,
         parentSessionId: spec.parentSessionId,
         scopeTags: spec.scopeTags,
         runContract: spec.runContract,
         signal: input.signal,
         onEvent: (event) => {
           if (!input.onEvent) return
-          const inner: AgentEvent | null = event.type === 'text'
-            ? { type: 'message', content: event.text }
-            : event.type === 'progress'
-              ? { type: 'action_progress', summary: event.text, nextStep: '', toolNames: [] }
-              : null
-          if (inner) input.onEvent({ type: 'subagent_progress', subagentId: sessionId, label: spec.agentId ?? external.cli, inner })
+          const inner: AgentEvent | null =
+            event.type === 'text'
+              ? { type: 'message', content: event.text }
+              : event.type === 'progress'
+                ? { type: 'action_progress', summary: event.text, nextStep: '', toolNames: [] }
+                : null
+          if (inner)
+            input.onEvent({
+              type: 'subagent_progress',
+              subagentId: sessionId,
+              label: spec.agentId ?? external.cli,
+              inner,
+            })
         },
       })
       output = result.output
@@ -443,15 +526,48 @@ export class SubagentDispatcher {
       usage.outputTokens = result.usage.outputTokens
       status = result.status === 'completed' ? 'completed' : 'failed'
       error = result.error
+      if (input.signal?.aborted) {
+        status = 'failed'
+        error = 'subagent canceled'
+      }
+      if (status === 'completed' && isEmptySubagentFinalOutput(output)) {
+        status = 'failed'
+        error = 'subagent returned empty response'
+        output = SUBAGENT_EMPTY_RESPONSE_OUTPUT
+      }
       spec.externalThreadId = result.threadId
     } catch (err) {
       error = err instanceof Error ? err.message : String(err)
       output = output || `[${external.cli} error] ${error}`
-    } finally {
-      this.running.delete(sessionId)
     }
-    await this.deps.sessions.appendEvent(sessionId, { type: 'assistant_message', id: randomUUID(), timestamp: new Date().toISOString(), content: output })
-    await this.deps.sessions.updateMeta?.(sessionId, { status: status === 'failed' ? 'abandoned' : 'completed' })
+    await this.deps.sessions.appendEvent(sessionId, {
+      type: 'assistant_message',
+      id: randomUUID(),
+      timestamp: new Date().toISOString(),
+      content: output,
+    })
+    await this.deps.sessions.appendEvent(sessionId, {
+      type: 'session_end',
+      id: randomUUID(),
+      timestamp: new Date().toISOString(),
+      totalTokens: { input: usage.inputTokens, output: usage.outputTokens },
+      totalCost: 0,
+      duration_ms: Date.now() - Date.parse(startedAt),
+      stopReason: {
+        kind: input.signal?.aborted ? 'cancelled' : status === 'completed' ? 'completed' : 'error',
+        code: input.signal?.aborted
+          ? 'user_abort'
+          : status === 'completed'
+            ? 'completed'
+            : 'provider_error',
+        resumable: false,
+        summary: error,
+        nextActions: status === 'completed' ? [] : ['retry'],
+      },
+    })
+    await this.deps.sessions.updateMeta?.(sessionId, {
+      status: status === 'failed' ? 'abandoned' : 'completed',
+    })
     const retained = this.children.get(sessionId)
     if (retained) {
       retained.lastStatus = status
@@ -459,7 +575,7 @@ export class SubagentDispatcher {
       retained.externalThreadId = spec.externalThreadId
       retained.updatedAt = new Date().toISOString()
     }
-    await this.deps.onLifecycle?.('stopped', { sessionId, parentSessionId: spec.parentSessionId, agentId: spec.agentId, status })
+    this.deps.specStore?.save(spec)
     return {
       output,
       sessionId,
@@ -469,13 +585,21 @@ export class SubagentDispatcher {
       truncated: false,
       status,
       ...(error ? { error } : {}),
-      stopReason: status === 'completed'
-        ? { kind: 'completed', code: 'completed', resumable: false, nextActions: [] }
-        : { kind: 'error', code: 'provider_error', summary: error, resumable: false, nextActions: ['retry'] },
+      stopReason:
+        status === 'completed'
+          ? { kind: 'completed', code: 'completed', resumable: false, nextActions: [] }
+          : {
+              kind: input.signal?.aborted ? 'cancelled' : 'error',
+              code: input.signal?.aborted ? 'user_abort' : 'provider_error',
+              summary: error,
+              resumable: false,
+              nextActions: ['retry'],
+            },
     }
   }
 
   private remember(spec: SubagentChildSpec): void {
+    this.deps.specStore?.save(spec)
     this.children.delete(spec.sessionId)
     this.children.set(spec.sessionId, spec)
     while (this.children.size > MAX_RETAINED_CHILD_SPECS) {
@@ -485,10 +609,18 @@ export class SubagentDispatcher {
     }
   }
 
-  private async boundedHistory(sessionId: string, model: string): Promise<Message[]> {
-    const messages = await loadSessionContext(this.deps.sessions, sessionId, Number.MAX_SAFE_INTEGER)
+  private async boundedHistory(
+    sessionId: string,
+    model: string,
+    providerId?: string,
+  ): Promise<Message[]> {
+    const messages = await loadSessionContext(
+      this.deps.sessions,
+      sessionId,
+      Number.MAX_SAFE_INTEGER,
+    )
     return boundConversationForChild(messages, {
-      maxTokens: resolveChildHistoryBudgetTokens(this.deps.modelContextWindow?.(model)),
+      maxTokens: resolveChildHistoryBudgetTokens(this.deps.modelContextWindow?.(model, providerId)),
     })
   }
 
@@ -502,6 +634,16 @@ export class SubagentDispatcher {
       meta.tags.find((tag) => tag.startsWith(prefix))?.slice(prefix.length)
     const parentSessionId = tagValue('parent:')
     if (!parentSessionId) return null
+    const saved = this.deps.specStore?.load(sessionId)
+    if (saved) {
+      if (saved.parentSessionId !== parentSessionId) return null
+      saved.parentExecutionPolicy = narrowExecutionPolicy(
+        saved.parentExecutionPolicy,
+        parentExecutionPolicy,
+      )
+      this.remember(saved)
+      return saved
+    }
     if (meta.tags.includes('isolation:worktree')) {
       throw subagentError(
         'SUBAGENT_NOT_RESUMABLE',
@@ -509,23 +651,36 @@ export class SubagentDispatcher {
       )
     }
     const tools = tagValue(TOOLS_TAG_PREFIX)
-    const spec = await this.resolveSpec({
-      prompt: meta.title,
-      category: tagValue('category:'),
-      agentId: tagValue('agent:'),
-      tools: tools === undefined ? undefined : tools.split(',').filter(Boolean),
-      model: meta.model,
-      parentSessionId,
-      cwd: meta.cwd,
-      parentExecutionPolicy,
-    }, sessionId)
+    const spec = await this.resolveSpec(
+      {
+        prompt: meta.title,
+        category: tagValue('category:'),
+        agentId: tagValue('agent:'),
+        tools: tools === undefined ? undefined : tools.split(',').filter(Boolean),
+        model: meta.model,
+        parentProvider: meta.provider,
+        parentSessionId,
+        cwd: meta.cwd,
+        parentExecutionPolicy,
+      },
+      sessionId,
+    )
+    spec.toolNames = spec.toolNames.filter((name) => isPolicyReadOnlyTool(name))
+    spec.parentExecutionPolicy = {
+      autonomy: AutonomyLevel.ReadOnly,
+      requireToolApproval: true,
+      allowedToolNames: [...spec.toolNames],
+    }
     spec.title = meta.title
     spec.updatedAt = meta.updatedAt
     this.remember(spec)
     return spec
   }
 
-  private async resolveSpec(input: SubagentDispatchInput, sessionId: string): Promise<SubagentChildSpec> {
+  private async resolveSpec(
+    input: SubagentDispatchInput,
+    sessionId: string,
+  ): Promise<SubagentChildSpec> {
     const category = input.category ? resolveSubagentDelegationCategory(input.category) : undefined
     if (input.category && !category) {
       throw unknownSubagentCategoryError(input.category)
@@ -547,14 +702,11 @@ export class SubagentDispatcher {
       parentBudget: input.parentMaxIterations,
     }).maxIterations
     const requested =
-      input.maxIterations
-      ?? userAgent?.maxIterations
-      ?? category?.defaultMaxIterations
-      ?? subagentDefault
-    const maxIterations = Math.min(
-      normalizeIterationBudget(requested, subagentDefault),
-      hardCap,
-    )
+      input.maxIterations ??
+      userAgent?.maxIterations ??
+      category?.defaultMaxIterations ??
+      subagentDefault
+    const maxIterations = Math.min(normalizeIterationBudget(requested, subagentDefault), hardCap)
 
     const parentExecutionPolicy = input.parentExecutionPolicy
       ? {
@@ -592,8 +744,17 @@ export class SubagentDispatcher {
     )
 
     const provider = this.deps.defaultProvider()
-    const providerId = input.parentProvider ?? provider?.id ?? 'unknown'
-    const model = input.model ?? userAgent?.model ?? input.parentModel ?? provider?.defaultModel ?? 'default'
+    const selection = {
+      providerId: input.provider ?? input.parentProvider ?? provider?.id ?? 'unknown',
+      model:
+        input.model ?? userAgent?.model ?? input.parentModel ?? provider?.defaultModel ?? 'default',
+    }
+    const { providerId, model } =
+      this.deps.resolveModel?.({
+        ...selection,
+        explicitModel: Boolean(input.model ?? userAgent?.model),
+        explicitProvider: Boolean(input.provider),
+      }) ?? selection
     const titleSeed = input.prompt.slice(0, 40)
 
     const contextPacket = input.contextPacket?.trim()
@@ -620,6 +781,11 @@ export class SubagentDispatcher {
       .filter(Boolean)
       .join('\n\n')
     const isolation = input.isolation ?? userAgent?.isolation
+    if (isolation && userAgent?.external)
+      throw subagentError(
+        'SUBAGENT_ISOLATION_UNAVAILABLE',
+        'External CLI worktree isolation is unavailable; use a native isolated child',
+      )
 
     return {
       sessionId,
@@ -634,7 +800,11 @@ export class SubagentDispatcher {
       model,
       maxIterations,
       systemPrompt,
-      budget: { requestedIterations: normalizeIterationBudget(requested, subagentDefault), appliedIterations: maxIterations, hardCap },
+      budget: {
+        requestedIterations: normalizeIterationBudget(requested, subagentDefault),
+        appliedIterations: maxIterations,
+        hardCap,
+      },
       cwd: input.cwd?.trim() || undefined,
       workspaceRoot: input.workspaceRoot,
       ...(isolation === 'worktree'
@@ -651,7 +821,13 @@ export class SubagentDispatcher {
     if (spec.worktree?.receipt.retained) {
       return reopenSubagentWorktree({ receipt: spec.worktree.receipt, cwd: spec.worktree.cwd })
     }
-    if (!spec.cwd) throw new Error('Worktree isolation requires an explicit parent working directory')
+    if (spec.worktree)
+      throw subagentError(
+        'SUBAGENT_NOT_RESUMABLE',
+        'the child checkout was already cleaned; dispatch a new isolated child',
+      )
+    if (!spec.cwd)
+      throw new Error('Worktree isolation requires an explicit parent working directory')
     return createSubagentWorktree({
       cwd: spec.cwd,
       workspaceRoot: spec.workspaceRoot,
@@ -660,8 +836,36 @@ export class SubagentDispatcher {
     })
   }
 
-  private async run(spec: SubagentChildSpec, input: SubagentRunInput): Promise<SubagentDispatchResult> {
-    if (spec.external) return this.runExternal(spec, input)
+  private async run(
+    spec: SubagentChildSpec,
+    input: SubagentRunInput,
+  ): Promise<SubagentDispatchResult> {
+    if (spec.external) {
+      this.running.add(spec.sessionId)
+      let status: SubagentDispatchResult['status'] = 'failed'
+      try {
+        if (spec.isolation)
+          throw subagentError(
+            'SUBAGENT_NOT_RESUMABLE',
+            'External CLI worktree isolation is unavailable; use a native isolated child',
+          )
+        const result = await this.runExternal(spec, input)
+        status = result.status
+        return result
+      } finally {
+        try {
+          this.deps.onRunFinished?.(spec.sessionId, { preserveParked: false })
+          await this.deps.onLifecycle?.('stopped', {
+            sessionId: spec.sessionId,
+            parentSessionId: spec.parentSessionId,
+            agentId: spec.agentId,
+            status,
+          })
+        } finally {
+          this.running.delete(spec.sessionId)
+        }
+      }
+    }
     const { sessionId, category, parentExecutionPolicy, model } = spec
     const startedAt = new Date().toISOString()
     const hasApprovalTransport = input.detached === true || Boolean(input.onEvent)
@@ -671,7 +875,8 @@ export class SubagentDispatcher {
         parentExecutionPolicy?.requireToolApproval &&
         !hasApprovalTransport &&
         !isPolicyReadOnlyTool(name)
-      ) continue
+      )
+        continue
       const tool = this.deps.toolRegistry.get(name)
       if (tool) {
         const source = this.deps.toolRegistry.registrationSource(name)
@@ -688,6 +893,8 @@ export class SubagentDispatcher {
     try {
       if (spec.isolation === 'worktree') {
         worktree = await this.openWorktree(spec)
+        spec.worktree = { receipt: worktree.receipt, cwd: worktree.cwd }
+        this.deps.specStore?.save(spec)
         cwd = worktree.cwd
         workspaceRoot = worktree.receipt.path
         await this.deps.sessions.updateMeta?.(sessionId, { cwd, workspaceIsolation: 'strict' })
@@ -717,7 +924,7 @@ export class SubagentDispatcher {
           : '',
         spec.systemPrompt,
         input.forked && input.previousMessages.length > 0
-          ? "[Forked parent context] The conversation before your task is the parent agent's recent history, bounded to a budget (older turns and large tool outputs may be omitted). Use it as background only; your task is the final user message. Do not continue the parent's other work."
+          ? "[Forked parent context] Background from the parent's conversation was snapshotted at dispatch, bounded to a budget (older turns and large tool outputs may be omitted). Your own earlier turns may follow it. Use inherited context as background only; your task is the final user message. Do not continue the parent's other work."
           : '',
         !input.isNew
           ? '[Follow-up] The parent agent sent another message to this subagent. Your earlier turns are above; answer the new message.'
@@ -733,15 +940,17 @@ export class SubagentDispatcher {
         cwd,
         workspaceRoot,
         workspaceIsolation: workspaceRoot ? 'strict' : undefined,
-        toolAllowlist: subagentTools.list().map(tool => tool.name),
+        toolAllowlist: subagentTools.list().map((tool) => tool.name),
         requireToolApproval: parentExecutionPolicy?.requireToolApproval,
         systemPrompt,
         ...(input.previousMessages.length > 0 ? { previousMessages: input.previousMessages } : {}),
-        runContract: spec.runContract ? {
-          ...structuredClone(spec.runContract),
-          summary: input.prompt,
-          acceptanceCriteria: [],
-        } : undefined,
+        runContract: spec.runContract
+          ? {
+              ...structuredClone(spec.runContract),
+              summary: input.prompt,
+              acceptanceCriteria: [],
+            }
+          : undefined,
         primaryAgentId: spec.agentId,
         scopeTags: spec.scopeTags ? [...spec.scopeTags] : undefined,
       }
@@ -936,21 +1145,26 @@ export class SubagentDispatcher {
           const retained = this.children.get(sessionId)
           if (retained) retained.worktree = { receipt: worktree.receipt, cwd: worktree.cwd }
         }
+        const retained = this.children.get(sessionId)
+        if (retained) this.deps.specStore?.save(retained)
       } finally {
-        this.running.delete(sessionId)
+        try {
+          this.deps.onRunFinished?.(sessionId, {
+            preserveParked: preserveParkedApproval && !input.signal?.aborted,
+          })
+          if (lifecycleStatus === 'failed') {
+            await this.deps.sessions.updateMeta?.(sessionId, { status: 'abandoned' })
+          }
+          await this.deps.onLifecycle?.('stopped', {
+            sessionId,
+            parentSessionId: spec.parentSessionId,
+            agentId: spec.agentId,
+            status: lifecycleStatus,
+          })
+        } finally {
+          this.running.delete(sessionId)
+        }
       }
-      this.deps.onRunFinished?.(sessionId, {
-        preserveParked: preserveParkedApproval && !input.signal?.aborted,
-      })
-      if (lifecycleStatus === 'failed') {
-        await this.deps.sessions.updateMeta?.(sessionId, { status: 'abandoned' })
-      }
-      await this.deps.onLifecycle?.('stopped', {
-        sessionId,
-        parentSessionId: spec.parentSessionId,
-        agentId: spec.agentId,
-        status: lifecycleStatus,
-      })
     }
   }
 }

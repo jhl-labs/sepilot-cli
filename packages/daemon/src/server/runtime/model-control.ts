@@ -16,6 +16,7 @@ const log = createLogger('model-control')
 export type ModelControlRuntime = Pick<RuntimeServices,
   | 'config'
   | 'providerRegistry'
+  | 'decisionProviderRegistry'
   | 'configMutationService'
   | 'providerFactoryRegistry'
   | 'dataDir'

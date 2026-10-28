@@ -16,6 +16,15 @@ const usageSummarySchema = z.object({
   requestCount: z.number().int(),
 })
 
+const cacheUsageSchema = z.object({
+  reportedRequests: z.number().int(),
+  cacheReadTokens: z.number().int(),
+  cacheWriteTokens: z.number().int(),
+  readHitRatio: z.number().nullable(),
+  averageFirstTokenMs: z.number().nullable(),
+})
+const cacheUsageResponseSchema = z.object({ data: cacheUsageSchema })
+
 const dailyUsageSummarySchema = z.object({
   date: z.string(),
   provider: z.string(),
@@ -61,6 +70,7 @@ export const usageOpenApiComponents = openApiComponentsFromZod({
     DailyUsageSummary: dailyUsageSummarySchema,
     UsageSnapshot: usageSnapshotSchema,
     UsageSummaryResponse: usageSummaryResponseSchema,
+    CacheUsageResponse: cacheUsageResponseSchema,
     DailyUsageResponse: dailyUsageResponseSchema,
     UsageSnapshotResponse: usageSnapshotResponseSchema,
   },
@@ -74,6 +84,12 @@ export const usageOpenApiComponents = openApiComponentsFromZod({
 })
 
 export const usageOpenApiOverrides: OpenApiOverrideMap = {
+  '/api/v1/usage/cache': {
+    get: { summary: 'Observed prompt cache usage and first-token latency', tags: ['Usage'],
+      parameters: [{ name: 'sessionId', in: 'query', schema: { type: 'string' } }],
+      responses: { 200: openApiJsonResponseRef('CacheUsageResponse') },
+    },
+  },
   '/api/v1/usage': {
     get: {
       summary: 'Usage summary',
@@ -107,6 +123,14 @@ export const usageOpenApiOverrides: OpenApiOverrideMap = {
 
 export async function usageRoutes(app: FastifyInstance) {
   const runtime = app.runtime
+
+  app.get<{ Querystring: { sessionId?: string } }>('/usage/cache', {
+    schema: fastifySchemaFromZod({ querystring: z.object({ sessionId: z.string().min(1).optional() }).strict() }),
+  }, async (request, reply) => {
+    if (!runtime?.usageTracker) return reply.status(503).send({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Runtime not initialized' } })
+    const query = request.query
+    return { data: cacheUsageSchema.parse(runtime.usageTracker.getCacheSummary(query.sessionId)) }
+  })
 
   app.get('/usage', async (_request, reply) => {
     if (!runtime?.usageTracker) return reply.status(503).send({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Runtime not initialized' } })

@@ -31,6 +31,7 @@ export type SessionManagementRuntime = Pick<RuntimeServices, 'sessions'> & Parti
     | 'toolStatsStore'
     | 'usageTracker'
     | 'dreaming'
+    | 'subagentDispatcher'
   >
 >
 
@@ -262,6 +263,7 @@ export async function cleanupSessionRuntimeState(
   runtime: SessionManagementRuntime,
   sessionId: string,
 ): Promise<SessionRuntimeCleanupResult> {
+  runtime.subagentDispatcher?.forget(sessionId)
   const sessionOwnedUploads = listUploadedFilesBySession(sessionId)
   const unreferencedAttachmentIds = await findUnreferencedSessionAttachmentIds(
     runtime,

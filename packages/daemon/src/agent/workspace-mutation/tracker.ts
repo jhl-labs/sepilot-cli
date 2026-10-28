@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { lstat, readFile, rm, rmdir, stat } from 'node:fs/promises'
+import { lstat, readFile, realpath, rm, rmdir, stat } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 interface FileFingerprint {
@@ -152,6 +152,19 @@ export class WorkspaceMutationTracker {
         recordedAt: cached.recordedAt,
       },
     }
+  }
+
+  async currentReadObservationHash(sessionId: string, path: string): Promise<string | null> {
+    const observations = [...(this.observationsBySession.get(sessionId)?.values() ?? [])]
+      .filter((entry) => entry.path === path)
+    if (observations.length === 0) return null
+    if (await realpath(path).catch(() => null) !== path) return null
+    const current = await this.fingerprint(path)
+    if (!current || !observations.some((entry) => entry.contentHash === current.contentHash)) {
+      this.invalidateReadObservations(sessionId, path)
+      return null
+    }
+    return current.contentHash
   }
 
   async recordReadObservation(

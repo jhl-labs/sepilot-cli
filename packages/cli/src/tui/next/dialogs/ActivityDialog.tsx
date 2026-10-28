@@ -3,6 +3,7 @@ import { useMemo, useState } from 'react'
 import wrapAnsi from 'wrap-ansi'
 import type { Message } from '../../types.js'
 import { colors } from '../../theme.js'
+import { summarizeToolInput, toolDisplayName } from '../../utils/tooling.js'
 
 export function ActivityDialog({ reasoning, messages, isStreaming, width, height, onClose }: {
   reasoning: string
@@ -14,16 +15,19 @@ export function ActivityDialog({ reasoning, messages, isStreaming, width, height
 }) {
   const [tab, setTab] = useState<'reasoning' | 'activity'>(() => reasoning.trim() ? 'reasoning' : 'activity')
   const [position, setPosition] = useState<number | null>(null)
+  const [rawArguments, setRawArguments] = useState(false)
   const content = useMemo(() => {
     if (tab === 'reasoning') return reasoning || 'No reasoning text received. Tab opens execution activity.'
     const start = messages.findLastIndex(({ role }) => role === 'user')
     return messages.slice(Math.max(0, start)).map((message) => {
       const tool = message.toolCall
       return tool
-        ? `[${tool.status}] ${tool.name}\n${tool.arguments}\n${tool.output ?? ''}`
+        ? rawArguments
+          ? `[${tool.status}] ${tool.name}\n${tool.arguments}\n${tool.output ?? ''}`
+          : `[${tool.status}] ${toolDisplayName(tool.name)} ${summarizeToolInput(tool.input, tool.name)}\n${tool.output ?? ''}`
         : `${message.role} · ${message.content}`
     }).join('\n\n') || 'No activity received for this turn.'
-  }, [tab, reasoning, messages])
+  }, [tab, reasoning, messages, rawArguments])
   const lines = useMemo(() => wrapAnsi(content, Math.max(1, width - 4), { hard: true, trim: false }).split('\n'), [content, width])
   const pageSize = Math.max(1, height - 5)
   const maxOffset = Math.max(0, lines.length - pageSize)
@@ -31,6 +35,7 @@ export function ActivityDialog({ reasoning, messages, isStreaming, width, height
   useInput((input, key) => {
     if (key.escape || (key.ctrl && input.toLowerCase() === 'o')) { onClose(); return }
     if (key.tab) { setTab(tab === 'reasoning' ? 'activity' : 'reasoning'); setPosition(null); return }
+    if (input === 'j' && tab === 'activity') { setRawArguments(!rawArguments); setPosition(null); return }
     if (key.upArrow) setPosition(Math.max(0, offset - 1))
     else if (key.downArrow) setPosition(offset + 1 >= maxOffset ? null : offset + 1)
     else if (key.pageUp) setPosition(Math.max(0, offset - pageSize))
@@ -43,7 +48,7 @@ export function ActivityDialog({ reasoning, messages, isStreaming, width, height
       <Text bold color={colors.info} wrap="truncate-end">{tab === 'reasoning' ? 'Thinking' : 'Execution activity'} · {isStreaming ? 'live' : 'latest turn'} · Tab switch</Text>
       <Text color={colors.dimText} wrap="truncate-end">{offset + 1}–{Math.min(lines.length, offset + pageSize)}/{lines.length} · {position === null ? 'following latest' : 'scroll paused · G resumes'}</Text>
       {lines.slice(offset, offset + pageSize).map((line, index) => <Text key={index} wrap="truncate-end">{line || ' '}</Text>)}
-      <Text color={colors.dimText} wrap="truncate-end">↑↓/PgUp/PgDn · g/G ends · Ctrl+O/Esc close</Text>
+      <Text color={colors.dimText} wrap="truncate-end">{`↑↓/PgUp/PgDn · g/G ends · ${tab === 'activity' ? `j ${rawArguments ? 'summary' : 'raw JSON'} · ` : ''}Ctrl+O/Esc close`}</Text>
     </Box>
   )
 }

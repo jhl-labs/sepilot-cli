@@ -57,7 +57,21 @@ export interface ExternalCliRunInput {
   model?: string
   threadId?: string
   timeoutMs?: number
+  idleTimeoutMs?: number
   env?: NodeJS.ProcessEnv
+}
+
+export type ExternalCliFailureKind = 'stalled' | 'timeout' | 'incomplete' | 'cancelled' | 'failed'
+
+export class ExternalCliRunError extends Error {
+  constructor(message: string, readonly kind: ExternalCliFailureKind, readonly threadId?: string) {
+    super(message)
+    this.name = 'ExternalCliRunError'
+  }
+}
+
+export function isResumableFailure(kind: ExternalCliFailureKind | undefined): boolean {
+  return kind === 'stalled' || kind === 'timeout' || kind === 'incomplete'
 }
 
 export type ExternalCliEvent =
@@ -80,6 +94,13 @@ export interface ExternalCliRunOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 20 * 60_000
+const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60_000
+
+export function externalCliIdleTimeout(input: Pick<ExternalCliRunInput, 'idleTimeoutMs'>, env: NodeJS.ProcessEnv = process.env): number {
+  if (input.idleTimeoutMs !== undefined) return Math.max(0, input.idleTimeoutMs)
+  const raw = Number(env.SEPILOTD_EXTERNAL_CLI_IDLE_TIMEOUT_MS)
+  return env.SEPILOTD_EXTERNAL_CLI_IDLE_TIMEOUT_MS?.trim() && Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_IDLE_TIMEOUT_MS
+}
 const THREAD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/
 const MAX_BUFFER_BYTES = 24 * 1024 * 1024
@@ -131,7 +152,7 @@ export async function runExternalCli(input: ExternalCliRunInput, options: Extern
   if (!isAbsolute(input.cwd)) throw new Error('EXTERNAL_CLI_INVALID_REQUEST: cwd must be absolute')
   if (input.threadId !== undefined && !THREAD_ID_PATTERN.test(input.threadId)) throw new Error('EXTERNAL_CLI_INVALID_REQUEST: threadId must be an identifier')
   if (input.model !== undefined && !MODEL_PATTERN.test(input.model)) throw new Error('EXTERNAL_CLI_INVALID_REQUEST: model must be an identifier')
-  if (options.signal?.aborted) throw new Error('external CLI run cancelled')
+  if (options.signal?.aborted) throw new ExternalCliRunError('external CLI run cancelled', 'cancelled', input.threadId)
 
   const env = input.env ?? process.env
   const [file, ...args] = buildExternalCliCommand(input, env)
@@ -141,6 +162,7 @@ export async function runExternalCli(input: ExternalCliRunInput, options: Extern
   const spawnFn = options.spawnFn ?? spawn
   const startedAt = Date.now()
   const timeoutMs = Math.max(1, input.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+  const idleTimeoutMs = externalCliIdleTimeout(input, env)
   const texts: string[] = []
   const usage = { inputTokens: 0, outputTokens: 0 }
   let threadId = input.threadId
@@ -160,12 +182,15 @@ export async function runExternalCli(input: ExternalCliRunInput, options: Extern
       return
     }
     let finished = false, sawCompletion = false, buffer = '', stderr = ''
+    let lastStepReason = ''
     const decoder = new StringDecoder('utf8')
     const seen = new Set<string>()
+    const fail = (message: string, kind: ExternalCliFailureKind) => finish(new ExternalCliRunError(message, kind, threadId))
     const finish = (error?: Error) => {
       if (finished) return
       finished = true
       clearTimeout(timer)
+      if (idle) clearTimeout(idle)
       options.signal?.removeEventListener('abort', abort)
       try { child.stdin.end() } catch {}
       child.kill()
@@ -174,11 +199,21 @@ export async function runExternalCli(input: ExternalCliRunInput, options: Extern
         force.unref()
         child.once('exit', () => clearTimeout(force))
       }
-      if (error) reject(error)
+      if (error) reject(error instanceof ExternalCliRunError ? error : new ExternalCliRunError(error.message, 'failed', threadId))
       else resolve()
     }
-    const abort = () => finish(new Error('external CLI run cancelled'))
-    const timer = setTimeout(() => finish(new Error(`external CLI run timed out after ${timeoutMs}ms`)), timeoutMs)
+    const abort = () => fail('external CLI run cancelled', 'cancelled')
+    const timer = setTimeout(() => fail(`external CLI run timed out after ${timeoutMs}ms`, 'timeout'), timeoutMs)
+    let idle: NodeJS.Timeout | undefined
+    const heard = () => {
+      if (!idleTimeoutMs || finished) return
+      if (idle) clearTimeout(idle)
+      idle = setTimeout(() => {
+        options.log?.('external_cli.stalled', { backend: input.backend, idleMs: idleTimeoutMs, threadId })
+        fail(`${input.backend} produced no output for ${idleTimeoutMs}ms (stalled: network or model server); the session can be resumed`, 'stalled')
+      }, idleTimeoutMs)
+    }
+    heard()
     options.signal?.addEventListener('abort', abort, { once: true })
     const send = (value: unknown) => child.stdin.write(`${JSON.stringify(value)}\n`)
 
@@ -267,17 +302,28 @@ export async function runExternalCli(input: ExternalCliRunInput, options: Extern
           const part = row(event.part)
           emit({ type: 'progress', text: `${str(part.tool) || str(part.name) || 'tool'}`.slice(0, 200) })
         }
-        if (event.type === 'step_finish') sawCompletion = true
+        if (event.type === 'step_start') { lastStepReason = ''; sawCompletion = false }
+        if (event.type === 'step_finish') {
+          const part = row(event.part), tokens = row(part.tokens), cache = row(tokens.cache)
+          emit({
+            type: 'usage',
+            inputTokens: (Number(tokens.input) || 0) + (Number(cache.read) || 0) + (Number(cache.write) || 0),
+            outputTokens: (Number(tokens.output) || 0) + (Number(tokens.reasoning) || 0),
+          })
+          lastStepReason = str(part.reason)
+          sawCompletion = lastStepReason === 'stop'
+        }
       }
     }
 
     child.on('error', (error) => finish(describeSpawnError(input.backend, file, error)))
     child.stdin.on('error', (error) => finish(error))
-    child.stderr.on('data', (data: Buffer) => { stderr = (stderr + data.toString()).slice(-4096) })
+    child.stderr.on('data', (data: Buffer) => { heard(); stderr = (stderr + data.toString()).slice(-4096) })
     child.stdout.on('data', (data: Buffer) => {
       if (finished) return
+      heard()
       buffer += decoder.write(data)
-      if (buffer.length > MAX_BUFFER_BYTES) { finish(new Error('external CLI event exceeded size limit')); return }
+      if (buffer.length > MAX_BUFFER_BYTES) { fail('external CLI event exceeded size limit', 'failed'); return }
       try {
         let newline: number
         while (!finished && (newline = buffer.indexOf('\n')) >= 0) {
@@ -291,9 +337,11 @@ export async function runExternalCli(input: ExternalCliRunInput, options: Extern
       if (finished) return
       try { parse(buffer + decoder.end()) } catch (error) { finish(error as Error); return }
       if (finished) return
-      finish(code === 0 && sawCompletion
-        ? undefined
-        : new Error(`${input.backend} exited (${code ?? 'unknown'}) before a successful turn completed.${stderr ? `\n${stderr}` : ''}`))
+      if (code === 0 && sawCompletion) { finish(); return }
+      const midTask = input.backend === 'opencode' && code === 0 && lastStepReason
+      fail(midTask
+        ? `opencode exited while its turn was still in progress (last step ended with "${lastStepReason}"); the session can be resumed.${stderr ? `\n${stderr}` : ''}`
+        : `${input.backend} exited (${code ?? 'unknown'}) before a successful turn completed.${stderr ? `\n${stderr}` : ''}`, midTask ? 'incomplete' : 'failed')
     })
 
     if (options.signal?.aborted) { abort(); return }

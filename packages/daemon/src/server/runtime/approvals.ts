@@ -9,6 +9,7 @@ import type {
   ISessionStore,
   RememberedApprovalScope,
   ToolCall,
+  PolicyCheckResult,
 } from '@sepilotd/core'
 import { describeRuleFor, matchesRule } from './approval-rules.js'
 
@@ -49,6 +50,7 @@ export interface PendingApproval {
 }
 
 interface PendingApprovalEntry extends PendingApproval {
+  recheckPolicy?: () => PolicyCheckResult
   resolve: (decision: ApprovalDecision) => void
   reject: (error: Error) => void
   onParked?: (approval: PendingApproval) => void
@@ -93,6 +95,7 @@ export class ApprovalRegistry {
     runId?: string
     timeoutMs?: number
     forcePrompt?: boolean
+    recheckPolicy?: () => PolicyCheckResult
     signal?: AbortSignal
     onParked?: (approval: PendingApproval) => void
   }): ApprovalDecision | Promise<ApprovalDecision> {
@@ -154,6 +157,7 @@ export class ApprovalRegistry {
         },
         onParked,
         timeout,
+        recheckPolicy: params.recheckPolicy,
       }
       this.pending.set(requestId, entry)
       this.hooks.onPending?.(toPendingApproval(entry))
@@ -275,6 +279,20 @@ export class ApprovalRegistry {
       }
     }
     return cancelled
+  }
+
+  async recheckForSession(sessionId: string): Promise<void> {
+    for (const entry of [...this.pending.values()]) {
+      if (entry.sessionId !== sessionId || entry.state !== 'live' || !entry.recheckPolicy) continue
+      const result = entry.recheckPolicy()
+      if (!result.allowed) {
+        await this.respond(entry.requestId, { decision: 'feedback', approved: false, note: `Privilege changed: ${result.reason ?? 'the current policy blocks this action'}` }, { approvedBy: 'privilege-change', scope: 'once' })
+      } else if (!result.requiresApproval) {
+        const remembered = this.tryAutoApproval({ sessionId, toolCall: { id: entry.toolCallId, name: entry.tool, arguments: entry.input }, runId: entry.runId })
+        if (remembered && !remembered.approved) continue
+        await this.respond(entry.requestId, { decision: 'approved', approved: true, note: 'The explicit session privilege change now permits this action without approval.' }, { approvedBy: 'privilege-change', scope: 'once' })
+      }
+    }
   }
 
   async respond(
@@ -441,6 +459,7 @@ function toPendingApproval(entry: PendingApprovalEntry): PendingApproval {
     reject: _reject,
     onParked: _onParked,
     timeout: _timeout,
+    recheckPolicy: _recheckPolicy,
     ...approval
   } = entry
   return { ...approval }

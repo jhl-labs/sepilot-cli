@@ -71,7 +71,7 @@ export function deriveRunStatusPresentation({
   } else if (busy) {
     color = colors.info
     add('state', `${activityFrame ?? '⠋'} ${progressLabel || (ko ? '작업 중' : 'Working…')}`, 90, 4)
-    if (elapsedMs != null) add('elapsed', formatRecapDuration(elapsedMs), 95)
+    if (elapsedMs != null) add('elapsed', `${width >= 60 ? (ko ? '전체 ' : 'total ') : ''}${formatRecapDuration(elapsedMs)}`, 95)
   } else if (metadataVisible && metadata.status === 'error') {
     color = colors.error
     add('state', ko ? '! 모델 설정 조회 실패' : '! Model settings unavailable', 95, 4)

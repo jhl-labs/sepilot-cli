@@ -1390,6 +1390,7 @@ export async function chatRoutes(app: FastifyInstance) {
 
       const selections = selectChatProviderCandidates({
         runtime,
+        routing: body.modelRouting,
         message,
         requestedProvider: body.provider,
         requestedModel: model,
@@ -1399,7 +1400,7 @@ export async function chatRoutes(app: FastifyInstance) {
       })
       const selection = selections[0]
       if (!selection) {
-        const failure = buildProviderSelectionFailure(runtime, body.provider, model)
+        const failure = buildProviderSelectionFailure(runtime, body.provider, model, body.modelRouting)
         return reply.status(failure.statusCode).send({ error: failure.error })
       }
       const provider = selection.provider
@@ -1780,6 +1781,7 @@ export async function chatRoutes(app: FastifyInstance) {
         const delegationToolRegistry = withSelectedBrowserTarget(turnToolAuthority.delegation, activeRemoteBrowser)
         const authorizedToolRegistry = withSelectedBrowserTarget(turnToolAuthority.own, activeRemoteBrowser)
         const agentToolRegistry = withContextualToolExposure(authorizedToolRegistry, {
+          previousMessages,
           surface: requestSurface,
           semanticRouting: true,
           activeRemoteBrowser,
@@ -1846,6 +1848,7 @@ export async function chatRoutes(app: FastifyInstance) {
             toolCall,
             requestId,
             runId: messageId,
+            recheckPolicy: options?.recheckPolicy,
             forcePrompt: options?.forcePrompt,
             signal: options?.signal,
           })

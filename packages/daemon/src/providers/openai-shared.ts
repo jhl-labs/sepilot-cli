@@ -7,6 +7,7 @@ import type {
   LLMRequestOptions,
   Message,
   ModelInfo,
+  PromptCacheConfig,
   StreamChunk,
   ToolCall,
   ToolDefinition,
@@ -14,6 +15,7 @@ import type {
 import { extractContent, toApiError, wrapError } from './utils.js'
 import { normalizeToolSchema } from './schema-normalize.js'
 import { partitionSystemMessages } from './system-messages.js'
+import { applyPromptCache, mapOpenAIUsage } from './prompt-cache.js'
 
 const streamLogger = createLogger('provider.openai-stream')
 
@@ -24,6 +26,7 @@ type StreamDelta = NonNullable<ChatCompletionChunk['choices'][number]['delta']>
 type OpenAIThinkingControl = NonNullable<ModelInfo['capabilities']['thinkingControl']>
 
 interface OpenAIResponseOptions {
+  promptCache?: PromptCacheConfig
   filterThinkTags?: boolean
   thinkingControl?: OpenAIThinkingControl
   reasoningEffortOffValue?: NonNullable<ModelInfo['compatibility']>['reasoningEffortOffValue']
@@ -94,7 +97,7 @@ export function mapOpenAIChatMessages(
 }
 
 function mapOpenAIChatTools(tools: ToolDefinition[]): OpenAI.Chat.Completions.ChatCompletionTool[] {
-  return tools.map((tool) => ({
+  return [...tools].sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0).map((tool) => ({
     type: 'function' as const,
     function: {
       name: tool.name,
@@ -150,6 +153,7 @@ function addOptionalChatParams(
   if (request.stopSequences?.length) {
     params.stop = request.stopSequences
   }
+  applyPromptCache(params as unknown as Record<string, unknown>, request, responseOptions.promptCache)
   if (!request.thinkingLevel || !thinkingControl) return
 
   const compatibleParams = params as unknown as Record<string, unknown>
@@ -258,10 +262,7 @@ export async function createOpenAIChatResponse(
         toolCalls: mapToolCalls(choice.message.tool_calls),
       },
       thinking: thinking || undefined,
-      usage: {
-        inputTokens: response.usage?.prompt_tokens ?? 0,
-        outputTokens: response.usage?.completion_tokens ?? 0,
-      },
+      usage: mapOpenAIUsage(response.usage),
       finishReason: mapOpenAIFinishReason(choice.finish_reason),
     }
   } catch (err) {
@@ -428,6 +429,7 @@ export async function* streamOpenAIChatResponse(
     rawToolDeltas: 0, rawToolArgumentChars: 0, mappedToolStarts: 0,
     firstFrameMs: null as number | null, finishReason: null as string | null,
     inputTokens: null as number | null, outputTokens: null as number | null,
+    firstTokenMs: null as number | null,
     failed: false,
   }
   try {
@@ -440,6 +442,10 @@ export async function* streamOpenAIChatResponse(
       thinkingControl: streamOptions.thinkingControl ?? null,
       wireReasoningEffort: wire.reasoning_effort ?? null,
       wireThinkingEnabled: (wire.chat_template_kwargs as { enable_thinking?: boolean } | undefined)?.enable_thinking ?? null,
+      promptCacheKeyPresent: typeof wire.prompt_cache_key === 'string',
+      promptCacheRetention: wire.prompt_cache_retention ?? null,
+      promptCacheOptions: wire.prompt_cache_options ?? null,
+      promptCacheBreakpoint: streamOptions.promptCache?.breakpoint ?? null,
     })
     const stream = await client.chat.completions.create(
       params, {
@@ -464,6 +470,7 @@ export async function* streamOpenAIChatResponse(
         stats.outputTokens = chunk.usage.completion_tokens ?? null
       }
       const reasoning = extractOpenAIReasoningContent(delta)
+      if (reasoning || delta?.content || delta?.tool_calls?.length) stats.firstTokenMs ??= Math.round(performance.now() - startedAt)
       stats.reasoningChars += reasoning.length
       if (reasoning) {
         yield { type: 'thinking', text: reasoning }
@@ -485,10 +492,7 @@ export async function* streamOpenAIChatResponse(
         chunk.usage && !usageEmitted
           ? {
               type: 'usage',
-              usage: {
-                inputTokens: chunk.usage.prompt_tokens ?? 0,
-                outputTokens: chunk.usage.completion_tokens ?? 0,
-              },
+              usage: { ...mapOpenAIUsage(chunk.usage), ...(stats.firstTokenMs !== null ? { firstTokenMs: stats.firstTokenMs } : {}) },
             }
           : null
 

@@ -154,7 +154,8 @@ export function createSubagentDispatchTool(
           items: { type: 'string' },
           description: 'Restrict to subset of parent allowed tools',
         },
-        model: { type: 'string', description: 'Provider model override' },
+        model: { type: 'string', description: 'Model override resolved together with its configured provider' },
+        provider: { type: 'string', description: 'Explicit configured provider for an unambiguous model selection' },
         contextPacket: {
           type: 'string',
           description: 'Compact parent context to avoid duplicate exploration',
@@ -175,6 +176,7 @@ export function createSubagentDispatchTool(
         maxIterations?: number
         tools?: string[]
         model?: string
+        provider?: string
         contextPacket?: string
         isolation?: 'worktree'
         worktreeBase?: 'head' | 'working-tree'
@@ -190,6 +192,7 @@ export function createSubagentDispatchTool(
           maxIterations: inputTyped.maxIterations,
           tools: inputTyped.tools,
           model: inputTyped.model,
+          provider: inputTyped.provider,
           contextPacket: inputTyped.contextPacket,
           isolation: inputTyped.isolation,
           ...(inputTyped.worktreeBase ? { worktreeBase: inputTyped.worktreeBase } : {}),

@@ -23,6 +23,7 @@ import { registerTeamDocsRoutes } from '../team-docs/routes.js'
 import { registerMessageSubscriptionRoutes } from '../message-subscription/routes.js'
 import { registerUsageSnapshotRoute } from './routes/usage-snapshot.js'
 import { registerLlmProvidersCapabilityRoutes } from './routes/llm-providers-capability.js'
+import { registerDecisionsCapabilityRoutes } from './routes/decisions-capability.js'
 import { registerSettingsCapabilityRoutes } from './routes/settings-capability.js'
 import { registerSkillsCapabilityRoutes } from './routes/skills-capability.js'
 import { registerRagCapabilityRoutes } from './routes/rag-capability.js'
@@ -58,6 +59,7 @@ export const capabilityRoutes: FastifyPluginAsync = async (app) => {
   await registerExtensionsFeatureRoutes(app)
   await registerUsageSnapshotRoute(app)
   await registerLlmProvidersCapabilityRoutes(app)
+  await registerDecisionsCapabilityRoutes(app)
   await registerSettingsCapabilityRoutes(app)
   await registerSkillsCapabilityRoutes(app)
   await registerRagCapabilityRoutes(app)

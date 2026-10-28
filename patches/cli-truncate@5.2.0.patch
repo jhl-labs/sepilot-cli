@@ -1,0 +1,21 @@
+diff --git a/index.js b/index.js
+index 5a1fe8641a91a30dabcb84d2fff537c10dcc57e5..a39918c330df1244b4b88c454c8e070dbcad4dc1 100644
+--- a/index.js
++++ b/index.js
+@@ -160,7 +160,15 @@ export default function cliTruncate(text, columns, options = {}) {
+ 			truncationCharacter = ` ${truncationCharacter}`;
+ 		}
+ 
+-		const left = sliceAnsi(text, 0, columns - stringWidth(truncationCharacter));
++		const suffixWidth = stringWidth(truncationCharacter);
++		let end = columns - suffixWidth;
++		let left = sliceAnsi(text, 0, end);
++		// A slice boundary can include the entire wide character that straddles
++		// it. Reserve the suffix again using measured cells before rendering.
++		while (end > 0 && stringWidth(left) + suffixWidth > columns) {
++			end--;
++			left = sliceAnsi(text, 0, end);
++		}
+ 		return appendWithInheritedStyleFromEnd(left, truncationCharacter);
+ 	}
+ 

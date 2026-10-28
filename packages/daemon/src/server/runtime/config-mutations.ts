@@ -1,3 +1,4 @@
+import { modelRoutingPolicySchema } from '../../providers/model-routing-policy.js'
 import {
   DAEMON_CONFIG_UPDATE_KEYS,
   isDaemonConfigUpdateKey,
@@ -81,6 +82,31 @@ export function restoreProviderSecrets(
   providers: SepilotdConfig['providers'],
 ): SepilotdConfig['providers'] {
   return providers.map((provider) => restoreProviderApiKey(existingProviders, provider))
+}
+
+export function restoreDecisionProviderSecrets(
+  existing: SepilotdConfig['decisionProviders'],
+  next: SepilotdConfig['decisionProviders'],
+): SepilotdConfig['decisionProviders'] {
+  return next.map((provider) => {
+    const previous = existing.find((candidate) => candidate.id === provider.id)
+    const targetUnchanged =
+      previous?.type === provider.type && (previous.baseUrl ?? '') === (provider.baseUrl ?? '')
+    const apiKey =
+      provider.apiKey !== '***redacted***'
+        ? provider.apiKey
+        : targetUnchanged
+          ? previous?.apiKey
+          : undefined
+    const headers = Object.fromEntries(
+      Object.entries(provider.headers ?? {}).flatMap(([key, value]) => {
+        if (value !== '***redacted***') return [[key, value] as const]
+        const kept = targetUnchanged ? previous?.headers?.[key] : undefined
+        return kept === undefined ? [] : [[key, kept] as const]
+      }),
+    )
+    return { ...provider, apiKey, headers }
+  })
 }
 
 export function restoreMcpServerEnv(
@@ -382,6 +408,12 @@ export function applyConfigUpdate(
         return true
       }
       return false
+    case 'agent.modelRouting': {
+      const parsed = modelRoutingPolicySchema.safeParse(value)
+      if (!parsed.success) return false
+      config.agent.modelRouting = parsed.data
+      return true
+    }
     case 'agent.graphNodeModelOverrides': {
       const parsed = agentGraphNodeModelOverridesSchema.safeParse(value)
       if (!parsed.success) {
@@ -499,6 +531,15 @@ export function applyConfigUpdate(
         config.providers = restoreProviderSecrets(
           config.providers,
           value as SepilotdConfig['providers'],
+        )
+        return true
+      }
+      return false
+    case 'decisionProviders':
+      if (Array.isArray(value)) {
+        config.decisionProviders = restoreDecisionProviderSecrets(
+          config.decisionProviders,
+          value as SepilotdConfig['decisionProviders'],
         )
         return true
       }
@@ -848,6 +889,8 @@ export function getConfigUpdateValue(config: SepilotdConfig, key: ConfigUpdateKe
       return config.agent.thinkingLevel
     case 'agent.disabledTools':
       return config.agent.disabledTools
+    case 'agent.modelRouting':
+      return config.agent.modelRouting
     case 'agent.graphNodeModelOverrides':
       return config.agent.graphNodeModelOverrides
     case 'daemon.resumeArtifactRetentionDays':

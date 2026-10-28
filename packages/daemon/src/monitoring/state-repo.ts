@@ -89,13 +89,16 @@ export interface MonitorReportResult {
     retentionLimited: boolean
   }
   transitions: Record<MonitorTransitionType, number>
-  metrics: Record<string, {
-    current: number
-    min: number
-    max: number
-    average: number
-    samples: number
-  }>
+  metrics: Record<
+    string,
+    {
+      current: number
+      min: number
+      max: number
+      average: number
+      samples: number
+    }
+  >
 }
 
 interface MonitorStateRow {
@@ -181,10 +184,25 @@ function ensureSchema(db: SqliteDatabase): void {
     );
     CREATE INDEX IF NOT EXISTS idx_monitor_samples_period
       ON monitor_samples(scope_key, monitor_id, observed_at DESC);
+    CREATE TABLE IF NOT EXISTS monitor_delivery_outbox (
+      id TEXT PRIMARY KEY,
+      scope_key TEXT NOT NULL,
+      monitor_id TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      delivered_at INTEGER,
+      owner TEXT,
+      lease_until INTEGER NOT NULL DEFAULT 0,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_monitor_delivery_due
+      ON monitor_delivery_outbox(delivered_at, next_attempt_at);
   `)
   const stateColumns = new Set(
-    (db.prepare('PRAGMA table_info(monitor_states)').all() as Array<{ name: string }>)
-      .map((column) => column.name),
+    (db.prepare('PRAGMA table_info(monitor_states)').all() as Array<{ name: string }>).map(
+      (column) => column.name,
+    ),
   )
   if (!stateColumns.has('last_observed_at')) {
     db.prepare('ALTER TABLE monitor_states ADD COLUMN last_observed_at INTEGER').run()
@@ -194,7 +212,7 @@ function ensureSchema(db: SqliteDatabase): void {
 function parseTransitions(raw: string): MonitorTransitionType[] {
   try {
     const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed as MonitorTransitionType[] : []
+    return Array.isArray(parsed) ? (parsed as MonitorTransitionType[]) : []
   } catch {
     return []
   }
@@ -205,9 +223,10 @@ function parseMetrics(raw: string): Record<string, number> {
     const parsed = JSON.parse(raw) as Record<string, unknown>
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
     return Object.fromEntries(
-      Object.entries(parsed).filter((entry): entry is [string, number] => (
-        typeof entry[1] === 'number' && Number.isFinite(entry[1])
-      )),
+      Object.entries(parsed).filter(
+        (entry): entry is [string, number] =>
+          typeof entry[1] === 'number' && Number.isFinite(entry[1]),
+      ),
     )
   } catch {
     return {}
@@ -303,7 +322,35 @@ function notificationKey(
 
 export interface MonitorStateRepo {
   evaluate(input: MonitorEvaluationInput): MonitorEvaluationResult
+  evaluateAndEnqueue(
+    input: MonitorEvaluationInput,
+    delivery: (result: MonitorEvaluationResult) => { id: string; payload: string } | null,
+  ): MonitorEvaluationResult
+  claimDeliveries(
+    owner: string,
+    now: number,
+    scopeKey?: string,
+    monitorId?: string,
+    limit?: number,
+  ): MonitorDeliveryIntent[]
+  deliveryStatus(now: number): {
+    pending: number
+    retrying: number
+    leased: number
+    oldestPendingAt: number | null
+    maxAttempts: number
+  }
+  finishDelivery(id: string, owner: string, now: number): void
+  retryDelivery(id: string, owner: string, nextAttemptAt: number): void
   report(input: MonitorReportInput): MonitorReportResult | null
+}
+
+export interface MonitorDeliveryIntent {
+  id: string
+  scopeKey: string
+  monitorId: string
+  payload: string
+  attempts: number
 }
 
 export function createMonitorStateRepo(): MonitorStateRepo {
@@ -314,15 +361,19 @@ export function createMonitorStateRepo(): MonitorStateRepo {
     const stateQuery = db.prepare(
       'SELECT * FROM monitor_states WHERE scope_key = ? AND monitor_id = ?',
     )
-    const existingState = stateQuery.get(input.scopeKey, input.monitorId) as MonitorStateRow | undefined
-    const existingSample = db.prepare(
-      `SELECT observation_hash, contract_version, observed_status, severity,
+    const existingState = stateQuery.get(input.scopeKey, input.monitorId) as
+      | MonitorStateRow
+      | undefined
+    const existingSample = db
+      .prepare(
+        `SELECT observation_hash, contract_version, observed_status, severity,
         evidence_summary, evidence_redacted, metrics_json, outcome,
         transitions_json, state_version, should_notify,
         notification_dedup_key, observed_at
        FROM monitor_samples
        WHERE scope_key = ? AND monitor_id = ? AND sample_hash = ?`,
-    ).get(input.scopeKey, input.monitorId, input.sampleHash) as MonitorSampleRow | undefined
+      )
+      .get(input.scopeKey, input.monitorId, input.sampleHash) as MonitorSampleRow | undefined
 
     if (existingSample) {
       if (existingSample.observation_hash !== input.observationHash) {
@@ -333,15 +384,15 @@ export function createMonitorStateRepo(): MonitorStateRepo {
     }
 
     if (
-      existingState
-      && existingState.contract_version === input.contractVersion
-      && existingState.contract_hash !== input.contractHash
+      existingState &&
+      existingState.contract_version === input.contractVersion &&
+      existingState.contract_hash !== input.contractHash
     ) {
       throw new Error('MONITOR_CONTRACT_MISMATCH_USER')
     }
     if (
-      existingState?.last_observed_at != null
-      && input.observedAt < existingState.last_observed_at
+      existingState?.last_observed_at != null &&
+      input.observedAt < existingState.last_observed_at
     ) {
       return staleResult(input, existingState)
     }
@@ -396,8 +447,9 @@ export function createMonitorStateRepo(): MonitorStateRepo {
 
       const desiredStatus = input.observedStatus
       const desiredSeverity = desiredStatus === 'anomaly' ? input.severity : null
-      const stableMatches = state.stable_status === desiredStatus
-        && (desiredStatus !== 'anomaly' || state.stable_severity === desiredSeverity)
+      const stableMatches =
+        state.stable_status === desiredStatus &&
+        (desiredStatus !== 'anomaly' || state.stable_severity === desiredSeverity)
 
       if (state.stable_status === null && desiredStatus === 'healthy') {
         state.stable_status = 'healthy'
@@ -411,8 +463,8 @@ export function createMonitorStateRepo(): MonitorStateRepo {
         state.candidate_count = 0
       } else {
         if (
-          state.candidate_status === desiredStatus
-          && state.candidate_severity === desiredSeverity
+          state.candidate_status === desiredStatus &&
+          state.candidate_severity === desiredSeverity
         ) {
           state.candidate_count += 1
         } else {
@@ -421,9 +473,8 @@ export function createMonitorStateRepo(): MonitorStateRepo {
           state.candidate_count = 1
         }
 
-        const required = desiredStatus === 'anomaly'
-          ? input.thresholds.anomaly
-          : input.thresholds.recovery
+        const required =
+          desiredStatus === 'anomaly' ? input.thresholds.anomaly : input.thresholds.recovery
         if (state.candidate_count >= required) {
           const previousStatus = state.stable_status
           const previousSeverity = state.stable_severity
@@ -450,14 +501,11 @@ export function createMonitorStateRepo(): MonitorStateRepo {
     const dedupKey = notificationRequired
       ? notificationKey(input, state.state_version, transitions)
       : null
-    const pending = transitions.length === 0 && (
-      state.candidate_count > 0 || (state.error_open === 0 && state.error_count > 0)
-    )
-    const outcome: 'quiet' | 'pending' | 'transition' = transitions.length > 0
-      ? 'transition'
-      : pending
-        ? 'pending'
-        : 'quiet'
+    const pending =
+      transitions.length === 0 &&
+      (state.candidate_count > 0 || (state.error_open === 0 && state.error_count > 0))
+    const outcome: 'quiet' | 'pending' | 'transition' =
+      transitions.length > 0 ? 'transition' : pending ? 'pending' : 'quiet'
 
     db.prepare(
       `INSERT INTO monitor_states (
@@ -524,21 +572,23 @@ export function createMonitorStateRepo(): MonitorStateRepo {
       input.now,
     )
 
-    const deleted = db.prepare(
-      `DELETE FROM monitor_samples
+    const deleted = db
+      .prepare(
+        `DELETE FROM monitor_samples
        WHERE scope_key = ? AND monitor_id = ? AND sample_hash IN (
          SELECT sample_hash FROM monitor_samples
          WHERE scope_key = ? AND monitor_id = ?
          ORDER BY observed_at DESC, created_at DESC
          LIMIT -1 OFFSET ?
        )`,
-    ).run(
-      input.scopeKey,
-      input.monitorId,
-      input.scopeKey,
-      input.monitorId,
-      MONITOR_SAMPLE_RETENTION,
-    ).changes
+      )
+      .run(
+        input.scopeKey,
+        input.monitorId,
+        input.scopeKey,
+        input.monitorId,
+        MONITOR_SAMPLE_RETENTION,
+      ).changes
     if (deleted > 0) {
       state.pruned_samples += deleted
       db.prepare(
@@ -579,22 +629,100 @@ export function createMonitorStateRepo(): MonitorStateRepo {
     evaluate(input) {
       return evaluateTransaction(input)
     },
+    evaluateAndEnqueue: db.transaction((input, delivery) => {
+      const result = evaluateTransaction(input)
+      const intent = delivery(result)
+      if (intent) {
+        db.prepare(
+          `INSERT INTO monitor_delivery_outbox (id, scope_key, monitor_id, payload, created_at)
+          VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+        ).run(intent.id, input.scopeKey, input.monitorId, intent.payload, input.now)
+      }
+      return result
+    }),
+    claimDeliveries: db.transaction((owner, now, scopeKey, monitorId, limit = 32) => {
+      const rows = db
+        .prepare(
+          `SELECT id, scope_key AS scopeKey, monitor_id AS monitorId, payload, attempts FROM monitor_delivery_outbox AS pending
+        WHERE delivered_at IS NULL AND next_attempt_at <= ? AND (owner IS NULL OR lease_until <= ?)
+          AND (? IS NULL OR scope_key = ?) AND (? IS NULL OR monitor_id = ?)
+          AND NOT EXISTS (SELECT 1 FROM monitor_delivery_outbox AS active
+            WHERE active.scope_key = pending.scope_key AND active.monitor_id = pending.monitor_id
+              AND active.delivered_at IS NULL AND active.owner IS NOT NULL AND active.lease_until > ?)
+          AND NOT EXISTS (SELECT 1 FROM monitor_delivery_outbox AS earlier
+            WHERE earlier.scope_key = pending.scope_key AND earlier.monitor_id = pending.monitor_id
+              AND earlier.delivered_at IS NULL AND earlier.rowid < pending.rowid)
+        ORDER BY next_attempt_at, created_at, pending.rowid LIMIT ?`,
+        )
+        .all(
+          now,
+          now,
+          scopeKey ?? null,
+          scopeKey ?? null,
+          monitorId ?? null,
+          monitorId ?? null,
+          now,
+          Math.min(32, Math.max(1, Math.floor(limit))),
+        ) as MonitorDeliveryIntent[]
+      for (const row of rows)
+        db.prepare(
+          `UPDATE monitor_delivery_outbox
+        SET owner = ?, lease_until = ?, attempts = attempts + 1 WHERE id = ?`,
+        ).run(owner, now + 300_000, row.id)
+      return rows.map((row) => ({ ...row, attempts: row.attempts + 1 }))
+    }),
+    deliveryStatus(now) {
+      return db
+        .prepare(
+          `SELECT COUNT(*) AS pending,
+        COALESCE(SUM(CASE WHEN attempts > 0 AND owner IS NULL THEN 1 ELSE 0 END), 0) AS retrying,
+        COALESCE(SUM(CASE WHEN owner IS NOT NULL AND lease_until > ? THEN 1 ELSE 0 END), 0) AS leased,
+        MIN(created_at) AS oldestPendingAt, COALESCE(MAX(attempts), 0) AS maxAttempts
+        FROM monitor_delivery_outbox WHERE delivered_at IS NULL`,
+        )
+        .get(now) as {
+        pending: number
+        retrying: number
+        leased: number
+        oldestPendingAt: number | null
+        maxAttempts: number
+      }
+    },
+    finishDelivery(id, owner, now) {
+      db.prepare(
+        `UPDATE monitor_delivery_outbox SET delivered_at = ?, owner = NULL, lease_until = 0
+        WHERE id = ? AND owner = ? AND delivered_at IS NULL`,
+      ).run(now, id, owner)
+      db.prepare('DELETE FROM monitor_delivery_outbox WHERE delivered_at < ?').run(
+        now - 7 * 24 * 60 * 60_000,
+      )
+    },
+    retryDelivery(id, owner, nextAttemptAt) {
+      db.prepare(
+        `UPDATE monitor_delivery_outbox SET owner = NULL, lease_until = 0, next_attempt_at = ?
+        WHERE id = ? AND owner = ? AND delivered_at IS NULL`,
+      ).run(nextAttemptAt, id, owner)
+    },
     report(input) {
-      const state = db.prepare(
-        'SELECT * FROM monitor_states WHERE scope_key = ? AND monitor_id = ?',
-      ).get(input.scopeKey, input.monitorId) as MonitorStateRow | undefined
+      const state = db
+        .prepare('SELECT * FROM monitor_states WHERE scope_key = ? AND monitor_id = ?')
+        .get(input.scopeKey, input.monitorId) as MonitorStateRow | undefined
       if (!state) return null
 
-      const rows = db.prepare(
-        `SELECT observed_status, metrics_json, transitions_json, observed_at
+      const rows = db
+        .prepare(
+          `SELECT observed_status, metrics_json, transitions_json, observed_at
          FROM monitor_samples
          WHERE scope_key = ? AND monitor_id = ? AND observed_at >= ? AND observed_at <= ?
          ORDER BY observed_at ASC`,
-      ).all(input.scopeKey, input.monitorId, input.since, input.until) as MonitorReportSampleRow[]
-      const earliestRetained = db.prepare(
-        `SELECT MIN(observed_at) AS observed_at FROM monitor_samples
+        )
+        .all(input.scopeKey, input.monitorId, input.since, input.until) as MonitorReportSampleRow[]
+      const earliestRetained = db
+        .prepare(
+          `SELECT MIN(observed_at) AS observed_at FROM monitor_samples
          WHERE scope_key = ? AND monitor_id = ?`,
-      ).get(input.scopeKey, input.monitorId) as { observed_at: number | null }
+        )
+        .get(input.scopeKey, input.monitorId) as { observed_at: number | null }
 
       const counts = { healthy: 0, anomaly: 0, unknown: 0 }
       const transitionCounts: Record<MonitorTransitionType, number> = {
@@ -606,13 +734,16 @@ export function createMonitorStateRepo(): MonitorStateRepo {
       }
       let unknownIntervals = 0
       let previousUnknown = false
-      const metricStats = new Map<string, {
-        current: number
-        min: number
-        max: number
-        total: number
-        samples: number
-      }>()
+      const metricStats = new Map<
+        string,
+        {
+          current: number
+          min: number
+          max: number
+          total: number
+          samples: number
+        }
+      >()
 
       for (const row of rows) {
         counts[row.observed_status] += 1
@@ -624,26 +755,32 @@ export function createMonitorStateRepo(): MonitorStateRepo {
         }
         for (const [name, value] of Object.entries(parseMetrics(row.metrics_json))) {
           const current = metricStats.get(name)
-          metricStats.set(name, current
-            ? {
-                current: value,
-                min: Math.min(current.min, value),
-                max: Math.max(current.max, value),
-                total: current.total + value,
-                samples: current.samples + 1,
-              }
-            : { current: value, min: value, max: value, total: value, samples: 1 })
+          metricStats.set(
+            name,
+            current
+              ? {
+                  current: value,
+                  min: Math.min(current.min, value),
+                  max: Math.max(current.max, value),
+                  total: current.total + value,
+                  samples: current.samples + 1,
+                }
+              : { current: value, min: value, max: value, total: value, samples: 1 },
+          )
         }
       }
 
       const metrics = Object.fromEntries(
-        [...metricStats.entries()].map(([name, stat]) => [name, {
-          current: stat.current,
-          min: stat.min,
-          max: stat.max,
-          average: stat.total / stat.samples,
-          samples: stat.samples,
-        }]),
+        [...metricStats.entries()].map(([name, stat]) => [
+          name,
+          {
+            current: stat.current,
+            min: stat.min,
+            max: stat.max,
+            average: stat.total / stat.samples,
+            samples: stat.samples,
+          },
+        ]),
       )
       return {
         monitorId: input.monitorId,
@@ -662,9 +799,10 @@ export function createMonitorStateRepo(): MonitorStateRepo {
           firstObservedAt: rows[0] ? new Date(rows[0].observed_at).toISOString() : null,
           lastObservedAt: rows.at(-1) ? new Date(rows.at(-1)!.observed_at).toISOString() : null,
           retentionLimit: MONITOR_SAMPLE_RETENTION,
-          retentionLimited: state.pruned_samples > 0
-            && earliestRetained.observed_at !== null
-            && earliestRetained.observed_at > input.since,
+          retentionLimited:
+            state.pruned_samples > 0 &&
+            earliestRetained.observed_at !== null &&
+            earliestRetained.observed_at > input.since,
         },
         transitions: transitionCounts,
         metrics,

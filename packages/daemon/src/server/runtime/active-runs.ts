@@ -168,20 +168,23 @@ export class ActiveRunRegistry {
     }
   }
 
-  private readonly privilegeSetters = new Map<string, (level: AutonomyLevel) => void>()
+  private readonly privilegeSetters = new Map<string, Set<(level: AutonomyLevel) => void>>()
 
   registerPrivilegeSetter(sessionId: string, setter: (level: AutonomyLevel) => void): () => void {
-    this.privilegeSetters.set(sessionId, setter)
+    const setters = this.privilegeSetters.get(sessionId) ?? new Set()
+    setters.add(setter)
+    this.privilegeSetters.set(sessionId, setters)
     return () => {
-      if (this.privilegeSetters.get(sessionId) === setter) this.privilegeSetters.delete(sessionId)
+      setters.delete(setter)
+      if (!setters.size && this.privilegeSetters.get(sessionId) === setters) this.privilegeSetters.delete(sessionId)
     }
   }
 
   setPrivilege(sessionId: string, level: AutonomyLevel): boolean {
     this.updateRecordedAutonomy(sessionId, level)
-    const setter = this.privilegeSetters.get(sessionId)
-    if (!setter) return false
-    setter(level)
+    const setters = [...(this.privilegeSetters.get(sessionId) ?? [])]
+    if (!setters.length) return false
+    for (const setter of setters) setter(level)
     return true
   }
 

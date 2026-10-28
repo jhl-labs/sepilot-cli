@@ -72,15 +72,13 @@ export function createBackgroundSubagents(deps: {
         const previous = deps.repo.findSubagentRequest(input.parentSessionId, data.requestKey)
         if (previous) {
           if (JSON.stringify(previous.request) !== JSON.stringify(request))
-            throw new Error('Background requestKey already belongs to a different request')
+            throw Object.assign(new Error('Background requestKey already belongs to a different request'), { code: 'SUBAGENT_REQUEST_CONFLICT', statusCode: 409 })
           const job = deps.repo.get(previous.jobId)!
           return { jobId: job.id, status: job.status, createdAt: job.createdAt }
         }
       }
       if (pending.size >= maxPending)
-        throw new Error(
-          `Background subagent queue is full (${maxPending}); no additional job was submitted`,
-        )
+        throw Object.assign(new Error(`Background subagent queue is full (${maxPending}); no additional job was submitted`), { code: 'SUBAGENT_QUEUE_FULL', statusCode: 429 })
       const job = deps.repo.create({ kind: 'subagent', total: 1, concurrency: 1 })
       deps.repo.insertItems(job.id, [{ idx: 0, request, sessionId: input.parentSessionId }])
       pending.add(job.id)

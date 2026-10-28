@@ -108,6 +108,7 @@ export async function sessionPrivilegeRoutes(app: FastifyInstance) {
     const body = request.body
     const resolution = resolveRequestedAutonomy(runtime.autonomy, body.level)
     const applied = runtime.activeRuns?.setPrivilege(params.id, resolution.effective) ?? false
+    if (applied) await runtime.approvalRegistry?.recheckForSession(params.id)
     return reply.send({ data: { sessionId: params.id, level: resolution.effective, applied } })
   })
 }

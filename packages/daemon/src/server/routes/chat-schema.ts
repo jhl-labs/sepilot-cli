@@ -1,3 +1,4 @@
+import { modelRoutingHintSchema } from '../../providers/model-routing-policy.js'
 import { z } from 'zod'
 import { resolveAgentMaxIterations } from '../../agent/iteration-budget.js'
 import { MAX_CHAT_ATTACHMENTS } from '../../media/pipeline.js'
@@ -33,6 +34,7 @@ export const chatRequestSchema = z.object({
   lastEventId: z.string().trim().min(1).max(256).optional(),
   model: z.string().optional(),
   provider: z.string().optional(),
+  modelRouting: modelRoutingHintSchema.optional(),
   tags: z.array(z.string().trim().min(1).max(64)).max(16).optional(),
   persona: z.string().optional(),
   bot: z.string().trim().min(1).max(64).optional(),

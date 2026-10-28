@@ -5,7 +5,9 @@ import {
   buildDiffLines,
   previewTextLines,
   splitTerminalOutput,
+  summarizeToolInput,
   terminalCommandLabel,
+  toolDisplayName,
   truncatePreviewItems,
 } from './tooling.js'
 
@@ -161,9 +163,9 @@ function buildToolReaderLines(message: Message): TranscriptReaderRow[] {
 
   const rows: TranscriptReaderRow[] = []
   const summary = [
-    tool.name,
+    toolDisplayName(tool.name),
     tool.meta,
-    tool.collapsed ? JSON.stringify(tool.input ?? {}) : null,
+    tool.collapsed ? summarizeToolInput(tool.input, tool.name) : null,
   ].filter(Boolean).join(' ')
 
   rows.push({

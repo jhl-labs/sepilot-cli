@@ -6,7 +6,7 @@ function register(
   effect: ToolSecurityDescriptor['effect'],
   rationale: string,
   names: readonly string[],
-  options: Pick<ToolSecurityDescriptor, 'mutationResultBoundary' | 'reach' | 'egressGuard' | 'writesArtifact'> = {},
+  options: Pick<ToolSecurityDescriptor, 'mutationResultBoundary' | 'reach' | 'egressGuard' | 'writesArtifact' | 'executionCapabilities'> = {},
 ): void {
   for (const name of names) {
     if (descriptors.has(name)) {
@@ -269,7 +269,7 @@ register('process-lifecycle', 'Starts, stops, signals, or reconfigures a managed
 register('dynamic', 'Effect is derived from validated invocation arguments and enforced execution capabilities', [
   'terminal.run',
   'process.start',
-])
+], { executionCapabilities: ['process', 'terminal'] })
 
 export const UNKNOWN_TOOL_SECURITY: ToolSecurityDescriptor = {
   effect: 'unknown',

@@ -1096,6 +1096,7 @@ export async function wsRoutes(app: FastifyInstance) {
               const delegationToolRegistry = withSelectedBrowserTarget(turnToolAuthority.delegation, activeRemoteBrowser)
               const authorizedToolRegistry = withSelectedBrowserTarget(turnToolAuthority.own, activeRemoteBrowser)
               const agentToolRegistry = withContextualToolExposure(authorizedToolRegistry, {
+                previousMessages,
                 surface: surfaceLabel,
                 semanticRouting: true,
                 activeRemoteBrowser,
@@ -1161,6 +1162,7 @@ export async function wsRoutes(app: FastifyInstance) {
                   sessionId,
                   toolCall: _tc,
                   requestId,
+                  recheckPolicy: options?.recheckPolicy,
                   forcePrompt: options?.forcePrompt,
                 })
               }
