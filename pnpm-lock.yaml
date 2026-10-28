@@ -266,7 +266,7 @@ importers:
     devDependencies:
       '@anthropic-ai/sdk':
         specifier: 0.91.1
-        version: 0.91.1(zod@3.25.76)
+        version: 0.91.1(zod@4.6.6)
       '@fastify/multipart':
         specifier: 10.0.0
         version: 10.0.0
@@ -275,7 +275,7 @@ importers:
         version: 11.2.0
       '@modelcontextprotocol/sdk':
         specifier: 1.32.1
-        version: 1.32.1(zod@3.25.76)
+        version: 1.32.1(zod@4.6.6)
       '@types/better-sqlite3':
         specifier: 7.6.13
         version: 7.6.13
@@ -314,7 +314,7 @@ importers:
         version: 0.6.3
       openai:
         specifier: 6.34.0
-        version: 6.34.0(ws@8.21.1)(zod@3.25.76)
+        version: 6.34.0(ws@8.21.1)(zod@4.6.6)
       picomatch:
         specifier: 4.0.4
         version: 4.0.4
@@ -334,11 +334,11 @@ importers:
         specifier: 8.21.1
         version: 8.21.1
       zod:
-        specifier: 3.25.76
-        version: 3.25.76
+        specifier: 4.6.6
+        version: 4.6.6
       zod-to-json-schema:
         specifier: 3.25.2
-        version: 3.25.2(zod@3.25.76)
+        version: 3.25.2(zod@4.6.6)
 
   packages/presentation:
     dependencies:
@@ -2771,8 +2771,8 @@ packages:
     peerDependencies:
       zod: ^3.25.28 || ^4
 
-  zod@3.25.76:
-    resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
+  zod@4.6.6:
+    resolution: {integrity: sha512-4UmzQUF5fxvfcYHlbjBmejU+w+hbDnWFx4aS8kBx7nPBHcO2SqPbpAG8snbdg+Xse4pRefR98hgjFgIMCI/UhA==}
 
 snapshots:
 
@@ -2781,11 +2781,11 @@ snapshots:
       ansi-styles: 6.2.3
       is-fullwidth-code-point: 4.0.0
 
-  '@anthropic-ai/sdk@0.91.1(zod@3.25.76)':
+  '@anthropic-ai/sdk@0.91.1(zod@4.6.6)':
     dependencies:
       json-schema-to-ts: 3.1.1
     optionalDependencies:
-      zod: 3.25.76
+      zod: 4.6.6
 
   '@babel/runtime@7.29.10': {}
 
@@ -2989,7 +2989,7 @@ snapshots:
 
   '@kwsites/promise-deferred@1.1.1': {}
 
-  '@modelcontextprotocol/sdk@1.32.1(zod@3.25.76)':
+  '@modelcontextprotocol/sdk@1.32.1(zod@4.6.6)':
     dependencies:
       '@hono/node-server': 1.19.15(hono@4.13.13)
       ajv: 8.18.0
@@ -3006,8 +3006,8 @@ snapshots:
       json-schema-typed: 8.0.2
       pkce-challenge: 5.0.1
       raw-body: 3.0.2
-      zod: 3.25.76
-      zod-to-json-schema: 3.25.2(zod@3.25.76)
+      zod: 4.6.6
+      zod-to-json-schema: 3.25.2(zod@4.6.6)
     transitivePeerDependencies:
       - supports-color
 
@@ -4397,10 +4397,10 @@ snapshots:
     dependencies:
       mimic-fn: 2.1.0
 
-  openai@6.34.0(ws@8.21.1)(zod@3.25.76):
+  openai@6.34.0(ws@8.21.1)(zod@4.6.6):
     optionalDependencies:
       ws: 8.21.1
-      zod: 3.25.76
+      zod: 4.6.6
 
   own-keys@1.0.2:
     dependencies:
@@ -5332,8 +5332,8 @@ snapshots:
 
   yoga-layout@3.2.1: {}
 
-  zod-to-json-schema@3.25.2(zod@3.25.76):
+  zod-to-json-schema@3.25.2(zod@4.6.6):
     dependencies:
-      zod: 3.25.76
+      zod: 4.6.6
 
-  zod@3.25.76: {}
+  zod@4.6.6: {}
